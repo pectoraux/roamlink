@@ -27,6 +27,7 @@ export function SiteHeader() {
     { href: "/esim", label: "Browse eSIMs" },
     { href: "/dashboard/esims", label: "My eSIMs" },
     { href: "/dashboard/orders", label: "Orders" },
+    { href: "/company", label: "Business" },
   ];
 
   function isActive(href: string) {
