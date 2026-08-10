@@ -58,7 +58,7 @@ export default async function HomePage() {
           </div>
           <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4">
             {destinations.map((d) => (
-              <Link key={d.countryCode} href={`/esim?country=${d.countryCode}`}>
+              <Link key={d.countryCode} href={`/esim/${d.country.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`}>
                 <Card className="lift flex items-center gap-3 p-4">
                   <span className="text-3xl leading-none" aria-hidden>{countryFlag(d.countryCode)}</span>
                   <div className="min-w-0">

@@ -11,6 +11,7 @@ import { api, ApiError } from "@/lib/api-client";
 import { formatPrice, formatDataSize, countryFlag, prettifyStatus, statusColor } from "@/lib/format";
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
+import { SendToPhoneButton } from "@/components/send-to-phone-button";
 
 type OrderData = {
   order: {
@@ -177,11 +178,14 @@ export default function OrderPage({ params }: { params: Promise<{ id: string }> 
 
           <div className="mt-6 flex w-full flex-col gap-3">
             {order.esimId && (
-              <Button asChild size="lg">
-                <Link href={`/dashboard/esims/${order.esimId}`}>
-                  <Smartphone className="mr-2 h-4 w-4" /> Install eSIM
-                </Link>
-              </Button>
+              <>
+                <Button asChild size="lg">
+                  <Link href={`/dashboard/esims/${order.esimId}`}>
+                    <Smartphone className="mr-2 h-4 w-4" /> Install eSIM
+                  </Link>
+                </Button>
+                <SendToPhoneButton esimId={order.esimId} />
+              </>
             )}
             <Button asChild variant="outline">
               <Link href="/dashboard/esims">View My eSIMs</Link>

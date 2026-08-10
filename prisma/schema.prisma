@@ -358,3 +358,77 @@ model Notification {
   @@index([userId])
   @@index([event])
 }
+
+// ---------------------------------------------------------------------------
+// Installation tokens — short-lived, secure tokens for web→mobile deep linking.
+// A web purchase generates a token; the mobile app consumes it to install the
+// eSIM. Never expose raw activation secrets in permanent URLs.
+// ---------------------------------------------------------------------------
+
+model InstallToken {
+  id        String    @id @default(cuid())
+  token     String    @unique
+  userId    String
+  esimId    String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([esimId])
+}
+
+// ---------------------------------------------------------------------------
+// B2B foundation — organizations, members, corporate eSIMs.
+// Built as a foundation so corporate features can be added without redesigning
+// authentication. Not fully implemented yet.
+// ---------------------------------------------------------------------------
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  status    String   @default("active") // active | suspended
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members   OrganizationMember[]
+  esims     OrganizationESIM[]
+  orders    CorporateOrder[]
+}
+
+model OrganizationMember {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  role           String   @default("member") // owner | admin | member
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+}
+
+model OrganizationESIM {
+  id             String   @id @default(cuid())
+  organizationId String
+  esimId         String
+  assignedTo     String?  // employee name/email
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}
+
+model CorporateOrder {
+  id             String   @id @default(cuid())
+  organizationId String
+  orderId        String
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+}

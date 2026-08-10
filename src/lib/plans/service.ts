@@ -191,6 +191,77 @@ export async function getCountries(): Promise<{ country: string; countryCode: st
   return Array.from(seen.values()).sort((a, b) => a.country.localeCompare(b.country));
 }
 
+/** Convert a country name to an SEO-friendly slug. */
+export function countryToSlug(country: string): string {
+  return country
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+/** Convert a slug back to a country name (best-effort). */
+export function slugToCountry(slug: string, countries: { country: string; countryCode: string }[]): string | null {
+  const target = slug.toLowerCase().replace(/-/g, " ");
+  const match = countries.find((c) => c.country.toLowerCase() === target);
+  if (match) return match.country;
+  // Try without spaces (e.g., "cotedivoire" → "Côte d'Ivoire")
+  const match2 = countries.find((c) => c.country.toLowerCase().replace(/[^a-z]/g, "") === slug.replace(/-/g, "").toLowerCase());
+  return match2?.country ?? null;
+}
+
+export type DestinationPage = {
+  country: string;
+  countryCode: string;
+  region: string;
+  slug: string;
+  plans: PublicPlan[];
+  coverage: string | null;
+  networks: string[];
+  speed: string | null;
+  minPriceMinor: number;
+  planCount: number;
+};
+
+/** Get a full destination page (country + all its plans). Returns null if no plans. */
+export async function getDestinationByCountry(country: string): Promise<DestinationPage | null> {
+  const plans = await db.plan.findMany({ where: { status: "active", country }, orderBy: { price: "asc" } });
+  if (plans.length === 0) return null;
+  const publicPlans = plans.map((p) => toPublicPlan(dbPlanToCanonical(p)));
+  const first = plans[0];
+  const allNetworks = new Set<string>();
+  plans.forEach((p) => {
+    if (p.networks) {
+      try { (JSON.parse(p.networks) as string[]).forEach((n) => allNetworks.add(n)); } catch { /* noop */ }
+    }
+  });
+  return {
+    country: first.country,
+    countryCode: first.countryCode,
+    region: first.region,
+    slug: countryToSlug(first.country),
+    plans: publicPlans,
+    coverage: first.coverage,
+    networks: Array.from(allNetworks).sort(),
+    speed: first.speed,
+    minPriceMinor: Math.min(...plans.map((p) => p.price)),
+    planCount: plans.length,
+  };
+}
+
+/** Get a destination by slug. */
+export async function getDestinationBySlug(slug: string): Promise<DestinationPage | null> {
+  const countries = await getCountries();
+  const country = slugToCountry(slug, countries);
+  if (!country) return null;
+  return getDestinationByCountry(country);
+}
+
+/** All destinations for sitemap generation. */
+export async function getAllDestinations(): Promise<{ country: string; countryCode: string; slug: string }[]> {
+  const countries = await getCountries();
+  return countries.map((c) => ({ ...c, slug: countryToSlug(c.country) }));
+}
+
 // ---------------------------------------------------------------------------
 // Provider synchronization
 // ---------------------------------------------------------------------------

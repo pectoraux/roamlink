@@ -35,7 +35,7 @@ export default async function PlansPage({ searchParams }: { searchParams: Promis
           {destinations.map((d) => (
             <Link
               key={d.countryCode}
-              href={`/esim?country=${d.countryCode}`}
+              href={`/esim/${d.country.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`}
               className="inline-flex items-center gap-1.5 rounded-full border border-border/60 bg-card px-3 py-1.5 text-sm hover:border-primary/40 hover:bg-primary/5"
             >
               <span aria-hidden>{countryFlag(d.countryCode)}</span> {d.country}
