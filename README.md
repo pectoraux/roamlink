@@ -52,8 +52,7 @@ journey locally.
 | Styling          | [Tailwind CSS 4](https://tailwindcss.com)                           |
 | UI primitives    | [shadcn/ui](https://ui.shadcn.com) + [Radix UI](https://www.radix-ui.com) |
 | ORM              | [Prisma](https://www.prisma.io) 6                                   |
-| Database (dev)   | SQLite (sandbox constraint — portable to PostgreSQL)                |
-| Database (prod)  | PostgreSQL (target)                                                 |
+| Database         | PostgreSQL ([Neon](https://neon.tech)) — dev, staging, and prod      |
 | Runtime / pkg mgr| [Bun](https://bun.sh)                                               |
 | Forms/validation | [React Hook Form](https://react-hook-form.com) + [Zod](https://zod.dev) |
 | QR codes         | [`qrcode`](https://www.npmjs.com/package/qrcode)                    |
@@ -77,7 +76,7 @@ bun install
 cp .env.example .env
 # Edit .env — at minimum set AUTH_SECRET (see below)
 
-# 3. Push the Prisma schema to the database (SQLite dev DB is created on demand)
+# 3. Push the Prisma schema to PostgreSQL (Neon)
 bun run db:push
 
 # 4. Seed demo data (pricing rules + 24 plans across 11 countries + admin + demo users)
@@ -106,8 +105,10 @@ Copy `.env.example` to `.env` and fill in. **Never commit `.env`.**
 
 ```ini
 # --- Database ---------------------------------------------------------------
-# Dev (SQLite, this sandbox): file-based
-DATABASE_URL="file:./db/custom.db"
+# Neon pooled connection (for the app runtime):
+DATABASE_URL="postgresql://USER:PASS@HOST-pooler.REGION.aws.neon.tech/DB?sslmode=require"
+# Neon direct connection (for Prisma migrations):
+DIRECT_URL="postgresql://USER:PASS@HOST.REGION.aws.neon.tech/DB?sslmode=require"
 # Production: PostgreSQL
 # DATABASE_URL="postgresql://user:pass@localhost:5432/esim?schema=public"
 
@@ -144,7 +145,8 @@ ADMIN_PASSWORD=admin12345
 
 ### Required for first run
 
-- `DATABASE_URL` — for dev, the SQLite file path is fine as shipped.
+- `DATABASE_URL` — PostgreSQL connection string (Neon pooled).
+- `DIRECT_URL` — PostgreSQL connection string (Neon direct, for migrations).
 - `AUTH_SECRET` — **must** be set to a long random string. Generate with
   `openssl rand -base64 32`. This is used to sign session cookies and tokens.
 
@@ -170,50 +172,40 @@ See [`docs/payments.md`](docs/payments.md).
 
 ## Database
 
-### Dev: SQLite
+### PostgreSQL (Neon) — the canonical database
 
-The development sandbox ships only a SQLite client, so the Prisma schema is
-written to be **portable**: no DB-specific features (native enums, arrays,
-JSON extensions) are used. The dev `DATABASE_URL` is a file path.
+RoamLink uses PostgreSQL (Neon) as the canonical database for **all**
+environments — development, staging, and production. SQLite is **not** supported.
 
-```bash
-# Push schema to SQLite (creates/updates tables; idempotent)
-bun run db:push
+The Prisma schema is already configured for PostgreSQL:
 
-# Or run Prisma migrations
-bun run db:migrate
+```prisma
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
 ```
 
-### Production: PostgreSQL
+Set your Neon connection strings in `.env`:
 
-To switch to PostgreSQL:
+```ini
+# Neon pooled connection (for the app runtime)
+DATABASE_URL="postgresql://USER:PASS@HOST-pooler.REGION.aws.neon.tech/DB?sslmode=require"
+# Neon direct connection (for Prisma migrations)
+DIRECT_URL="postgresql://USER:PASS@HOST.REGION.aws.neon.tech/DB?sslmode=require"
+```
 
-1. Open [`prisma/schema.prisma`](prisma/schema.prisma) and change the provider:
+Then push the schema and seed:
 
-   ```prisma
-   datasource db {
-     provider = "postgresql"   // was "sqlite"
-     url      = env("DATABASE_URL")
-   }
-   ```
-
-2. Set a PostgreSQL `DATABASE_URL`:
-
-   ```ini
-   DATABASE_URL="postgresql://user:pass@localhost:5432/esim?schema=public"
-   ```
-
-3. Reset & migrate:
-
-   ```bash
-   bun run db:reset   # if migrating from SQLite
-   bun run db:migrate
-   bun run db:seed
-   ```
+```bash
+bun run db:push     # push schema to PostgreSQL (idempotent)
+bun run db:seed     # seed plans + admin + demo accounts
+```
 
 > All money fields are `Int` (minor units). All status enums are stored as
-> plain strings (no native enums) so the same schema runs on both SQLite and
-> PostgreSQL without changes.
+> plain strings (no native enums) for maximum portability, but PostgreSQL is
+> the only supported database.
 
 See [`docs/database.md`](docs/database.md) for the full schema reference.
 
@@ -249,7 +241,7 @@ flowchart LR
   Pay -->|mock| MockP[MockPaymentProvider]
   Pay -->|real| RealP[Real payment adapter<br/>Stripe / Paystack / ...]
   Lib --> Prisma[Prisma Client]
-  Prisma --> DB[(SQLite dev /<br/>PostgreSQL prod)]
+  Prisma --> DB[(PostgreSQL<br/>Neon)]
   RealE -.webhook.-> WH1[POST /api/webhooks/esim]
   RealP -.webhook.-> WH2[POST /api/payments/webhook]
   WH1 --> Lib
@@ -729,7 +721,7 @@ directory so the resulting bundle is self-contained.
 | [`docs/payments.md`](docs/payments.md) | `PaymentProvider` interface, server-side verification rule, mock flow, real-provider integration (Stripe / Paystack), webhook idempotency, no-card-data rule |
 | [`docs/provisioning.md`](docs/provisioning.md) | Provisioning flow triggered after `PAYMENT_CONFIRMED`, `createOrder` → `provisionESIM` → store ICCID/SM-DP+/activation → QR → `COMPLETED`, one-eSIM-per-order, failure handling |
 | [`docs/webhooks.md`](docs/webhooks.md) | Webhook endpoints, HMAC-SHA256 signature verification, `WebhookEvent` idempotency, event logging, mock-webhook testing with `curl` |
-| [`docs/database.md`](docs/database.md) | SQLite dev vs PostgreSQL prod, every Prisma model documented, key constraints, money storage, indexes |
+| [`docs/database.md`](docs/database.md) | PostgreSQL/Neon setup, every Prisma model documented, key constraints, money storage, indexes |
 
 ---
 

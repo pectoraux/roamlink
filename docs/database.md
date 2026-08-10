@@ -16,10 +16,12 @@ provider split, every model, key constraints, money storage, and indexes.
 
 ---
 
-## Dev vs Production
+## Database Provider
 
-The schema is written to be **portable** between SQLite (dev) and PostgreSQL
-(production). It avoids DB-specific features:
+RoamLink uses **PostgreSQL (Neon)** as the canonical database for all
+environments — development, staging, and production. SQLite is **not** supported.
+
+The schema avoids DB-specific features for maximum portability:
 
 - **No native enums.** All "enum" fields are stored as plain strings with
   the legal values documented in code (e.g. `Order.status` is a string,
@@ -28,60 +30,29 @@ The schema is written to be **portable** between SQLite (dev) and PostgreSQL
 - **No arrays.** List-typed fields are stored as JSON strings (e.g.
   `Plan.networks` is a JSON-encoded `string[]`).
 - **No JSON extension reliance.** JSON fields are stored as plain text and
-  parsed in TS code with `JSON.parse`. (Prisma's native `Json` type works
-  on both, but plain strings keep the schema portable to other ORMs and
-  make raw SQL inspection easier.)
+  parsed in TS code with `JSON.parse`.
 
-### Dev: SQLite
+### Configuration
 
 ```prisma
 datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 ```
 
 ```ini
-DATABASE_URL="file:./db/custom.db"
+# Neon pooled connection (for the app runtime)
+DATABASE_URL="postgresql://USER:PASS@HOST-pooler.REGION.aws.neon.tech/DB?sslmode=require"
+# Neon direct connection (for Prisma migrations)
+DIRECT_URL="postgresql://USER:PASS@HOST.REGION.aws.neon.tech/DB?sslmode=require"
 ```
-
-The SQLite file is created on demand by `bun run db:push`. Use SQLite for
-local development and tests.
-
-### Production: PostgreSQL
-
-To switch:
-
-1. Edit [`prisma/schema.prisma`](../prisma/schema.prisma):
-
-   ```prisma
-   datasource db {
-     provider = "postgresql"
-     url      = env("DATABASE_URL")
-   }
-   ```
-
-2. Set a PostgreSQL connection string in `.env`:
-
-   ```ini
-   DATABASE_URL="postgresql://user:pass@localhost:5432/esim?schema=public"
-   ```
-
-3. Reset and migrate:
-
-   ```bash
-   bun run db:reset
-   bun run db:migrate
-   bun run db:seed
-   ```
-
-The Prisma client and all application code work identically on both
-databases — that's the point of the portable schema.
 
 ### Migration commands
 
 ```bash
-bun run db:push       # Push schema to DB (idempotent, accepts data loss)
+bun run db:push       # Push schema to PostgreSQL (idempotent, accepts data loss)
 bun run db:generate   # Regenerate the Prisma client
 bun run db:migrate    # Create + apply a migration (dev)
 bun run db:reset      # Drop and recreate (dev)
@@ -104,7 +75,7 @@ bun run db:seed       # Populate demo data
 | `TopUp`        | `amount`           | `Int` | Top-up charge                 |
 | `PricingRule`  | `value`            | `Int` | Fixed: minor units; Percentage: percent integer (30 = 30%) |
 
-`Int` columns on SQLite are 64-bit integers; on PostgreSQL they're
+`Int` columns on PostgreSQL are 64-bit integers. Money is stored as
 `integer` (32-bit, ±2.1 billion). For a marketplace charging in minor
 units of USD, 32-bit is fine (max ~$21M per row). If you expect larger
 single values, change the column type to `BigInt` in the schema.

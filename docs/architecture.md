@@ -40,8 +40,7 @@ flowchart TB
 
   subgraph DB["Persistence"]
     Prisma["Prisma Client"]
-    SQLite[("SQLite dev")]
-    Pg[("PostgreSQL prod")]
+    Pg[("PostgreSQL<br/>Neon")]
   end
 
   UI -->|HTTP / SSE| SC
@@ -55,7 +54,7 @@ flowchart TB
   PayIface -.implemented by.-> MockP
   PayIface -.implemented by.-> RealP
   Lib --> Prisma
-  Prisma --> SQLite
+  Prisma --> PostgreSQL
   Prisma --> Pg
 
   RealE -.webhook.-> API
@@ -363,7 +362,7 @@ for any new idempotent operation.
 ### Why minor units?
 
 - **No floating-point rounding errors.** `0.1 + 0.2 !== 0.3` in IEEE 754.
-- **Database portability.** Integer columns behave identically on SQLite and
+- **Integer storage.** Integer columns are 64-bit on PostgreSQL. Money is stored as
   PostgreSQL.
 - **Provider parity.** Most payment provider SDKs accept minor units
   natively (Stripe's `amount` is in cents).

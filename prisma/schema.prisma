@@ -1,12 +1,9 @@
 // =============================================================================
 // eSIM Marketplace — Prisma Schema
 // -----------------------------------------------------------------------------
-// NOTE ON DATABASE PROVIDER:
-// The production target is PostgreSQL. This development sandbox only ships a
-// SQLite client, so the schema is written to be portable: it avoids DB-specific
-// features (native enums, arrays, json extension reliance) so it can be flipped
-// to PostgreSQL by changing the `provider` below to "postgresql" and running
-// `prisma migrate dev`. Money is stored as Int (minor units) — never float.
+// DATABASE: PostgreSQL (Neon) is the canonical database for development,
+// staging, and production. SQLite is NOT supported. Money is stored as Int
+// (minor units) — never float.
 // =============================================================================
 
 generator client {
@@ -15,9 +12,8 @@ generator client {
 }
 
 datasource db {
-  // PostgreSQL (Neon) for both dev and production.
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
 
