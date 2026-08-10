@@ -218,3 +218,37 @@ Stage Summary:
   * Backend: PostgreSQL (Neon), provider abstractions, order state machine, idempotency, webhooks, pricing engine, installation tokens, device compatibility, organizations
   * Payments: mock (default) + Stripe + Flutterwave + PayStack adapters (verified working keys)
   * eSIM: mock (default) + RealESIMProvider boundary (awaits real provider docs)
+
+---
+Task ID: 16
+Agent: Lead engineer (main)
+Task: Add automated test suite + eliminate type duplication (reviewer's top 2 priorities).
+
+Work Log:
+- Created 6 test files (48 tests total, all passing):
+  * pricing.test.ts (8 tests): money as integer minor units, no float drift, markup engine
+  * state-machine.test.ts (18 tests): all legal/illegal order transitions, terminal/failure states
+  * purchase.test.ts (6 tests): full purchase→provisioning lifecycle, idempotency (duplicate confirm = same eSIM), failure handling, unauthorized access
+  * install-tokens.test.ts (7 tests): token creation/consumption, replay rejection (single-use), wrong-user rejection, expiry, invalid token, cross-user eSIM ownership
+  * webhooks.test.ts (3 tests): event creation, (provider, externalId) uniqueness, upsert dedup
+  * b2b-isolation.test.ts (6 tests): tenant isolation (Org A ≠ Org B), role enforcement, non-member rejection, cross-org member
+- Test infrastructure:
+  * bunfig.toml: preload env loader, 120s timeout
+  * tests/env.ts: loads .env, uses pooled Neon connection with connect_timeout
+  * tests/setup.ts: lazy global setup (avoids bun:test's 5s beforeAll hook timeout)
+  * tests/helpers.ts: expectReject helper for Prisma promise compatibility
+- Eliminated type duplication:
+  * src/types/index.ts now re-exports from @roamlink/shared
+  * Both web and mobile consume the same canonical types
+  * tsconfig.json: added @roamlink/shared path alias
+- Fixed EXIM_PROVIDER→ESIM_PROVIDER typo in mobile README (spotted by reviewer)
+- All 48 tests pass. Build succeeds. Lint clean.
+- Pushed to GitHub (commit a508ec7). Vercel deployment succeeded (READY).
+- Production verified: / → 200, /esim/ghana → 200, /company → 200.
+
+Stage Summary:
+- The reviewer's top 2 priorities are done:
+  1. ✅ Automated test suite (48 tests covering purchase, idempotency, install tokens, webhooks, B2B isolation)
+  2. ✅ Type duplication eliminated (packages/shared is canonical, web re-exports)
+- RoamLink is now a "production-candidate Level-1 platform, pending automated regression testing (done), real-device validation, and real eSIM-provider integration."
+- The biggest remaining unknown is commercial (eSIM provider economics/coverage), not architectural.
