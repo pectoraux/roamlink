@@ -252,3 +252,47 @@ Stage Summary:
   2. ✅ Type duplication eliminated (packages/shared is canonical, web re-exports)
 - RoamLink is now a "production-candidate Level-1 platform, pending automated regression testing (done), real-device validation, and real eSIM-provider integration."
 - The biggest remaining unknown is commercial (eSIM provider economics/coverage), not architectural.
+
+---
+Task ID: 17
+Agent: Lead engineer (main)
+Task: Integrate Virtual Numbers as a second connectivity product alongside eSIMs.
+
+Work Log:
+- Created VirtualNumberProvider abstraction (src/lib/virtual-numbers/provider.ts) with
+  interface: searchNumbers, getNumber, purchaseNumber, releaseNumber, configureNumber,
+  sendSMS, getMessages, makeCall, verifyWebhook. Provider-native data normalized.
+- MockVirtualNumberProvider: 8 countries (GH, NG, TG, US, GB, FR, KE, ZA),
+  6 numbers per country, simulated SMS/voice, idempotent purchase, webhook verification.
+- Factory (index.ts): selects provider via VN_PROVIDER env var (mock default).
+- Number state machine: discovered→available→reserved→provisioning→configuring→active→suspended→releasing→released, with failed states.
+- Service layer (service.ts): searchNumbers, getNumberCountries, purchaseNumber
+  (reuses Order+Payment infra, idempotent), listUserNumbers, getUserNumber,
+  releaseNumber, sendSMS, getMessages, processInboundMessage, getCalls.
+- Schema changes: VirtualNumber, NumberSubscription, Message, Call, TrialPolicy,
+  CountryCapability models. Order.planId now nullable (virtual-number orders have
+  no Plan row), Order.productType field distinguishes esim vs virtual_number.
+- API routes: search, orders, list, [id], [id]/release, [id]/messages (GET+POST),
+  [id]/calls, webhooks/virtual-numbers (idempotent inbound processing).
+- Web UX: /numbers (country marketplace), /numbers/[country] (SEO destination with
+  JSON-LD), /dashboard/numbers (My Numbers), /dashboard/numbers/[id] (details with
+  messages + calls tabs, send SMS form). 'Numbers' link added to header.
+- Shared types: VirtualNumber, Message, Call, NumberCountry added to packages/shared.
+- VN_PROVIDER + VN_WEBHOOK_SECRET added to .env.
+- Verified end-to-end on production:
+  * Country catalog: 8 countries with capabilities
+  * Search Ghana: 6 numbers available
+  * Purchase: order created → payment verified → number provisioned (active)
+  * Send SMS: message sent + stored
+  * List numbers: purchased number appears with e164, status, capabilities
+  * Build succeeds, lint clean, existing 48 tests still pass
+- Pushed to GitHub (commit f348ee4). Vercel deployment succeeded.
+
+Stage Summary:
+- RoamLink is now a unified connectivity platform with two products:
+  eSIMs (mobile data) + Virtual Numbers (SMS/voice)
+- Both share the same: auth, payments, orders, organizations, billing, web/mobile infra
+- The existing eSIM functionality is unchanged and still works.
+- Virtual number provider is mock (dev). Real adapter (Telnyx/Twilio/Vonage)
+  awaits real API docs — boundary is in place, not fabricated.
+- Architecture principle: "One platform for your global connectivity."
