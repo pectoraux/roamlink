@@ -43,6 +43,8 @@ model User {
   approvedFrom          WaitlistEntry?
   approvedWaitlist      WaitlistEntry[] @relation("WaitlistApprover")
   orgMemberships        OrganizationMember[]
+  virtualNumbers        VirtualNumber[]
+  numberSubscriptions   NumberSubscription[]
 }
 
 model WaitlistEntry {
@@ -151,7 +153,8 @@ model Plan {
 model Order {
   id               String   @id @default(cuid())
   userId           String
-  planId           String
+  planId           String?  // nullable for virtual-number orders (no Plan row)
+  productType      String   @default("esim") // esim | virtual_number
   // State machine: PLAN_SELECTED | CHECKOUT_CREATED | PAYMENT_PENDING |
   // PAYMENT_CONFIRMED | ESIM_PROVISIONING | ESIM_PROVISIONED | COMPLETED |
   // PAYMENT_FAILED | PROVISIONING_FAILED | CANCELLED | REFUNDED
@@ -171,10 +174,11 @@ model Order {
   updatedAt        DateTime @updatedAt
 
   user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  plan             Plan     @relation(fields: [planId], references: [id])
+  plan             Plan?    @relation(fields: [planId], references: [id])
   payments         Payment[]
   esim             Esim?
   corporateOrder   CorporateOrder?
+  virtualNumber    VirtualNumber? @relation("VirtualNumberOrder")
 
   @@index([userId])
   @@index([status])
@@ -394,6 +398,7 @@ model Organization {
   members   OrganizationMember[]
   esims     OrganizationESIM[]
   orders    CorporateOrder[]
+  numbers   VirtualNumber[] @relation("OrgNumbers")
 }
 
 model OrganizationMember {
@@ -434,4 +439,136 @@ model CorporateOrder {
   order          Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Virtual Numbers — second connectivity product alongside eSIMs.
+// Reuses: User, Organization, Order, Payment, WebhookEvent, AuditLog.
+// ---------------------------------------------------------------------------
+
+model VirtualNumber {
+  id              String    @id @default(cuid())
+  e164            String    @unique // e.g. "+233241234567"
+  country         String
+  countryCode     String
+  region          String?
+  city            String?
+  numberType      String    @default("local") // local | toll_free | mobile | national
+  smsEnabled      Boolean   @default(false)
+  mmsEnabled      Boolean   @default(false)
+  voiceEnabled    Boolean   @default(false)
+  // Lifecycle: discovered | available | reserved | provisioning | configuring | active | suspended | releasing | released | failed
+  status          String    @default("available")
+  provider        String    // e.g. "mock", "telnyx", "twilio"
+  providerNumberId String?  // provider's native number id
+  providerCost    Int       // wholesale cost in minor units (monthly)
+  sellingPrice    Int       // customer price in minor units (monthly)
+  currency        String    @default("USD")
+  userId          String?
+  organizationId  String?
+  orderId         String?   @unique // 1:1 with the order that purchased it
+  activatedAt     DateTime?
+  releasedAt      DateTime?
+  expiresAt       DateTime? // subscription expiry
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user            User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+  order           Order?          @relation("VirtualNumberOrder", fields: [orderId], references: [id], onDelete: SetNull)
+  organization    Organization?   @relation("OrgNumbers", fields: [organizationId], references: [id], onDelete: SetNull)
+  messages        Message[]
+  calls           Call[]
+  subscriptions   NumberSubscription[]
+
+  @@index([userId])
+  @@index([organizationId])
+  @@index([countryCode])
+  @@index([status])
+}
+
+model NumberSubscription {
+  id              String    @id @default(cuid())
+  virtualNumberId String
+  userId          String
+  status          String    @default("active") // active | past_due | suspended | cancelled | expired | trial
+  billingCycle    String    @default("monthly") // monthly | yearly
+  currentPeriodEnd DateTime
+  trialEndsAt     DateTime?
+  cancelledAt     DateTime?
+  idempotencyKey  String    @unique
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  virtualNumber   VirtualNumber @relation(fields: [virtualNumberId], references: [id], onDelete: Cascade)
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([virtualNumberId])
+  @@index([status])
+}
+
+model Message {
+  id              String   @id @default(cuid())
+  virtualNumberId String
+  direction       String   // inbound | outbound
+  fromNumber      String
+  toNumber        String
+  body            String
+  status          String   @default("received") // received | sent | delivered | failed
+  providerMessageId String?
+  segments        Int      @default(1)
+  createdAt       DateTime @default(now())
+
+  virtualNumber   VirtualNumber @relation(fields: [virtualNumberId], references: [id], onDelete: Cascade)
+
+  @@index([virtualNumberId])
+  @@index([createdAt])
+}
+
+model Call {
+  id              String   @id @default(cuid())
+  virtualNumberId String
+  direction       String   // inbound | outbound
+  fromNumber      String
+  toNumber        String
+  status          String   @default("completed") // ringing | in_progress | completed | failed | no_answer | busy
+  durationSeconds Int      @default(0)
+  providerCallId  String?
+  recordingUrl    String?
+  createdAt       DateTime @default(now())
+
+  virtualNumber   VirtualNumber @relation(fields: [virtualNumberId], references: [id], onDelete: Cascade)
+
+  @@index([virtualNumberId])
+  @@index([createdAt])
+}
+
+model TrialPolicy {
+  id              String   @id @default(cuid())
+  name            String   @unique
+  durationHours   Int      @default(24)
+  maxNumbers      Int      @default(1)
+  maxInboundSMS   Int      @default(3)
+  maxOutboundSMS  Int      @default(0)
+  maxInboundMinutes Int    @default(5)
+  maxOutboundMinutes Int   @default(0)
+  apiAllowed      Boolean  @default(false)
+  eligibleCountries String? // comma-separated country codes, null = all
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model CountryCapability {
+  id              String   @id @default(cuid())
+  countryCode     String   @unique
+  country         String
+  smsAllowed      Boolean  @default(true)
+  voiceAllowed    Boolean  @default(true)
+  mmsAllowed      Boolean  @default(false)
+  identityRequired Boolean @default(false)
+  notes           String?
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 }

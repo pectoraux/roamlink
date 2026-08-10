@@ -1,0 +1,1804 @@
+     1→Yes — but I would **not give Z.ai that prompt unchanged**. It was written for a standalone virtual-number company. RoamLink already has the platform foundation, so the correct instruction is to **integrate Virtual Numbers as a second connectivity product inside the existing RoamLink architecture**, without duplicating auth, payments, organizations, providers, billing, mobile/web infrastructure, etc.
+     2→
+     3→I would give Z.ai this prompt:
+     4→
+     5→# ROAMLINK — INTEGRATE VIRTUAL NUMBERS AS A SECOND CONNECTIVITY PRODUCT
+     6→
+     7→You are working on the EXISTING RoamLink repository.
+     8→
+     9→Do NOT build a separate virtual-number application.
+    10→
+    11→Do NOT replace the existing RoamLink architecture.
+    12→
+    13→Do NOT duplicate authentication, payments, organizations, billing, provider abstractions, mobile infrastructure, web infrastructure, or database concepts that already exist.
+    14→
+    15→Your task is to evolve RoamLink from an **eSIM marketplace** into a broader **global connectivity platform** by adding **Virtual Phone Numbers** as a first-class product alongside eSIMs.
+    16→
+    17→The existing eSIM functionality must continue working.
+    18→
+    19→---
+    20→
+    21→# 1. CURRENT ROAMLINK ARCHITECTURE
+    22→
+    23→RoamLink already has:
+    24→
+    25→* Next.js web application
+    26→* Expo/React Native mobile application
+    27→* PostgreSQL/Neon
+    28→* Prisma
+    29→* shared TypeScript package
+    30→* authentication
+    31→* user accounts
+    32→* organizations/B2B
+    33→* payment abstraction
+    34→* Stripe
+    35→* Paystack
+    36→* Flutterwave
+    37→* eSIM provider abstraction
+    38→* order lifecycle/state machine
+    39→* provisioning
+    40→* usage
+    41→* top-ups
+    42→* installation tokens
+    43→* webhooks
+    44→* SEO destination pages
+    45→* admin functionality
+    46→
+    47→The current architecture is approximately:
+    48→
+    49→```text
+    50→                         ROAMLINK
+    51→                            │
+    52→               ┌────────────┴────────────┐
+    53→               │                         │
+    54→              WEB                     MOBILE
+    55→               │                         │
+    56→               └────────────┬────────────┘
+    57→                            │
+    58→                     Shared API/Types
+    59→                            │
+    60→                       Backend API
+    61→                            │
+    62→             ┌──────────────┼──────────────┐
+    63→             │              │              │
+    64→          Commerce       Payments       Providers
+    65→             │              │              │
+    66→           Orders       Stripe/etc.     eSIM
+    67→           Billing      Paystack/etc.
+    68→           B2B                         │
+    69→             │                         │
+    70→             └────────── PostgreSQL ───┘
+    71→```
+    72→
+    73→We are now extending this to:
+    74→
+    75→```text
+    76→                         ROAMLINK
+    77→                            │
+    78→               ┌────────────┴────────────┐
+    79→               │                         │
+    80→              WEB                     MOBILE
+    81→               │                         │
+    82→               └────────────┬────────────┘
+    83→                            │
+    84→                     Shared API/Types
+    85→                            │
+    86→                       Backend API
+    87→                            │
+    88→              ┌─────────────┼─────────────┐
+    89→              │             │             │
+    90→           Commerce      Payments      Connectivity
+    91→              │             │             │
+    92→           Orders        Providers       ├── eSIM
+    93→           Billing       Stripe/etc.     │
+    94→           B2B                           └── Virtual Numbers
+    95→              │
+    96→              └──────────── PostgreSQL
+    97→```
+    98→
+    99→The fundamental product concept becomes:
+   100→
+   101→> **RoamLink provides connectivity identities and connectivity services globally.**
+   102→
+   103→eSIMs provide mobile data.
+   104→
+   105→Virtual Numbers provide communication identity through SMS/voice where supported.
+   106→
+   107→---
+   108→
+   109→# 2. DO NOT REBUILD WHAT ALREADY EXISTS
+   110→
+   111→Before changing anything:
+   112→
+   113→1. Inspect the repository.
+   114→2. Inspect the current Prisma schema.
+   115→3. Inspect existing payment abstractions.
+   116→4. Inspect existing provider abstractions.
+   117→5. Inspect existing order/state-machine implementation.
+   118→6. Inspect existing user/auth implementation.
+   119→7. Inspect existing Organization/B2B implementation.
+   120→8. Inspect existing mobile navigation.
+   121→9. Inspect existing shared package.
+   122→10. Inspect existing admin architecture.
+   123→11. Inspect existing webhook architecture.
+   124→12. Inspect existing usage/billing implementation.
+   125→
+   126→Reuse existing infrastructure wherever possible.
+   127→
+   128→If an existing subsystem can support virtual numbers through extension rather than replacement, extend it.
+   129→
+   130→Do NOT create:
+   131→
+   132→```text
+   133→VirtualNumberAuth
+   134→VirtualNumberPayment
+   135→VirtualNumberUser
+   136→VirtualNumberOrganization
+   137→VirtualNumberBilling
+   138→```
+   139→
+   140→when RoamLink already has those concepts.
+   141→
+   142→---
+   143→
+   144→# 3. NEW PRODUCT MODEL
+   145→
+   146→RoamLink should now have two primary connectivity products:
+   147→
+   148→```text
+   149→Connectivity
+   150→│
+   151→├── eSIM
+   152→│   ├── Data
+   153→│   ├── Travel plans
+   154→│   ├── Usage
+   155→│   ├── Top-ups
+   156→│   └── Installation
+   157→│
+   158→└── Virtual Number
+   159→    ├── SMS
+   160→    ├── Voice
+   161→    ├── MMS where supported
+   162→    ├── Number rental
+   163→    ├── Usage
+   164→    └── Communication management
+   165→```
+   166→
+   167→Do NOT force virtual numbers into the eSIM data model.
+   168→
+   169→An eSIM and a virtual phone number are different resources.
+   170→
+   171→However, they should share common platform concepts such as:
+   172→
+   173→* User
+   174→* Organization
+   175→* Order
+   176→* Payment
+   177→* Provider
+   178→* Usage
+   179→* Subscription
+   180→* Billing
+   181→* AuditLog
+   182→* WebhookEvent
+   183→
+   184→---
+   185→
+   186→# 4. PRODUCT UX
+   187→
+   188→RoamLink should expose a top-level product structure such as:
+   189→
+   190→```text
+   191→RoamLink
+   192→
+   193→Connectivity
+   194→
+   195→├── eSIMs
+   196→│   ├── Explore
+   197→│   ├── My eSIMs
+   198→│   └── Usage
+   199→│
+   200→└── Virtual Numbers
+   201→    ├── Find a Number
+   202→    ├── My Numbers
+   203→    ├── Messages
+   204→    └── Calls
+   205→```
+   206→
+   207→The existing eSIM experience must remain intact.
+   208→
+   209→Add virtual numbers as a sibling product, not as a replacement.
+   210→
+   211→---
+   212→
+   213→# 5. CRITICAL DISTINCTION: DATA-ONLY ESIM VS NUMBER
+   214→
+   215→Do NOT incorrectly assume that every eSIM has a phone number.
+   216→
+   217→RoamLink should explicitly distinguish:
+   218→
+   219→```text
+   220→eSIM
+   221→ └── data connectivity
+   222→
+   223→Virtual Number
+   224→ ├── telephone number
+   225→ ├── SMS
+   226→ └── voice where supported
+   227→```
+   228→
+   229→A future telecom provider may offer an eSIM with an MSISDN/voice/SMS, but that is provider/product-specific.
+   230→
+   231→Do not invent such capability.
+   232→
+   233→---
+   234→
+   235→# 6. VIRTUAL NUMBER DOMAIN
+   236→
+   237→Introduce a normalized internal VirtualNumber model.
+   238→
+   239→Conceptually:
+   240→
+   241→```text
+   242→VirtualNumber
+   243→ ├── id
+   244→ ├── e164
+   245→ ├── country
+   246→ ├── countryCode
+   247→ ├── region
+   248→ ├── city
+   249→ ├── numberType
+   250→ ├── smsEnabled
+   251→ ├── mmsEnabled
+   252→ ├── voiceEnabled
+   253→ ├── status
+   254→ ├── providerId
+   255→ ├── providerNumberId
+   256→ ├── providerCost
+   257→ ├── sellingPrice
+   258→ ├── currency
+   259→ ├── assignedUserId
+   260→ ├── assignedOrganizationId
+   261→ ├── createdAt
+   262→ ├── activatedAt
+   263→ └── releasedAt
+   264→```
+   265→
+   266→Use proper relations instead of duplicating ownership information unnecessarily.
+   267→
+   268→If the existing schema has a better ownership model, use it.
+   269→
+   270→---
+   271→
+   272→# 7. PROVIDER ABSTRACTION
+   273→
+   274→Do NOT hard-code virtual-number functionality directly into routes or React components.
+   275→
+   276→Create a telecom provider abstraction.
+   277→
+   278→For example:
+   279→
+   280→```typescript
+   281→interface VirtualNumberProvider {
+   282→  searchNumbers(params: SearchNumbersParams): Promise<ProviderNumber[]>
+   283→
+   284→  getNumber(providerNumberId: string): Promise<ProviderNumber>
+   285→
+   286→  purchaseNumber(providerNumberId: string): Promise<ProviderNumber>
+   287→
+   288→  releaseNumber(providerNumberId: string): Promise<void>
+   289→
+   290→  configureNumber(
+   291→    providerNumberId: string,
+   292→    config: NumberConfiguration
+   293→  ): Promise<void>
+   294→
+   295→  sendSMS(params: SendSMSParams): Promise<ProviderMessage>
+   296→
+   297→  getMessages(params: GetMessagesParams): Promise<ProviderMessage[]>
+   298→
+   299→  makeCall(params: MakeCallParams): Promise<ProviderCall>
+   300→
+   301→  configureVoice(
+   302→    providerNumberId: string,
+   303→    config: VoiceConfiguration
+   304→  ): Promise<void>
+   305→}
+   306→```
+   307→
+   308→Improve the interface if the existing RoamLink architecture suggests a better abstraction.
+   309→
+   310→Potential adapters:
+   311→
+   312→```text
+   313→VirtualNumberProvider
+   314→│
+   315→├── Telnyx
+   316→├── Twilio
+   317→├── Vonage
+   318→└── Future providers
+   319→```
+   320→
+   321→Do not add providers merely for appearance.
+   322→
+   323→Start with **one real provider integration** when credentials/API documentation are available.
+   324→
+   325→Keep the abstraction capable of supporting multiple providers.
+   326→
+   327→---
+   328→
+   329→# 8. PROVIDER ROUTING
+   330→
+   331→Virtual numbers must NOT be permanently coupled to a single provider.
+   332→
+   333→Build a routing layer:
+   334→
+   335→```text
+   336→Customer request
+   337→      ↓
+   338→Country
+   339→      ↓
+   340→Region
+   341→      ↓
+   342→Required capabilities
+   343→      ↓
+   344→Compliance requirements
+   345→      ↓
+   346→Available provider inventory
+   347→      ↓
+   348→Provider routing
+   349→      ↓
+   350→Provider adapter
+   351→      ↓
+   352→Number
+   353→```
+   354→
+   355→Provider selection should eventually consider:
+   356→
+   357→* availability
+   358→* country
+   359→* region
+   360→* capabilities
+   361→* compliance
+   362→* provider health
+   363→* provider cost
+   364→* provisioning reliability
+   365→* expected margin
+   366→
+   367→Initially a simple deterministic provider selection is acceptable.
+   368→
+   369→Architect the system so scoring can later be introduced.
+   370→
+   371→---
+   372→
+   373→# 9. COUNTRY AVAILABILITY
+   374→
+   375→Do NOT hard-code assumptions about countries.
+   376→
+   377→Create a configurable country/capability system.
+   378→
+   379→A country may support:
+   380→
+   381→```text
+   382→SMS ✓
+   383→Voice ✓
+   384→MMS ✗
+   385→```
+   386→
+   387→while another may support:
+   388→
+   389→```text
+   390→SMS ✓
+   391→Voice ✗
+   392→MMS ✗
+   393→```
+   394→
+   395→The UI must derive capabilities from backend configuration/provider availability.
+   396→
+   397→Never display a capability that the selected number/provider does not actually support.
+   398→
+   399→---
+   400→
+   401→# 10. NUMBER SEARCH
+   402→
+   403→Create a polished search experience.
+   404→
+   405→Example:
+   406→
+   407→```text
+   408→Find a virtual number
+   409→
+   410→Country
+   411→[ Ghana ▼ ]
+   412→
+   413→Region
+   414→[ Accra ▼ ]
+   415→
+   416→Capabilities
+   417→
+   418→☑ SMS
+   419→☑ Voice
+   420→☐ MMS
+   421→
+   422→[ Search numbers ]
+   423→```
+   424→
+   425→Results:
+   426→
+   427→```text
+   428→🇬🇭 +233 XX XXX XXXX
+   429→
+   430→Accra, Ghana
+   431→
+   432→SMS ✓
+   433→Voice ✓
+   434→
+   435→$X.XX/month
+   436→
+   437→[ Get number ]
+   438→```
+   439→
+   440→Support:
+   441→
+   442→* country
+   443→* calling code
+   444→* region
+   445→* city
+   446→* area code where applicable
+   447→* number type
+   448→* SMS
+   449→* MMS
+   450→* voice
+   451→* price
+   452→* availability
+   453→
+   454→Do not expose provider identity to ordinary customers unless there is a legitimate reason.
+   455→
+   456→RoamLink should abstract the underlying telecom infrastructure.
+   457→
+   458→---
+   459→
+   460→# 11. NUMBER LIFECYCLE
+   461→
+   462→Implement an explicit state machine.
+   463→
+   464→At minimum:
+   465→
+   466→```text
+   467→DISCOVERED
+   468→AVAILABLE
+   469→RESERVED
+   470→PROVISIONING
+   471→CONFIGURING
+   472→ACTIVE
+   473→SUSPENDED
+   474→RELEASING
+   475→RELEASED
+   476→FAILED
+   477→```
+   478→
+   479→Do not use only:
+   480→
+   481→```text
+   482→isActive
+   483→```
+   484→
+   485→All lifecycle transitions must be explicit and validated.
+   486→
+   487→---
+   488→
+   489→# 12. PURCHASE / PROVISIONING FLOW
+   490→
+   491→Implement:
+   492→
+   493→```text
+   494→Number selected
+   495→      ↓
+   496→Order created
+   497→      ↓
+   498→Payment pending
+   499→      ↓
+   500→Payment confirmed
+   501→      ↓
+   502→Number reserved
+   503→      ↓
+   504→Provisioning
+   505→      ↓
+   506→Configuration
+   507→      ↓
+   508→ACTIVE
+   509→```
+   510→
+   511→The provisioning operation must be idempotent.
+   512→
+   513→A duplicate request must NOT:
+   514→
+   515→* charge twice
+   516→* buy two numbers
+   517→* create two assignments
+   518→* create duplicate subscriptions
+   519→
+   520→Use database constraints and idempotency keys.
+   521→
+   522→Reuse the existing RoamLink idempotency architecture where appropriate.
+   523→
+   524→---
+   525→
+   526→# 13. SUBSCRIPTIONS
+   527→
+   528→Virtual numbers are generally rental/subscription resources.
+   529→
+   530→Support:
+   531→
+   532→```text
+   533→ACTIVE
+   534→PAST_DUE
+   535→SUSPENDED
+   536→CANCELLED
+   537→EXPIRED
+   538→```
+   539→
+   540→A number subscription should be separate from the underlying provider resource.
+   541→
+   542→For example:
+   543→
+   544→```text
+   545→Customer Subscription
+   546→        │
+   547→        └── VirtualNumber
+   548→                │
+   549→                └── ProviderNumber
+   550→```
+   551→
+   552→This distinction is important.
+   553→
+   554→RoamLink owns the customer relationship.
+   555→
+   556→The provider owns the underlying telecom resource.
+   557→
+   558→---
+   559→
+   560→# 14. FREE TRIAL
+   561→
+   562→Add a configurable trial system for virtual numbers.
+   563→
+   564→Do NOT offer unlimited free numbers.
+   565→
+   566→Example:
+   567→
+   568→```text
+   569→Trial
+   570→
+   571→1 number
+   572→24 hours
+   573→3 inbound SMS
+   574→5 inbound call minutes
+   575→No outbound calls
+   576→No bulk messaging
+   577→No API access
+   578→```
+   579→
+   580→These are examples only.
+   581→
+   582→Make trial limits configurable.
+   583→
+   584→Create a model similar to:
+   585→
+   586→```text
+   587→TrialPolicy
+   588→ ├── duration
+   589→ ├── maxNumbers
+   590→ ├── maxInboundSMS
+   591→ ├── maxOutboundSMS
+   592→ ├── maxInboundMinutes
+   593→ ├── maxOutboundMinutes
+   594→ ├── apiAllowed
+   595→ ├── eligibleCountries
+   596→ └── riskLevel
+   597→```
+   598→
+   599→Reuse an existing trial/risk subsystem if present.
+   600→
+   601→---
+   602→
+   603→# 15. TRIAL ELIGIBILITY / ABUSE
+   604→
+   605→Virtual-number trials are abuse-sensitive.
+   606→
+   607→Integrate trial eligibility with RoamLink's existing account/risk/security architecture.
+   608→
+   609→Do not build mechanisms intended to evade anti-abuse systems.
+   610→
+   611→Implement sensible controls:
+   612→
+   613→* verified account
+   614→* velocity limits
+   615→* one trial per appropriate identity/account policy
+   616→* suspicious activity detection
+   617→* country restrictions
+   618→* messaging limits
+   619→* automated suspension
+   620→* manual review
+   621→
+   622→Do not over-engineer this before launch.
+   623→
+   624→The architecture should be extensible.
+   625→
+   626→---
+   627→
+   628→# 16. SMS
+   629→
+   630→Add SMS capabilities to the virtual-number product.
+   631→
+   632→Support:
+   633→
+   634→### Inbox
+   635→
+   636→```text
+   637→Messages
+   638→│
+   639→├── Conversation
+   640→├── Sender
+   641→├── Recipient
+   642→├── Timestamp
+   643→├── Delivery status
+   644→└── Content
+   645→```
+   646→
+   647→Support:
+   648→
+   649→* inbound SMS
+   650→* outbound SMS where provider/country permits
+   651→* delivery status
+   652→* message history
+   653→* conversation threads
+   654→* provider message IDs
+   655→* webhook processing
+   656→
+   657→Normalize provider events.
+   658→
+   659→Example:
+   660→
+   661→```text
+   662→SMS_RECEIVED
+   663→SMS_SENT
+   664→SMS_DELIVERED
+   665→SMS_FAILED
+   666→```
+   667→
+   668→All events must be idempotent.
+   669→
+   670→---
+   671→
+   672→# 17. VOICE
+   673→
+   674→Where supported, implement:
+   675→
+   676→* incoming calls
+   677→* outgoing calls
+   678→* missed calls
+   679→* call history
+   680→* duration
+   681→* call status
+   682→* forwarding architecture
+   683→* voice webhook configuration
+   684→
+   685→Do NOT pretend that voice is available for every number.
+   686→
+   687→The UI must derive capabilities from actual number configuration.
+   688→
+   689→---
+   690→
+   691→# 18. MMS
+   692→
+   693→Treat MMS as optional.
+   694→
+   695→Only enable it when:
+   696→
+   697→```text
+   698→country supports MMS
+   699→AND
+   700→provider supports MMS
+   701→AND
+   702→number supports MMS
+   703→```
+   704→
+   705→Never assume SMS capability implies MMS capability.
+   706→
+   707→---
+   708→
+   709→# 19. MOBILE APP
+   710→
+   711→Extend the existing Expo app.
+   712→
+   713→Do NOT create a second mobile application.
+   714→
+   715→Add navigation such as:
+   716→
+   717→```text
+   718→Home
+   719→Explore
+   720→My eSIMs
+   721→Numbers
+   722→Activity
+   723→Profile
+   724→```
+   725→
+   726→or another structure that fits the existing navigation.
+   727→
+   728→Virtual Number screens should include:
+   729→
+   730→```text
+   731→Find Number
+   732→Number Details
+   733→Checkout
+   734→My Numbers
+   735→Number Details
+   736→Messages
+   737→Conversation
+   738→Calls
+   739→Number Settings
+   740→```
+   741→
+   742→The mobile app should be the primary place where customers **use** their virtual numbers.
+   743→
+   744→For example:
+   745→
+   746→```text
+   747→My Number
+   748→
+   749→🇬🇭 +233 XX XXX XXXX
+   750→
+   751→SMS ✓
+   752→Voice ✓
+   753→
+   754→[ Messages ]
+   755→[ Calls ]
+   756→[ Settings ]
+   757→```
+   758→
+   759→---
+   760→
+   761→# 20. WEB APP
+   762→
+   763→Extend the existing web application.
+   764→
+   765→The web experience should be excellent for:
+   766→
+   767→* discovering numbers
+   768→* SEO
+   769→* purchasing
+   770→* managing numbers
+   771→* business users
+   772→* admin users
+   773→
+   774→Potential routes:
+   775→
+   776→```text
+   777→/numbers
+   778→/numbers/[country]
+   779→/numbers/[country]/[region]
+   780→/numbers/search
+   781→/dashboard/numbers
+   782→/dashboard/numbers/[id]
+   783→/dashboard/numbers/[id]/messages
+   784→/dashboard/numbers/[id]/calls
+   785→```
+   786→
+   787→Use the existing routing conventions where appropriate.
+   788→
+   789→---
+   790→
+   791→# 21. SEO
+   792→
+   793→Virtual numbers create a major SEO opportunity.
+   794→
+   795→Build server-rendered country/region pages where actual availability data supports them.
+   796→
+   797→Examples:
+   798→
+   799→```text
+   800→/numbers/ghana
+   801→/numbers/togo
+   802→/numbers/nigeria
+   803→/numbers/united-states
+   804→/numbers/united-kingdom
+   805→```
+   806→
+   807→Potential region pages:
+   808→
+   809→```text
+   810→/numbers/united-states/new-york
+   811→/numbers/united-states/california
+   812→```
+   813→
+   814→Only generate pages for supported destinations.
+   815→
+   816→Each page should have:
+   817→
+   818→* metadata
+   819→* canonical URL
+   820→* JSON-LD where appropriate
+   821→* FAQ
+   822→* supported capabilities
+   823→* pricing information where appropriate
+   824→* clear CTA
+   825→
+   826→Do not create thousands of thin SEO pages with no real inventory/value.
+   827→
+   828→---
+   829→
+   830→# 22. PAYMENTS
+   831→
+   832→REUSE THE EXISTING RoamLink payment abstraction.
+   833→
+   834→Do NOT create a second payment system.
+   835→
+   836→Virtual-number purchases/subscriptions should use the existing payment architecture.
+   837→
+   838→Support existing providers where appropriate:
+   839→
+   840→* Stripe
+   841→* Paystack
+   842→* Flutterwave
+   843→
+   844→Use the existing payment verification and webhook architecture.
+   845→
+   846→If a payment-provider feature is unavailable, fail explicitly rather than pretending it works.
+   847→
+   848→---
+   849→
+   850→# 23. BILLING
+   851→
+   852→Extend existing RoamLink billing.
+   853→
+   854→Virtual-number revenue may include:
+   855→
+   856→```text
+   857→Monthly number rental
+   858→SMS
+   859→Voice
+   860→MMS
+   861→Premium numbers
+   862→```
+   863→
+   864→Provider cost must remain separate from customer price.
+   865→
+   866→Example:
+   867→
+   868→```text
+   869→Provider cost: $2.10/month
+   870→Customer price: $4.99/month
+   871→Gross margin: $2.89
+   872→```
+   873→
+   874→Do not use floating-point arithmetic for financial calculations.
+   875→
+   876→Reuse the existing money representation.
+   877→
+   878→If RoamLink does not yet have an immutable ledger, implement the minimum correct financial model rather than creating an unnecessary second billing system.
+   879→
+   880→---
+   881→
+   882→# 24. WALLET / USAGE
+   883→
+   884→If the existing RoamLink wallet/top-up architecture can support usage billing, extend it.
+   885→
+   886→Do NOT create:
+   887→
+   888→```text
+   889→ESIMWallet
+   890→VirtualNumberWallet
+   891→```
+   892→
+   893→Use a unified RoamLink financial model.
+   894→
+   895→The customer should eventually be able to see:
+   896→
+   897→```text
+   898→RoamLink Balance
+   899→
+   900→Number rental
+   901→SMS
+   902→Voice
+   903→eSIM top-up
+   904→Other connectivity services
+   905→```
+   906→
+   907→Keep individual usage records product-specific but financial accounting platform-wide.
+   908→
+   909→---
+   910→
+   911→# 25. ORGANIZATIONS / B2B
+   912→
+   913→Virtual numbers must integrate with the existing Organization architecture.
+   914→
+   915→Businesses should be able to:
+   916→
+   917→* own multiple numbers
+   918→* assign numbers to employees
+   919→* view messages
+   920→* view call history
+   921→* manage billing
+   922→* configure permissions
+   923→
+   924→Reuse:
+   925→
+   926→```text
+   927→Organization
+   928→OrganizationMember
+   929→roles
+   930→authorization
+   931→```
+   932→
+   933→Do not build another tenant system.
+   934→
+   935→Ensure strict tenant isolation.
+   936→
+   937→Organization A must never access Organization B's numbers, messages, calls, usage, or billing.
+   938→
+   939→---
+   940→
+   941→# 26. ADMIN
+   942→
+   943→Extend the existing RoamLink admin dashboard.
+   944→
+   945→Add:
+   946→
+   947→### Virtual Numbers
+   948→
+   949→* inventory
+   950→* active numbers
+   951→* provider
+   952→* country
+   953→* capabilities
+   954→* customer
+   955→* organization
+   956→* cost
+   957→* selling price
+   958→* status
+   959→
+   960→### Providers
+   961→
+   962→* provider health
+   963→* supported countries
+   964→* supported capabilities
+   965→* provisioning failures
+   966→* latency
+   967→* error rates
+   968→
+   969→### Orders
+   970→
+   971→* purchase
+   972→* provisioning
+   973→* payment
+   974→* subscription
+   975→
+   976→### Abuse
+   977→
+   978→* suspicious accounts
+   979→* messaging violations
+   980→* trial abuse
+   981→* blocked numbers/accounts
+   982→
+   983→Do not create a separate admin application.
+   984→
+   985→---
+   986→
+   987→# 27. WEBHOOKS
+   988→
+   989→Extend the existing webhook architecture.
+   990→
+   991→Provider-specific endpoints may exist:
+   992→
+   993→```text
+   994→/api/webhooks/virtual-numbers/[provider]
+   995→```
+   996→
+   997→but normalize all events internally.
+   998→
+   999→Example:
+  1000→
+  1001→```text
+  1002→TelecomEvent
+  1003→ ├── provider
+  1004→ ├── providerEventId
+  1005→ ├── type
+  1006→ ├── virtualNumberId
+  1007→ ├── timestamp
+  1008→ └── payload
+  1009→```
+  1010→
+  1011→Support:
+  1012→
+  1013→```text
+  1014→SMS_RECEIVED
+  1015→SMS_SENT
+  1016→SMS_DELIVERED
+  1017→SMS_FAILED
+  1018→
+  1019→CALL_STARTED
+  1020→CALL_ENDED
+  1021→CALL_MISSED
+  1022→```
+  1023→
+  1024→Verify webhook signatures.
+  1025→
+  1026→Use idempotency.
+  1027→
+  1028→Persist event IDs.
+  1029→
+  1030→Duplicate webhook delivery must be harmless.
+  1031→
+  1032→---
+  1033→
+  1034→# 28. BACKGROUND JOBS
+  1035→
+  1036→Reuse the existing job infrastructure if available.
+  1037→
+  1038→Virtual-number background jobs should support:
+  1039→
+  1040→```text
+  1041→number provisioning
+  1042→number release
+  1043→subscription renewal
+  1044→trial expiration
+  1045→provider reconciliation
+  1046→SMS event processing
+  1047→voice event processing
+  1048→usage ingestion
+  1049→billing
+  1050→```
+  1051→
+  1052→Do not perform fragile long-running telecom operations directly inside normal HTTP requests where a background job is more appropriate.
+  1053→
+  1054→---
+  1055→
+  1056→# 29. PROVIDER RECONCILIATION
+  1057→
+  1058→Build this into the architecture.
+  1059→
+  1060→For example:
+  1061→
+  1062→```text
+  1063→RoamLink:
+  1064→VirtualNumber = ACTIVE
+  1065→
+  1066→Provider:
+  1067→Number = RELEASED
+  1068→```
+  1069→
+  1070→The system must detect discrepancies.
+  1071→
+  1072→Create reconciliation jobs comparing:
+  1073→
+  1074→```text
+  1075→RoamLink state
+  1076→        vs
+  1077→Provider state
+  1078→```
+  1079→
+  1080→Record discrepancies and take safe corrective action.
+  1081→
+  1082→Never silently overwrite customer state.
+  1083→
+  1084→---
+  1085→
+  1086→# 30. COMPLIANCE
+  1087→
+  1088→Treat country-specific telecom requirements as configuration.
+  1089→
+  1090→Create/extend:
+  1091→
+  1092→```text
+  1093→CountryCompliancePolicy
+  1094→```
+  1095→
+  1096→Potential fields:
+  1097→
+  1098→```text
+  1099→smsAllowed
+  1100→voiceAllowed
+  1101→mmsAllowed
+  1102→identityRequired
+  1103→businessVerificationRequired
+  1104→registrationRequired
+  1105→addressRequired
+  1106→restrictions
+  1107→```
+  1108→
+  1109→Do NOT invent regulations.
+  1110→
+  1111→Do not claim that a country permits a capability unless provider/regulatory data confirms it.
+  1112→
+  1113→The admin should be able to disable:
+  1114→
+  1115→```text
+  1116→country
+  1117→region
+  1118→number type
+  1119→capability
+  1120→provider
+  1121→```
+  1122→
+  1123→without changing application code.
+  1124→
+  1125→---
+  1126→
+  1127→# 31. SECURITY
+  1128→
+  1129→Reuse existing RoamLink security infrastructure.
+  1130→
+  1131→Ensure:
+  1132→
+  1133→* provider credentials remain server-side
+  1134→* users cannot access another user's numbers
+  1135→* users cannot access another organization's numbers
+  1136→* messages are properly authorized
+  1137→* calls are properly authorized
+  1138→* telecom webhooks are verified
+  1139→* rate limiting exists
+  1140→* trial abuse is controlled
+  1141→* sensitive provider data is not exposed unnecessarily
+  1142→* audit logs capture administrative changes
+  1143→
+  1144→Do not expose telecom provider IDs/secrets to clients unless technically necessary.
+  1145→
+  1146→---
+  1147→
+  1148→# 32. DATA MODEL
+  1149→
+  1150→Extend the existing Prisma/PostgreSQL schema.
+  1151→
+  1152→Do not blindly create every table from the standalone specification.
+  1153→
+  1154→Determine what already exists.
+  1155→
+  1156→Likely new entities include:
+  1157→
+  1158→```text
+  1159→VirtualNumber
+  1160→ProviderNumber
+  1161→NumberReservation
+  1162→NumberAssignment
+  1163→VirtualNumberSubscription
+  1164→Message
+  1165→Call
+  1166→TelecomEvent
+  1167→TrialPolicy
+  1168→```
+  1169→
+  1170→Use existing:
+  1171→
+  1172→```text
+  1173→User
+  1174→Organization
+  1175→OrganizationMember
+  1176→Order
+  1177→Payment
+  1178→Provider
+  1179→WebhookEvent
+  1180→Usage
+  1181→AuditLog
+  1182→```
+  1183→
+  1184→where appropriate.
+  1185→
+  1186→Use proper:
+  1187→
+  1188→* foreign keys
+  1189→* indexes
+  1190→* unique constraints
+  1191→* timestamps
+  1192→* state transitions
+  1193→* transactional boundaries
+  1194→
+  1195→---
+  1196→
+  1197→# 33. API
+  1198→
+  1199→Add a clean internal API.
+  1200→
+  1201→Potential endpoints:
+  1202→
+  1203→```text
+  1204→GET  /api/virtual-numbers/search
+  1205→
+  1206→POST /api/virtual-numbers/orders
+  1207→
+  1208→GET  /api/virtual-numbers
+  1209→
+  1210→GET  /api/virtual-numbers/:id
+  1211→
+  1212→POST /api/virtual-numbers/:id/release
+  1213→
+  1214→GET  /api/virtual-numbers/:id/messages
+  1215→
+  1216→POST /api/virtual-numbers/:id/messages
+  1217→
+  1218→GET  /api/virtual-numbers/:id/calls
+  1219→
+  1220→POST /api/virtual-numbers/:id/calls
+  1221→```
+  1222→
+  1223→Follow the existing RoamLink API conventions rather than blindly adopting these exact routes.
+  1224→
+  1225→Mobile and web must consume the same backend API.
+  1226→
+  1227→---
+  1228→
+  1229→# 34. SHARED TYPES
+  1230→
+  1231→IMPORTANT:
+  1232→
+  1233→The previous audit identified duplicated types between:
+  1234→
+  1235→```text
+  1236→src/types
+  1237→packages/shared
+  1238→```
+  1239→
+  1240→Do not make this problem worse.
+  1241→
+  1242→Make `packages/shared` the canonical client-facing contract where appropriate.
+  1243→
+  1244→Virtual-number types should live in the shared package:
+  1245→
+  1246→```text
+  1247→VirtualNumber
+  1248→VirtualNumberPlan
+  1249→NumberCapability
+  1250→Message
+  1251→Call
+  1252→NumberStatus
+  1253→```
+  1254→
+  1255→Web and mobile should consume the same types.
+  1256→
+  1257→Do not create separate web/mobile definitions.
+  1258→
+  1259→---
+  1260→
+  1261→# 35. PRODUCT CATALOG
+  1262→
+  1263→RoamLink should eventually have a unified conceptual product catalog:
+  1264→
+  1265→```text
+  1266→Connectivity Product
+  1267→│
+  1268→├── eSIM Plan
+  1269→│   └── data / validity / coverage
+  1270→│
+  1271→└── Virtual Number Plan
+  1272→    └── number / rental / capabilities
+  1273→```
+  1274→
+  1275→Do not force the database into a generic abstraction if it makes the implementation worse.
+  1276→
+  1277→The important thing is that the customer sees both as RoamLink products while their underlying telecom resources remain correctly modeled.
+  1278→
+  1279→---
+  1280→
+  1281→# 36. CUSTOMER EXPERIENCE
+  1282→
+  1283→The user should not need to understand telecom infrastructure.
+  1284→
+  1285→Bad:
+  1286→
+  1287→> Select Telnyx DID provider.
+  1288→
+  1289→Good:
+  1290→
+  1291→> Choose a United States number.
+  1292→
+  1293→Bad:
+  1294→
+  1295→> SM-DP+ provisioning state.
+  1296→
+  1297→Good:
+  1298→
+  1299→> Your eSIM is ready to install.
+  1300→
+  1301→Provider infrastructure should remain behind RoamLink's abstraction.
+  1302→
+  1303→---
+  1304→
+  1305→# 37. PRODUCT POSITIONING
+  1306→
+  1307→The long-term RoamLink concept should become:
+  1308→
+  1309→> **One platform for your global connectivity.**
+  1310→
+  1311→Example:
+  1312→
+  1313→```text
+  1314→RoamLink
+  1315→
+  1316→Travel
+  1317→├── eSIMs
+  1318→│   └── Mobile data
+  1319→│
+  1320→Communication
+  1321→└── Virtual Numbers
+  1322→    ├── SMS
+  1323→    └── Voice
+  1324→```
+  1325→
+  1326→A customer might have:
+  1327→
+  1328→```text
+  1329→My RoamLink
+  1330→
+  1331→🇹🇬 Togo eSIM
+  1332→10 GB remaining
+  1333→
+  1334→🇬🇭 Ghana Number
+  1335→+233 XX XXX XXXX
+  1336→SMS ✓
+  1337→Voice ✓
+  1338→
+  1339→🇺🇸 US Number
+  1340→+1 XXX XXX XXXX
+  1341→SMS ✓
+  1342→Voice ✓
+  1343→```
+  1344→
+  1345→This is the desired product direction.
+  1346→
+  1347→---
+  1348→
+  1349→# 38. FUTURE COMPATIBILITY
+  1350→
+  1351→Architect the system so it can eventually support:
+  1352→
+  1353→```text
+  1354→Virtual Numbers
+  1355→SMS
+  1356→Voice
+  1357→MMS
+  1358→SIP
+  1359→Call forwarding
+  1360→IVR
+  1361→Voicemail
+  1362→Programmable messaging
+  1363→Programmable voice
+  1364→Developer API
+  1365→Webhooks
+  1366→Business phone systems
+  1367→```
+  1368→
+  1369→But DO NOT implement all of these now.
+  1370→
+  1371→The immediate goal is:
+  1372→
+  1373→```text
+  1374→Number search
+  1375→      ↓
+  1376→Purchase
+  1377→      ↓
+  1378→Provision
+  1379→      ↓
+  1380→Manage
+  1381→      ↓
+  1382→SMS
+  1383→      ↓
+  1384→Voice where supported
+  1385→```
+  1386→
+  1387→---
+  1388→
+  1389→# 39. DEVELOPMENT PHASES
+  1390→
+  1391→## Phase A — Integrate the domain
+  1392→
+  1393→Implement:
+  1394→
+  1395→* VirtualNumber domain
+  1396→* provider abstraction
+  1397→* country/capability configuration
+  1398→* number search
+  1399→* lifecycle state machine
+  1400→* provisioning
+  1401→* assignment
+  1402→* subscription
+  1403→
+  1404→## Phase B — Customer experience
+  1405→
+  1406→Implement:
+  1407→
+  1408→* web number marketplace
+  1409→* mobile number marketplace
+  1410→* My Numbers
+  1411→* number details
+  1412→* SMS inbox
+  1413→* conversation view
+  1414→* calls
+  1415→* billing
+  1416→
+  1417→## Phase C — Commercialization
+  1418→
+  1419→Implement:
+  1420→
+  1421→* real provider integration
+  1422→* real provisioning
+  1423→* subscription billing
+  1424→* usage billing
+  1425→* trial
+  1426→* abuse controls
+  1427→* reconciliation
+  1428→
+  1429→## Phase D — B2B
+  1430→
+  1431→Integrate:
+  1432→
+  1433→* organizations
+  1434→* assignments
+  1435→* team permissions
+  1436→* business inboxes
+  1437→* billing
+  1438→
+  1439→## Phase E — Platform
+  1440→
+  1441→Later:
+  1442→
+  1443→* second provider
+  1444→* provider routing
+  1445→* developer API
+  1446→* webhooks
+  1447→* advanced analytics
+  1448→
+  1449→---
+  1450→
+  1451→# 40. TESTING REQUIREMENTS
+  1452→
+  1453→Do NOT repeat the current situation where critical functionality has no automated test suite.
+  1454→
+  1455→The previous RoamLink audit identified:
+  1456→
+  1457→> No automated test suite.
+  1458→
+  1459→This feature must be built with tests.
+  1460→
+  1461→At minimum test:
+  1462→
+  1463→### Number search
+  1464→
+  1465→```text
+  1466→country
+  1467→region
+  1468→capability
+  1469→availability
+  1470→```
+  1471→
+  1472→### Provisioning
+  1473→
+  1474→```text
+  1475→successful provisioning
+  1476→provider failure
+  1477→duplicate request
+  1478→retry
+  1479→```
+  1480→
+  1481→### Authorization
+  1482→
+  1483→```text
+  1484→user A cannot access user B number
+  1485→organization A cannot access organization B number
+  1486→```
+  1487→
+  1488→### SMS
+  1489→
+  1490→```text
+  1491→inbound
+  1492→outbound
+  1493→duplicate webhook
+  1494→invalid webhook
+  1495→```
+  1496→
+  1497→### Voice
+  1498→
+  1499→```text
+  1500→incoming
+  1501→outgoing
+  1502→missed
+  1503→duplicate webhook
+  1504→```
+  1505→
+  1506→### Subscription
+  1507→
+  1508→```text
+  1509→purchase
+  1510→renewal
+  1511→failure
+  1512→cancellation
+  1513→release
+  1514→```
+  1515→
+  1516→### Trial
+  1517→
+  1518→```text
+  1519→eligible
+  1520→ineligible
+  1521→expired
+  1522→converted
+  1523→abuse
+  1524→```
+  1525→
+  1526→### Payments
+  1527→
+  1528→```text
+  1529→payment success
+  1530→payment failure
+  1531→duplicate payment webhook
+  1532→refund
+  1533→```
+  1534→
+  1535→### Provider reconciliation
+  1536→
+  1537→```text
+  1538→matching state
+  1539→provider mismatch
+  1540→recovery
+  1541→```
+  1542→
+  1543→---
+  1544→
+  1545→# 41. REAL PROVIDER RULE
+  1546→
+  1547→Do NOT fabricate telecom integrations.
+  1548→
+  1549→If provider credentials/API documentation are available:
+  1550→
+  1551→> implement the real adapter.
+  1552→
+  1553→If they are not available:
+  1554→
+  1555→> implement the abstraction + sandbox/mock adapter and clearly mark the production adapter as pending.
+  1556→
+  1557→Never invent API endpoints.
+  1558→
+  1559→Never claim provisioning works against a provider unless it has actually been verified.
+  1560→
+  1561→The existing RoamLink philosophy of distinguishing real functionality from mocks must remain.
+  1562→
+  1563→---
+  1564→
+  1565→# 42. IMPLEMENTATION PROCESS
+  1566→
+  1567→Before coding:
+  1568→
+  1569→### Step 1
+  1570→
+  1571→Inspect the existing repository.
+  1572→
+  1573→### Step 2
+  1574→
+  1575→Map existing:
+  1576→
+  1577→```text
+  1578→auth
+  1579→payments
+  1580→orders
+  1581→providers
+  1582→billing
+  1583→usage
+  1584→B2B
+  1585→webhooks
+  1586→mobile
+  1587→shared
+  1588→admin
+  1589→```
+  1590→
+  1591→### Step 3
+  1592→
+  1593→Identify what can be reused.
+  1594→
+  1595→### Step 4
+  1596→
+  1597→Produce a concise integration plan.
+  1598→
+  1599→### Step 5
+  1600→
+  1601→Implement database/domain changes.
+  1602→
+  1603→### Step 6
+  1604→
+  1605→Implement provider abstraction.
+  1606→
+  1607→### Step 7
+  1608→
+  1609→Implement backend APIs.
+  1610→
+  1611→### Step 8
+  1612→
+  1613→Implement web UX.
+  1614→
+  1615→### Step 9
+  1616→
+  1617→Implement mobile UX.
+  1618→
+  1619→### Step 10
+  1620→
+  1621→Implement tests.
+  1622→
+  1623→### Step 11
+  1624→
+  1625→Run:
+  1626→
+  1627→```text
+  1628→lint
+  1629→typecheck
+  1630→tests
+  1631→build
+  1632→```
+  1633→
+  1634→### Step 12
+  1635→
+  1636→Perform a real end-to-end test of the virtual-number flow.
+  1637→
+  1638→---
+  1639→
+  1640→# 43. END-TO-END ACCEPTANCE TEST
+  1641→
+  1642→The finished implementation must be able to demonstrate:
+  1643→
+  1644→```text
+  1645→User
+  1646→ ↓
+  1647→Login
+  1648→ ↓
+  1649→Virtual Numbers
+  1650→ ↓
+  1651→Choose country
+  1652→ ↓
+  1653→Choose capabilities
+  1654→ ↓
+  1655→Search
+  1656→ ↓
+  1657→Select number
+  1658→ ↓
+  1659→Checkout
+  1660→ ↓
+  1661→Payment
+  1662→ ↓
+  1663→Provision
+  1664→ ↓
+  1665→Number ACTIVE
+  1666→ ↓
+  1667→Number appears on web
+  1668→ ↓
+  1669→Number appears on mobile
+  1670→ ↓
+  1671→Receive SMS
+  1672→ ↓
+  1673→Message appears in RoamLink
+  1674→ ↓
+  1675→Send SMS where supported
+  1676→ ↓
+  1677→View call history where supported
+  1678→```
+  1679→
+  1680→For a trial-enabled country:
+  1681→
+  1682→```text
+  1683→User
+  1684→ ↓
+  1685→Eligible for trial
+  1686→ ↓
+  1687→Trial number provisioned
+  1688→ ↓
+  1689→Use limited SMS/voice
+  1690→ ↓
+  1691→Trial countdown
+  1692→ ↓
+  1693→Keep number
+  1694→ ↓
+  1695→Subscription
+  1696→```
+  1697→
+  1698→Every step must be backed by actual implementation.
+  1699→
+  1700→---
+  1701→
+  1702→# 44. FINAL AUDIT
+  1703→
+  1704→After implementation, produce a factual audit.
+  1705→
+  1706→Use:
+  1707→
+  1708→| Area                  | Status | Evidence | Remaining Work |
+  1709→| --------------------- | ------ | -------- | -------------- |
+  1710→| Virtual Number domain |        |          |                |
+  1711→| Provider abstraction  |        |          |                |
+  1712→| Provider integration  |        |          |                |
+  1713→| Number search         |        |          |                |
+  1714→| Provisioning          |        |          |                |
+  1715→| Lifecycle             |        |          |                |
+  1716→| Subscription          |        |          |                |
+  1717→| SMS                   |        |          |                |
+  1718→| Voice                 |        |          |                |
+  1719→| MMS                   |        |          |                |
+  1720→| Trial                 |        |          |                |
+  1721→| Abuse prevention      |        |          |                |
+  1722→| Payments              |        |          |                |
+  1723→| Billing               |        |          |                |
+  1724→| Mobile                |        |          |                |
+  1725→| Web                   |        |          |                |
+  1726→| Shared types          |        |          |                |
+  1727→| B2B                   |        |          |                |
+  1728→| Compliance            |        |          |                |
+  1729→| Webhooks              |        |          |                |
+  1730→| Reconciliation        |        |          |                |
+  1731→| Security              |        |          |                |
+  1732→| Tests                 |        |          |                |
+  1733→| Deployment            |        |          |                |
+  1734→
+  1735→Clearly distinguish:
+  1736→
+  1737→```text
+  1738→IMPLEMENTED
+  1739→VERIFIED
+  1740→MOCK/SANDBOX
+  1741→PARTIALLY IMPLEMENTED
+  1742→NOT IMPLEMENTED
+  1743→```
+  1744→
+  1745→Do not call something production-ready simply because an interface exists.
+  1746→
+  1747→---
+  1748→
+  1749→# 45. MOST IMPORTANT RULE
+  1750→
+  1751→**RoamLink is not becoming two applications.**
+  1752→
+  1753→It is becoming one connectivity platform with two major products:
+  1754→
+  1755→```text
+  1756→                    ROAMLINK
+  1757→                       │
+  1758→          ┌────────────┴────────────┐
+  1759→          │                         │
+  1760→        eSIM                 VIRTUAL NUMBER
+  1761→          │                         │
+  1762→       Data                    SMS / Voice
+  1763→          │                         │
+  1764→          └────────────┬────────────┘
+  1765→                       │
+  1766→              Unified RoamLink
+  1767→                 infrastructure
+  1768→```
+  1769→
+  1770→Preserve the existing eSIM functionality.
+  1771→
+  1772→Preserve the existing users.
+  1773→
+  1774→Preserve the existing organizations.
+  1775→
+  1776→Preserve the existing payment architecture.
+  1777→
+  1778→Preserve the existing security model.
+  1779→
+  1780→Preserve PostgreSQL.
+  1781→
+  1782→Preserve the existing web/mobile architecture.
+  1783→
+  1784→Extend the platform rather than forking it.
+  1785→
+  1786→The goal is to make RoamLink a **unified global connectivity platform**, where customers can purchase and manage both mobile-data eSIMs and virtual communication numbers from the same account, same wallet/billing infrastructure, same organizations, same applications, and same backend.
+  1787→
+  1788→### One strategic change I'd make beyond the prompt
+  1789→
+  1790→I would **not launch virtual numbers globally immediately**. The architecture can be global, but the actual product catalog should initially be based on **countries where your chosen provider has reliable inventory and where the regulatory requirements are understood**.
+  1791→
+  1792→That gives RoamLink a much stronger product model:
+  1793→
+  1794→**eSIM → "Get connected when you travel."**
+  1795→**Virtual Number → "Have a communication identity wherever you operate."**
+  1796→
+  1797→And eventually the really powerful part is that one RoamLink account can contain both:
+  1798→
+  1799→> 🇹🇬 **Togo eSIM** — 8.4 GB remaining
+  1800→> 🇬🇭 **Ghana number** — +233… — SMS/Voice
+  1801→> 🇺🇸 **US number** — +1… — SMS/Voice
+  1802→
+  1803→That is a much more defensible product than simply adding another standalone virtual-number marketplace.
+  1804→

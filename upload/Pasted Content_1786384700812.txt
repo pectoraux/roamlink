@@ -1,0 +1,1803 @@
+Yes — but I would **not give Z.ai that prompt unchanged**. It was written for a standalone virtual-number company. RoamLink already has the platform foundation, so the correct instruction is to **integrate Virtual Numbers as a second connectivity product inside the existing RoamLink architecture**, without duplicating auth, payments, organizations, providers, billing, mobile/web infrastructure, etc.
+
+I would give Z.ai this prompt:
+
+# ROAMLINK — INTEGRATE VIRTUAL NUMBERS AS A SECOND CONNECTIVITY PRODUCT
+
+You are working on the EXISTING RoamLink repository.
+
+Do NOT build a separate virtual-number application.
+
+Do NOT replace the existing RoamLink architecture.
+
+Do NOT duplicate authentication, payments, organizations, billing, provider abstractions, mobile infrastructure, web infrastructure, or database concepts that already exist.
+
+Your task is to evolve RoamLink from an **eSIM marketplace** into a broader **global connectivity platform** by adding **Virtual Phone Numbers** as a first-class product alongside eSIMs.
+
+The existing eSIM functionality must continue working.
+
+---
+
+# 1. CURRENT ROAMLINK ARCHITECTURE
+
+RoamLink already has:
+
+* Next.js web application
+* Expo/React Native mobile application
+* PostgreSQL/Neon
+* Prisma
+* shared TypeScript package
+* authentication
+* user accounts
+* organizations/B2B
+* payment abstraction
+* Stripe
+* Paystack
+* Flutterwave
+* eSIM provider abstraction
+* order lifecycle/state machine
+* provisioning
+* usage
+* top-ups
+* installation tokens
+* webhooks
+* SEO destination pages
+* admin functionality
+
+The current architecture is approximately:
+
+```text
+                         ROAMLINK
+                            │
+               ┌────────────┴────────────┐
+               │                         │
+              WEB                     MOBILE
+               │                         │
+               └────────────┬────────────┘
+                            │
+                     Shared API/Types
+                            │
+                       Backend API
+                            │
+             ┌──────────────┼──────────────┐
+             │              │              │
+          Commerce       Payments       Providers
+             │              │              │
+           Orders       Stripe/etc.     eSIM
+           Billing      Paystack/etc.
+           B2B                         │
+             │                         │
+             └────────── PostgreSQL ───┘
+```
+
+We are now extending this to:
+
+```text
+                         ROAMLINK
+                            │
+               ┌────────────┴────────────┐
+               │                         │
+              WEB                     MOBILE
+               │                         │
+               └────────────┬────────────┘
+                            │
+                     Shared API/Types
+                            │
+                       Backend API
+                            │
+              ┌─────────────┼─────────────┐
+              │             │             │
+           Commerce      Payments      Connectivity
+              │             │             │
+           Orders        Providers       ├── eSIM
+           Billing       Stripe/etc.     │
+           B2B                           └── Virtual Numbers
+              │
+              └──────────── PostgreSQL
+```
+
+The fundamental product concept becomes:
+
+> **RoamLink provides connectivity identities and connectivity services globally.**
+
+eSIMs provide mobile data.
+
+Virtual Numbers provide communication identity through SMS/voice where supported.
+
+---
+
+# 2. DO NOT REBUILD WHAT ALREADY EXISTS
+
+Before changing anything:
+
+1. Inspect the repository.
+2. Inspect the current Prisma schema.
+3. Inspect existing payment abstractions.
+4. Inspect existing provider abstractions.
+5. Inspect existing order/state-machine implementation.
+6. Inspect existing user/auth implementation.
+7. Inspect existing Organization/B2B implementation.
+8. Inspect existing mobile navigation.
+9. Inspect existing shared package.
+10. Inspect existing admin architecture.
+11. Inspect existing webhook architecture.
+12. Inspect existing usage/billing implementation.
+
+Reuse existing infrastructure wherever possible.
+
+If an existing subsystem can support virtual numbers through extension rather than replacement, extend it.
+
+Do NOT create:
+
+```text
+VirtualNumberAuth
+VirtualNumberPayment
+VirtualNumberUser
+VirtualNumberOrganization
+VirtualNumberBilling
+```
+
+when RoamLink already has those concepts.
+
+---
+
+# 3. NEW PRODUCT MODEL
+
+RoamLink should now have two primary connectivity products:
+
+```text
+Connectivity
+│
+├── eSIM
+│   ├── Data
+│   ├── Travel plans
+│   ├── Usage
+│   ├── Top-ups
+│   └── Installation
+│
+└── Virtual Number
+    ├── SMS
+    ├── Voice
+    ├── MMS where supported
+    ├── Number rental
+    ├── Usage
+    └── Communication management
+```
+
+Do NOT force virtual numbers into the eSIM data model.
+
+An eSIM and a virtual phone number are different resources.
+
+However, they should share common platform concepts such as:
+
+* User
+* Organization
+* Order
+* Payment
+* Provider
+* Usage
+* Subscription
+* Billing
+* AuditLog
+* WebhookEvent
+
+---
+
+# 4. PRODUCT UX
+
+RoamLink should expose a top-level product structure such as:
+
+```text
+RoamLink
+
+Connectivity
+
+├── eSIMs
+│   ├── Explore
+│   ├── My eSIMs
+│   └── Usage
+│
+└── Virtual Numbers
+    ├── Find a Number
+    ├── My Numbers
+    ├── Messages
+    └── Calls
+```
+
+The existing eSIM experience must remain intact.
+
+Add virtual numbers as a sibling product, not as a replacement.
+
+---
+
+# 5. CRITICAL DISTINCTION: DATA-ONLY ESIM VS NUMBER
+
+Do NOT incorrectly assume that every eSIM has a phone number.
+
+RoamLink should explicitly distinguish:
+
+```text
+eSIM
+ └── data connectivity
+
+Virtual Number
+ ├── telephone number
+ ├── SMS
+ └── voice where supported
+```
+
+A future telecom provider may offer an eSIM with an MSISDN/voice/SMS, but that is provider/product-specific.
+
+Do not invent such capability.
+
+---
+
+# 6. VIRTUAL NUMBER DOMAIN
+
+Introduce a normalized internal VirtualNumber model.
+
+Conceptually:
+
+```text
+VirtualNumber
+ ├── id
+ ├── e164
+ ├── country
+ ├── countryCode
+ ├── region
+ ├── city
+ ├── numberType
+ ├── smsEnabled
+ ├── mmsEnabled
+ ├── voiceEnabled
+ ├── status
+ ├── providerId
+ ├── providerNumberId
+ ├── providerCost
+ ├── sellingPrice
+ ├── currency
+ ├── assignedUserId
+ ├── assignedOrganizationId
+ ├── createdAt
+ ├── activatedAt
+ └── releasedAt
+```
+
+Use proper relations instead of duplicating ownership information unnecessarily.
+
+If the existing schema has a better ownership model, use it.
+
+---
+
+# 7. PROVIDER ABSTRACTION
+
+Do NOT hard-code virtual-number functionality directly into routes or React components.
+
+Create a telecom provider abstraction.
+
+For example:
+
+```typescript
+interface VirtualNumberProvider {
+  searchNumbers(params: SearchNumbersParams): Promise<ProviderNumber[]>
+
+  getNumber(providerNumberId: string): Promise<ProviderNumber>
+
+  purchaseNumber(providerNumberId: string): Promise<ProviderNumber>
+
+  releaseNumber(providerNumberId: string): Promise<void>
+
+  configureNumber(
+    providerNumberId: string,
+    config: NumberConfiguration
+  ): Promise<void>
+
+  sendSMS(params: SendSMSParams): Promise<ProviderMessage>
+
+  getMessages(params: GetMessagesParams): Promise<ProviderMessage[]>
+
+  makeCall(params: MakeCallParams): Promise<ProviderCall>
+
+  configureVoice(
+    providerNumberId: string,
+    config: VoiceConfiguration
+  ): Promise<void>
+}
+```
+
+Improve the interface if the existing RoamLink architecture suggests a better abstraction.
+
+Potential adapters:
+
+```text
+VirtualNumberProvider
+│
+├── Telnyx
+├── Twilio
+├── Vonage
+└── Future providers
+```
+
+Do not add providers merely for appearance.
+
+Start with **one real provider integration** when credentials/API documentation are available.
+
+Keep the abstraction capable of supporting multiple providers.
+
+---
+
+# 8. PROVIDER ROUTING
+
+Virtual numbers must NOT be permanently coupled to a single provider.
+
+Build a routing layer:
+
+```text
+Customer request
+      ↓
+Country
+      ↓
+Region
+      ↓
+Required capabilities
+      ↓
+Compliance requirements
+      ↓
+Available provider inventory
+      ↓
+Provider routing
+      ↓
+Provider adapter
+      ↓
+Number
+```
+
+Provider selection should eventually consider:
+
+* availability
+* country
+* region
+* capabilities
+* compliance
+* provider health
+* provider cost
+* provisioning reliability
+* expected margin
+
+Initially a simple deterministic provider selection is acceptable.
+
+Architect the system so scoring can later be introduced.
+
+---
+
+# 9. COUNTRY AVAILABILITY
+
+Do NOT hard-code assumptions about countries.
+
+Create a configurable country/capability system.
+
+A country may support:
+
+```text
+SMS ✓
+Voice ✓
+MMS ✗
+```
+
+while another may support:
+
+```text
+SMS ✓
+Voice ✗
+MMS ✗
+```
+
+The UI must derive capabilities from backend configuration/provider availability.
+
+Never display a capability that the selected number/provider does not actually support.
+
+---
+
+# 10. NUMBER SEARCH
+
+Create a polished search experience.
+
+Example:
+
+```text
+Find a virtual number
+
+Country
+[ Ghana ▼ ]
+
+Region
+[ Accra ▼ ]
+
+Capabilities
+
+☑ SMS
+☑ Voice
+☐ MMS
+
+[ Search numbers ]
+```
+
+Results:
+
+```text
+🇬🇭 +233 XX XXX XXXX
+
+Accra, Ghana
+
+SMS ✓
+Voice ✓
+
+$X.XX/month
+
+[ Get number ]
+```
+
+Support:
+
+* country
+* calling code
+* region
+* city
+* area code where applicable
+* number type
+* SMS
+* MMS
+* voice
+* price
+* availability
+
+Do not expose provider identity to ordinary customers unless there is a legitimate reason.
+
+RoamLink should abstract the underlying telecom infrastructure.
+
+---
+
+# 11. NUMBER LIFECYCLE
+
+Implement an explicit state machine.
+
+At minimum:
+
+```text
+DISCOVERED
+AVAILABLE
+RESERVED
+PROVISIONING
+CONFIGURING
+ACTIVE
+SUSPENDED
+RELEASING
+RELEASED
+FAILED
+```
+
+Do not use only:
+
+```text
+isActive
+```
+
+All lifecycle transitions must be explicit and validated.
+
+---
+
+# 12. PURCHASE / PROVISIONING FLOW
+
+Implement:
+
+```text
+Number selected
+      ↓
+Order created
+      ↓
+Payment pending
+      ↓
+Payment confirmed
+      ↓
+Number reserved
+      ↓
+Provisioning
+      ↓
+Configuration
+      ↓
+ACTIVE
+```
+
+The provisioning operation must be idempotent.
+
+A duplicate request must NOT:
+
+* charge twice
+* buy two numbers
+* create two assignments
+* create duplicate subscriptions
+
+Use database constraints and idempotency keys.
+
+Reuse the existing RoamLink idempotency architecture where appropriate.
+
+---
+
+# 13. SUBSCRIPTIONS
+
+Virtual numbers are generally rental/subscription resources.
+
+Support:
+
+```text
+ACTIVE
+PAST_DUE
+SUSPENDED
+CANCELLED
+EXPIRED
+```
+
+A number subscription should be separate from the underlying provider resource.
+
+For example:
+
+```text
+Customer Subscription
+        │
+        └── VirtualNumber
+                │
+                └── ProviderNumber
+```
+
+This distinction is important.
+
+RoamLink owns the customer relationship.
+
+The provider owns the underlying telecom resource.
+
+---
+
+# 14. FREE TRIAL
+
+Add a configurable trial system for virtual numbers.
+
+Do NOT offer unlimited free numbers.
+
+Example:
+
+```text
+Trial
+
+1 number
+24 hours
+3 inbound SMS
+5 inbound call minutes
+No outbound calls
+No bulk messaging
+No API access
+```
+
+These are examples only.
+
+Make trial limits configurable.
+
+Create a model similar to:
+
+```text
+TrialPolicy
+ ├── duration
+ ├── maxNumbers
+ ├── maxInboundSMS
+ ├── maxOutboundSMS
+ ├── maxInboundMinutes
+ ├── maxOutboundMinutes
+ ├── apiAllowed
+ ├── eligibleCountries
+ └── riskLevel
+```
+
+Reuse an existing trial/risk subsystem if present.
+
+---
+
+# 15. TRIAL ELIGIBILITY / ABUSE
+
+Virtual-number trials are abuse-sensitive.
+
+Integrate trial eligibility with RoamLink's existing account/risk/security architecture.
+
+Do not build mechanisms intended to evade anti-abuse systems.
+
+Implement sensible controls:
+
+* verified account
+* velocity limits
+* one trial per appropriate identity/account policy
+* suspicious activity detection
+* country restrictions
+* messaging limits
+* automated suspension
+* manual review
+
+Do not over-engineer this before launch.
+
+The architecture should be extensible.
+
+---
+
+# 16. SMS
+
+Add SMS capabilities to the virtual-number product.
+
+Support:
+
+### Inbox
+
+```text
+Messages
+│
+├── Conversation
+├── Sender
+├── Recipient
+├── Timestamp
+├── Delivery status
+└── Content
+```
+
+Support:
+
+* inbound SMS
+* outbound SMS where provider/country permits
+* delivery status
+* message history
+* conversation threads
+* provider message IDs
+* webhook processing
+
+Normalize provider events.
+
+Example:
+
+```text
+SMS_RECEIVED
+SMS_SENT
+SMS_DELIVERED
+SMS_FAILED
+```
+
+All events must be idempotent.
+
+---
+
+# 17. VOICE
+
+Where supported, implement:
+
+* incoming calls
+* outgoing calls
+* missed calls
+* call history
+* duration
+* call status
+* forwarding architecture
+* voice webhook configuration
+
+Do NOT pretend that voice is available for every number.
+
+The UI must derive capabilities from actual number configuration.
+
+---
+
+# 18. MMS
+
+Treat MMS as optional.
+
+Only enable it when:
+
+```text
+country supports MMS
+AND
+provider supports MMS
+AND
+number supports MMS
+```
+
+Never assume SMS capability implies MMS capability.
+
+---
+
+# 19. MOBILE APP
+
+Extend the existing Expo app.
+
+Do NOT create a second mobile application.
+
+Add navigation such as:
+
+```text
+Home
+Explore
+My eSIMs
+Numbers
+Activity
+Profile
+```
+
+or another structure that fits the existing navigation.
+
+Virtual Number screens should include:
+
+```text
+Find Number
+Number Details
+Checkout
+My Numbers
+Number Details
+Messages
+Conversation
+Calls
+Number Settings
+```
+
+The mobile app should be the primary place where customers **use** their virtual numbers.
+
+For example:
+
+```text
+My Number
+
+🇬🇭 +233 XX XXX XXXX
+
+SMS ✓
+Voice ✓
+
+[ Messages ]
+[ Calls ]
+[ Settings ]
+```
+
+---
+
+# 20. WEB APP
+
+Extend the existing web application.
+
+The web experience should be excellent for:
+
+* discovering numbers
+* SEO
+* purchasing
+* managing numbers
+* business users
+* admin users
+
+Potential routes:
+
+```text
+/numbers
+/numbers/[country]
+/numbers/[country]/[region]
+/numbers/search
+/dashboard/numbers
+/dashboard/numbers/[id]
+/dashboard/numbers/[id]/messages
+/dashboard/numbers/[id]/calls
+```
+
+Use the existing routing conventions where appropriate.
+
+---
+
+# 21. SEO
+
+Virtual numbers create a major SEO opportunity.
+
+Build server-rendered country/region pages where actual availability data supports them.
+
+Examples:
+
+```text
+/numbers/ghana
+/numbers/togo
+/numbers/nigeria
+/numbers/united-states
+/numbers/united-kingdom
+```
+
+Potential region pages:
+
+```text
+/numbers/united-states/new-york
+/numbers/united-states/california
+```
+
+Only generate pages for supported destinations.
+
+Each page should have:
+
+* metadata
+* canonical URL
+* JSON-LD where appropriate
+* FAQ
+* supported capabilities
+* pricing information where appropriate
+* clear CTA
+
+Do not create thousands of thin SEO pages with no real inventory/value.
+
+---
+
+# 22. PAYMENTS
+
+REUSE THE EXISTING RoamLink payment abstraction.
+
+Do NOT create a second payment system.
+
+Virtual-number purchases/subscriptions should use the existing payment architecture.
+
+Support existing providers where appropriate:
+
+* Stripe
+* Paystack
+* Flutterwave
+
+Use the existing payment verification and webhook architecture.
+
+If a payment-provider feature is unavailable, fail explicitly rather than pretending it works.
+
+---
+
+# 23. BILLING
+
+Extend existing RoamLink billing.
+
+Virtual-number revenue may include:
+
+```text
+Monthly number rental
+SMS
+Voice
+MMS
+Premium numbers
+```
+
+Provider cost must remain separate from customer price.
+
+Example:
+
+```text
+Provider cost: $2.10/month
+Customer price: $4.99/month
+Gross margin: $2.89
+```
+
+Do not use floating-point arithmetic for financial calculations.
+
+Reuse the existing money representation.
+
+If RoamLink does not yet have an immutable ledger, implement the minimum correct financial model rather than creating an unnecessary second billing system.
+
+---
+
+# 24. WALLET / USAGE
+
+If the existing RoamLink wallet/top-up architecture can support usage billing, extend it.
+
+Do NOT create:
+
+```text
+ESIMWallet
+VirtualNumberWallet
+```
+
+Use a unified RoamLink financial model.
+
+The customer should eventually be able to see:
+
+```text
+RoamLink Balance
+
+Number rental
+SMS
+Voice
+eSIM top-up
+Other connectivity services
+```
+
+Keep individual usage records product-specific but financial accounting platform-wide.
+
+---
+
+# 25. ORGANIZATIONS / B2B
+
+Virtual numbers must integrate with the existing Organization architecture.
+
+Businesses should be able to:
+
+* own multiple numbers
+* assign numbers to employees
+* view messages
+* view call history
+* manage billing
+* configure permissions
+
+Reuse:
+
+```text
+Organization
+OrganizationMember
+roles
+authorization
+```
+
+Do not build another tenant system.
+
+Ensure strict tenant isolation.
+
+Organization A must never access Organization B's numbers, messages, calls, usage, or billing.
+
+---
+
+# 26. ADMIN
+
+Extend the existing RoamLink admin dashboard.
+
+Add:
+
+### Virtual Numbers
+
+* inventory
+* active numbers
+* provider
+* country
+* capabilities
+* customer
+* organization
+* cost
+* selling price
+* status
+
+### Providers
+
+* provider health
+* supported countries
+* supported capabilities
+* provisioning failures
+* latency
+* error rates
+
+### Orders
+
+* purchase
+* provisioning
+* payment
+* subscription
+
+### Abuse
+
+* suspicious accounts
+* messaging violations
+* trial abuse
+* blocked numbers/accounts
+
+Do not create a separate admin application.
+
+---
+
+# 27. WEBHOOKS
+
+Extend the existing webhook architecture.
+
+Provider-specific endpoints may exist:
+
+```text
+/api/webhooks/virtual-numbers/[provider]
+```
+
+but normalize all events internally.
+
+Example:
+
+```text
+TelecomEvent
+ ├── provider
+ ├── providerEventId
+ ├── type
+ ├── virtualNumberId
+ ├── timestamp
+ └── payload
+```
+
+Support:
+
+```text
+SMS_RECEIVED
+SMS_SENT
+SMS_DELIVERED
+SMS_FAILED
+
+CALL_STARTED
+CALL_ENDED
+CALL_MISSED
+```
+
+Verify webhook signatures.
+
+Use idempotency.
+
+Persist event IDs.
+
+Duplicate webhook delivery must be harmless.
+
+---
+
+# 28. BACKGROUND JOBS
+
+Reuse the existing job infrastructure if available.
+
+Virtual-number background jobs should support:
+
+```text
+number provisioning
+number release
+subscription renewal
+trial expiration
+provider reconciliation
+SMS event processing
+voice event processing
+usage ingestion
+billing
+```
+
+Do not perform fragile long-running telecom operations directly inside normal HTTP requests where a background job is more appropriate.
+
+---
+
+# 29. PROVIDER RECONCILIATION
+
+Build this into the architecture.
+
+For example:
+
+```text
+RoamLink:
+VirtualNumber = ACTIVE
+
+Provider:
+Number = RELEASED
+```
+
+The system must detect discrepancies.
+
+Create reconciliation jobs comparing:
+
+```text
+RoamLink state
+        vs
+Provider state
+```
+
+Record discrepancies and take safe corrective action.
+
+Never silently overwrite customer state.
+
+---
+
+# 30. COMPLIANCE
+
+Treat country-specific telecom requirements as configuration.
+
+Create/extend:
+
+```text
+CountryCompliancePolicy
+```
+
+Potential fields:
+
+```text
+smsAllowed
+voiceAllowed
+mmsAllowed
+identityRequired
+businessVerificationRequired
+registrationRequired
+addressRequired
+restrictions
+```
+
+Do NOT invent regulations.
+
+Do not claim that a country permits a capability unless provider/regulatory data confirms it.
+
+The admin should be able to disable:
+
+```text
+country
+region
+number type
+capability
+provider
+```
+
+without changing application code.
+
+---
+
+# 31. SECURITY
+
+Reuse existing RoamLink security infrastructure.
+
+Ensure:
+
+* provider credentials remain server-side
+* users cannot access another user's numbers
+* users cannot access another organization's numbers
+* messages are properly authorized
+* calls are properly authorized
+* telecom webhooks are verified
+* rate limiting exists
+* trial abuse is controlled
+* sensitive provider data is not exposed unnecessarily
+* audit logs capture administrative changes
+
+Do not expose telecom provider IDs/secrets to clients unless technically necessary.
+
+---
+
+# 32. DATA MODEL
+
+Extend the existing Prisma/PostgreSQL schema.
+
+Do not blindly create every table from the standalone specification.
+
+Determine what already exists.
+
+Likely new entities include:
+
+```text
+VirtualNumber
+ProviderNumber
+NumberReservation
+NumberAssignment
+VirtualNumberSubscription
+Message
+Call
+TelecomEvent
+TrialPolicy
+```
+
+Use existing:
+
+```text
+User
+Organization
+OrganizationMember
+Order
+Payment
+Provider
+WebhookEvent
+Usage
+AuditLog
+```
+
+where appropriate.
+
+Use proper:
+
+* foreign keys
+* indexes
+* unique constraints
+* timestamps
+* state transitions
+* transactional boundaries
+
+---
+
+# 33. API
+
+Add a clean internal API.
+
+Potential endpoints:
+
+```text
+GET  /api/virtual-numbers/search
+
+POST /api/virtual-numbers/orders
+
+GET  /api/virtual-numbers
+
+GET  /api/virtual-numbers/:id
+
+POST /api/virtual-numbers/:id/release
+
+GET  /api/virtual-numbers/:id/messages
+
+POST /api/virtual-numbers/:id/messages
+
+GET  /api/virtual-numbers/:id/calls
+
+POST /api/virtual-numbers/:id/calls
+```
+
+Follow the existing RoamLink API conventions rather than blindly adopting these exact routes.
+
+Mobile and web must consume the same backend API.
+
+---
+
+# 34. SHARED TYPES
+
+IMPORTANT:
+
+The previous audit identified duplicated types between:
+
+```text
+src/types
+packages/shared
+```
+
+Do not make this problem worse.
+
+Make `packages/shared` the canonical client-facing contract where appropriate.
+
+Virtual-number types should live in the shared package:
+
+```text
+VirtualNumber
+VirtualNumberPlan
+NumberCapability
+Message
+Call
+NumberStatus
+```
+
+Web and mobile should consume the same types.
+
+Do not create separate web/mobile definitions.
+
+---
+
+# 35. PRODUCT CATALOG
+
+RoamLink should eventually have a unified conceptual product catalog:
+
+```text
+Connectivity Product
+│
+├── eSIM Plan
+│   └── data / validity / coverage
+│
+└── Virtual Number Plan
+    └── number / rental / capabilities
+```
+
+Do not force the database into a generic abstraction if it makes the implementation worse.
+
+The important thing is that the customer sees both as RoamLink products while their underlying telecom resources remain correctly modeled.
+
+---
+
+# 36. CUSTOMER EXPERIENCE
+
+The user should not need to understand telecom infrastructure.
+
+Bad:
+
+> Select Telnyx DID provider.
+
+Good:
+
+> Choose a United States number.
+
+Bad:
+
+> SM-DP+ provisioning state.
+
+Good:
+
+> Your eSIM is ready to install.
+
+Provider infrastructure should remain behind RoamLink's abstraction.
+
+---
+
+# 37. PRODUCT POSITIONING
+
+The long-term RoamLink concept should become:
+
+> **One platform for your global connectivity.**
+
+Example:
+
+```text
+RoamLink
+
+Travel
+├── eSIMs
+│   └── Mobile data
+│
+Communication
+└── Virtual Numbers
+    ├── SMS
+    └── Voice
+```
+
+A customer might have:
+
+```text
+My RoamLink
+
+🇹🇬 Togo eSIM
+10 GB remaining
+
+🇬🇭 Ghana Number
++233 XX XXX XXXX
+SMS ✓
+Voice ✓
+
+🇺🇸 US Number
++1 XXX XXX XXXX
+SMS ✓
+Voice ✓
+```
+
+This is the desired product direction.
+
+---
+
+# 38. FUTURE COMPATIBILITY
+
+Architect the system so it can eventually support:
+
+```text
+Virtual Numbers
+SMS
+Voice
+MMS
+SIP
+Call forwarding
+IVR
+Voicemail
+Programmable messaging
+Programmable voice
+Developer API
+Webhooks
+Business phone systems
+```
+
+But DO NOT implement all of these now.
+
+The immediate goal is:
+
+```text
+Number search
+      ↓
+Purchase
+      ↓
+Provision
+      ↓
+Manage
+      ↓
+SMS
+      ↓
+Voice where supported
+```
+
+---
+
+# 39. DEVELOPMENT PHASES
+
+## Phase A — Integrate the domain
+
+Implement:
+
+* VirtualNumber domain
+* provider abstraction
+* country/capability configuration
+* number search
+* lifecycle state machine
+* provisioning
+* assignment
+* subscription
+
+## Phase B — Customer experience
+
+Implement:
+
+* web number marketplace
+* mobile number marketplace
+* My Numbers
+* number details
+* SMS inbox
+* conversation view
+* calls
+* billing
+
+## Phase C — Commercialization
+
+Implement:
+
+* real provider integration
+* real provisioning
+* subscription billing
+* usage billing
+* trial
+* abuse controls
+* reconciliation
+
+## Phase D — B2B
+
+Integrate:
+
+* organizations
+* assignments
+* team permissions
+* business inboxes
+* billing
+
+## Phase E — Platform
+
+Later:
+
+* second provider
+* provider routing
+* developer API
+* webhooks
+* advanced analytics
+
+---
+
+# 40. TESTING REQUIREMENTS
+
+Do NOT repeat the current situation where critical functionality has no automated test suite.
+
+The previous RoamLink audit identified:
+
+> No automated test suite.
+
+This feature must be built with tests.
+
+At minimum test:
+
+### Number search
+
+```text
+country
+region
+capability
+availability
+```
+
+### Provisioning
+
+```text
+successful provisioning
+provider failure
+duplicate request
+retry
+```
+
+### Authorization
+
+```text
+user A cannot access user B number
+organization A cannot access organization B number
+```
+
+### SMS
+
+```text
+inbound
+outbound
+duplicate webhook
+invalid webhook
+```
+
+### Voice
+
+```text
+incoming
+outgoing
+missed
+duplicate webhook
+```
+
+### Subscription
+
+```text
+purchase
+renewal
+failure
+cancellation
+release
+```
+
+### Trial
+
+```text
+eligible
+ineligible
+expired
+converted
+abuse
+```
+
+### Payments
+
+```text
+payment success
+payment failure
+duplicate payment webhook
+refund
+```
+
+### Provider reconciliation
+
+```text
+matching state
+provider mismatch
+recovery
+```
+
+---
+
+# 41. REAL PROVIDER RULE
+
+Do NOT fabricate telecom integrations.
+
+If provider credentials/API documentation are available:
+
+> implement the real adapter.
+
+If they are not available:
+
+> implement the abstraction + sandbox/mock adapter and clearly mark the production adapter as pending.
+
+Never invent API endpoints.
+
+Never claim provisioning works against a provider unless it has actually been verified.
+
+The existing RoamLink philosophy of distinguishing real functionality from mocks must remain.
+
+---
+
+# 42. IMPLEMENTATION PROCESS
+
+Before coding:
+
+### Step 1
+
+Inspect the existing repository.
+
+### Step 2
+
+Map existing:
+
+```text
+auth
+payments
+orders
+providers
+billing
+usage
+B2B
+webhooks
+mobile
+shared
+admin
+```
+
+### Step 3
+
+Identify what can be reused.
+
+### Step 4
+
+Produce a concise integration plan.
+
+### Step 5
+
+Implement database/domain changes.
+
+### Step 6
+
+Implement provider abstraction.
+
+### Step 7
+
+Implement backend APIs.
+
+### Step 8
+
+Implement web UX.
+
+### Step 9
+
+Implement mobile UX.
+
+### Step 10
+
+Implement tests.
+
+### Step 11
+
+Run:
+
+```text
+lint
+typecheck
+tests
+build
+```
+
+### Step 12
+
+Perform a real end-to-end test of the virtual-number flow.
+
+---
+
+# 43. END-TO-END ACCEPTANCE TEST
+
+The finished implementation must be able to demonstrate:
+
+```text
+User
+ ↓
+Login
+ ↓
+Virtual Numbers
+ ↓
+Choose country
+ ↓
+Choose capabilities
+ ↓
+Search
+ ↓
+Select number
+ ↓
+Checkout
+ ↓
+Payment
+ ↓
+Provision
+ ↓
+Number ACTIVE
+ ↓
+Number appears on web
+ ↓
+Number appears on mobile
+ ↓
+Receive SMS
+ ↓
+Message appears in RoamLink
+ ↓
+Send SMS where supported
+ ↓
+View call history where supported
+```
+
+For a trial-enabled country:
+
+```text
+User
+ ↓
+Eligible for trial
+ ↓
+Trial number provisioned
+ ↓
+Use limited SMS/voice
+ ↓
+Trial countdown
+ ↓
+Keep number
+ ↓
+Subscription
+```
+
+Every step must be backed by actual implementation.
+
+---
+
+# 44. FINAL AUDIT
+
+After implementation, produce a factual audit.
+
+Use:
+
+| Area                  | Status | Evidence | Remaining Work |
+| --------------------- | ------ | -------- | -------------- |
+| Virtual Number domain |        |          |                |
+| Provider abstraction  |        |          |                |
+| Provider integration  |        |          |                |
+| Number search         |        |          |                |
+| Provisioning          |        |          |                |
+| Lifecycle             |        |          |                |
+| Subscription          |        |          |                |
+| SMS                   |        |          |                |
+| Voice                 |        |          |                |
+| MMS                   |        |          |                |
+| Trial                 |        |          |                |
+| Abuse prevention      |        |          |                |
+| Payments              |        |          |                |
+| Billing               |        |          |                |
+| Mobile                |        |          |                |
+| Web                   |        |          |                |
+| Shared types          |        |          |                |
+| B2B                   |        |          |                |
+| Compliance            |        |          |                |
+| Webhooks              |        |          |                |
+| Reconciliation        |        |          |                |
+| Security              |        |          |                |
+| Tests                 |        |          |                |
+| Deployment            |        |          |                |
+
+Clearly distinguish:
+
+```text
+IMPLEMENTED
+VERIFIED
+MOCK/SANDBOX
+PARTIALLY IMPLEMENTED
+NOT IMPLEMENTED
+```
+
+Do not call something production-ready simply because an interface exists.
+
+---
+
+# 45. MOST IMPORTANT RULE
+
+**RoamLink is not becoming two applications.**
+
+It is becoming one connectivity platform with two major products:
+
+```text
+                    ROAMLINK
+                       │
+          ┌────────────┴────────────┐
+          │                         │
+        eSIM                 VIRTUAL NUMBER
+          │                         │
+       Data                    SMS / Voice
+          │                         │
+          └────────────┬────────────┘
+                       │
+              Unified RoamLink
+                 infrastructure
+```
+
+Preserve the existing eSIM functionality.
+
+Preserve the existing users.
+
+Preserve the existing organizations.
+
+Preserve the existing payment architecture.
+
+Preserve the existing security model.
+
+Preserve PostgreSQL.
+
+Preserve the existing web/mobile architecture.
+
+Extend the platform rather than forking it.
+
+The goal is to make RoamLink a **unified global connectivity platform**, where customers can purchase and manage both mobile-data eSIMs and virtual communication numbers from the same account, same wallet/billing infrastructure, same organizations, same applications, and same backend.
+
+### One strategic change I'd make beyond the prompt
+
+I would **not launch virtual numbers globally immediately**. The architecture can be global, but the actual product catalog should initially be based on **countries where your chosen provider has reliable inventory and where the regulatory requirements are understood**.
+
+That gives RoamLink a much stronger product model:
+
+**eSIM → "Get connected when you travel."**
+**Virtual Number → "Have a communication identity wherever you operate."**
+
+And eventually the really powerful part is that one RoamLink account can contain both:
+
+> 🇹🇬 **Togo eSIM** — 8.4 GB remaining
+> 🇬🇭 **Ghana number** — +233… — SMS/Voice
+> 🇺🇸 **US number** — +1… — SMS/Voice
+
+That is a much more defensible product than simply adding another standalone virtual-number marketplace.

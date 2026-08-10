@@ -24,9 +24,10 @@ export function SiteHeader() {
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const navLinks = [
-    { href: "/esim", label: "Browse eSIMs" },
+    { href: "/esim", label: "eSIMs" },
+    { href: "/numbers", label: "Numbers" },
     { href: "/dashboard/esims", label: "My eSIMs" },
-    { href: "/dashboard/orders", label: "Orders" },
+    { href: "/dashboard/numbers", label: "My Numbers" },
     { href: "/company", label: "Business" },
   ];
 

@@ -155,4 +155,89 @@ export function countryFlag(countryCode: string): string {
   return String.fromCodePoint(...countryCode.toUpperCase().split("").map((c) => 127397 + c.charCodeAt(0)));
 }
 
+// ---------------------------------------------------------------------------
+// Virtual Number types (second connectivity product)
+// ---------------------------------------------------------------------------
+
+export type NumberStatus =
+  | "discovered"
+  | "available"
+  | "reserved"
+  | "provisioning"
+  | "configuring"
+  | "active"
+  | "suspended"
+  | "releasing"
+  | "released"
+  | "failed";
+
+export type NumberType = "local" | "toll_free" | "mobile" | "national";
+
+export type ProviderNumber = {
+  providerNumberId: string;
+  e164: string;
+  country: string;
+  countryCode: string;
+  region?: string;
+  city?: string;
+  numberType: NumberType;
+  smsEnabled: boolean;
+  mmsEnabled: boolean;
+  voiceEnabled: boolean;
+  monthlyCostMinor: number;
+  currency: Currency;
+  sellingPriceMinor: number;
+};
+
+export type VirtualNumber = {
+  id: string;
+  e164: string;
+  country: string;
+  countryCode: string;
+  region: string | null;
+  city: string | null;
+  numberType: string;
+  smsEnabled: boolean;
+  mmsEnabled: boolean;
+  voiceEnabled: boolean;
+  status: NumberStatus;
+  provider: string;
+  sellingPrice: number;
+  currency: string;
+  expiresAt: string | null;
+  activatedAt: string | null;
+  createdAt: string;
+};
+
+export type Message = {
+  id: string;
+  direction: "inbound" | "outbound";
+  fromNumber: string;
+  toNumber: string;
+  body: string;
+  status: string;
+  segments: number;
+  createdAt: string;
+};
+
+export type Call = {
+  id: string;
+  direction: "inbound" | "outbound";
+  fromNumber: string;
+  toNumber: string;
+  status: string;
+  durationSeconds: number;
+  createdAt: string;
+};
+
+export type NumberCountry = {
+  country: string;
+  countryCode: string;
+  sms: boolean;
+  voice: boolean;
+  mms: boolean;
+  count: number;
+  regions: string[];
+};
+
 export * from "./api-client";
