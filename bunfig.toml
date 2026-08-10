@@ -1,0 +1,7 @@
+[test]
+# Load .env before running tests
+preload = ["./tests/env.ts"]
+# Neon cold starts + cross-region latency need generous timeouts
+timeout = 120000
+# Increase hook timeout (beforeAll/afterAll) for DB-heavy setup
+# Bun test hooks use the same timeout as tests
