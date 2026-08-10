@@ -179,6 +179,66 @@ export class RoamLinkClient {
   async checkCompatibility(device: string) {
     return this.request<{ found: boolean; result?: CompatibilityResult; message?: string }>(`/api/compatibility?device=${encodeURIComponent(device)}`);
   }
+
+  // --- Virtual Numbers ---
+  async getVNCountries() {
+    return this.request<{ countries: NumberCountry[] }>("/api/virtual-numbers/search");
+  }
+
+  async searchVNNumbers(params: { countryCode?: string; smsRequired?: boolean; voiceRequired?: boolean }) {
+    const qs = new URLSearchParams();
+    if (params.countryCode) qs.set("country", params.countryCode);
+    if (params.smsRequired) qs.set("sms", "true");
+    if (params.voiceRequired) qs.set("voice", "true");
+    return this.request<{ numbers: ProviderNumber[] }>(`/api/virtual-numbers/search?${qs}`);
+  }
+
+  async purchaseNumber(token: string, providerNumberId: string, idempotencyKey: string) {
+    return this.request<{ orderId: string; virtualNumberId: string; status: string }>("/api/virtual-numbers/orders", {
+      method: "POST",
+      body: JSON.stringify({ providerNumberId, idempotencyKey }),
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  async listNumbers(token: string) {
+    return this.request<{ numbers: VirtualNumber[] }>("/api/virtual-numbers", {
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  async getNumber(token: string, id: string) {
+    return this.request<{ number: VirtualNumber & { messages?: Message[]; calls?: Call[] } }>(`/api/virtual-numbers/${id}`, {
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  async releaseNumber(token: string, id: string) {
+    return this.request<{ ok: true }>(`/api/virtual-numbers/${id}/release`, {
+      method: "POST",
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  async sendSMS(token: string, vnId: string, to: string, body: string) {
+    return this.request<{ message: Message }>(`/api/virtual-numbers/${vnId}/messages`, {
+      method: "POST",
+      body: JSON.stringify({ to, body }),
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  async getMessages(token: string, vnId: string) {
+    return this.request<{ messages: Message[] }>(`/api/virtual-numbers/${vnId}/messages`, {
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  async getCalls(token: string, vnId: string) {
+    return this.request<{ calls: Call[] }>(`/api/virtual-numbers/${vnId}/calls`, {
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
 }
 
 export const roamlinkClient = new RoamLinkClient();

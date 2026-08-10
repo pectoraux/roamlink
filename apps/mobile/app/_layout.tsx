@@ -18,6 +18,8 @@ export default function RootLayout() {
         <Stack.Screen name="esim/[id]" options={{ title: "eSIM", headerShown: true }} />
         <Stack.Screen name="install/[esimId]" options={{ title: "Install", headerShown: true }} />
         <Stack.Screen name="topup/[esimId]" options={{ title: "Top Up", headerShown: true }} />
+        <Stack.Screen name="number-search/[code]" options={{ title: "Numbers", headerShown: true }} />
+        <Stack.Screen name="number/[id]" options={{ title: "Number", headerShown: true }} />
       </Stack>
     </AuthProvider>
   );
