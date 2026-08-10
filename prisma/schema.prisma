@@ -178,6 +178,7 @@ model Order {
   plan             Plan     @relation(fields: [planId], references: [id])
   payments         Payment[]
   esim             Esim?
+  corporateOrder   CorporateOrder?
 
   @@index([userId])
   @@index([status])
@@ -237,6 +238,7 @@ model Esim {
   order           Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
   usages          Usage[]
   topUps          TopUp[]
+  orgAssignments  OrganizationESIM[]
 
   @@index([userId])
   @@index([status])
@@ -420,17 +422,20 @@ model OrganizationESIM {
   createdAt      DateTime @default(now())
 
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  esim           Esim        @relation(fields: [esimId], references: [id], onDelete: Cascade)
 
   @@index([organizationId])
+  @@index([esimId])
 }
 
 model CorporateOrder {
   id             String   @id @default(cuid())
   organizationId String
-  orderId        String
+  orderId        String   @unique
   createdAt      DateTime @default(now())
 
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  order          Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([organizationId])
 }
