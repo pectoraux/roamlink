@@ -154,3 +154,38 @@ Stage Summary:
 - Production: https://roamlink-chi.vercel.app — all new features verified.
 - GitHub: https://github.com/pectoraux/roamlink — Phase 2 committed and pushed.
 - Architecture principle preserved: "Web discovers and sells connectivity. Mobile installs, manages and uses connectivity. Backend coordinates everything."
+
+---
+Task ID: 14
+Agent: Lead engineer (main)
+Task: B2B corporate dashboard + verified real payment providers + final verification.
+
+Work Log:
+- Verified real payment providers have valid working keys:
+  * Stripe: creates payment intents successfully (pi_3U2mV0... returned with client_secret)
+  * Flutterwave: creates payment links successfully (status: success, link returned)
+  * PayStack: test merchant needs currency configuration (USD not supported, NGN/GHS needed)
+  * Mock remains default for reliable demos; real providers ready to switch via PAYMENT_PROVIDER env var
+- Built B2B corporate dashboard:
+  * Organization service (src/server/services/organization.ts): create org, add members (owner/admin/member roles), assign eSIMs, get stats
+  * API: GET/POST /api/organization
+  * /company: dashboard with stats (members, eSIMs, orders), member list, quick actions, create-org form
+  * /company/employees: team member management
+  * /company/esims: assigned eSIMs with status
+  * /company/orders: corporate order history
+  * Added "Business" link to site header
+- Fixed Prisma schema: added OrganizationMember.user relation, OrganizationESIM.esim relation, CorporateOrder.order relation (with @unique on orderId for 1:1), and reverse relations on User/Esim/Order models.
+- Deployed to Vercel — all routes verified on production:
+  * /company, /company/employees, /company/esims, /company/orders → all 200
+  * /esim/ghana → 200 (SEO title + 2 JSON-LD blocks)
+  * /sitemap.xml → 200
+  * Homepage nav includes "Business" link
+  * Organization creation works (Acme Travel created, role: owner, 1 member)
+- Agent Browser final verification: homepage, destination page, login, B2B dashboard all render correctly with no errors.
+
+Stage Summary:
+- B2B foundation is now functional: organizations can be created, members listed, eSIMs assigned.
+- Real payment providers verified (Stripe + Flutterwave working, PayStack needs currency config).
+- Full platform deployed and verified on https://roamlink-chi.vercel.app
+- Architecture: Web (discovery + SEO + commerce + B2B) + Mobile (connectivity) + Backend (shared source of truth)
+- Remaining for commercial launch: choose real eSIM wholesale provider, implement its adapter from official docs.
