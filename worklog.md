@@ -118,3 +118,39 @@ Stage Summary:
 - All env vars configured on Vercel (DATABASE_URL, DIRECT_URL, payment keys, AUTH_SECRET, APP_URL).
 - Note: roamlink.vercel.app was taken by another account; using roamlink-chi.vercel.app instead.
 - The mobile-first architecture (shared backend, web + mobile clients) is documented in the prompt; the web app is the deployed deliverable. The backend API is provider-abstracted and ready for a mobile client to consume.
+
+---
+Task ID: 13
+Agent: Lead engineer (main)
+Task: Phase 2 — Evolve RoamLink into a multi-client eSIM platform (SEO destinations, mobile app, install tokens, B2B foundation).
+
+Work Log:
+- Audited existing repo. Confirmed PostgreSQL is live (Neon). Removed remaining SQLite references from docs.
+- Destination-first SEO: created unified /esim/[slug] route that handles both destination pages (/esim/ghana) and plan detail pages (/esim/[planId]). Destination pages include: hero with country flag, all plans for the country, coverage & networks, features, installation guide (iPhone/Android/compatibility), FAQ with JSON-LD, other destinations. Added sitemap.ts (dynamic, includes all destinations), robots.ts, OG image route (/api/og), generateMetadata with canonical URLs + OpenGraph + Twitter cards.
+- Device compatibility service: static dataset of common devices. Distinguishes esimCompatible (hardware) from nativeInstallationSupported (OS-level). API: GET /api/compatibility?device=...
+- Installation tokens: InstallToken model (short-lived 15min, single-use, user-bound). Service: createInstallToken + consumeInstallToken. API: POST /api/esims/[id]/install-token, GET /api/install/[token]. Web UI: SendToPhoneButton component on order success page generates QR + link. /install page consumes token and shows activation details.
+- B2B foundation: Organization, OrganizationMember, OrganizationESIM, CorporateOrder models in Prisma schema. Foundation only — not fully implemented.
+- Shared packages: packages/shared/ with canonical types (PublicPlan, Order, ESIM, etc.) + RoamLinkClient API client. Both web and mobile import from here.
+- Expo mobile app (apps/mobile): full React Native + Expo Router structure:
+  * Navigation: 5 tabs (Home, Explore, My eSIMs, Activity, Profile)
+  * Screens: Home (active eSIM + search + destinations), Explore (region-grouped browsing), My eSIMs, Activity (orders), Profile, Login (with demo quick-login), Plan detail, Checkout, eSIM detail (QR + usage + simulate), Install (post-purchase flow), Top-up
+  * Auth: expo-secure-store for session tokens (not AsyncStorage). Same backend session as web.
+  * API: shared RoamLinkClient with configurable base URL
+  * Cross-platform: same user account works on web and mobile
+- Deployed to Vercel: build succeeded, all routes live on production.
+  * /esim/ghana → 200 (destination page with SEO metadata + structured data)
+  * /sitemap.xml → 200 (11 destination URLs)
+  * /robots.txt → 200
+  * /install → 200
+  * /api/compatibility → 200
+- Lint clean. Build succeeds.
+
+Stage Summary:
+- Web: destination-first SEO pages live (/esim/ghana, /esim/nigeria, etc.) with sitemap, robots, JSON-LD, OG images.
+- Mobile: full Expo app structure created (apps/mobile) — runnable with `npx expo start`. Consumes same backend API.
+- Shared: packages/shared/ with types + API client consumed by both clients.
+- Installation tokens: secure web→mobile deep linking with short-lived tokens + QR.
+- B2B: Organization models in schema (foundation for future corporate features).
+- Production: https://roamlink-chi.vercel.app — all new features verified.
+- GitHub: https://github.com/pectoraux/roamlink — Phase 2 committed and pushed.
+- Architecture principle preserved: "Web discovers and sells connectivity. Mobile installs, manages and uses connectivity. Backend coordinates everything."
