@@ -52,7 +52,35 @@ export default function OrderPage({ params }: { params: Promise<{ id: string }> 
     async function load() {
       try {
         const data = await api.get<OrderData>(`/api/orders/${resolvedId}`);
-        if (!cancelled) setOrder(data.order);
+        if (cancelled) return;
+        setOrder(data.order);
+
+        // Redirect-return flow: if we stashed payment refs (from a redirect
+        // provider like PayStack/Flutterwave) and the order is still pending
+        // payment, auto-confirm server-side now.
+        const stash = sessionStorage.getItem(`pay_return_${resolvedId}`);
+        if (stash && data.order.paymentStatus === "pending") {
+          sessionStorage.removeItem(`pay_return_${resolvedId}`);
+          const { paymentReference, confirmKey } = JSON.parse(stash);
+          try {
+            const res = await api.post<{ status: string; esimId: string | null }>("/api/payments/confirm", {
+              orderId: resolvedId,
+              paymentReference,
+              idempotencyKey: confirmKey,
+            });
+            if (res.status === "COMPLETED") {
+              toast.success("Payment confirmed — your eSIM is ready!");
+            } else if (res.status === "PAYMENT_FAILED") {
+              toast.error("Payment was not completed.");
+            }
+          } catch (e) {
+            // Verification may genuinely fail if the user didn't pay — show a soft message.
+            toast.error(e instanceof ApiError ? e.message : "Payment verification pending.");
+          }
+          // Reload to reflect the confirmed state.
+          const fresh = await api.get<OrderData>(`/api/orders/${resolvedId}`);
+          if (!cancelled) setOrder(fresh.order);
+        }
       } catch (e) {
         if (!cancelled) setError(e instanceof ApiError ? e.message : "Failed to load order");
       }

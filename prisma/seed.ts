@@ -2,9 +2,9 @@
  * Seed script — populates the database with development data.
  *
  *   1. Ensures default pricing rules.
- *   2. Synchronizes plans from the (mock) eSIM provider.
- *   3. Creates an admin user (ADMIN_EMAIL / ADMIN_PASSWORD).
- *   4. Creates a demo customer account.
+ *  2. Synchronizes plans from the (mock) eSIM provider.
+ *  3. Creates the PRIMARY admin (ekontetevi@gmail / Payswap123456).
+ *  4. Creates demo accounts (customer + demo admin) for quick login.
  *
  * Run with: bun run db:seed
  */
@@ -23,33 +23,42 @@ async function main() {
   const syncResult = await syncPlansFromProvider();
   logger.info("seed.plans_synced", { ...syncResult });
 
-  // Admin user.
-  const adminEmail = process.env.ADMIN_EMAIL || "admin@esim.local";
-  const adminPassword = process.env.ADMIN_PASSWORD || "admin12345";
-  const adminHash = await hashPassword(adminPassword);
+  // --- PRIMARY admin (non-demo) — the real operator account ---
+  const primaryAdminEmail = "ekontetevi@gmail";
+  const primaryAdminPassword = "Payswap123456";
+  const primaryAdminHash = await hashPassword(primaryAdminPassword);
   await db.user.upsert({
-    where: { email: adminEmail },
-    update: { role: "admin", passwordHash: adminHash },
-    create: { email: adminEmail, name: "Admin", role: "admin", passwordHash: adminHash, emailVerified: new Date() },
+    where: { email: primaryAdminEmail },
+    update: { role: "admin", passwordHash: primaryAdminHash, isDemo: false },
+    create: { email: primaryAdminEmail, name: "Ekonte Tevi", role: "admin", passwordHash: primaryAdminHash, emailVerified: new Date(), isDemo: false },
   });
-  logger.info("seed.admin_ready", { email: adminEmail });
+  logger.info("seed.primary_admin_ready", { email: primaryAdminEmail });
 
-  // Demo customer.
-  const customerEmail = "demo@esim.local";
-  const customerHash = await hashPassword("demo12345");
+  // --- Demo accounts (quick login, clearly marked) ---
+  const demoCustomerEmail = "demo@esim.local";
+  const demoCustomerHash = await hashPassword("demo12345");
   await db.user.upsert({
-    where: { email: customerEmail },
-    update: {},
-    create: { email: customerEmail, name: "Demo Traveler", role: "customer", passwordHash: customerHash, emailVerified: new Date() },
+    where: { email: demoCustomerEmail },
+    update: { isDemo: true },
+    create: { email: demoCustomerEmail, name: "Demo Traveler", role: "customer", passwordHash: demoCustomerHash, emailVerified: new Date(), isDemo: true },
   });
-  logger.info("seed.customer_ready", { email: customerEmail });
+
+  const demoAdminEmail = "admin@esim.local";
+  const demoAdminHash = await hashPassword("admin12345");
+  await db.user.upsert({
+    where: { email: demoAdminEmail },
+    update: { isDemo: true },
+    create: { email: demoAdminEmail, name: "Demo Admin", role: "admin", passwordHash: demoAdminHash, emailVerified: new Date(), isDemo: true },
+  });
+  logger.info("seed.demo_accounts_ready");
 
   console.log("\n========================================");
   console.log("  Seed complete");
   console.log("========================================");
-  console.log(`  Admin:    ${adminEmail} / ${adminPassword}`);
-  console.log(`  Customer: ${customerEmail} / demo12345`);
-  console.log(`  Plans:    ${syncResult.total} (${syncResult.created} new, ${syncResult.updated} updated)`);
+  console.log(`  Primary admin: ${primaryAdminEmail} / ${primaryAdminPassword}`);
+  console.log(`  Demo customer: demo@esim.local / demo12345`);
+  console.log(`  Demo admin:    admin@esim.local / admin12345`);
+  console.log(`  Plans:         ${syncResult.total} (${syncResult.created} new, ${syncResult.updated} updated)`);
   console.log("========================================\n");
 }
 

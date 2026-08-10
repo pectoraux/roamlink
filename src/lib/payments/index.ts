@@ -1,9 +1,17 @@
 /**
  * Payment provider factory — selects the concrete provider from PAYMENT_PROVIDER.
+ *
+ * Supported: mock | paystack | flutterwave | stripe
+ *
+ * Switching providers is a pure env-var change. Each adapter implements the
+ * same PaymentProvider interface with server-side verification.
  */
 
 import type { PaymentProvider } from "./provider";
 import { MockPaymentProvider, mockPaymentProvider } from "./mock-provider";
+import { PayStackProvider } from "./paystack-provider";
+import { FlutterwaveProvider } from "./flutterwave-provider";
+import { StripeProvider } from "./stripe-provider";
 
 let cached: PaymentProvider | null = null;
 
@@ -14,11 +22,18 @@ export function getPaymentProvider(): PaymentProvider {
     case "mock":
       cached = mockPaymentProvider;
       break;
+    case "paystack":
+      cached = new PayStackProvider();
+      break;
+    case "flutterwave":
+      cached = new FlutterwaveProvider();
+      break;
+    case "stripe":
+      cached = new StripeProvider();
+      break;
     default:
-      // Real providers (Stripe, Paystack, etc.) would be implemented as
-      // separate adapters selected here. We do not fabricate them.
       throw new Error(
-        `Payment provider "${key}" is not implemented. Implement a concrete adapter and register it here. For development, set PAYMENT_PROVIDER=mock.`,
+        `Unknown PAYMENT_PROVIDER "${key}". Supported: mock, paystack, flutterwave, stripe.`,
       );
   }
   return cached;
@@ -26,3 +41,6 @@ export function getPaymentProvider(): PaymentProvider {
 
 export type { PaymentProvider } from "./provider";
 export { MockPaymentProvider, mockPaymentProvider } from "./mock-provider";
+export { PayStackProvider } from "./paystack-provider";
+export { FlutterwaveProvider } from "./flutterwave-provider";
+export { StripeProvider } from "./stripe-provider";

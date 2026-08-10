@@ -14,9 +14,10 @@ generator client {
 }
 
 datasource db {
-  // Swap to "postgresql" + a postgres DATABASE_URL for production.
-  provider = "sqlite"
+  // PostgreSQL (Neon) for both dev and production.
+  provider = "postgresql"
   url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // ---------------------------------------------------------------------------
@@ -29,6 +30,7 @@ model User {
   name          String?
   passwordHash  String
   role          String   @default("customer") // "customer" | "admin"
+  isDemo        Boolean  @default(false) // demo accounts (quick-login)
   emailVerified DateTime?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
@@ -41,6 +43,26 @@ model User {
   auditLogs             AuditLog[]
   passwordResetTokens   PasswordResetToken[]
   emailVerificationTokens EmailVerificationToken[]
+  approvedFrom          WaitlistEntry?
+  approvedWaitlist      WaitlistEntry[] @relation("WaitlistApprover")
+}
+
+model WaitlistEntry {
+  id          String   @id @default(cuid())
+  email       String   @unique
+  name        String?
+  status      String   @default("pending") // pending | approved | rejected
+  note        String?  // admin note
+  approvedById String? // admin user who approved
+  approvedAt  DateTime?
+  createdUserId String? @unique // the User created when approved (1:1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  approvedBy  User?    @relation("WaitlistApprover", fields: [approvedById], references: [id])
+  createdUser User?    @relation(fields: [createdUserId], references: [id])
+
+  @@index([status])
 }
 
 model Session {

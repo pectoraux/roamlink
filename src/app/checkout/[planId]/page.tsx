@@ -61,12 +61,30 @@ export default function CheckoutPage({ params }: { params: Promise<{ planId: str
 
       // 2. Initiate payment (idempotent).
       const payKey = `payment_${orderId}`;
-      const payRes = await api.post<{ paymentReference: string; idempotencyKey: string }>("/api/payments", {
+      const payRes = await api.post<{
+        paymentReference: string;
+        idempotencyKey: string;
+        nextAction?: { type: string; url?: string; instructions?: string };
+        providerId: string;
+      }>("/api/payments", {
         orderId,
         idempotencyKey: payKey,
       });
 
-      // 3. Confirm payment (server-side verified) + provision.
+      // Redirect-based providers (PayStack/Flutterwave): send the user to the
+      // provider's hosted payment page. They return to /order/[id] which calls
+      // confirm. We stash the refs so the order page can complete confirmation.
+      if (payRes.nextAction?.type === "redirect" && payRes.nextAction.url) {
+        // Persist refs for the return-trip confirmation.
+        sessionStorage.setItem(
+          `pay_return_${orderId}`,
+          JSON.stringify({ paymentReference: payRes.paymentReference, confirmKey: `confirm_${orderId}`, idempotencyKey: payKey }),
+        );
+        window.location.href = payRes.nextAction.url;
+        return;
+      }
+
+      // Mock / Stripe (client-side confirm): verify + provision immediately.
       const confirmKey = `confirm_${orderId}`;
       const confirmRes = await api.post<{ status: string; esimId: string | null; paymentStatus: string }>(
         "/api/payments/confirm",

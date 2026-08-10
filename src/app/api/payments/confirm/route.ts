@@ -10,9 +10,14 @@ import { AppError } from "@/lib/errors";
 /**
  * Confirm a payment SERVER-SIDE and provision the eSIM.
  *
- * For the mock provider, this first tells the mock provider to mark the intent
- * succeeded (simulating the provider's own confirmation), then verifies. With a
- * real provider, this step would be absent — verification calls the provider.
+ * Two paths:
+ *  - Mock provider: we simulate the provider's own confirmation (confirmIntent),
+ *    then verify. This lets the full flow run without a real provider.
+ *  - Real provider (PayStack/Flutterwave/Stripe): the customer has already
+ *    completed payment on the provider's hosted page / SDK. We ONLY verify
+ *    server-side — we never trust the client's claim of success.
+ *
+ * This is the single trusted entry point that triggers provisioning.
  */
 export async function POST(req: NextRequest) {
   try {
@@ -21,7 +26,10 @@ export async function POST(req: NextRequest) {
     const body = await req.json();
     if (!body?.orderId) throw new AppError("validation", "Missing orderId", 400, "Order id is required.");
 
-    // Mock: simulate the provider-side confirmation event.
+    // Mock: simulate the provider-side confirmation event (the "customer paid"
+    // signal the real provider would send via webhook/redirect). For real
+    // providers this step is absent — verification reads the truth from the
+    // provider's API.
     const provider = getPaymentProvider();
     if (provider.isMock && body.paymentReference) {
       mockPaymentProvider.confirmIntent(body.paymentReference);

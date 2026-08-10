@@ -150,13 +150,19 @@ export async function initiatePayment(input: {
   paymentReference: string;
   paymentStatus: string;
   clientSecret?: string;
+  nextAction?: {
+    type: "redirect" | "otp" | "none";
+    url?: string;
+    instructions?: string;
+  };
+  providerId: string;
 }> {
   const order = await db.order.findUnique({ where: { id: input.orderId }, include: { plan: true } });
   if (!order || order.userId !== input.userId) throw new AppError("not_found", "Order not found", 404, "Order not found.");
 
   // Already paid? Short-circuit.
   if (order.paymentStatus === "succeeded") {
-    return { orderId: order.id, status: order.status as OrderStatus, paymentReference: order.paymentReference ?? "", paymentStatus: "succeeded" };
+    return { orderId: order.id, status: order.status as OrderStatus, paymentReference: order.paymentReference ?? "", paymentStatus: "succeeded", providerId: order.paymentProvider ?? "mock" };
   }
 
   assertTransition(order.status as OrderStatus, "PAYMENT_PENDING");
@@ -198,13 +204,15 @@ export async function initiatePayment(input: {
   });
 
   await audit({ userId: input.userId, orderId: order.id, action: "payment.initiated", entity: "payment", entityId: payment.id, ip: input.ip });
-  logger.info("payment.initiated", { orderId: order.id, paymentReference: intent.providerReference });
+  logger.info("payment.initiated", { orderId: order.id, paymentReference: intent.providerReference, provider: paymentProvider.id });
   return {
     orderId: order.id,
     status: "PAYMENT_PENDING",
     paymentReference: intent.providerReference,
     paymentStatus: "pending",
     clientSecret: intent.clientSecret,
+    nextAction: intent.nextAction,
+    providerId: paymentProvider.id,
   };
 }
 

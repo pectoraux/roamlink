@@ -9,6 +9,7 @@ export type ClientUser = {
   email: string;
   name: string | null;
   role: "customer" | "admin";
+  isDemo: boolean;
 };
 
 type AuthContextValue = {

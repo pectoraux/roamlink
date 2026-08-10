@@ -27,6 +27,7 @@ export type AuthUser = {
   email: string;
   name: string | null;
   role: "customer" | "admin";
+  isDemo: boolean;
 };
 
 export type AuthResult = {
@@ -38,35 +39,88 @@ function toAuthUser(u: {
   email: string;
   name: string | null;
   role: string;
+  isDemo: boolean;
 }): AuthUser {
   return {
     id: u.id,
     email: u.email,
     name: u.name,
     role: u.role as "customer" | "admin",
+    isDemo: u.isDemo,
   };
 }
 
-/** Register a new customer. */
-export async function registerCustomer(input: {
+/**
+ * Sign-up puts the user on a WAITLIST (no account created yet).
+ * An admin reviews and creates the account via `approveWaitlistEntry`.
+ * This gates access while the product is in early access / beta.
+ */
+export async function joinWaitlist(input: {
   email: string;
-  password: string;
   name?: string;
-}): Promise<AuthUser> {
+}): Promise<{ id: string; status: string }> {
   const email = input.email.trim().toLowerCase();
   if (!isValidEmail(email)) throw new AppError("validation", "Invalid email", 400, "Please enter a valid email address.");
+
+  // If already a full user, don't re-waitlist.
+  const existingUser = await db.user.findUnique({ where: { email } });
+  if (existingUser) throw new AppError("conflict", "Already registered", 409, "An account with this email already exists. Please sign in.");
+
+  // Upsert waitlist entry (idempotent if they re-submit).
+  const entry = await db.waitlistEntry.upsert({
+    where: { email },
+    create: { email, name: input.name?.trim() || null, status: "pending" },
+    update: {}, // keep existing status (e.g. don't downgrade approved back to pending)
+  });
+  logger.info("waitlist.joined", { waitlistId: entry.id, email, status: entry.status });
+  return { id: entry.id, status: entry.status };
+}
+
+/**
+ * Admin approves a waitlist entry and creates a real user account.
+ * Returns the new user (admin then communicates credentials to the user).
+ */
+export async function approveWaitlistEntry(input: {
+  waitlistId: string;
+  adminId: string;
+  password: string;
+  name?: string;
+}): Promise<{ userId: string; email: string }> {
   if (!isStrongPassword(input.password))
     throw new AppError("validation", "Password too weak", 400, "Password must be at least 8 characters.");
 
-  const existing = await db.user.findUnique({ where: { email } });
-  if (existing) throw new AppError("conflict", "Email already registered", 409, "An account with this email already exists.");
+  const entry = await db.waitlistEntry.findUnique({ where: { id: input.waitlistId } });
+  if (!entry) throw new AppError("not_found", "Waitlist entry not found", 404, "Waitlist entry not found.");
+  if (entry.status === "approved") throw new AppError("conflict", "Already approved", 409, "This entry was already approved.");
 
   const passwordHash = await hashPassword(input.password);
-  const user = await db.user.create({
-    data: { email, name: input.name?.trim() || null, passwordHash, role: "customer" },
+  const user = await db.$transaction(async (tx) => {
+    const u = await tx.user.create({
+      data: {
+        email: entry.email,
+        name: input.name?.trim() || entry.name || null,
+        passwordHash,
+        role: "customer",
+        emailVerified: new Date(),
+      },
+    });
+    await tx.waitlistEntry.update({
+      where: { id: entry.id },
+      data: { status: "approved", approvedAt: new Date(), approvedById: input.adminId, createdUserId: u.id },
+    });
+    return u;
   });
-  logger.info("user.registered", { userId: user.id, email });
-  return toAuthUser(user);
+  logger.info("waitlist.approved", { waitlistId: entry.id, userId: user.id, adminId: input.adminId });
+  return { userId: user.id, email: user.email };
+}
+
+/** Reject a waitlist entry (no account created). */
+export async function rejectWaitlistEntry(input: { waitlistId: string; adminId: string; note?: string }): Promise<void> {
+  await db.waitlistEntry.update({
+    where: { id: input.waitlistId },
+    data: { status: "rejected", note: input.note ?? null, approvedById: input.adminId, approvedAt: new Date() },
+  });
+  logger.info("waitlist.rejected", { waitlistId: input.waitlistId, adminId: input.adminId });
 }
 
 /** Login with email/password and create a session. */

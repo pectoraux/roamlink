@@ -14,7 +14,7 @@ export async function POST(req: NextRequest) {
       ip: getClientIP(req),
     });
     await setSessionCookie(token);
-    return json({ user: { id: user.id, email: user.email, name: user.name, role: user.role } });
+    return json({ user: { id: user.id, email: user.email, name: user.name, role: user.role, isDemo: user.isDemo } });
   } catch (err) {
     return errorResponse(err);
   }
