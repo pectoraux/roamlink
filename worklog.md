@@ -82,3 +82,39 @@ Stage Summary:
 - Admin dashboard reflects the real purchase (revenue, eSIM, orders).
 - All critical business rules enforced: server-side payment verification, one eSIM per order, idempotency, wholesale isolation, provider abstraction.
 - Dev caveat documented: dev uses SQLite (sandbox constraint), PostgreSQL is the production target (documented switch). Mock eSIM/payment providers are in-memory; a real provider persists state across restarts.
+
+---
+Task ID: 12
+Agent: Lead engineer (main)
+Task: Evolve to mobile-first platform — PostgreSQL (Neon), waitlist auth, real payment providers (PayStack/Flutterwave/Stripe), deploy to GitHub + Vercel.
+
+Work Log:
+- Switched Prisma from SQLite to PostgreSQL (Neon). Updated schema provider to postgresql with pooled (DATABASE_URL) + direct (DIRECT_URL) connection strings. Added WaitlistEntry model + isDemo field on User. Added Prisma binary targets for Vercel Linux (rhel-openssl-3.0.x).
+- Waitlist authentication: register → joinWaitlist (no account created) → admin reviews via /admin/waitlist → approveWaitlistEntry creates the account with a temp password. Rejected registerCustomer → replaced with joinWaitlist. New API routes: /api/admin/waitlist (GET), /api/admin/waitlist/[id]/approve (POST), /api/admin/waitlist/[id]/reject (POST).
+- Created primary admin: ekontetevi@gmail / Payswap123456 (isDemo=false). Demo accounts: demo@esim.local/demo12345 (customer), admin@esim.local/admin12345 (admin), both isDemo=true. Login page has quick-login buttons for both demo accounts.
+- Real payment providers: PayStackProvider (redirect flow, HMAC-SHA512 webhook), FlutterwaveProvider (redirect flow, SHA256 webhook), StripeProvider (PaymentIntent + client_secret, Stripe-Signature webhook). Factory selects via PAYMENT_PROVIDER env (mock|paystack|flutterwave|stripe). Checkout page handles both redirect (PayStack/Flutterwave) and instant (mock/Stripe) flows. Order page auto-confirms on redirect return via sessionStorage.
+- Seeded PostgreSQL (Neon): 24 plans, primary admin, demo accounts.
+- Fixed build errors: (1) Next.js 16 async cookies() — await setSessionCookie/clearSessionCookie in route handlers. (2) useSearchParams in login page required Suspense boundary for static prerendering. (3) Removed output:standalone from next.config for Vercel. (4) Added postinstall: prisma generate + buildCommand: prisma generate && next build.
+- Pushed to GitHub: github.com/pectoraux/roamlink (new repo, PAT auth).
+- Deployed to Vercel: project "roamlink" (prj_8NjmBvLtajfmCYfskblNaOnhg3w8). Set 16 env vars (DATABASE_URL, DIRECT_URL, all payment keys, AUTH_SECRET, etc.). Build succeeded after Suspense fix.
+- Production URL: https://roamlink-chi.vercel.app (roamlink.vercel.app was already taken by another Vercel account).
+- Verified on production via Agent Browser + curl:
+  * Homepage renders (hero, plans, destinations from PostgreSQL).
+  * Waitlist sign-up works (/register → "You're on the waitlist!").
+  * Login with session cookie persists across requests (critical for Vercel serverless).
+  * Quick-login buttons work (demo customer → /dashboard/esims, demo admin → /admin).
+  * Primary admin (ekontetevi@gmail) logs in with isDemo=false.
+  * Admin waitlist page accessible.
+  * Full purchase flow: login → create order → initiate payment → confirm (server-side verify) → provision eSIM → eSIM appears in dashboard (ICCID, SM-DP+, 10GB).
+  * API returns 24 plans from Neon PostgreSQL.
+
+Stage Summary:
+- App deployed and fully functional on Vercel at https://roamlink-chi.vercel.app
+- GitHub repo: https://github.com/pectoraux/roamlink
+- PostgreSQL (Neon) replaces SQLite — same DB for dev and prod.
+- Waitlist auth: sign-up → waitlist → admin approves → account created.
+- 3 real payment providers integrated (test mode) + mock. PAYMENT_PROVIDER env switches them.
+- Auth works on Vercel (session cookies persist across serverless invocations).
+- All env vars configured on Vercel (DATABASE_URL, DIRECT_URL, payment keys, AUTH_SECRET, APP_URL).
+- Note: roamlink.vercel.app was taken by another account; using roamlink-chi.vercel.app instead.
+- The mobile-first architecture (shared backend, web + mobile clients) is documented in the prompt; the web app is the deployed deliverable. The backend API is provider-abstracted and ready for a mobile client to consume.
