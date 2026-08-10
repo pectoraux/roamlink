@@ -189,3 +189,32 @@ Stage Summary:
 - Full platform deployed and verified on https://roamlink-chi.vercel.app
 - Architecture: Web (discovery + SEO + commerce + B2B) + Mobile (connectivity) + Backend (shared source of truth)
 - Remaining for commercial launch: choose real eSIM wholesale provider, implement its adapter from official docs.
+
+---
+Task ID: 15
+Agent: Lead engineer (main)
+Task: Address reviewer feedback — verify mobile app is on GitHub, lock PostgreSQL as the only database.
+
+Work Log:
+- Verified GitHub repo tree: apps/mobile/ and packages/shared/ ARE on GitHub (committed in ba4b3e9). The reviewer was looking at an outdated version. Confirmed via GitHub API: apps/mobile contains README.md, app.json, app/, lib/, package.json, tsconfig.json + all screens.
+- Locked PostgreSQL as the ONLY supported database:
+  * prisma/schema.prisma: comment updated — "PostgreSQL (Neon) is the canonical database for development, staging, and production. SQLite is NOT supported."
+  * README.md: database section completely rewritten — removed dev SQLite / prod PostgreSQL split, now PostgreSQL-only with Neon connection strings (DATABASE_URL + DIRECT_URL).
+  * docs/database.md: removed "Dev vs Production" section, replaced with "Database Provider" section showing PostgreSQL-only config.
+  * docs/architecture.md: diagram updated — removed SQLite node, shows PostgreSQL/Neon only.
+  * .env.example: already PostgreSQL-only (verified).
+- The actual running app has been on PostgreSQL (Neon) since the earlier migration; this commit aligns documentation with reality.
+- Pushed all changes to GitHub. Vercel deployment succeeded (READY).
+- Production verified: / → 200, /esim/ghana → 200, /company → 200, /sitemap.xml → 200.
+
+Stage Summary:
+- The reviewer's two concerns are resolved:
+  1. Mobile app + shared packages ARE on GitHub (verified via API).
+  2. PostgreSQL is now the only documented database — zero SQLite references in README, docs, or schema (except "SQLite is NOT supported" statements).
+- Current platform state on GitHub (pectoraux/roamlink) and production (roamlink-chi.vercel.app):
+  * Web app: SEO destination pages, marketplace, checkout, customer dashboard, admin dashboard, B2B corporate dashboard
+  * Mobile app: full Expo structure at apps/mobile (5 tabs + all flow screens)
+  * Shared packages: packages/shared with types + API client
+  * Backend: PostgreSQL (Neon), provider abstractions, order state machine, idempotency, webhooks, pricing engine, installation tokens, device compatibility, organizations
+  * Payments: mock (default) + Stripe + Flutterwave + PayStack adapters (verified working keys)
+  * eSIM: mock (default) + RealESIMProvider boundary (awaits real provider docs)
