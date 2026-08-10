@@ -1,0 +1,337 @@
+// =============================================================================
+// eSIM Marketplace — Prisma Schema
+// -----------------------------------------------------------------------------
+// NOTE ON DATABASE PROVIDER:
+// The production target is PostgreSQL. This development sandbox only ships a
+// SQLite client, so the schema is written to be portable: it avoids DB-specific
+// features (native enums, arrays, json extension reliance) so it can be flipped
+// to PostgreSQL by changing the `provider` below to "postgresql" and running
+// `prisma migrate dev`. Money is stored as Int (minor units) — never float.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  // Swap to "postgresql" + a postgres DATABASE_URL for production.
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// User & Authentication
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  passwordHash  String
+  role          String   @default("customer") // "customer" | "admin"
+  emailVerified DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  sessions              Session[]
+  orders                Order[]
+  esims                 Esim[]
+  payments              Payment[]
+  topUps                TopUp[]
+  auditLogs             AuditLog[]
+  passwordResetTokens   PasswordResetToken[]
+  emailVerificationTokens EmailVerificationToken[]
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  token        String   @unique
+  expiresAt    DateTime
+  userAgent    String?
+  ip           String?
+  createdAt    DateTime @default(now())
+
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Plans (canonical marketplace model — never provider-native shape)
+// ---------------------------------------------------------------------------
+
+model Plan {
+  id              String   @id @default(cuid())
+  providerId      String   // internal provider key, e.g. "mock"
+  providerPlanId  String   // provider's native plan id
+  name            String
+  description     String?
+  country         String
+  countryCode     String   // ISO 3166-1 alpha-2
+  region          String   // e.g. "Africa", "Europe", "North America"
+  dataAmount      Int      // in MB (1024 = 1 GB)
+  dataUnit        String   @default("MB")
+  validityDays    Int
+  // Money — integer minor units (cents). See lib/money.ts.
+  price           Int      // retail price in minor units
+  wholesalePrice  Int      // internal cost, NEVER exposed to customers
+  currency        String   @default("USD")
+  coverage        String?  // comma-separated countries / description
+  networks        String?  // JSON string: ["MTN","Vodafone"]
+  roaming         Boolean  @default(false)
+  hotspot         Boolean  @default(true)
+  speed           String?  // e.g. "4G/5G"
+  topUpSupported  Boolean  @default(true)
+  status          String   @default("active") // "active" | "inactive"
+  // Pricing rule that produced `price` (audit). JSON string.
+  pricingRule     String?
+  // Provider-native payload (never sent to client). JSON string.
+  metadata        String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  orders          Order[]
+
+  @@unique([providerId, providerPlanId])
+  @@index([countryCode])
+  @@index([region])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Orders
+// ---------------------------------------------------------------------------
+
+model Order {
+  id               String   @id @default(cuid())
+  userId           String
+  planId           String
+  // State machine: PLAN_SELECTED | CHECKOUT_CREATED | PAYMENT_PENDING |
+  // PAYMENT_CONFIRMED | ESIM_PROVISIONING | ESIM_PROVISIONED | COMPLETED |
+  // PAYMENT_FAILED | PROVISIONING_FAILED | CANCELLED | REFUNDED
+  status           String   @default("PLAN_SELECTED")
+  amount           Int      // total charged (minor units)
+  currency         String   @default("USD")
+  paymentStatus    String   @default("pending") // pending | succeeded | failed | refunded
+  paymentProvider  String?
+  paymentReference String?  // provider's payment intent / charge id
+  providerOrderId  String?  // eSIM provider order id
+  // Idempotency: prevents duplicate orders / payments / provisioning on retry.
+  idempotencyKey   String   @unique
+  // Snapshot of plan at purchase time (so historical orders stay accurate).
+  planSnapshot     String?  // JSON string
+  failureReason    String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan             Plan     @relation(fields: [planId], references: [id])
+  payments         Payment[]
+  esim             Esim?
+
+  @@index([userId])
+  @@index([status])
+  @@index([paymentStatus])
+}
+
+// ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+
+model Payment {
+  id               String   @id @default(cuid())
+  userId           String
+  orderId          String
+  amount           Int
+  currency         String   @default("USD")
+  status           String   @default("pending") // pending | succeeded | failed | refunded
+  provider         String
+  providerReference String?
+  // Idempotency key from the client payment attempt.
+  idempotencyKey   String?  @unique
+  raw              String?  // provider response (server-side only), JSON string
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order            Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// eSIMs
+// ---------------------------------------------------------------------------
+
+model Esim {
+  id              String    @id @default(cuid())
+  userId          String
+  orderId         String    @unique // one eSIM per order (1:1)
+  provider        String
+  providerESIMId  String?   // provider's native esim id
+  iccid           String?   // 19-20 digit Integrated Circuit Card ID
+  smdpAddress     String?   // SM-DP+ server address
+  activationCode  String?   // LPA activation code
+  matchId         String?   // optional confirmation code
+  qrCode          String?   // generated QR payload (LPA string)
+  status          String    @default("pending") // pending|active|expired|suspended|exhausted|cancelled
+  dataAmount      Int       // total allowance in MB
+  dataRemaining   Int       // remaining in MB
+  validityDays    Int
+  expiresAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order           Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  usages          Usage[]
+  topUps          TopUp[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([iccid])
+}
+
+// ---------------------------------------------------------------------------
+// Usage tracking
+// ---------------------------------------------------------------------------
+
+model Usage {
+  id            String   @id @default(cuid())
+  esimId        String
+  dataUsed      Int      // MB used in this sample
+  dataRemaining Int      // MB remaining at sample time
+  source        String   @default("provider") // provider | simulated
+  timestamp     DateTime @default(now())
+
+  esim          Esim     @relation(fields: [esimId], references: [id], onDelete: Cascade)
+
+  @@index([esimId])
+}
+
+// ---------------------------------------------------------------------------
+// Top-ups
+// ---------------------------------------------------------------------------
+
+model TopUp {
+  id               String   @id @default(cuid())
+  esimId           String
+  userId           String
+  amount           Int      // charged (minor units)
+  currency         String   @default("USD")
+  dataAmount       Int      // MB added
+  paymentStatus    String   @default("pending") // pending | succeeded | failed
+  providerReference String?
+  idempotencyKey   String   @unique
+  createdAt        DateTime @default(now())
+
+  esim             Esim     @relation(fields: [esimId], references: [id], onDelete: Cascade)
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([esimId])
+}
+
+// ---------------------------------------------------------------------------
+// Webhook events (idempotent delivery log)
+// ---------------------------------------------------------------------------
+
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  provider    String
+  eventType   String
+  externalId  String?  // provider's event id, used for dedup
+  payload     String   // JSON string
+  processed   Boolean  @default(false)
+  error       String?
+  createdAt   DateTime @default(now())
+  processedAt DateTime?
+
+  @@unique([provider, externalId])
+  @@index([provider, eventType])
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  orderId   String?
+  action    String
+  entity    String   // order | esim | payment | plan | user
+  entityId  String?
+  detail    String?  // JSON string
+  ip        String?
+  createdAt DateTime @default(now())
+
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([entity, entityId])
+}
+
+// ---------------------------------------------------------------------------
+// Pricing rules (markup engine)
+// ---------------------------------------------------------------------------
+
+model PricingRule {
+  id         String   @id @default(cuid())
+  name       String
+  type       String   // "fixed" | "percentage"
+  value      Int      // fixed: minor units; percentage: basis points (30% = 3000)
+  scope      String   @default("global") // global | country | region
+  scopeValue String?  // countryCode / region when scoped
+  priority   Int      @default(0) // higher wins
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([scope, scopeValue])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications log (development implementation)
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String?
+  channel   String   // email | sms | push | whatsapp | log
+  event     String
+  recipient String?
+  subject   String?
+  body      String
+  status    String   @default("sent") // sent | failed
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([event])
+}

@@ -1,0 +1,134 @@
+/**
+ * MockPaymentProvider — simulates payment pending / success / failure.
+ *
+ * In development mode, payments "succeed" synchronously but still go through
+ * the full server-side verification path so the application logic is exercised
+ * exactly as it would be with a real provider. A special card/test value can
+ * force a failure to test failure paths.
+ */
+
+import type {
+  PaymentProvider,
+  PaymentIntentResult,
+  PaymentVerification,
+  PaymentWebhookEvent,
+} from "./provider";
+import type { Currency } from "@/lib/money";
+import { logger } from "@/lib/logger";
+import { safeEqual } from "@/lib/security";
+import { createHmac } from "crypto";
+
+type MockIntent = {
+  providerReference: string;
+  amountMinor: number;
+  currency: Currency;
+  status: "pending" | "succeeded" | "failed";
+  // Test hook: intents created with metadata.forceFail will fail verification.
+  forceFail: boolean;
+};
+
+const intents = new Map<string, MockIntent>();
+const intentByIdem = new Map<string, string>();
+
+export class MockPaymentProvider implements PaymentProvider {
+  readonly id = "mock";
+  readonly label = "Mock Payment Provider (Development)";
+  readonly isMock = true;
+
+  async createPaymentIntent(input: {
+    amountMinor: number;
+    currency: Currency;
+    description: string;
+    idempotencyKey: string;
+    metadata?: Record<string, string>;
+  }): Promise<PaymentIntentResult> {
+    // Idempotent: same key returns same intent.
+    let providerReference = intentByIdem.get(input.idempotencyKey);
+    if (!providerReference) {
+      providerReference = `mock-pay-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      intentByIdem.set(input.idempotencyKey, providerReference);
+      const forceFail = input.metadata?.forceFail === "true";
+      intents.set(providerReference, {
+        providerReference,
+        amountMinor: input.amountMinor,
+        currency: input.currency,
+        status: "pending",
+        forceFail,
+      });
+      logger.info("mock.payment_intent_created", { providerReference, amountMinor: input.amountMinor });
+    }
+    return {
+      providerReference,
+      status: "pending",
+      nextAction: {
+        type: "none",
+        instructions: "Mock payment — confirm on the client to simulate payment.",
+      },
+    };
+  }
+
+  async verifyPayment(input: {
+    providerReference: string;
+    idempotencyKey: string;
+  }): Promise<PaymentVerification> {
+    const intent = intents.get(input.providerReference);
+    if (!intent) {
+      return {
+        status: "failed",
+        providerReference: input.providerReference,
+        raw: { reason: "unknown_intent" },
+      };
+    }
+    // In mock mode, the "confirmation" happens client-side via the confirm
+    // endpoint, which marks the intent succeeded. Here we read back the truth.
+    if (intent.forceFail) {
+      intent.status = "failed";
+      return { status: "failed", providerReference: intent.providerReference, raw: { reason: "forced_failure" } };
+    }
+    return {
+      status: intent.status === "pending" ? "pending" : intent.status,
+      providerReference: intent.providerReference,
+      raw: { amountMinor: intent.amountMinor, currency: intent.currency },
+    };
+  }
+
+  /** Dev-only: mark a mock intent as succeeded (simulates client confirmation). */
+  confirmIntent(providerReference: string): boolean {
+    const intent = intents.get(providerReference);
+    if (!intent) return false;
+    if (intent.forceFail) {
+      intent.status = "failed";
+      return false;
+    }
+    intent.status = "succeeded";
+    logger.info("mock.payment_confirmed", { providerReference });
+    return true;
+  }
+
+  async verifyWebhook(input: {
+    signature: string | null;
+    rawBody: string;
+  }): Promise<PaymentWebhookEvent | null> {
+    const secret = process.env.PAYMENT_WEBHOOK_SECRET;
+    if (!secret) return null;
+    const expected = createHmac("sha256", secret).update(input.rawBody).digest("hex");
+    if (!input.signature || !safeEqual(input.signature, expected)) return null;
+    try {
+      const parsed = JSON.parse(input.rawBody);
+      return {
+        externalId: String(parsed.id ?? `evt-${Date.now()}`),
+        eventType: String(parsed.type ?? "payment.succeeded"),
+        data: {
+          providerReference: parsed.providerReference ?? parsed.reference,
+          status: parsed.status,
+          amountMinor: parsed.amountMinor != null ? Number(parsed.amountMinor) : undefined,
+        },
+        raw: parsed,
+      };
+    } catch {
+      return null;
+    }
+  }
+}
+
+export const mockPaymentProvider = new MockPaymentProvider();
