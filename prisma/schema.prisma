@@ -46,6 +46,7 @@ model User {
   emailVerificationTokens EmailVerificationToken[]
   approvedFrom          WaitlistEntry?
   approvedWaitlist      WaitlistEntry[] @relation("WaitlistApprover")
+  orgMemberships        OrganizationMember[]
 }
 
 model WaitlistEntry {
@@ -405,6 +406,7 @@ model OrganizationMember {
   createdAt      DateTime @default(now())
 
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([organizationId, userId])
   @@index([userId])
