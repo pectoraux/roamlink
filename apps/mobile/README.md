@@ -58,4 +58,4 @@ The app shows QR code + manual activation details (SM-DP+ address, activation co
 
 ## Development
 
-The mock eSIM and payment providers work end-to-end. Set `EXIM_PROVIDER=mock` and `PAYMENT_PROVIDER=mock` on the backend.
+The mock eSIM and payment providers work end-to-end. Set `ESIM_PROVIDER=mock` and `PAYMENT_PROVIDER=mock` on the backend.
