@@ -296,3 +296,24 @@ Stage Summary:
 - Virtual number provider is mock (dev). Real adapter (Telnyx/Twilio/Vonage)
   awaits real API docs — boundary is in place, not fabricated.
 - Architecture principle: "One platform for your global connectivity."
+
+---
+Task ID: 18
+Agent: Lead engineer (main)
+Task: Mobile virtual number screens + VN tests (continuing VN integration).
+
+Work Log:
+- Added VN methods to shared API client (packages/shared): getVNCountries, searchVNNumbers, purchaseNumber, listNumbers, getNumber, releaseNumber, sendSMS, getMessages, getCalls.
+- Mobile app: added "Numbers" tab (6th tab) with My Numbers / Browse toggle.
+- Mobile screens: number-search/[code] (browse + purchase), number/[id] (detail with Messages/Calls tabs, send SMS, release number).
+- Updated mobile root layout with number routes.
+- Tests (11 new, all passing): search (country catalog, country filter, SMS filter), purchase (provisioning, idempotency), authorization (cross-user rejected), SMS (outbound, retrieval, inbound processing), release.
+- Total: 59 tests (48 existing + 11 new), all passing. Lint clean. Build succeeds.
+- Pushed to GitHub (commit d56c8f6). Vercel deployment succeeded.
+- Production verified: /numbers → 200, /numbers/gh → 200, /dashboard/numbers → 200, 8 countries in catalog.
+
+Stage Summary:
+- Virtual Numbers integration is now complete across web + mobile + backend + tests.
+- RoamLink is a unified connectivity platform: eSIMs (data) + Virtual Numbers (SMS/voice).
+- Both products share: auth, payments, orders, organizations, billing, web/mobile infra.
+- 59 automated tests covering: pricing, state machine, purchase/provisioning, idempotency, install tokens, webhooks, B2B tenant isolation, virtual numbers.

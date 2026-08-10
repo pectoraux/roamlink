@@ -1,0 +1,1911 @@
+# RoamLink — Build the Connectivity Commerce Business Engine
+
+You are working directly inside the existing GitHub repository:
+
+https://github.com/pectoraux/roamlink
+
+RoamLink is an existing Next.js 16 + React 19 + TypeScript + PostgreSQL/Neon + Prisma + Bun eSIM reseller marketplace.
+
+Your task is NOT to rebuild RoamLink from scratch.
+
+Your task is to **inspect the existing codebase, preserve its good architecture, and transform it into a production-grade, commercially optimized connectivity commerce platform**.
+
+The first product is travel eSIMs.
+
+The long-term product is a broader connectivity marketplace capable of supporting multiple eSIM providers, regional products, top-ups, referrals, B2B customers, and eventually additional connectivity products.
+
+---
+
+# 1. IMPORTANT: START WITH CODEBASE AUDIT
+
+Before changing code:
+
+1. Inspect the entire repository.
+2. Read:
+
+   * README.md
+   * docs/*
+   * prisma/schema.prisma
+   * src/*
+   * apps/mobile/*
+   * packages/shared/*
+   * tests/*
+   * existing pricing engine
+   * provider abstraction
+   * payment abstraction
+   * order state machine
+   * admin functionality
+   * customer dashboard
+   * webhook implementation
+3. Identify what already works.
+4. Identify incomplete/mock-only functionality.
+5. Identify architectural weaknesses.
+6. Identify duplicated logic.
+7. Identify missing database models.
+8. Identify missing indexes and constraints.
+9. Identify security issues.
+10. Identify anything that should NOT be rewritten.
+
+Do not destroy or unnecessarily replace existing architecture.
+
+Produce an internal implementation plan based on the actual repository rather than assumptions.
+
+---
+
+# 2. PRESERVE THESE EXISTING ARCHITECTURAL PRINCIPLES
+
+The existing repository has several principles that MUST remain.
+
+## Provider abstraction
+
+The application must remain provider-independent.
+
+Business logic must never directly depend on Airalo.
+
+Continue using:
+
+ESIMProvider
+PaymentProvider
+
+and canonical provider-independent models.
+
+Provider-native payloads must never leak into application/business logic.
+
+Airalo must be an adapter, not the application architecture.
+
+---
+
+# 3. AIRALO IS THE INITIAL WHOLESALE SUPPLIER
+
+RoamLink has an Airalo reseller relationship with these commercial terms:
+
+* Program: Airalo for Resellers
+* Payment: postpaid
+* Credit limit: USD 10,000
+* eSIM pricing: 20% commercial pricing/discount as shown in the agreement
+* Monthly invoicing
+* Invoice payable within 7 days
+* Late interest: 1.5% per month or applicable legal maximum
+* Taxes may apply
+* Airalo can suspend additional purchases if undisputed invoices remain unpaid
+* Credit-limit increases can be requested
+* Airalo allows Partner to purchase, distribute and resell Services to End Users
+* API integration is permitted where approved
+* Airalo may change pricing
+* The Partner is responsible for customer-facing refunds/replacements
+* Top-up earnings may exist, but the current commercial terms show no top-up earnings rate, so DO NOT assume top-up revenue until explicitly configured
+
+IMPORTANT:
+
+Never hard-code the assumption that the Airalo "20%" value means a permanent 20% discount.
+
+The platform must treat actual provider wholesale/net pricing returned by the provider as authoritative.
+
+Store provider cost independently from customer selling price.
+
+---
+
+# 4. CORE BUSINESS STRATEGY
+
+RoamLink should NOT compete simply by being another generic "Airalo clone."
+
+Build the business around:
+
+## A. Connectivity discovery
+
+Help customers answer:
+
+"Where am I going?"
+
+rather than forcing them to understand telecom products.
+
+Examples:
+
+* Ghana
+* Togo
+* Nigeria
+* France
+* Europe
+* West Africa
+* Africa
+* Asia
+* Worldwide
+
+## B. Regional bundles
+
+The platform should support products such as:
+
+West Africa Pass
+East Africa Pass
+Africa Pass
+Europe Pass
+Asia Pass
+Global Pass
+
+These are commercial products composed from provider plans.
+
+The architecture must distinguish:
+
+1. Provider plan
+2. RoamLink product
+3. Customer order
+
+A RoamLink product may reference one or more underlying provider plans/providers.
+
+Do not assume a regional product always maps 1:1 to one provider plan.
+
+---
+
+# 5. MAKE ROAMLINK A PRICING ENGINE, NOT A STATIC STORE
+
+The existing repository already has a pricing engine. Extend it substantially.
+
+Every product must have:
+
+provider_cost
+provider_currency
+provider_plan_id
+retail_price
+currency
+gross_profit
+gross_margin_percent
+markup_percent
+payment_cost
+expected_refund_cost
+expected_chargeback_cost
+contribution_profit
+pricing_rule_id
+price_version
+price_timestamp
+
+Never expose provider wholesale cost to customers.
+
+---
+
+# 6. PRICING STRATEGY
+
+Do NOT use one universal markup.
+
+Create a dynamic pricing engine supporting:
+
+* global rules
+* region rules
+* country rules
+* provider rules
+* product rules
+* plan rules
+* customer-segment rules
+* promotional rules
+* minimum-margin rules
+* maximum-price rules
+* competitive-price rules
+* psychological pricing
+* rounding rules
+
+Example:
+
+Provider cost: $10
+
+Possible retail prices:
+
+$11.99
+$12.99
+$13.99
+$14.99
+
+The pricing engine determines the optimal price subject to:
+
+minimum contribution margin
+competitive positioning
+customer demand
+payment fees
+refund risk
+provider cost
+country
+product category
+
+---
+
+# 7. NEVER SELL BELOW SAFE CONTRIBUTION MARGIN
+
+Introduce:
+
+minimumGrossMargin
+minimumContributionMargin
+
+The platform must refuse to publish a product if selling it would create an unsafe margin.
+
+Example:
+
+Provider cost: $10
+Payment fee: $0.60
+Expected risk reserve: $0.20
+
+If minimum contribution margin is $2:
+
+Minimum retail price = $12.80+
+
+The system should calculate this automatically.
+
+---
+
+# 8. ADD UNIT ECONOMICS
+
+Every order must produce a complete unit-economics record.
+
+Track:
+
+Revenue
+Provider cost
+Payment processing fee
+Taxes
+Refund amount
+Refund cost
+Chargeback cost
+Affiliate commission
+Referral reward
+Promotional discount
+Gross profit
+Contribution profit
+Gross margin %
+Contribution margin %
+
+This should be visible to administrators.
+
+---
+
+# 9. PROVIDER LIABILITY / CREDIT MANAGEMENT
+
+RoamLink now operates with postpaid Airalo credit.
+
+Build a provider liability ledger.
+
+Track:
+
+provider
+credit_limit
+credit_used
+credit_available
+pending_liability
+settled_liability
+invoice_amount
+invoice_date
+due_date
+payment_status
+
+For Airalo:
+
+Current approved credit limit = $10,000.
+
+This MUST be configurable rather than hard-coded.
+
+Create configurable thresholds:
+
+warning threshold: 70%
+critical threshold: 85%
+hard stop threshold: 95% or provider-defined threshold
+
+The admin dashboard should clearly display:
+
+Airalo Credit
+$7,430 / $10,000 used
+
+74.3%
+
+Available:
+$2,570
+
+Projected liability:
+$8,120
+
+---
+
+# 10. DO NOT TREAT CREDIT AS PROFIT
+
+The accounting model must distinguish:
+
+customer cash
+provider payable
+revenue
+gross profit
+cash balance
+available working capital
+provider credit exposure
+
+When an eSIM is provisioned:
+
+Customer owes/has paid RoamLink.
+RoamLink incurs a provider payable.
+
+The system must never classify provider credit as revenue or free cash.
+
+---
+
+# 11. PROVIDER INVOICE RECONCILIATION
+
+Create a provider billing/reconciliation system.
+
+Support:
+
+provider invoice
+invoice lines
+provider order IDs
+provider costs
+RoamLink order IDs
+currency
+tax
+invoice total
+disputed amount
+paid amount
+remaining amount
+due date
+payment status
+
+Allow admin to import or manually enter Airalo invoices.
+
+Automatically reconcile:
+
+RoamLink orders
+provider orders
+provider costs
+invoice lines
+
+Highlight:
+
+missing provider order
+unexpected provider charge
+duplicate provider charge
+price mismatch
+currency mismatch
+unmatched invoice line
+
+---
+
+# 12. CASH-FLOW DASHBOARD
+
+Create a financial dashboard showing:
+
+Revenue
+Provider liabilities
+Gross profit
+Contribution profit
+Cash collected
+Outstanding customer payments
+Outstanding provider invoices
+Provider credit utilization
+Expected provider bill
+Expected payment date
+Cash required for next 7/14/30 days
+
+Show:
+
+"Can RoamLink safely fulfill another $X of orders?"
+
+This should be a first-class business metric.
+
+---
+
+# 13. BUILD A REAL BUSINESS DASHBOARD
+
+Admin dashboard should show:
+
+## Today
+
+Orders
+Revenue
+eSIMs sold
+Gross profit
+Contribution profit
+Average order value
+Conversion rate
+
+## This month
+
+Revenue
+Provider costs
+Gross profit
+Contribution margin
+Top-ups
+Refunds
+Chargebacks
+CAC if marketing data exists
+LTV if sufficient data exists
+
+## Provider
+
+Airalo credit utilization
+Airalo outstanding liability
+Airalo invoice due
+Provider cost trend
+Provider error rate
+
+## Product
+
+Top countries
+Top products
+Highest-margin products
+Lowest-margin products
+Best-selling products
+Products with poor conversion
+Products with high refund rates
+
+---
+
+# 14. CUSTOMER PRODUCT STRATEGY
+
+Do not make customers browse hundreds of telecom plans first.
+
+The homepage should primarily answer:
+
+"Where are you going?"
+
+Then:
+
+Choose destination
+→ Choose trip duration
+→ Choose data needs
+→ Receive recommended plans
+
+Example:
+
+Where are you going?
+
+Ghana
+
+How long?
+
+7 days
+
+What do you need?
+
+Light
+Normal
+Heavy
+
+Recommended:
+
+Ghana 3GB / 7 days
+Ghana 10GB / 30 days
+Ghana Unlimited / 7 days
+
+---
+
+# 15. ADD TRAVEL ITINERARIES
+
+Allow:
+
+Trip:
+
+Accra → Lomé → Lagos → Abidjan
+
+RoamLink recommends:
+
+West Africa regional plan
+
+instead of four separate plans.
+
+This is a major differentiation feature.
+
+---
+
+# 16. SMART PLAN RECOMMENDATION
+
+Build a recommendation engine.
+
+Inputs:
+
+destination
+countries
+trip duration
+data requirement
+device compatibility
+budget
+traveler type
+existing eSIMs
+previous purchases
+
+Output:
+
+recommended product
+alternative product
+premium option
+cheapest option
+
+The recommendation engine must optimize for:
+
+customer suitability
+not simply highest RoamLink margin.
+
+However, among sufficiently equivalent products, prefer the product with stronger contribution economics.
+
+---
+
+# 17. CUSTOMER SEGMENTS
+
+Support:
+
+consumer
+frequent traveler
+digital nomad
+business traveler
+enterprise
+travel agency
+affiliate
+
+Do not create separate codebases.
+
+Use a customer-segment/pricing abstraction.
+
+---
+
+# 18. B2B BUSINESS MODEL
+
+Add B2B capability.
+
+Businesses should be able to:
+
+create organization
+invite employees
+purchase eSIMs
+assign eSIMs
+track usage
+view invoices
+manage budgets
+set spending limits
+
+Examples:
+
+NGOs
+consultancies
+travel companies
+construction companies
+international teams
+universities
+events
+field teams
+
+B2B should eventually support:
+
+bulk purchase
+bulk assignment
+CSV import
+API access
+monthly billing
+prepaid balance
+spending limits
+department-level reporting
+
+---
+
+# 19. B2B SHOULD NOT VIOLATE AIRALO RESELLER TERMS
+
+Do NOT build a downstream reseller marketplace where customers buy Airalo connectivity specifically to resell it again.
+
+RoamLink's B2B functionality should initially be for organizations purchasing connectivity for their own employees/contractors/end users, subject to the applicable Airalo agreement.
+
+Do not market RoamLink as an Airalo reseller-of-resellers.
+
+---
+
+# 20. TOP-UPS
+
+Top-ups are a retention mechanism.
+
+Build:
+
+low-data notification
+top-up recommendation
+one-click top-up
+saved payment method where supported
+top-up history
+top-up economics
+
+The system must calculate:
+
+top-up revenue
+provider top-up cost
+gross profit
+contribution profit
+
+Do NOT assume Airalo top-up earnings.
+
+If Airalo provides a top-up earnings rate, make it configurable.
+
+---
+
+# 21. AUTOMATIC TOP-UP
+
+Eventually support:
+
+"Automatically top up when data falls below 500MB."
+
+But this must only be enabled where payment-provider authorization and provider capabilities support it safely.
+
+Require explicit customer consent.
+
+Include:
+
+maximum monthly spend
+maximum top-up count
+disable switch
+transaction history
+
+---
+
+# 22. REFERRAL SYSTEM
+
+Create a referral engine.
+
+Customer A refers Customer B.
+
+Possible model:
+
+Customer B gets:
+$X discount
+
+Customer A gets:
+$X RoamLink credit
+
+Do NOT create unlimited liabilities.
+
+Referral rewards should be:
+
+pending
+confirmed
+reversed
+expired
+
+Only confirm the reward after the order passes the refund/chargeback risk window defined by the business.
+
+---
+
+# 23. AFFILIATE PROGRAM
+
+Build an affiliate system separately from referrals.
+
+Affiliate partners receive:
+
+tracked links
+campaign IDs
+conversion tracking
+commission rules
+commission balance
+payout status
+
+Support:
+
+percentage commission
+fixed commission
+country-specific commission
+product-specific commission
+
+Again, calculate commissions against contribution economics.
+
+Never allow affiliate commission to push an order below minimum contribution margin unless an admin explicitly overrides the rule.
+
+---
+
+# 24. PROMOTIONS
+
+Build a promotion engine.
+
+Support:
+
+percentage discount
+fixed discount
+country promotion
+regional promotion
+first purchase
+referral
+campaign
+seasonal promotion
+coupon
+limited-time offer
+
+Every promotion must have:
+
+start
+end
+budget
+usage limit
+customer limit
+minimum order
+eligible products
+maximum discount
+
+---
+
+# 25. DO NOT DESTROY MARGINS THROUGH DISCOUNTS
+
+The pricing engine must calculate:
+
+provider cost
+normal retail price
+promotion discount
+payment cost
+commission
+expected risk
+final contribution profit
+
+If contribution profit falls below the configured threshold:
+
+prevent checkout or require explicit admin override.
+
+---
+
+# 26. CUSTOMER LIFETIME VALUE
+
+Track customer economics.
+
+Track:
+
+first purchase
+repeat purchases
+top-ups
+number of trips
+average order value
+gross profit
+contribution profit
+referral activity
+
+Calculate:
+
+LTV revenue
+LTV gross profit
+LTV contribution profit
+
+Use these metrics to determine how much RoamLink can rationally spend to acquire customers.
+
+---
+
+# 27. CUSTOMER ACQUISITION
+
+Build campaign attribution.
+
+Support:
+
+utm_source
+utm_medium
+utm_campaign
+utm_content
+referral_code
+affiliate_id
+
+Persist acquisition attribution to the customer and order.
+
+Admin should be able to see:
+
+campaign
+customers
+orders
+revenue
+gross profit
+contribution profit
+CAC
+ROI
+
+---
+
+# 28. SEO-FIRST ACQUISITION
+
+Build indexable destination/product pages.
+
+Examples:
+
+/esim/ghana
+/esim/togo
+/esim/nigeria
+/esim/west-africa
+/esim/france
+/esim/europe
+
+Each page should answer:
+
+coverage
+supported networks
+data options
+validity
+device compatibility
+installation
+pricing
+FAQ
+
+Do not generate thousands of thin pages.
+
+Only publish pages for commercially useful destinations/products.
+
+---
+
+# 29. COUNTRY + REGION PRODUCT SYSTEM
+
+Model:
+
+Country
+Region
+ProviderCoverage
+Product
+ProviderPlan
+
+Example:
+
+West Africa
+├── Ghana
+├── Togo
+├── Benin
+├── Nigeria
+├── Côte d'Ivoire
+└── Senegal
+
+A product can have:
+
+coverage countries
+provider plans
+fallback providers
+pricing rule
+availability status
+
+---
+
+# 30. MULTI-PROVIDER ROUTING
+
+Keep Airalo as the first provider.
+
+But design the system so a product can eventually have:
+
+Airalo
+Provider B
+Provider C
+
+For each destination/product, the routing engine should consider:
+
+availability
+provider cost
+coverage
+network quality
+activation reliability
+usage reliability
+provider health
+credit availability
+provider limits
+
+The cheapest provider should NOT automatically win.
+
+Optimize for:
+
+effective contribution margin × reliability.
+
+---
+
+# 31. PROVIDER FAILOVER
+
+If the primary provider is unavailable:
+
+1. detect provider failure
+2. prevent new orders if necessary
+3. route eligible products to a fallback provider
+4. never duplicate provisioning
+5. preserve order idempotency
+6. record provider routing decision
+
+Do not automatically fail over after an eSIM has already been successfully provisioned.
+
+---
+
+# 32. AIRALO API INTEGRATION
+
+Use Airalo's official API documentation.
+
+DO NOT invent endpoints.
+
+Implement only documented operations.
+
+Use the existing ESIMProvider abstraction.
+
+Implement where supported:
+
+plan synchronization
+plan details
+order creation
+eSIM provisioning
+activation information
+usage
+top-ups
+cancellation
+refund/replacement workflow
+webhooks
+
+Normalize everything into RoamLink canonical types.
+
+Keep provider-specific fields in provider metadata where necessary.
+
+---
+
+# 33. AIRALO POSTPAID SAFETY
+
+Introduce an order-level provider liability record.
+
+Before provisioning:
+
+calculate expected provider cost.
+
+Check:
+
+provider credit available
+provider risk limits
+expected order cost
+
+If:
+
+expected provider liability > safe available credit
+
+do not provision.
+
+Show a customer-friendly message and alert administrators.
+
+Never allow a race condition where 20 simultaneous orders can collectively exceed the provider credit limit.
+
+Use database transactions/locking or an equivalent concurrency-safe reservation mechanism.
+
+---
+
+# 34. PROVIDER CREDIT RESERVATION
+
+When an order is about to create provider liability:
+
+reserve the expected provider cost.
+
+States:
+
+AVAILABLE
+RESERVED
+INCURRED
+SETTLED
+RELEASED
+
+If provisioning fails before liability is incurred:
+
+release reservation.
+
+If provider confirms the order:
+
+convert reservation → incurred liability.
+
+This is essential for the $10,000 Airalo limit.
+
+---
+
+# 35. PROVIDER HEALTH
+
+Admin should see:
+
+API status
+latency
+error rate
+successful provisioning rate
+failed provisioning rate
+webhook delay
+plan sync age
+usage sync age
+credit utilization
+
+Build provider health scoring.
+
+---
+
+# 36. REFUNDS
+
+Create a robust refund system.
+
+Refund states:
+
+REQUESTED
+UNDER_REVIEW
+APPROVED
+REJECTED
+PROCESSING
+COMPLETED
+FAILED
+
+Track:
+
+customer refund
+provider refund
+RoamLink loss
+payment processing loss
+
+Do not automatically refund an eSIM simply because the customer requests it.
+
+Respect provider capabilities and commercial rules.
+
+---
+
+# 37. CHARGEBACK / FRAUD PROTECTION
+
+Because RoamLink may provision a digital service immediately after payment, fraud risk is significant.
+
+Add:
+
+velocity checks
+duplicate card/order signals where payment provider supports them
+IP risk signals
+country mismatch
+unusual order frequency
+high-value order threshold
+new-account risk
+device/session risk
+
+Do not store card numbers.
+
+Use payment provider risk tools where available.
+
+Orders can enter:
+
+RISK_REVIEW
+
+before provisioning when appropriate.
+
+---
+
+# 38. INSTALLATION EXPERIENCE
+
+The existing QR-code experience should remain.
+
+But make installation provider/platform-aware.
+
+Support:
+
+QR installation
+manual activation
+copy activation information
+device compatibility instructions
+iOS instructions
+Android instructions
+
+IMPORTANT:
+
+Do not assume Airalo's API permits a fully white-label installation experience.
+
+Keep the installation layer provider-aware.
+
+If Airalo requires the Airalo App for certain functionality, represent that requirement honestly.
+
+Do not claim RoamLink can do something the provider does not support.
+
+---
+
+# 39. MOBILE APPLICATION
+
+Inspect the existing `apps/mobile`.
+
+Bring mobile toward the same product model.
+
+Prioritize:
+
+destination discovery
+trip planning
+purchase
+installation
+My eSIMs
+usage
+top-up
+notifications
+
+Use the same canonical backend.
+
+Do not duplicate business logic in mobile.
+
+---
+
+# 40. NOTIFICATION SYSTEM
+
+Build notifications for:
+
+purchase confirmation
+eSIM ready
+installation reminder
+trip start
+data 75%
+data 90%
+data 100%
+plan expiration
+top-up recommendation
+payment failure
+refund status
+
+Support email initially.
+
+Keep notification providers abstract.
+
+---
+
+# 41. BUSINESS ANALYTICS
+
+Track events:
+
+landing_view
+destination_view
+plan_view
+checkout_started
+payment_started
+payment_completed
+payment_failed
+esim_provisioned
+installation_viewed
+topup_started
+topup_completed
+refund_requested
+refund_completed
+referral_used
+
+Create a funnel:
+
+Visitors
+→ Destination views
+→ Product views
+→ Checkout
+→ Payment
+→ Provisioned
+→ Activated
+→ Top-up
+→ Repeat purchase
+
+---
+
+# 42. PRODUCT ANALYTICS
+
+For every product calculate:
+
+views
+checkout starts
+orders
+conversion rate
+revenue
+provider cost
+gross profit
+contribution profit
+refund rate
+top-up rate
+repeat purchase rate
+
+This tells the business which products deserve promotion.
+
+---
+
+# 43. BUSINESS INTELLIGENCE: MARGIN × DEMAND MATRIX
+
+Build an admin view that categorizes products:
+
+HIGH DEMAND / HIGH MARGIN
+→ aggressively promote
+
+HIGH DEMAND / LOW MARGIN
+→ optimize pricing/cost
+
+LOW DEMAND / HIGH MARGIN
+→ improve discovery
+
+LOW DEMAND / LOW MARGIN
+→ consider removing
+
+This should become one of the core business tools.
+
+---
+
+# 44. WORKING-CAPITAL MANAGEMENT
+
+Create:
+
+Cash Position
+Provider Payables
+Customer Receivables
+Provider Credit
+Expected 7-day obligations
+Expected 30-day obligations
+
+Show a "safe operating capacity" metric.
+
+Example:
+
+Airalo credit available:
+$4,000
+
+Cash reserve:
+$3,000
+
+Safe provider exposure:
+$5,000
+
+Do not confuse:
+
+credit capacity
+
+with
+
+cash available.
+
+---
+
+# 45. FINANCIAL SCENARIO SIMULATOR
+
+Admin should be able to model:
+
+monthly provider volume
+markup
+gross margin
+payment fees
+refund rate
+chargeback rate
+affiliate commissions
+marketing spend
+customer acquisition cost
+
+Output:
+
+revenue
+provider costs
+gross profit
+contribution profit
+net operating result
+
+Provide scenarios:
+
+$10k provider volume
+$25k
+$50k
+$100k
+$250k
+$500k
+$1M
+
+The purpose is to determine what happens as Airalo credit limits increase.
+
+---
+
+# 46. TARGET BUSINESS MODEL
+
+Design RoamLink to support these revenue streams:
+
+1. eSIM initial purchase margin
+2. eSIM top-up margin
+3. regional bundle margin
+4. B2B connectivity margin
+5. affiliate-driven sales
+6. referral-driven sales
+7. eventually additional connectivity providers/products
+
+Do not rely on subscriptions as the primary business model initially.
+
+Connectivity usage is naturally transactional.
+
+A subscription can be considered later for frequent travelers, but only if customer behavior supports it.
+
+---
+
+# 47. DO NOT COMPETE ON PRICE ALONE
+
+The RoamLink proposition should be:
+
+"Tell us where you're going. We'll give you the best connectivity option."
+
+Not:
+
+"Here are 500 telecom plans."
+
+The product should optimize for:
+
+simplicity
+coverage
+price
+reliability
+installation ease
+top-up convenience
+regional travel
+
+---
+
+# 48. AFRICA-FIRST GO-TO-MARKET
+
+Prioritize Africa initially.
+
+Especially:
+
+West Africa
+East Africa
+Southern Africa
+
+Create high-quality destination experiences for:
+
+Ghana
+Togo
+Benin
+Nigeria
+Côte d'Ivoire
+Senegal
+Kenya
+Rwanda
+South Africa
+
+Then expand based on actual demand.
+
+Do not spend engineering effort creating hundreds of destinations before validating customer acquisition.
+
+---
+
+# 49. AFRICA REGIONAL PRODUCT STRATEGY
+
+Create the architecture for products such as:
+
+West Africa Pass
+East Africa Pass
+Africa Pass
+
+But only publish a product when actual provider coverage supports it.
+
+Never fake coverage.
+
+The product must dynamically show:
+
+covered countries
+networks
+speed
+fair-use limitations where applicable
+validity
+activation requirements
+
+---
+
+# 50. ADMIN PRODUCT CONTROL
+
+Admins must be able to:
+
+activate/deactivate product
+change retail price
+change pricing rule
+set minimum margin
+set maximum discount
+feature product
+mark recommended
+set SEO metadata
+set regional/country associations
+set provider priority
+set fallback provider
+view profitability
+
+---
+
+# 51. CUSTOMER EXPERIENCE
+
+The storefront should feel like a premium travel product, not a telecom dashboard.
+
+Primary navigation:
+
+Destinations
+Regions
+My eSIMs
+Top Up
+Trips
+
+Potential homepage:
+
+"Where are you going?"
+
+Search destination.
+
+Then:
+
+"How long are you staying?"
+
+Then:
+
+"How much data do you need?"
+
+Then:
+
+"Here's the best option."
+
+---
+
+# 52. TRIP MODE
+
+Add a trip abstraction.
+
+Trip:
+
+name
+start date
+end date
+countries
+recommended product
+purchased products
+active eSIMs
+
+A customer should be able to create:
+
+"West Africa Trip — September"
+
+and attach:
+
+Ghana
+Togo
+Nigeria
+
+RoamLink recommends the optimal connectivity setup.
+
+---
+
+# 53. REPEAT PURCHASE ENGINE
+
+After a customer finishes a trip:
+
+show:
+
+"Going somewhere else?"
+
+Recommend based on:
+
+previous destinations
+travel history
+season
+popular routes
+
+The objective is to turn one-time travelers into repeat customers.
+
+---
+
+# 54. DATA MODEL
+
+Extend Prisma carefully.
+
+Potential models include:
+
+ProviderAccount
+ProviderCreditAccount
+ProviderLiability
+ProviderLiabilityReservation
+ProviderInvoice
+ProviderInvoiceLine
+ProviderReconciliation
+Product
+ProductComponent
+ProductCoverage
+Region
+Country
+PricingRule
+PriceSnapshot
+UnitEconomics
+Promotion
+Coupon
+Referral
+Affiliate
+AffiliateConversion
+CustomerSegment
+Trip
+TripCountry
+Recommendation
+Notification
+NotificationPreference
+FinancialLedgerEntry
+Refund
+Chargeback
+RiskAssessment
+Campaign
+Attribution
+Organization
+OrganizationMember
+B2BOrder
+B2BInvoice
+
+Do NOT blindly create all models.
+
+First inspect the existing schema and reuse existing concepts wherever possible.
+
+Avoid unnecessary schema bloat.
+
+---
+
+# 55. ACCOUNTING PRINCIPLES
+
+Every money movement must be auditable.
+
+Use integer minor units.
+
+Never use floating point.
+
+Every transaction must have:
+
+amount
+currency
+type
+source
+reference
+createdAt
+
+Do not silently mutate historical financial records.
+
+Use immutable ledger/event records where appropriate.
+
+---
+
+# 56. SECURITY
+
+Maintain and strengthen:
+
+server-side payment verification
+webhook signature validation
+idempotency
+RBAC
+audit logging
+secure sessions
+CSRF protection where applicable
+rate limiting
+input validation
+authorization checks
+secret isolation
+
+Never expose:
+
+provider API secrets
+provider wholesale prices
+internal financial rules
+payment credentials
+
+to the client.
+
+---
+
+# 57. OBSERVABILITY
+
+Add structured logs for:
+
+provider requests
+provider responses
+payment events
+provisioning
+webhooks
+refunds
+top-ups
+pricing decisions
+credit reservations
+risk decisions
+
+Never log secrets or sensitive payment information.
+
+---
+
+# 58. TESTING
+
+Add automated tests for:
+
+pricing
+margin protection
+provider credit reservation
+concurrency
+order state transitions
+payment idempotency
+provider idempotency
+webhook replay
+refunds
+top-ups
+referrals
+promotions
+affiliate commissions
+provider failure
+provider failover
+currency handling
+
+Especially test:
+
+10 simultaneous purchases approaching the $10,000 Airalo credit limit.
+
+The system must never knowingly exceed the configured safe provider exposure.
+
+---
+
+# 59. MOCK MODE MUST REMAIN
+
+Do not remove the mock providers.
+
+They are essential for local development and testing.
+
+The production system must be able to run against:
+
+mock
+airalo
+future providers
+
+without changing core business logic.
+
+---
+
+# 60. REAL AIRALO INTEGRATION
+
+Implement the Airalo adapter only using Airalo's actual, current, documented API.
+
+Before coding:
+
+inspect the official Airalo Partner API documentation.
+
+Map the actual endpoints and payloads into the existing canonical interfaces.
+
+Do not invent:
+
+endpoints
+fields
+webhooks
+pricing semantics
+refund behavior
+installation behavior
+
+If a capability is not supported by Airalo's API, represent that limitation explicitly.
+
+---
+
+# 61. PAYMENT PROVIDERS
+
+Keep payment abstraction.
+
+Prioritize payment providers appropriate to RoamLink's target markets.
+
+At minimum keep the architecture capable of supporting:
+
+Stripe
+Paystack
+
+and future providers.
+
+Never store raw card information.
+
+---
+
+# 62. ADMIN "BUSINESS CONTROL CENTER"
+
+Create an admin command center with:
+
+Revenue
+Gross Profit
+Contribution Profit
+Provider Liability
+Airalo Credit Utilization
+Cash Position
+Orders
+Customers
+Top-ups
+Refunds
+Chargebacks
+Provider Health
+Best Products
+Worst Products
+Best Destinations
+Acquisition Channels
+
+The administrator should be able to understand the entire business in under one minute.
+
+---
+
+# 63. IMPORTANT BUSINESS RULE
+
+Optimize for **contribution profit**, not revenue.
+
+If Product A:
+
+Revenue = $20
+Contribution profit = $5
+
+and Product B:
+
+Revenue = $25
+Contribution profit = $2
+
+Product A is commercially better.
+
+Analytics, recommendations and promotions should understand this distinction.
+
+---
+
+# 64. IMPORTANT BUSINESS RULE
+
+Do not maximize margin at the expense of customer trust.
+
+If two products are equivalent:
+
+prefer the product with better economics.
+
+But if one product is materially better for the customer:
+
+recommend the better customer product.
+
+Trust and repeat purchases are more valuable than squeezing an extra dollar from one transaction.
+
+---
+
+# 65. IMPORTANT BUSINESS RULE
+
+Never assume that every Airalo plan can be resold in every country.
+
+The system must respect:
+
+provider availability
+reseller terms
+country restrictions
+permanent roaming rules
+local regulatory requirements
+product restrictions
+
+Allow administrators to disable products by territory.
+
+---
+
+# 66. LEGAL / COMPLIANCE
+
+The platform must not make unsupported claims about:
+
+coverage
+speed
+unlimited data
+network availability
+local phone numbers
+regulatory compliance
+
+Use provider-supplied data where possible.
+
+Make terms, refund policy and privacy policy configurable.
+
+---
+
+# 67. BUILD ORDER
+
+Implement in this order:
+
+PHASE 1
+Audit existing codebase.
+
+PHASE 2
+Production Airalo provider adapter using official documentation.
+
+PHASE 3
+Production payment provider.
+
+PHASE 4
+Provider liability + $10k credit management.
+
+PHASE 5
+Advanced pricing + unit economics.
+
+PHASE 6
+Financial dashboard + reconciliation.
+
+PHASE 7
+Destination/region product system.
+
+PHASE 8
+Recommendation/trip engine.
+
+PHASE 9
+Top-ups + notifications.
+
+PHASE 10
+Referral + affiliate engine.
+
+PHASE 11
+B2B organizations.
+
+PHASE 12
+Analytics + acquisition attribution.
+
+PHASE 13
+Multi-provider routing architecture.
+
+Do not build everything as one giant untestable change.
+
+---
+
+# 68. ACCEPTANCE CRITERIA
+
+A production-ready RoamLink must be able to:
+
+1. Sync real provider plans.
+2. Calculate customer prices.
+3. Protect minimum contribution margins.
+4. Accept a real payment.
+5. Verify payment server-side.
+6. Reserve provider credit.
+7. Provision an eSIM exactly once.
+8. Record provider liability.
+9. Deliver installation information.
+10. Track usage.
+11. Sell top-ups.
+12. Track top-up economics.
+13. Process refunds safely.
+14. Track provider invoices.
+15. Reconcile provider charges.
+16. Display Airalo credit utilization.
+17. Prevent unsafe provider exposure.
+18. Calculate contribution profit.
+19. Track customer lifetime economics.
+20. Track acquisition sources.
+21. Recommend products based on destination/trip.
+22. Support regional products.
+23. Support B2B organizations.
+24. Maintain complete audit trails.
+25. Survive provider/payment webhook retries.
+26. Survive provider API failures.
+27. Preserve idempotency.
+28. Never expose wholesale pricing.
+29. Never store card data.
+30. Never fabricate provider capabilities.
+
+---
+
+# 69. FINAL PRODUCT VISION
+
+RoamLink is not merely:
+
+"an eSIM store."
+
+It is:
+
+**A connectivity commerce platform that finds, prices, sells, provisions, manages and optimizes connectivity for travelers and organizations.**
+
+The initial wedge is:
+
+**travel eSIMs**
+
+The initial geographic advantage is:
+
+**Africa / emerging travel corridors**
+
+The initial wholesale advantage is:
+
+**Airalo postpaid reseller access with a $10,000 monthly credit limit**
+
+The initial monetization is:
+
+**eSIM margin + top-up margin**
+
+The expansion is:
+
+**regional products → repeat travel → referrals → affiliates → B2B → multi-provider routing → broader connectivity**
+
+Build the software so that this business can grow from:
+
+$10k monthly provider volume
+
+to:
+
+$50k
+
+$100k
+
+$250k
+
+$500k
+
+$1M+
+
+without redesigning the architecture.
+
+The most important principle is:
+
+**Do not optimize RoamLink to sell the most eSIMs. Optimize RoamLink to generate the highest sustainable contribution profit while maintaining excellent customer experience and staying within provider credit, payment, regulatory and contractual constraints.**
+
+Before modifying code, inspect what already exists and preserve everything that is already correct.
