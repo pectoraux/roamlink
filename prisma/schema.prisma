@@ -45,6 +45,7 @@ model User {
   orgMemberships        OrganizationMember[]
   virtualNumbers        VirtualNumber[]
   numberSubscriptions   NumberSubscription[]
+  financialTxns         FinancialTransaction[]
 }
 
 model WaitlistEntry {
@@ -179,6 +180,7 @@ model Order {
   esim             Esim?
   corporateOrder   CorporateOrder?
   virtualNumber    VirtualNumber? @relation("VirtualNumberOrder")
+  financialTxns    FinancialTransaction[] @relation("FinancialOrder")
 
   @@index([userId])
   @@index([status])
@@ -571,4 +573,119 @@ model CountryCapability {
   active          Boolean  @default(true)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Financial Ledger — immutable record of all financial events.
+// Financial truth must not depend exclusively on mutable order records.
+// ---------------------------------------------------------------------------
+
+model FinancialTransaction {
+  id              String   @id @default(cuid())
+  type            String   // CUSTOMER_PAYMENT | PAYMENT_FEE | PROVIDER_PURCHASE | PROVIDER_LIABILITY | PROVIDER_INVOICE | PROVIDER_PAYMENT | REFUND | CHARGEBACK | PROMOTIONAL_CREDIT | CUSTOMER_CREDIT | TRIAL_COST | COMMISSION | ADJUSTMENT
+  userId          String?
+  organizationId  String?
+  orderId         String?
+  provider        String?  // esim provider or payment provider
+  providerTxnId   String?  // provider's transaction id
+  amountMinor     Int      // positive = debit (cost), negative = credit (revenue). In minor units.
+  currency        String   @default("USD")
+  // Financial breakdown (all in minor units, may be 0 if not applicable)
+  customerPrice   Int      @default(0)  // what customer paid
+  providerCost    Int      @default(0)  // wholesale cost
+  paymentFee      Int      @default(0)  // payment processing fee
+  grossProfit     Int      @default(0)  // customerPrice - providerCost
+  contributionProfit Int   @default(0)  // grossProfit - paymentFee - refundCost - fraudLoss
+  refundCost      Int      @default(0)
+  fraudLoss       Int      @default(0)
+  // Metadata
+  source          String   @default("system") // system | admin | provider | webhook
+  reason          String?
+  state           String   @default("pending") // pending | settled | disputed | reversed
+  idempotencyKey  String?  @unique
+  createdAt       DateTime @default(now())
+  settledAt       DateTime?
+
+  user            User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+  order           Order?         @relation("FinancialOrder", fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([orderId])
+  @@index([type])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Provider Credit Account — tracks provider credit facilities (e.g., Airalo $10K).
+// This is a financial liability, NOT cash. Must be tracked for risk control.
+// ---------------------------------------------------------------------------
+
+model ProviderCreditAccount {
+  id              String   @id @default(cuid())
+  provider        String   @unique // e.g. "airalo", "mock"
+  creditLimit     Int      // in minor units (e.g., 1000000 = $10,000)
+  currency        String   @default("USD")
+  outstandingLiability Int  @default(0) // accumulated unbilled provider purchases
+  pendingCommitments Int   @default(0) // in-flight provider orders not yet confirmed
+  invoicedAmount  Int      @default(0) // amount invoiced by provider
+  paidAmount      Int      @default(0) // amount paid to provider
+  // Thresholds (percentage of credit limit)
+  thresholdInfo   Int      @default(50) // informational
+  thresholdWarn   Int      @default(75) // warning
+  thresholdElevated Int    @default(80) // elevated
+  thresholdCritical Int    @default(90) // critical — restrict new commitments
+  thresholdEmergency Int   @default(95) // emergency
+  // State
+  active          Boolean  @default(true)
+  lastInvoiceDate DateTime?
+  nextPaymentDue  DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  invoices        ProviderInvoice[]
+}
+
+model ProviderInvoice {
+  id              String   @id @default(cuid())
+  providerAccountId String
+  providerInvoiceId String? @unique // provider's invoice number
+  amountMinor     Int      // invoiced amount in minor units
+  currency        String   @default("USD")
+  status          String   @default("pending") // pending | paid | overdue | disputed
+  periodStart     DateTime?
+  periodEnd       DateTime?
+  dueDate         DateTime?
+  paidAt          DateTime?
+  // Reconciliation
+  reconciledTransactions Int @default(0)
+  mismatchedTransactions  Int @default(0)
+  reconciled      Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  providerAccount ProviderCreditAccount @relation(fields: [providerAccountId], references: [id], onDelete: Cascade)
+
+  @@index([providerAccountId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Pricing Snapshot — preserves the pricing used for each transaction so
+// historical economics can't be retroactively changed.
+// ---------------------------------------------------------------------------
+
+model PricingSnapshot {
+  id              String   @id @default(cuid())
+  orderId         String?  @unique
+  productId       String?  // planId or virtualNumberId
+  productType     String   // esim | virtual_number
+  wholesaleMinor  Int      // provider cost at time of purchase
+  retailMinor     Int      // customer price at time of purchase
+  currency        String   @default("USD")
+  markupPercent   Float    // (retail - wholesale) / wholesale * 100
+  grossMarginPercent Float // (retail - wholesale) / retail * 100
+  pricingRule     String?  // JSON of the rule that produced this price
+  createdAt       DateTime @default(now())
+
+  @@index([productType])
 }

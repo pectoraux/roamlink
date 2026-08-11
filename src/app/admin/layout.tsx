@@ -2,13 +2,14 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { ShieldCheck, LayoutDashboard, Package, ShoppingBag, Smartphone, Users, Radio, ArrowLeft, ClipboardList } from "lucide-react";
+import { ShieldCheck, LayoutDashboard, Package, ShoppingBag, Smartphone, Users, Radio, ArrowLeft, ClipboardList, DollarSign } from "lucide-react";
 import { useAuth } from "@/app/providers";
 import { useRouter } from "next/navigation";
 import { useEffect } from "react";
 
 const nav = [
   { href: "/admin", label: "Overview", icon: LayoutDashboard, exact: true },
+  { href: "/admin/finance", label: "Finance", icon: DollarSign },
   { href: "/admin/waitlist", label: "Waitlist", icon: ClipboardList },
   { href: "/admin/plans", label: "Plans", icon: Package },
   { href: "/admin/orders", label: "Orders", icon: ShoppingBag },

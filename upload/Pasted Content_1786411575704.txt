@@ -1,0 +1,2137 @@
+# ROAMLINK — BUILD THE CONNECTIVITY COMPANY, NOT AN ESIM STORE
+
+You are the **lead product architect, principal engineer, business-systems architect, and fintech/telecom platform engineer** for the existing **RoamLink** repository.
+
+Repository:
+
+`https://github.com/pectoraux/roamlink`
+
+Your job is to transform the existing RoamLink codebase into the strongest commercially viable **connectivity platform** that can realistically be built on top of the existing architecture.
+
+This is an existing product.
+
+**Do not create a new application.**
+
+**Do not rewrite the repository from scratch.**
+
+**Do not replace working infrastructure simply because you would personally design it differently.**
+
+The existing codebase is the foundation.
+
+Your responsibility is to understand it first, preserve what is valuable, repair what is weak, and extend it into a coherent connectivity business.
+
+---
+
+# 0. THE BUSINESS THESIS
+
+RoamLink is **not fundamentally an eSIM store**.
+
+eSIMs are the initial customer-acquisition product.
+
+The long-term business is:
+
+# A UNIFIED CONNECTIVITY PLATFORM
+
+RoamLink should eventually allow customers and organizations to acquire, manage, and pay for multiple forms of connectivity through one account:
+
+* eSIM data
+* regional/global data
+* top-ups
+* virtual phone numbers
+* inbound SMS
+* outbound SMS where commercially and technically supported
+* voice/calling where commercially and technically supported
+* recurring connectivity subscriptions
+* connectivity bundles
+* business/team connectivity
+* future connectivity products
+
+The customer should experience these as **one RoamLink connectivity relationship**, not disconnected products from different telecom suppliers.
+
+The strategic principle is:
+
+> RoamLink owns the customer relationship, product experience, pricing, billing, payments, distribution, analytics, support, risk management, and provider abstraction.
+
+> Upstream connectivity providers supply the underlying telecom infrastructure.
+
+Do not build telecom infrastructure unnecessarily when it can be obtained economically through legitimate provider APIs and commercial agreements.
+
+---
+
+# 1. THE CUSTOMER LIFECYCLE
+
+The desired business progression is:
+
+```text
+Visitor
+  ↓
+eSIM customer
+  ↓
+Second purchase
+  ↓
+Top-up customer
+  ↓
+Multi-product customer
+  ↓
+Virtual-number customer
+  ↓
+Recurring customer
+  ↓
+Business/organization customer
+```
+
+The purpose of the eSIM business is therefore not simply:
+
+> sell more eSIMs.
+
+It is:
+
+> acquire connectivity customers who can eventually become recurring, multi-product customers.
+
+Every major product decision should be evaluated against:
+
+1. acquisition
+2. activation
+3. second purchase
+4. retention
+5. recurring revenue
+6. cross-product adoption
+7. contribution profit
+8. customer lifetime value
+9. B2B expansion
+
+Do not optimize solely for:
+
+* GMV
+* number of registered users
+* number of eSIMs sold
+* downloads
+* revenue
+
+The primary economic metric should be:
+
+# MONTHLY CONTRIBUTION PROFIT
+
+---
+
+# 2. NON-NEGOTIABLE DEVELOPMENT RULE
+
+Before changing code, inspect the repository.
+
+Do not assume the architecture.
+
+Do not assume what is already implemented.
+
+Do not recreate existing functionality.
+
+Do not create parallel systems.
+
+The first task is an **architecture and business audit**.
+
+---
+
+# 3. PHASE 0 — REPOSITORY AUDIT
+
+Inspect the repository comprehensively.
+
+Determine the actual:
+
+### Application architecture
+
+* framework
+* frontend
+* backend
+* mobile architecture
+* web architecture
+* routing
+* state management
+* API architecture
+* background jobs
+* queues
+* event system
+
+### Data architecture
+
+* database
+* ORM
+* existing schema
+* financial models
+* billing models
+* organization models
+* user models
+* eSIM models
+* provider models
+* order models
+* subscription models
+
+### Authentication
+
+Determine:
+
+* authentication mechanism
+* sessions
+* identity model
+* verification
+* permissions
+* roles
+* organization membership
+
+### Payments
+
+Determine:
+
+* payment provider
+* payment lifecycle
+* authorization
+* capture
+* refunds
+* chargebacks
+* payment methods
+* webhooks
+* currencies
+
+### Existing connectivity functionality
+
+Determine:
+
+* current eSIM implementation
+* existing provider integrations
+* product catalog
+* purchasing flow
+* activation flow
+* usage
+* top-ups
+* refunds
+* provider webhooks
+* provider reconciliation
+
+### Existing commercial functionality
+
+Determine:
+
+* pricing
+* margins
+* promotions
+* subscriptions
+* organizations
+* invoicing
+* wallets
+* credits
+* referrals
+
+### Existing UI
+
+Determine:
+
+* customer dashboard
+* store
+* eSIM screens
+* account screens
+* billing
+* organization screens
+* admin screens
+* mobile screens
+* web screens
+
+### Engineering quality
+
+Identify:
+
+* duplicated logic
+* architectural inconsistencies
+* technical debt
+* security issues
+* missing tests
+* race conditions
+* unreliable provider operations
+* financial inconsistencies
+* missing idempotency
+* missing reconciliation
+
+---
+
+# 4. AUDIT OUTPUT — REQUIRED BEFORE IMPLEMENTATION
+
+Before modifying production code, produce:
+
+## A. Current architecture map
+
+## B. Current business model map
+
+## C. Existing domain model
+
+## D. Existing provider architecture
+
+## E. Existing payment/billing architecture
+
+## F. Existing customer/organization architecture
+
+## G. Existing mobile/web architecture
+
+## H. Existing eSIM lifecycle
+
+## I. Existing financial lifecycle
+
+## J. Technical debt
+
+## K. Security risks
+
+## L. Business risks
+
+## M. Missing capabilities
+
+## N. Reusable abstractions
+
+## O. Architecture conflicts
+
+Then produce a gap analysis:
+
+| Capability | Existing | Partial | Missing | Reuse | Refactor | New |
+| ---------- | -------- | ------- | ------- | ----- | -------- | --- |
+
+Do not begin implementation until this analysis is complete.
+
+---
+
+# 5. ARCHITECTURAL PRINCIPLE
+
+RoamLink should have one unified connectivity domain.
+
+Conceptually:
+
+```text
+                    ROAMLINK
+                       │
+              Connectivity Platform
+                       │
+       ┌───────────────┼────────────────┐
+       │               │                │
+      Data           Identity        Messaging
+       │               │                │
+     eSIM          Numbers             SMS
+       │                                │
+       └───────────────┬────────────────┘
+                       │
+                     Voice
+```
+
+Do not create separate applications for each capability.
+
+Do not create separate:
+
+* user systems
+* authentication
+* billing
+* payments
+* wallets
+* organization systems
+* notification systems
+* support systems
+
+Reuse the existing RoamLink platform.
+
+---
+
+# 6. THE CONNECTIVITY WALLET
+
+Where compatible with the existing architecture, introduce the concept of a unified:
+
+# ROAMLINK CONNECTIVITY ACCOUNT
+
+The customer should eventually have one account representing their relationship with RoamLink.
+
+Conceptually:
+
+```text
+RoamLink Account
+│
+├── Identity
+├── Payment methods
+├── Wallet / credits
+├── Orders
+├── eSIMs
+├── Numbers
+├── SMS
+├── Voice
+├── Subscriptions
+├── Usage
+├── Support
+└── Billing history
+```
+
+The user should not need to understand which upstream provider supplies each product.
+
+Provider information can be exposed when commercially, legally, or operationally necessary.
+
+But provider complexity should remain behind the RoamLink experience.
+
+---
+
+# 7. AIRALO — CURRENT PROVIDER CONSTRAINTS
+
+RoamLink currently has an Airalo reseller relationship.
+
+Treat the following commercial facts as constraints:
+
+* Airalo is currently an upstream provider.
+* The relationship permits API-based resale of supported services.
+* Current commercial terms include a postpaid purchasing model.
+* Current approved credit limit is $10,000 USD.
+* Current commercial pricing information indicates a 20% commercial term.
+* Airalo invoices for prior purchases.
+* Invoices are payable according to the contractual payment terms.
+* Late-payment consequences can include interest and service suspension.
+* Payment obligations survive termination.
+* Taxes applicable to Airalo charges remain RoamLink's responsibility.
+* RoamLink may not assume the credit facility represents cash or revenue.
+* Current commercial information does not establish a top-up commission; never assume one exists.
+* Provider pricing can change.
+* RoamLink must maintain sufficient liquidity to settle provider liabilities.
+* Current contractual restrictions regarding downstream resale must be respected.
+
+Treat the actual signed/current agreement and official provider documentation as authoritative over this specification.
+
+Never invent commercial terms.
+
+Never infer undocumented provider capabilities.
+
+Never represent the $10,000 credit facility as RoamLink cash.
+
+---
+
+# 8. PROVIDER CREDIT IS A FINANCIAL LIABILITY
+
+The provider credit facility must become a first-class financial risk-control concept.
+
+For every provider that extends credit, maintain:
+
+* credit limit
+* outstanding liability
+* pending commitments
+* available credit
+* invoiced amount
+* paid amount
+* overdue amount
+* projected liability
+* utilization
+* safety reserve
+* payment due date
+
+For Airalo:
+
+```text
+Credit Limit
+-
+Outstanding Liability
+-
+Pending Provider Commitments
+=
+Remaining Operational Capacity
+```
+
+Do not simply calculate available credit from completed orders.
+
+Include known/predictable exposure where appropriate.
+
+Create configurable thresholds:
+
+```text
+50%  informational
+75%  warning
+80%  elevated
+90%  critical
+95%  emergency
+100% hard limit
+```
+
+Thresholds must be configurable.
+
+At critical exposure, the system should proactively restrict or slow new provider commitments rather than waiting for provider rejection.
+
+Administrators may override controls only through explicit, auditable actions.
+
+---
+
+# 9. CASH-FLOW SAFETY
+
+RoamLink must understand that:
+
+```text
+Customer payment
+≠
+free operating cash
+```
+
+Some customer cash may effectively be required to settle:
+
+* provider liabilities
+* refunds
+* chargebacks
+* payment fees
+* taxes
+* operational expenses
+
+Build visibility into:
+
+```text
+Customer cash collected
+-
+provider obligations
+-
+payment obligations
+-
+refund reserve
+-
+chargeback reserve
+-
+tax obligations
+=
+estimated available operating cash
+```
+
+This is a management metric, not necessarily a legal accounting statement.
+
+Clearly label estimates versus finalized accounting values.
+
+The system must make provider liabilities visible before management makes spending decisions.
+
+---
+
+# 10. BUSINESS ECONOMICS
+
+For every transaction, calculate and preserve:
+
+* customer price
+* provider cost
+* provider currency
+* customer currency
+* exchange rate where relevant
+* gross profit
+* gross margin
+* payment processing cost
+* provider fees
+* refund cost
+* expected fraud loss
+* chargeback cost
+* promotional discount
+* customer acquisition allocation where available
+* contribution profit
+* contribution margin
+
+Definitions must remain distinct.
+
+### Markup
+
+```text
+(Customer Price - Provider Cost) / Provider Cost
+```
+
+### Gross Margin
+
+```text
+(Customer Price - Provider Cost) / Customer Price
+```
+
+### Contribution Profit
+
+```text
+Revenue
+-
+Provider Cost
+-
+Payment Fees
+-
+Refunds
+-
+Chargebacks
+-
+Fraud Loss
+-
+Direct Variable Costs
+```
+
+Do not call a transaction profitable merely because its markup is positive.
+
+---
+
+# 11. FINANCIAL LEDGER
+
+If the existing architecture does not already provide an adequate financial ledger, introduce one.
+
+Financial truth must not depend exclusively on mutable order records.
+
+Track immutable financial events such as:
+
+```text
+CUSTOMER_PAYMENT
+PAYMENT_FEE
+PROVIDER_PURCHASE
+PROVIDER_LIABILITY
+PROVIDER_INVOICE
+PROVIDER_PAYMENT
+REFUND
+CHARGEBACK
+PROMOTIONAL_CREDIT
+CUSTOMER_CREDIT
+TRIAL_COST
+COMMISSION
+ADJUSTMENT
+```
+
+Every financial transaction must be traceable to:
+
+* customer
+* organization where applicable
+* order
+* provider
+* provider transaction
+* currency
+* amount
+* timestamp
+* source
+* reason
+* state
+
+Use integer minor units or another precise monetary representation.
+
+Never use floating-point arithmetic for financial truth.
+
+---
+
+# 12. PROVIDER ABSTRACTION
+
+RoamLink must not become architecturally dependent on Airalo.
+
+Create or improve a normalized provider abstraction.
+
+Conceptually:
+
+```text
+ConnectivityProvider
+│
+├── AiraloProvider
+├── NumberProviderA
+├── NumberProviderB
+├── MessagingProvider
+└── FutureProvider
+```
+
+The abstraction must represent capabilities rather than pretending every provider supports everything.
+
+Potential capabilities:
+
+```text
+PRODUCT_CATALOG
+ESIM_PURCHASE
+ESIM_ACTIVATION
+ESIM_USAGE
+ESIM_TOPUP
+ESIM_REFUND
+
+NUMBER_SEARCH
+NUMBER_PROVISION
+NUMBER_RENEW
+NUMBER_RELEASE
+
+SMS_INBOUND
+SMS_OUTBOUND
+
+VOICE_INBOUND
+VOICE_OUTBOUND
+
+SUBSCRIPTION
+```
+
+Each provider declares supported capabilities.
+
+Never call unsupported operations.
+
+---
+
+# 13. PROVIDER ROUTING
+
+Eventually RoamLink should be able to choose between providers.
+
+Routing should consider:
+
+* availability
+* country
+* network
+* product capability
+* provider reliability
+* wholesale cost
+* expected margin
+* latency
+* provider limits
+* regulatory requirements
+* customer segment
+
+For example:
+
+```text
+Customer requirement
+        ↓
+Eligible providers
+        ↓
+Capability check
+        ↓
+Availability
+        ↓
+Cost
+        ↓
+Margin
+        ↓
+Reliability
+        ↓
+Best provider
+```
+
+Never silently substitute a materially different product.
+
+For eSIMs, the system must preserve product compatibility and customer expectations.
+
+---
+
+# 14. ESIM BUSINESS
+
+Preserve and improve existing eSIM functionality.
+
+Customers should be able to:
+
+* browse countries
+* browse regions
+* search plans
+* compare plans
+* see data allowance
+* see validity
+* see supported networks where available
+* see relevant coverage information
+* see technology information where reliably provided
+* purchase
+* activate/install
+* view activation information
+* monitor usage
+* top up where supported
+* manage the eSIM
+* request support
+* request refunds/replacements where supported
+
+Do not expose unnecessary provider complexity.
+
+Do not claim coverage, speeds, or network characteristics that are not supported by authoritative provider data.
+
+---
+
+# 15. VIRTUAL NUMBERS
+
+Virtual numbers should become the first major recurring-revenue expansion.
+
+Do not create a separate application.
+
+Use existing:
+
+* authentication
+* users
+* organizations
+* billing
+* payment infrastructure
+* mobile architecture
+* web architecture
+* notifications
+* support
+* API conventions
+
+Customers should eventually be able to:
+
+1. select country
+2. select number type
+3. view available numbers
+4. see recurring price
+5. see setup fees
+6. see capabilities
+7. see KYC requirements
+8. order
+9. activate
+10. manage
+11. receive SMS
+12. send SMS where supported
+13. make/receive calls where supported
+14. renew
+15. suspend
+16. release
+17. replace
+18. view usage
+
+Never assume a provider supports a capability simply because another provider does.
+
+---
+
+# 16. NUMBER ECONOMICS
+
+Numbers require a different economic model from eSIMs.
+
+Track independently:
+
+* acquisition cost
+* monthly provider rental
+* activation cost
+* replacement cost
+* SMS cost
+* voice cost
+* regulatory/KYC cost
+* customer subscription price
+* usage price
+* expected support cost
+* contribution profit
+
+Support:
+
+### Subscription pricing
+
+```text
+Wholesale: $3/month
+Customer: $7.99/month
+```
+
+### Usage pricing
+
+```text
+SMS: $X
+Voice: $X/minute
+```
+
+The pricing engine must support both.
+
+Never hard-code these examples.
+
+---
+
+# 17. SUBSCRIPTIONS
+
+Recurring revenue should be a first-class domain.
+
+Support where commercially appropriate:
+
+* recurring numbers
+* recurring data
+* monthly connectivity plans
+* automatic renewal
+* automatic top-up
+* connectivity credits
+
+Subscription states should be explicit:
+
+```text
+TRIAL
+ACTIVE
+PAST_DUE
+SUSPENDED
+CANCELLED
+EXPIRED
+```
+
+Provider obligations must be considered before renewal.
+
+Do not renew a service if payment has failed unless the configured business rules explicitly permit a grace period.
+
+---
+
+# 18. TRIALS
+
+Trials must be designed around economics and fraud.
+
+Never create unlimited free telecom resources.
+
+Support configurable trial models:
+
+### Preview
+
+No provider resource provisioned.
+
+### Credit trial
+
+Give the customer a small RoamLink connectivity credit.
+
+### Limited telecom trial
+
+Only provision a real resource when:
+
+* provider economics permit it
+* identity/risk controls permit it
+* maximum cost is known
+* maximum duration is known
+
+Every trial must have:
+
+* maximum provider cost
+* duration
+* usage limit
+* eligibility rules
+* fraud controls
+* automatic expiration
+* resource cleanup
+* cost attribution
+
+Before provisioning a paid provider resource for free, calculate its maximum expected RoamLink liability.
+
+---
+
+# 19. FRAUD AND ABUSE
+
+Connectivity products can be abused.
+
+Build risk controls around:
+
+* account age
+* email verification
+* phone verification
+* IP risk
+* device signals
+* payment method
+* payment failures
+* velocity
+* repeated trials
+* number provisioning frequency
+* SMS volume
+* unusual usage
+* chargebacks
+* previous fraud
+* provider rejection history
+
+Risk levels:
+
+```text
+LOW
+MEDIUM
+HIGH
+BLOCKED
+```
+
+Possible controls:
+
+* additional verification
+* manual review
+* reduced limits
+* no trial
+* payment verification
+* temporary hold
+* service suspension
+
+Do not implement mechanisms intended to facilitate spam, fraud, identity abuse, or circumvention of third-party verification systems.
+
+---
+
+# 20. B2C + B2B
+
+Use the existing organization architecture.
+
+Do not build an independent B2B application.
+
+Consumer:
+
+```text
+User
+└── Personal RoamLink Account
+```
+
+Business:
+
+```text
+Organization
+├── Members
+├── Services
+├── eSIMs
+├── Numbers
+├── Usage
+├── Billing
+├── Policies
+└── Spending Limits
+```
+
+Business administrators should eventually be able to:
+
+* provision services
+* assign eSIMs
+* assign numbers
+* invite members
+* set limits
+* view usage
+* manage billing
+* export usage
+* suspend services
+* manage departments
+* define policies
+
+Respect provider agreements.
+
+Do not turn B2B customers into downstream resellers unless upstream agreements explicitly permit resale.
+
+---
+
+# 21. BUNDLES
+
+The catalog should eventually support bundles.
+
+Examples:
+
+### Traveler
+
+eSIM + temporary number
+
+### Business Traveler
+
+eSIM + business number + messaging
+
+### Digital Nomad
+
+regional/global eSIM + recurring number
+
+### Africa Traveler
+
+regional African data + eligible local number
+
+### Business Team
+
+eSIMs + numbers + centralized billing + usage controls
+
+Bundles must be composed from underlying products rather than duplicated product logic.
+
+---
+
+# 22. THE AFRICA OPPORTUNITY
+
+Do not hard-code this as the only strategy, but explicitly evaluate Africa as a potential competitive advantage.
+
+Potential products:
+
+* West Africa connectivity
+* East Africa connectivity
+* Africa regional connectivity
+* country-specific plans
+* traveler bundles
+* business mobility packages
+
+Evaluate each opportunity based on:
+
+* wholesale cost
+* coverage
+* provider availability
+* demand
+* margin
+* regulatory requirements
+* reliability
+* competition
+
+Do not build a product merely because it sounds strategically attractive.
+
+Validate its economics.
+
+---
+
+# 23. CROSS-SELLING
+
+Build a recommendation system based on actual economics.
+
+Examples:
+
+eSIM purchase:
+
+```text
+→ top-up
+→ compatible regional plan
+→ number
+→ bundle
+```
+
+Number purchase:
+
+```text
+→ eSIM
+→ recurring data
+→ business bundle
+```
+
+Recommendations should consider:
+
+* destination
+* previous purchases
+* product compatibility
+* customer segment
+* margin
+* contribution profit
+* subscription status
+
+Do not optimize recommendations solely for revenue.
+
+---
+
+# 24. REFERRALS
+
+Build referral capability only if the economics support it.
+
+Support:
+
+* referral codes
+* links
+* customer credits
+* fixed rewards
+* percentage rewards
+* campaign-specific rewards
+
+Rewards should be based on configurable economics.
+
+Prevent:
+
+* self-referrals
+* duplicate accounts
+* payment abuse
+* referral loops
+* artificial account creation
+
+---
+
+# 25. CUSTOMER LIFETIME VALUE
+
+Track:
+
+* first purchase
+* second purchase
+* time to second purchase
+* number of purchases
+* active subscriptions
+* products per customer
+* revenue/customer
+* gross profit/customer
+* contribution profit/customer
+* churn
+* retention
+* LTV
+* CAC
+* LTV/CAC
+
+Critical metric:
+
+# SECOND PURCHASE RATE
+
+An eSIM customer who purchases once is a transaction.
+
+An eSIM customer who returns is a customer.
+
+---
+
+# 26. ADMINISTRATIVE BUSINESS INTELLIGENCE
+
+Create an executive/business dashboard using actual system data.
+
+### Today
+
+* revenue
+* orders
+* customers
+* active eSIMs
+* active numbers
+* refunds
+* failed payments
+* provider failures
+* contribution profit
+
+### Month
+
+* revenue
+* provider cost
+* gross profit
+* contribution profit
+* recurring revenue
+* churn
+* retention
+* new customers
+* second purchase rate
+* LTV
+* CAC
+
+### Provider exposure
+
+* credit limit
+* utilization
+* outstanding liability
+* pending liability
+* projected invoice
+* due dates
+* available capacity
+
+### Product profitability
+
+Rank by:
+
+* product
+* country
+* region
+* provider
+* customer segment
+
+using:
+
+* revenue
+* gross profit
+* contribution profit
+* margin
+* volume
+
+---
+
+# 27. PROVIDER INVOICE RECONCILIATION
+
+For every provider that invoices RoamLink, support reconciliation.
+
+For Airalo, reconcile:
+
+```text
+Internal Provider Orders
+        ↓
+Provider Transactions
+        ↓
+Provider Invoice
+        ↓
+Payment
+```
+
+Detect:
+
+* missing transactions
+* duplicate transactions
+* unexpected pricing
+* refunds
+* credits
+* invoice mismatches
+* outstanding liabilities
+
+Never mark a provider invoice as reconciled without traceable supporting records.
+
+---
+
+# 28. ORDER STATE MACHINES
+
+Every provider transaction must have deterministic backend state.
+
+Example:
+
+```text
+CREATED
+→ PAYMENT_PENDING
+→ PAYMENT_CONFIRMED
+→ PROVIDER_PENDING
+→ PROVISIONED
+→ ACTIVE
+→ COMPLETED
+```
+
+Failure paths:
+
+```text
+PAYMENT_FAILED
+PROVIDER_FAILED
+REFUND_PENDING
+REFUNDED
+CANCELLED
+```
+
+The frontend must never be the source of truth.
+
+The backend is authoritative.
+
+Unknown states must be explicitly represented.
+
+---
+
+# 29. IDEMPOTENCY
+
+Provider operations must be idempotent.
+
+Especially:
+
+* purchase
+* eSIM provisioning
+* number provisioning
+* top-up
+* refund
+* renewal
+* cancellation
+
+Use:
+
+* internal transaction IDs
+* provider transaction IDs
+* idempotency keys
+* unique database constraints
+* retries
+* reconciliation
+* dead-letter handling
+
+The system must safely handle:
+
+```text
+Payment succeeds
++
+Provider request times out
+```
+
+without accidentally purchasing twice.
+
+---
+
+# 30. WEBHOOK ARCHITECTURE
+
+Provider webhooks must be:
+
+* authenticated
+* signature-verified where supported
+* persisted
+* idempotent
+* replayable
+* auditable
+
+Store raw payloads where legally and contractually appropriate.
+
+Normalize provider events into internal events.
+
+---
+
+# 31. PRICING ENGINE
+
+Build one centralized pricing engine.
+
+Do not hard-code markup into individual products.
+
+Pricing should be configurable by:
+
+* provider
+* product
+* country
+* region
+* currency
+* customer segment
+* organization
+* plan
+* data size
+* validity
+* volume
+* demand
+* promotion
+* acquisition channel
+* B2C/B2B
+* minimum margin
+* fixed fee
+* percentage markup
+* reference price
+
+Every price shown to a customer should be based on a reproducible pricing snapshot.
+
+Never allow an administrator to change a pricing rule and retroactively change historical transaction economics.
+
+---
+
+# 32. PROFITABILITY GUARDRAILS
+
+Every purchasable product should have:
+
+```text
+HIGHLY_PROFITABLE
+PROFITABLE
+LOW_MARGIN
+BREAK_EVEN
+LOSS_MAKING
+UNKNOWN
+```
+
+Administrators should be able to configure:
+
+* minimum gross margin
+* minimum contribution margin
+* minimum transaction profit
+* maximum discount
+* maximum acquisition cost
+* minimum provider spread
+
+Prevent accidental below-threshold pricing unless an explicitly authorized override occurs.
+
+Every override must be auditable.
+
+---
+
+# 33. PRODUCT CATALOG
+
+Separate:
+
+```text
+Product
+Plan
+Provider Product
+Customer Price
+Provider Cost
+Availability
+Capability
+```
+
+Do not duplicate provider inventory unnecessarily.
+
+Normalize provider products into RoamLink's customer-facing catalog.
+
+Cache provider inventory appropriately.
+
+Respect provider freshness requirements.
+
+---
+
+# 34. API ARCHITECTURE
+
+Extend the existing API conventions.
+
+Do not invent a second backend architecture.
+
+Conceptually support:
+
+```text
+/connectivity/products
+/connectivity/products/:id
+
+/connectivity/orders
+/connectivity/orders/:id
+
+/esims
+/esims/:id/usage
+/esims/:id/topup
+
+/numbers
+/numbers/available
+/numbers/:id
+/numbers/:id/messages
+/numbers/:id/renew
+/numbers/:id/release
+
+/subscriptions
+/billing
+/billing/ledger
+/billing/invoices
+
+/organizations
+/organizations/:id/usage
+/organizations/:id/members
+```
+
+Adapt these to the actual existing API architecture.
+
+Do not blindly create these exact routes if the repository already has a better convention.
+
+---
+
+# 35. MOBILE + WEB INFORMATION ARCHITECTURE
+
+Preserve existing mobile/web architecture.
+
+The eventual information architecture should move toward:
+
+```text
+Home
+
+Store
+├── eSIM
+├── Numbers
+├── Travel
+├── Business
+└── Bundles
+
+My Connectivity
+├── eSIMs
+├── Numbers
+├── SMS
+├── Voice
+├── Usage
+└── Subscriptions
+
+Billing
+├── Payments
+├── Wallet
+├── Transactions
+└── Invoices
+
+Organization
+
+Support
+```
+
+Do not duplicate business logic between platforms.
+
+---
+
+# 36. SECURITY
+
+Treat RoamLink as a financial + telecom platform.
+
+Audit:
+
+* authorization
+* tenant isolation
+* organization permissions
+* payment security
+* webhook authentication
+* provider credentials
+* secret storage
+* API abuse
+* rate limiting
+* sensitive telecom data
+* SMS data
+* phone numbers
+* audit logs
+
+Never expose provider credentials to clients.
+
+Never trust client-supplied prices.
+
+Never trust client-supplied provider costs.
+
+Never trust client-supplied organization ownership.
+
+Never allow users to manipulate financial ledger records.
+
+---
+
+# 37. OBSERVABILITY
+
+Every important business operation should be traceable.
+
+For example:
+
+```text
+Customer
+ ↓
+Order
+ ↓
+Payment
+ ↓
+Provider Request
+ ↓
+Provider Transaction
+ ↓
+Provisioning
+ ↓
+Webhook
+ ↓
+Activation
+ ↓
+Financial Ledger
+```
+
+A support administrator should be able to investigate a failed transaction without opening multiple unrelated systems.
+
+Use structured logging and correlation IDs.
+
+---
+
+# 38. BUSINESS SIMULATION
+
+Build administrative simulation/analytics capabilities.
+
+Allow management to model:
+
+```text
+$1,000 provider volume
+$10,000 provider volume
+$50,000 provider volume
+$100,000 provider volume
+$500,000 provider volume
+```
+
+Estimate:
+
+* customer revenue
+* provider cost
+* gross profit
+* contribution profit
+* payment costs
+* refunds
+* chargebacks
+* provider credit utilization
+* expected provider liability
+* working-capital requirement
+
+Make assumptions explicit.
+
+Do not present simulations as accounting facts.
+
+---
+
+# 39. BUSINESS PRIORITY
+
+Implement in this order unless the repository audit provides strong evidence for a different sequence:
+
+## PHASE 1 — MAKE THE EXISTING ESIM BUSINESS ECONOMICALLY SAFE
+
+* provider abstraction
+* pricing engine
+* margin calculation
+* financial ledger
+* provider liability
+* credit utilization
+* reconciliation
+* idempotency
+* webhooks
+* refunds
+* business analytics
+
+## PHASE 2 — IMPROVE ESIM CUSTOMER ECONOMICS
+
+* better discovery
+* better pricing
+* top-ups where supported
+* bundles
+* second-purchase mechanisms
+* referrals
+* retention
+
+## PHASE 3 — ADD RECURRING CONNECTIVITY
+
+* virtual numbers
+* subscriptions
+* usage billing
+* SMS
+* voice where viable
+
+## PHASE 4 — BUILD THE CONNECTIVITY ACCOUNT
+
+* unified services
+* wallet/credits
+* unified billing
+* cross-selling
+* customer lifecycle
+
+## PHASE 5 — B2B
+
+* organizations
+* employee provisioning
+* spending limits
+* usage
+* centralized billing
+* reporting
+
+## PHASE 6 — MULTI-PROVIDER OPTIMIZATION
+
+* provider routing
+* provider failover
+* cost optimization
+* reliability scoring
+* margin optimization
+
+## PHASE 7 — ENTERPRISE
+
+* negotiated pricing
+* contracts
+* invoicing
+* enterprise controls
+* account management
+
+Do not implement later phases merely because this specification mentions them.
+
+Build the highest-value phase supported by the repository and actual provider availability.
+
+---
+
+# 40. WHAT NOT TO BUILD
+
+Do not build:
+
+* an MVNO core network
+* SM-DP+ infrastructure
+* physical telecom infrastructure
+* carrier infrastructure
+* unnecessary telecom infrastructure
+* fake provider integrations
+* mock provider transactions presented as production functionality
+* speculative features without provider support
+* duplicate authentication
+* duplicate payments
+* duplicate billing
+* duplicate organizations
+* duplicate databases
+
+Use legitimate provider APIs and commercial agreements.
+
+---
+
+# 41. COMMERCIAL COMPLIANCE
+
+Do not implement functionality that violates provider agreements.
+
+For Airalo specifically:
+
+* do not misrepresent RoamLink as Airalo
+* do not misuse Airalo trademarks
+* do not enable prohibited downstream resale
+* do not expose confidential commercial information unnecessarily
+* do not scrape Airalo when an official API is available
+* do not fabricate provider capabilities
+* do not assume pricing is permanent
+* do not assume commissions not explicitly documented
+* do not promise coverage or service characteristics that are not guaranteed
+
+Provider agreements and official provider documentation take precedence over assumptions in this prompt.
+
+---
+
+# 42. DATA MODEL RULE
+
+Inspect the existing Prisma/database schema before creating anything.
+
+Reuse existing models whenever possible.
+
+Do not create duplicate concepts under different names.
+
+Potential conceptual domains include:
+
+```text
+Provider
+ConnectivityProduct
+ConnectivityPlan
+ProviderProduct
+ProviderOrder
+CustomerOrder
+
+ESIM
+VirtualNumber
+SMSMessage
+VoiceUsage
+UsageRecord
+
+Subscription
+TopUp
+Bundle
+
+PricingRule
+PricingSnapshot
+
+FinancialTransaction
+ProviderLiability
+ProviderInvoice
+ProviderCreditAccount
+
+Refund
+Chargeback
+
+Trial
+FraudRisk
+
+Referral
+Promotion
+```
+
+These are conceptual suggestions, not instructions to blindly create all of them.
+
+Map them onto the existing schema.
+
+---
+
+# 43. DOMAIN OWNERSHIP
+
+Keep domain responsibilities clean.
+
+For example:
+
+```text
+Payments
+    owns payment lifecycle
+
+Orders
+    owns customer purchase lifecycle
+
+Providers
+    owns provider communication
+
+Connectivity
+    owns telecom resources
+
+Pricing
+    owns customer pricing
+
+Ledger
+    owns financial events
+
+Billing
+    owns invoices/subscriptions
+
+Risk
+    owns fraud decisions
+
+Organizations
+    owns business permissions
+
+Analytics
+    derives business metrics
+```
+
+Avoid circular dependencies.
+
+Avoid placing business logic in UI components.
+
+Avoid placing provider-specific logic throughout the application.
+
+---
+
+# 44. TESTING
+
+Test the complete business lifecycle.
+
+### Payment
+
+* successful payment
+* failed payment
+* duplicate payment webhook
+* refund
+* chargeback
+
+### Provider
+
+* successful purchase
+* provider rejection
+* provider timeout
+* duplicate request
+* webhook replay
+* delayed provisioning
+
+### Financial
+
+* provider liability
+* invoice reconciliation
+* credit limit
+* safety reserve
+* margin calculation
+* currency conversion
+* refund accounting
+
+### eSIM
+
+* provisioning
+* activation
+* usage
+* top-up
+* expiration
+
+### Numbers
+
+* availability
+* provisioning
+* renewal
+* release
+* expiration
+* SMS
+* usage
+
+### Subscriptions
+
+* creation
+* renewal
+* payment failure
+* grace period
+* cancellation
+* expiration
+
+### Organizations
+
+* permissions
+* provisioning
+* spending limits
+* member removal
+* billing
+
+### Fraud
+
+* repeated trials
+* velocity
+* chargebacks
+* suspicious provisioning
+
+---
+
+# 45. QUALITY BAR
+
+Do not satisfy requirements with:
+
+* placeholder buttons
+* fake API responses
+* static dashboards
+* hard-coded business data
+* mock transactions
+* fake provider states
+* frontend-only state
+* TODO comments pretending functionality is complete
+
+If a capability cannot yet be implemented because an upstream provider is unavailable, build the correct abstraction and explicitly mark the capability as unavailable rather than faking production behavior.
+
+---
+
+# 46. IMPLEMENTATION METHOD
+
+After the audit:
+
+### Step 1
+
+Produce the architecture audit.
+
+### Step 2
+
+Produce the gap analysis.
+
+### Step 3
+
+Produce the proposed target architecture.
+
+### Step 4
+
+Produce the database migration plan.
+
+### Step 5
+
+Produce the implementation phases.
+
+### Step 6
+
+Identify the smallest high-value production phase.
+
+### Step 7
+
+Implement that phase completely.
+
+### Step 8
+
+Run tests.
+
+### Step 9
+
+Run type checks/lint/build.
+
+### Step 10
+
+Perform a security review.
+
+### Step 11
+
+Perform a financial-consistency review.
+
+### Step 12
+
+Perform a provider-integration review.
+
+### Step 13
+
+Only then continue to the next phase.
+
+Do not make hundreds of speculative changes in one pass.
+
+Prefer small, coherent, production-ready increments.
+
+---
+
+# 47. DECISION FRAMEWORK
+
+When choosing between implementation options, prioritize in this order:
+
+1. preserve working production functionality
+2. financial correctness
+3. security
+4. provider reliability
+5. customer experience
+6. architectural simplicity
+7. extensibility
+8. development speed
+9. cosmetic improvements
+
+Do not sacrifice financial correctness for speed.
+
+Do not sacrifice provider reliability for a cleaner abstraction.
+
+Do not introduce architectural complexity without a business reason.
+
+---
+
+# 48. THE ROAMLINK MOAT
+
+RoamLink should eventually build defensibility around:
+
+### 1. Customer relationship
+
+One account for all connectivity.
+
+### 2. Provider abstraction
+
+RoamLink is not locked to one telecom supplier.
+
+### 3. Pricing intelligence
+
+Know the true economics of every product.
+
+### 4. Financial intelligence
+
+Know provider exposure and working-capital requirements.
+
+### 5. Connectivity wallet
+
+One economic relationship across products.
+
+### 6. Recurring revenue
+
+Numbers, subscriptions, top-ups and business accounts.
+
+### 7. B2B
+
+Organizations become high-LTV customers.
+
+### 8. Distribution
+
+Travel, Africa, business mobility, referrals and partnerships.
+
+The moat is **not** the eSIM technology itself.
+
+---
+
+# 49. NORTH STAR
+
+The ultimate objective is:
+
+# MONTHLY CONTRIBUTION PROFIT FROM ACTIVE CONNECTIVITY CUSTOMERS
+
+Track:
+
+* Monthly Recurring Revenue
+* Monthly Contribution Profit
+* Contribution Profit / Customer
+* Active Connectivity Customers
+* Second Purchase Rate
+* Retention
+* Churn
+* LTV
+* CAC
+* LTV/CAC
+* Products / Customer
+* Number Attachment Rate
+* Top-up Rate
+* Bundle Attachment Rate
+* B2B Revenue
+* Provider Margin
+* Provider Credit Utilization
+* Working Capital Requirement
+* Refund Rate
+* Chargeback Rate
+* Fraud Loss
+* Provider Failure Rate
+
+---
+
+# 50. FINAL PRODUCT VISION
+
+The customer should eventually think:
+
+> “RoamLink is my connectivity account.”
+
+Not:
+
+> “RoamLink sells Airalo eSIMs.”
+
+The platform should eventually resemble:
+
+# Stripe + Shopify for connectivity
+
+Customers discover and purchase connectivity.
+
+Providers supply connectivity.
+
+RoamLink manages:
+
+* discovery
+* identity
+* payments
+* pricing
+* provisioning
+* subscriptions
+* usage
+* support
+* billing
+* organizations
+* risk
+* analytics
+* provider routing
+* financial reconciliation
+
+The strategic progression is:
+
+```text
+eSIM marketplace
+        ↓
+Connectivity marketplace
+        ↓
+Connectivity account
+        ↓
+Recurring connectivity platform
+        ↓
+Business connectivity platform
+        ↓
+Provider-agnostic connectivity infrastructure
+```
+
+---
+
+# 51. FINAL DELIVERABLE
+
+At the end of each implementation phase, report:
+
+1. Architecture audit
+2. Business-model implications
+3. Files changed
+4. Database changes
+5. API changes
+6. Provider changes
+7. Financial-model changes
+8. UI changes
+9. Tests added
+10. Security considerations
+11. Remaining risks
+12. Known provider limitations
+13. Commands to run locally
+14. Production deployment steps
+15. Metrics affected
+16. Recommended next milestone
+
+For every major business decision, explain:
+
+**Why does this increase RoamLink's probability of becoming a profitable connectivity company?**
+
+Do not merely explain what code was written.
+
+---
+
+# 52. THE MOST IMPORTANT RULE
+
+Do not confuse **building features** with **building the business**.
+
+A feature belongs in RoamLink only when it contributes to one or more of:
+
+* customer acquisition
+* customer retention
+* recurring revenue
+* contribution profit
+* operational efficiency
+* provider diversification
+* B2B expansion
+* risk reduction
+* defensibility
+
+Build the smallest system that accomplishes those objectives correctly.
+
+**Inspect first.**
+
+**Preserve what works.**
+
+**Fix what matters.**
+
+**Build the economics before scaling the features.**
+
+**Build recurring relationships instead of one-off transactions.**
+
+**Own the customer relationship, not the telecom infrastructure.**

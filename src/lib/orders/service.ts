@@ -20,6 +20,7 @@ import { assertTransition } from "./state-machine";
 import { generateIdempotencyKey, audit } from "./idempotency";
 import { logger } from "@/lib/logger";
 import { AppError, classifyProviderError } from "@/lib/errors";
+import { recordFinancialEvent } from "@/lib/finance/ledger";
 import type { OrderStatus, ProvisioningResult } from "@/types";
 import type { Currency } from "@/lib/money";
 import QRCode from "qrcode";
@@ -287,6 +288,39 @@ export async function confirmAndProvision(input: {
   // --- Provisioning ---
   try {
     const esimId = await provisionOrderESIM({ orderId: order.id, userId: input.userId, idempotencyKey: `prov_${input.idempotencyKey}`, ip: input.ip });
+
+    // --- Record financial events in the ledger ---
+    // Get the plan's wholesale cost for profit calculation
+    const plan = order.plan ?? await db.plan.findUnique({ where: { id: order.planId ?? "" } });
+    if (plan) {
+      const paymentFee = Math.round(order.amount * 0.029 + 30); // ~2.9% + $0.30 (Stripe-like)
+      await recordFinancialEvent({
+        type: "CUSTOMER_PAYMENT",
+        userId: input.userId,
+        orderId: order.id,
+        provider: order.paymentProvider ?? undefined,
+        customerPrice: order.amount,
+        providerCost: 0, // payment revenue, not provider cost
+        paymentFee,
+        currency: order.currency,
+        reason: `Customer payment for ${plan.name}`,
+        idempotencyKey: `ledger_pay_${order.id}`,
+      });
+
+      await recordFinancialEvent({
+        type: "PROVIDER_PURCHASE",
+        userId: input.userId,
+        orderId: order.id,
+        provider: "mock", // eSIM provider
+        providerTxnId: order.providerOrderId ?? undefined,
+        customerPrice: 0,
+        providerCost: plan.wholesalePrice,
+        currency: order.currency,
+        reason: `Provider purchase for ${plan.name}`,
+        idempotencyKey: `ledger_prov_${order.id}`,
+      });
+    }
+
     return { status: "COMPLETED", paymentStatus: "succeeded", esimId };
   } catch (err) {
     logger.error("provisioning.failed", { orderId: order.id, error: err instanceof Error ? err.message : String(err) });

@@ -23,6 +23,33 @@ async function main() {
   const syncResult = await syncPlansFromProvider();
   logger.info("seed.plans_synced", { ...syncResult });
 
+  // --- Provider credit accounts ---
+  // Airalo: $10,000 credit facility (1,000,000 minor units)
+  await db.providerCreditAccount.upsert({
+    where: { provider: "airalo" },
+    update: {},
+    create: {
+      provider: "airalo",
+      creditLimit: 1_000_000,
+      currency: "USD",
+      outstandingLiability: 0,
+      pendingCommitments: 0,
+      invoicedAmount: 0,
+      paidAmount: 0,
+    },
+  });
+  // Mock provider: same limit for dev
+  await db.providerCreditAccount.upsert({
+    where: { provider: "mock" },
+    update: {},
+    create: {
+      provider: "mock",
+      creditLimit: 1_000_000,
+      currency: "USD",
+    },
+  });
+  logger.info("seed.provider_credit_accounts_ready");
+
   // --- PRIMARY admin (non-demo) — the real operator account ---
   const primaryAdminEmail = "ekontetevi@gmail";
   const primaryAdminPassword = "Payswap123456";
