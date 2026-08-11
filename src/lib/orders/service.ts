@@ -321,6 +321,14 @@ export async function confirmAndProvision(input: {
       });
     }
 
+    // --- Complete any pending referral (awards credits to both parties) ---
+    try {
+      const { completeReferral } = await import("@/lib/promotions/referral-service");
+      await completeReferral({ refereeUserId: input.userId, orderId: order.id });
+    } catch (e) {
+      logger.warn("referral.completion_failed", { orderId: order.id, error: e instanceof Error ? e.message : String(e) });
+    }
+
     return { status: "COMPLETED", paymentStatus: "succeeded", esimId };
   } catch (err) {
     logger.error("provisioning.failed", { orderId: order.id, error: err instanceof Error ? err.message : String(err) });
