@@ -433,3 +433,33 @@ Stage Summary:
 - Architecture: "Build recurring relationships instead of one-off transactions."
 - Remaining phases: B2B expansion (employee provisioning, spending limits),
   multi-provider optimization (routing, failover, cost optimization).
+
+---
+Task ID: 22
+Agent: Lead engineer (main)
+Task: Phase 5 — B2B expansion (spending limits, usage reporting, billing, member management).
+
+Work Log:
+- Organization model extended: billingEmail, monthlySpendLimit, currentMonthSpend.
+- OrganizationMember model extended: per-member spendLimit + currentSpend.
+- Spending limit enforcement: checkSpendLimit() checks both org-level and
+  member-level limits before purchases. -1 = disabled, 0 = unlimited.
+- recordOrgSpend(): atomic increment of org + member spend counters.
+- Member management: removeMember (owners protected), updateMember (role + limit).
+- Number assignment: assignNumber to organizations (in addition to eSIMs).
+- Usage reporting: getOrgUsage — eSIM data usage + number SMS/call counts per org.
+- Billing settings: updateOrgBilling (email + spend limit).
+- API routes: GET /api/organization/usage, GET/PATCH /api/organization/billing,
+  PATCH/DELETE /api/organization/members/[id].
+- Web pages: /company/usage (eSIM + number usage), /company/billing (spend config).
+- Company dashboard now has Usage + Billing quick action links.
+- Pushed to GitHub (commit fb540c0). Vercel deployment succeeded.
+- All routes verified on production (200).
+
+Stage Summary:
+- Phase 5 complete: B2B organizations can manage members with spending limits,
+  view usage across eSIMs + numbers, and configure billing.
+- The platform now has the full B2B toolkit: organizations, roles, spending
+  controls, usage reporting, centralized billing, number/eSIM assignment.
+- Remaining: Phase 6 (multi-provider optimization — routing, failover, cost
+  scoring) and Phase 7 (enterprise — contracts, invoicing, account management).
