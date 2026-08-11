@@ -364,3 +364,37 @@ Stage Summary:
 - Next phases: improve eSIM economics (bundles, referrals, retention),
   add recurring connectivity (subscriptions, usage billing), build the
   connectivity account (wallet, cross-selling), B2B, multi-provider optimization.
+
+---
+Task ID: 20
+Agent: Lead engineer (main)
+Task: Phase 2 — Promo codes, referrals, customer credit wallet (improve eSIM customer economics).
+
+Work Log:
+- PromoCode model: percentage/fixed discounts, max uses, per-user limits, validity
+  period, min order amount, max discount cap, profitability guardrails (minMarginPercent).
+- PromoRedemption: 1:1 with order, tracks discount applied.
+- validatePromoCode (non-mutating check) + redeemPromoCode (atomic, increments usesCount).
+- Referral model: unique referral code per user (ROAM-XXXXXX), configurable rewards
+  ($2 referrer + $2 referee), stats (totalReferrals, completedReferrals, totalRewardPaid).
+- ReferralUse: tracks pending/completed, prevents self-referral.
+- completeReferral: awards credits to both parties on referee's first purchase.
+  Wired into the order completion flow (after provisioning + ledger recording).
+- CustomerCredit model: unified balance across all products. CreditTransaction:
+  immutable ledger of credit movements (referral_reward, promo_credit, purchase_credit, etc.).
+- addCredit (admin/referral/promo) + spendCredit (checkout, capped at balance).
+- API routes: POST /api/promo/validate, GET /api/referral.
+- /dashboard/referral: referral code, shareable link, stats (invited/completed/earned),
+  credit balance, credit history.
+- Verified on production: referral code generated (ROAM-BFE4B2), credit balance 0,
+  promo validation rejects invalid codes. Build succeeds, lint clean.
+
+Stage Summary:
+- Phase 2 complete: promo codes, referrals, and unified credit wallet are live.
+- These features directly drive: customer acquisition (referrals), retention
+  (credits incentivize return), and cross-product adoption (credits work across
+  eSIMs and virtual numbers).
+- Every referral reward is tracked in the financial ledger.
+- Architecture: "Build recurring relationships instead of one-off transactions."
+- Next phases: recurring connectivity (subscriptions, usage billing), connectivity
+  account (wallet at checkout), B2B expansion, multi-provider optimization.
