@@ -12,6 +12,7 @@ import { formatPrice, formatDataSize, countryFlag, prettifyStatus, statusColor }
 import { Badge } from "@/components/ui/badge";
 import { toast } from "sonner";
 import { SendToPhoneButton } from "@/components/send-to-phone-button";
+import { CrossSellRecommendations } from "@/components/cross-sell-recommendations";
 
 type OrderData = {
   order: {
@@ -190,6 +191,11 @@ export default function OrderPage({ params }: { params: Promise<{ id: string }> 
             <Button asChild variant="outline">
               <Link href="/dashboard/esims">View My eSIMs</Link>
             </Button>
+          </div>
+
+          {/* Cross-sell recommendations */}
+          <div className="mt-6 w-full">
+            <CrossSellRecommendations productType="esim" countryCode={order.countryCode} countryName={order.country} />
           </div>
         </div>
       ) : provisioning ? (
