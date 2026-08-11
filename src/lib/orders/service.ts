@@ -332,6 +332,11 @@ export async function confirmAndProvision(input: {
     return { status: "COMPLETED", paymentStatus: "succeeded", esimId };
   } catch (err) {
     logger.error("provisioning.failed", { orderId: order.id, error: err instanceof Error ? err.message : String(err) });
+    // Record provider failure
+    try {
+      const { recordProviderResult } = await import("@/lib/providers/routing");
+      recordProviderResult(getESIMProvider().id, false, 0);
+    } catch { /* noop */ }
     await db.order.update({
       where: { id: order.id },
       data: { status: "PROVISIONING_FAILED", failureReason: err instanceof Error ? err.message : "Provisioning failed" },
@@ -369,6 +374,7 @@ export async function provisionOrderESIM(input: {
   await db.order.update({ where: { id: order.id }, data: { status: "ESIM_PROVISIONING" } });
 
   const provider = getESIMProvider();
+  const startTime = Date.now();
 
   // Create provider order (idempotent). We use a stable key derived from orderId.
   const orderKey = `po_${order.id}`;
@@ -382,6 +388,10 @@ export async function provisionOrderESIM(input: {
     providerOrderId,
     idempotencyKey: input.idempotencyKey,
   });
+
+  // Record provider reliability
+  const { recordProviderResult } = await import("@/lib/providers/routing");
+  recordProviderResult(provider.id, true, Date.now() - startTime);
 
   // Build LPA QR payload: LPA:1<smdpAddress>&<activationCode>
   const qrPayload = `LPA:1${result.smdpAddress}&${result.activationCode}`;
