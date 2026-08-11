@@ -317,3 +317,50 @@ Stage Summary:
 - RoamLink is a unified connectivity platform: eSIMs (data) + Virtual Numbers (SMS/voice).
 - Both products share: auth, payments, orders, organizations, billing, web/mobile infra.
 - 59 automated tests covering: pricing, state machine, purchase/provisioning, idempotency, install tokens, webhooks, B2B tenant isolation, virtual numbers.
+
+---
+Task ID: 19
+Agent: Lead engineer (main)
+Task: Phase 1 — Financial ledger, provider credit tracking, business intelligence dashboard.
+
+Work Log:
+- Created FinancialTransaction model: immutable ledger of all financial events
+  (CUSTOMER_PAYMENT, PAYMENT_FEE, PROVIDER_PURCHASE, REFUND, CHARGEBACK, etc.)
+  with full breakdown: customerPrice, providerCost, paymentFee, grossProfit,
+  contributionProfit (auto-calculated), refundCost, fraudLoss.
+- Created ProviderCreditAccount model: tracks credit facilities (Airalo $10K).
+  Fields: creditLimit, outstandingLiability, pendingCommitments, invoicedAmount,
+  paidAmount, configurable thresholds (info 50%, warn 75%, elevated 80%,
+  critical 90%, emergency 95%).
+- Created ProviderInvoice model: reconciliation tracking with mismatch detection.
+- Created PricingSnapshot model: preserves pricing used per transaction so
+  historical economics can't be retroactively changed.
+- Ledger service (src/lib/finance/ledger.ts): recordFinancialEvent (idempotent,
+  auto-calculates grossProfit + contributionProfit), getFinancialSummary,
+  getOrderFinancials.
+- Provider credit service (src/lib/finance/provider-credit.ts): getProviderCredit
+  (with utilization + alertLevel), canProviderCommit (threshold check),
+  addPendingCommitment, settleCommitment, recordProviderInvoice, payProviderInvoice.
+- Wired ledger into existing eSIM purchase flow: every completed order now
+  records 2 ledger entries (customer payment + provider purchase).
+- Business Intelligence Dashboard (/admin/finance): today/month metrics,
+  provider credit exposure with utilization bars + alert levels, financial
+  definitions reference. API: GET /api/admin/finance.
+- Seed: Airalo + mock provider credit accounts created ($10K each).
+- Verified end-to-end on production:
+  * Purchase $9.45 eSIM → ledger records revenue $9.45, provider cost $7.00,
+    payment fee $0.27, contribution profit $1.88
+  * Admin finance dashboard shows real metrics from the ledger
+  * 2 provider accounts tracked, MRR $47.86 from active numbers
+- Pushed to GitHub (commit 037eeb0). Vercel deployment succeeded.
+
+Stage Summary:
+- Phase 1 complete: the eSIM business is now economically tracked.
+- Every transaction has immutable financial truth (not just mutable order records).
+- Provider credit exposure is visible and threshold-controlled.
+- Contribution profit (not just revenue) is calculated per transaction.
+- The Airalo $10K credit facility is modeled as a liability, not cash.
+- Architecture principle: "Build the economics before scaling the features."
+- Next phases: improve eSIM economics (bundles, referrals, retention),
+  add recurring connectivity (subscriptions, usage billing), build the
+  connectivity account (wallet, cross-selling), B2B, multi-provider optimization.
