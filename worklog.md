@@ -398,3 +398,38 @@ Stage Summary:
 - Architecture: "Build recurring relationships instead of one-off transactions."
 - Next phases: recurring connectivity (subscriptions, usage billing), connectivity
   account (wallet at checkout), B2B expansion, multi-provider optimization.
+
+---
+Task ID: 21
+Agent: Lead engineer (main)
+Task: Phase 3+4 — Subscription billing + cross-sell recommendations.
+
+Work Log:
+Phase 3 — Subscription billing:
+- renewSubscription: tries credit balance first, then payment provider (mock/Stripe/etc).
+  On success: extends period by 1 month, updates virtual number expiry, records
+  in financial ledger. On failure: moves to past_due.
+- cancelSubscription: marks cancelled (number stays active until period end).
+- processDueSubscriptions: batch job that processes all due subscriptions:
+  active+past_period → renew → on fail: past_due
+  past_due+past_grace(3d) → suspended (number also suspended)
+  suspended+past_cancellation(7d) → cancelled + number released
+- API routes: GET /api/subscriptions, POST /api/subscriptions/renew,
+  POST /api/subscriptions/[id]/cancel, POST /api/admin/subscriptions/process
+
+Phase 4 — Cross-sell recommendations:
+- CrossSellRecommendations component on order success page.
+- eSIM purchase → suggests getting a virtual number for the same country.
+- Virtual number purchase → suggests getting an eSIM for the same country.
+- Checks user's existing products to avoid redundant suggestions.
+
+Verified on production: 2 active subscriptions, all routes 200, build succeeds.
+
+Stage Summary:
+- Phase 3: Recurring connectivity billing is live. Virtual numbers renew
+  automatically, with credit-balance-first payment, grace periods, and
+  auto-suspension/cancellation. Every renewal is in the financial ledger.
+- Phase 4: Cross-sell drives multi-product adoption (eSIM→number, number→eSIM).
+- Architecture: "Build recurring relationships instead of one-off transactions."
+- Remaining phases: B2B expansion (employee provisioning, spending limits),
+  multi-provider optimization (routing, failover, cost optimization).
