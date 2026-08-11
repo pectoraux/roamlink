@@ -399,6 +399,11 @@ model Organization {
   name      String
   slug      String   @unique
   status    String   @default("active") // active | suspended
+  // Billing
+  billingEmail   String?
+  // Spending limits (in minor units, 0 = unlimited)
+  monthlySpendLimit Int   @default(0) // 0 = no limit
+  currentMonthSpend Int  @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -413,6 +418,9 @@ model OrganizationMember {
   organizationId String
   userId         String
   role           String   @default("member") // owner | admin | member
+  // Per-member spending limit (0 = use org default, -1 = no purchases allowed)
+  spendLimit     Int      @default(0) // minor units per month
+  currentSpend   Int      @default(0) // spent this month
   createdAt      DateTime @default(now())
 
   organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)

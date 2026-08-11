@@ -59,6 +59,8 @@ export default async function CompanyDashboard() {
         <CardContent className="flex flex-wrap gap-3">
           <Button asChild variant="outline"><Link href="/company/employees">Manage employees</Link></Button>
           <Button asChild variant="outline"><Link href="/company/esims">View eSIMs</Link></Button>
+          <Button asChild variant="outline"><Link href="/company/usage">Usage</Link></Button>
+          <Button asChild variant="outline"><Link href="/company/billing">Billing</Link></Button>
           <Button asChild><Link href="/esim"><Plus className="mr-1 h-4 w-4" /> Buy eSIM</Link></Button>
         </CardContent>
       </Card>
