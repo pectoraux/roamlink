@@ -1,14 +1,17 @@
 /**
- * ESIM Fulfillment Adapter — wraps the existing ESIMProvider abstraction so
- * the orchestrator can fulfill ESIM orders without knowing about eSIM-specific
- * APIs (SM-DP+, ICCID, activation codes).
+ * ESIM Fulfillment Adapter — wraps an ESIMProvider instance behind the
+ * generic FulfillmentAdapter interface.
  *
- * The adapter is registered under the providerKey (e.g. "mock") and resolves
- * to the corresponding ESIMProvider via the existing factory.
+ * Phase 2E P0 FIX: The adapter receives a CONCRETE ESIMProvider instance
+ * at construction time — NOT a providerKey that later resolves to a global
+ * getESIMProvider() singleton. Multiple adapters can coexist, each bound
+ * to a different upstream provider instance.
+ *
+ * The purchase path NEVER calls getESIMProvider(). Provider selection is
+ * driven by Supplier.providerKey → registry → adapter → provider instance.
  */
 
-import type { ESIMProvider } from "@/lib/esim";
-import { getESIMProvider } from "@/lib/esim";
+import type { ESIMProvider } from "@/lib/esim/provider";
 import type {
   FulfillmentAdapter,
   FulfillmentContext,
@@ -17,12 +20,13 @@ import type {
 import { logger } from "@/lib/logger";
 
 /**
- * Build a FulfillmentAdapter for a given ESIMProvider instance. Used by the
- * registry to register one adapter per providerKey.
+ * Build a FulfillmentAdapter for a given ESIMProvider instance.
+ * The provider instance is captured in the closure — it is NOT resolved
+ * from a global singleton at call time.
  */
 export function makeESIMFulfillmentAdapter(
   providerKey: string,
-  provider: ESIMProvider = getESIMProvider(),
+  provider: ESIMProvider,
 ): FulfillmentAdapter {
   return {
     providerKey,
@@ -96,11 +100,3 @@ export function makeESIMFulfillmentAdapter(
     },
   };
 }
-
-/**
- * The default ESIM fulfillment adapter — registered under the currently
- * active ESIMProvider's id (default: "mock").
- */
-export const ESIMFulfillmentAdapter: FulfillmentAdapter = makeESIMFulfillmentAdapter(
-  getESIMProvider().id,
-);

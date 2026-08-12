@@ -35,6 +35,7 @@ export type SelectedSupplierOffer = {
   supplierId: string;
   supplierName: string;
   providerKey: string | null;
+  supplierProductId: string | null;
   wholesalePrice: number;
   retailPrice: number;
   currency: string;
@@ -111,6 +112,7 @@ export async function selectSupplierForProduct(
       supplierId: supplier.id,
       supplierName: supplier.name,
       providerKey: supplier.providerKey,
+      supplierProductId: offer.supplierProductId,
       wholesalePrice: offer.wholesalePrice,
       retailPrice: offer.retailPrice,
       currency: offer.currency,

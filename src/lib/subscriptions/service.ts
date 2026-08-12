@@ -6,7 +6,6 @@
 
 import { db } from "@/lib/db";
 import { getPaymentProvider, mockPaymentProvider } from "@/lib/payments";
-import { recordFinancialEvent } from "@/lib/finance/ledger";
 import { spendCredit } from "@/lib/promotions/referral-service";
 import { logger } from "@/lib/logger";
 import { audit } from "@/lib/orders/idempotency";
@@ -104,16 +103,22 @@ export async function renewSubscription(subscriptionId: string): Promise<{
     data: { expiresAt: newPeriodEnd },
   });
 
-  await recordFinancialEvent({
-    type: "CUSTOMER_PAYMENT",
+  // Phase 2E P1 FIX: Use the CANONICAL double-entry ledger path
+  // (finalizeCommercialTransaction), NOT the legacy recordFinancialEvent.
+  // This converges subscription renewal onto the same financial posting
+  // path as the purchase flow — one authoritative ledger.
+  const { finalizeCommercialTransaction } = await import("@/lib/finance/finalize");
+  const paymentFee = paidFromCredit > 0 ? 0 : Math.round(remaining * 0.029 + 30);
+  await finalizeCommercialTransaction({
+    orderId: `sub_renewal_${sub.id}_${sub.currentPeriodEnd.getTime()}`,
     userId,
-    provider: "subscription_renewal",
-    customerPrice: amount,
-    providerCost: vn.providerCost,
-    paymentFee: paidFromCredit > 0 ? 0 : Math.round(remaining * 0.029 + 30),
+    customerPriceMinor: amount,
+    wholesalePriceMinor: vn.providerCost,
+    paymentFeeMinor: paymentFee,
     currency: vn.currency,
-    reason: `Subscription renewal: ${vn.e164}`,
-    idempotencyKey: `ledger_sub_${sub.id}_${sub.currentPeriodEnd.getTime()}`,
+    provider: "subscription_renewal",
+    providerTxnId: vn.providerNumberId ?? undefined,
+    idempotencyKey: `fin_sub_${sub.id}_${sub.currentPeriodEnd.getTime()}`,
   });
 
   await audit({ userId, action: "subscription.renewed", entity: "virtual_number", entityId: vn.id, detail: { subscriptionId: sub.id, newPeriodEnd } });

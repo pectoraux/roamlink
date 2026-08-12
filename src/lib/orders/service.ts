@@ -28,7 +28,6 @@
  */
 
 import { db } from "@/lib/db";
-import { getESIMProvider } from "@/lib/esim";
 import { getPaymentProvider } from "@/lib/payments";
 import { getCanonicalPlan } from "@/lib/plans/service";
 import { assertTransition } from "./state-machine";
@@ -44,6 +43,7 @@ import { AppError, classifyProviderError } from "@/lib/errors";
 import { recordProviderResult } from "@/lib/providers/routing";
 import { computeProductIdentity } from "@/lib/catalog/identity";
 import { selectSupplierForProduct } from "@/lib/orchestration/engine";
+import type { SelectedSupplierOffer } from "@/lib/orchestration/engine";
 import {
   resolveProviderKey,
   getAdapter,
@@ -743,7 +743,64 @@ export async function fulfillOrder(input: {
   }
 
   // 2. Orchestrate: select the best supplier offer for the canonical product.
-  const selected = await selectSupplierForProduct(snapshot.canonicalProductId);
+  //    If the order already has a frozen supplierOfferId (from a previous
+  //    fulfillment attempt), reuse it — do NOT re-select. This ensures that
+  //    mutating catalog state after the first fulfillment attempt does not
+  //    change which supplier fulfills the order.
+  let selected: SelectedSupplierOffer;
+  let frozenSupplierProductId: string;
+
+  if (order.supplierOfferId && order.frozenSupplierProductId) {
+    // Reuse the previously frozen selection.
+    logger.info("fulfillment.reusing_frozen_selection", {
+      orderId: order.id,
+      supplierOfferId: order.supplierOfferId,
+      frozenSupplierProductId: order.frozenSupplierProductId,
+    });
+    // Re-fetch the offer to get the wholesale price (needed for credit reservation).
+    const frozenOffer = await db.connectivityOffer.findUnique({
+      where: { id: order.supplierOfferId },
+      include: { supplier: true },
+    });
+    if (!frozenOffer) {
+      throw new AppError("internal", `Frozen ConnectivityOffer ${order.supplierOfferId} not found`, 500, "The previously selected supplier offer no longer exists.");
+    }
+    selected = {
+      offerId: frozenOffer.id,
+      productId: frozenOffer.productId,
+      supplierId: frozenOffer.supplierId,
+      supplierName: frozenOffer.supplier.name,
+      providerKey: frozenOffer.supplier.providerKey,
+      supplierProductId: order.frozenSupplierProductId, // FROZEN — not re-read from offer
+      wholesalePrice: frozenOffer.wholesalePrice,
+      retailPrice: frozenOffer.retailPrice,
+      currency: frozenOffer.currency,
+      reliability: 0,
+      score: 0,
+      reason: "Reusing frozen selection from previous fulfillment attempt",
+    };
+    frozenSupplierProductId = order.frozenSupplierProductId;
+  } else {
+    // First fulfillment attempt — select the best supplier.
+    selected = await selectSupplierForProduct(snapshot.canonicalProductId);
+    frozenSupplierProductId = selected.supplierProductId ?? "";
+    if (!frozenSupplierProductId) {
+      throw new AppError(
+        "internal",
+        `Selected ConnectivityOffer ${selected.offerId} has no supplierProductId`,
+        500,
+        "The selected supplier offer is missing the provider-native product identifier.",
+      );
+    }
+    // Freeze the selection on the order atomically.
+    await db.order.update({
+      where: { id: order.id },
+      data: {
+        supplierOfferId: selected.offerId,
+        frozenSupplierProductId,
+      },
+    });
+  }
 
   // 3. Reserve provider credit (atomic conditional update, idempotent).
   const reservationId = `res_${order.id}_${selected.offerId}`;
@@ -756,14 +813,9 @@ export async function fulfillOrder(input: {
     orderId: order.id,
   });
 
-  // 4. Record the selected supplier offer on the order (so subsequent
-  //    fulfillments of the same order use the same supplier).
-  await db.order.update({
-    where: { id: order.id },
-    data: { supplierOfferId: selected.offerId },
-  });
-
-  // 5. Resolve the fulfillment adapter (from supplier.providerKey).
+  // 5. Resolve the fulfillment adapter (from the FROZEN providerKey).
+  // The adapter is bound to a specific provider instance at registration time.
+  // getAdapter("mock-a") and getAdapter("mock-b") return DIFFERENT adapters.
   const adapter = getAdapter(providerKey);
 
   // 6. Resolve the persistence handler (from snapshot.productType).
@@ -785,13 +837,12 @@ export async function fulfillOrder(input: {
 
   try {
     // 8. Create provider order + provision.
-    const plan = order.plan;
-    if (!plan) {
-      throw new AppError("internal", "Order has no Plan", 500, "Order is missing the source plan.");
-    }
+    // Use the FROZEN supplierProductId, NOT order.plan.providerPlanId.
+    // This ensures fulfillment uses the supplier-native product identifier
+    // captured at supplier-selection time, not a mutable Plan field.
     const { providerOrderId } = await adapter.createProviderOrder({
       context: ctx,
-      providerPlanId: plan.providerPlanId,
+      providerPlanId: frozenSupplierProductId,
     });
 
     const result = await adapter.provision({ context: ctx, providerOrderId });

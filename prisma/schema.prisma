@@ -181,6 +181,7 @@ model Order {
   fulfillmentExternalReference String? // provider's external fulfillment ref
   fulfillmentEntityId String?  // id of persisted fulfillment entity (e.g. Esim.id)
   supplierOfferId  String?  // the ConnectivityOffer selected by the orchestrator
+  frozenSupplierProductId String? // the supplierProductId frozen at selection time
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 
