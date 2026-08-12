@@ -864,3 +864,29 @@ Stage Summary:
 - Architecture preserved: all reseller orders flow through existing ConnectivityProduct → ConnectivityOffer → Supplier → Routing → FulfillmentAdapter → Provider → Service → Ledger pipeline
 - No parallel commerce/billing/ledger system created — reseller control plane is an operating layer ON TOP OF the canonical connectivity platform
 - Files changed: ~25 new files, 3 modified (schema.prisma, orders/service.ts, orders/idempotency.ts)
+
+---
+Task ID: 2B.1
+Agent: Lead engineer (main) — Reseller Commerce + Billing Convergence
+Task: Fix the 5 issues from independent code review + make reseller control plane commercially real
+
+Work Log:
+- §5 (per-session active tenant): Rewrote context.ts — getActiveTenant now resolves from the current session token (via cookies), setActiveTenant updates only the current session (db.session.updateMany WHERE token+userId, not all user sessions). Two devices can have different active tenants.
+- §3 (hide wholesale prices): Rewrote catalog.ts — removed wholesalePriceMinor from the API response. Replaced with recommendedRetailPriceMinor + minimumRetailPriceMinor (derived server-side). Economics endpoint returns minimumRetailPriceMinor instead of wholesaleCostMinor. Supplier (Airalo) confidential pricing is never exposed to tenants.
+- §4 (real idempotency): Rewrote tenant orders route — requires client-supplied Idempotency-Key header (min 8 chars). Removed Date.now()-based key generation. Repeated requests with the same key return the same order (createOrder is idempotent via DB unique constraint).
+- §2 (canonical product resolution): Rewrote tenant orders route — resolves Plan via DistributionOffer → ConnectivityProduct → sourcePlanId → Plan (NOT fuzzy findFirst by country/dataAmount/validityDays). This prevents two plans with the same visible attributes but different provider identities from being confused.
+- §7+§8 (reseller balance + ledger): Created migration 0006 with TenantBalance + TenantTransaction models. Added 3 new ledger accounts: RESELLER_FUNDS_LIABILITY (2300), PLATFORM_FEE_REVENUE (4100), SAAS_SUBSCRIPTION_REVENUE (4200). Created src/lib/tenant/balance.ts with depositResellerBalance + debitResellerBalance (concurrency-safe FOR UPDATE lock, idempotent via idempotencyKey). Added ledgerResellerDeposit + ledgerResellerPurchase + ledgerSaasSubscriptionPayment posting functions.
+- P0 (no mock payment): Rewrote tenant orders route — debits from TenantBalance (paymentProvider = "reseller_balance", NOT "mock"). Balance check before order creation. Insufficient balance → 402. Platform fee calculated and posted to PLATFORM_FEE_REVENUE (separated from SALES_REVENUE).
+- §10 (platform revenue separation): ledgerResellerPurchase posts Dr RESELLER_FUNDS_LIABILITY (full retail), Cr SALES_REVENUE (retail - platformFee), Cr PLATFORM_FEE_REVENUE (platformFee). Supplier wholesale cost posted separately by ledgerProviderPurchase (Dr COGS, Cr PROVIDER_CREDIT_LIABILITY). RoamLink gross margin = Sales Revenue - COGS.
+- Added /api/tenant/balance (GET) and /api/tenant/balance/deposit (POST) routes. Updated /api/tenant/billing to include balance + transactions. Updated billing UI with a Reseller Balance card + Add Funds button.
+- Fixed supplier model field mismatch: Supplier has `active` (boolean), not `status`. Fixed in catalog.ts + test files.
+
+Stage Summary:
+- Migration: 0006_phase2b1_reseller_balance (TenantBalance, TenantTransaction)
+- New services: tenant/balance.ts (deposit, debit, list transactions — all concurrency-safe + idempotent)
+- New ledger functions: ledgerResellerDeposit, ledgerResellerPurchase, ledgerSaasSubscriptionPayment
+- New API routes: /api/tenant/balance, /api/tenant/balance/deposit
+- Rewritten: tenant orders route (canonical product, real idempotency, reseller balance), tenant context (per-session), tenant catalog (no wholesale exposure)
+- Tests: 19 tests in phase2b1-reseller-commerce.test.ts — all pass (deposit→ledger, catalog no-wholesale, economics, canonical product, order debit, platform fee separation, idempotency, insufficient balance, concurrent, margin protection + 9 static)
+- Architecture preserved: reseller orders flow through existing ConnectivityProduct → ConnectivityOffer → Supplier → Routing → FulfillmentAdapter → Provider → Service → Ledger pipeline. No parallel commerce/billing/ledger system.
+- Supplier confidentiality enforced: wholesale prices never exposed to tenants.

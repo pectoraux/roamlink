@@ -6,6 +6,7 @@
 import { requireUser } from "@/lib/auth";
 import { requireTenantContext, requireTenantRole, TENANT_VIEW_ROLES } from "@/lib/tenant/context";
 import { getTenantEntitlements, calculatePlatformFee } from "@/lib/tenant/entitlements";
+import { getOrCreateTenantBalance, listTenantTransactions } from "@/lib/tenant/balance";
 import { db } from "@/lib/db";
 import { json, errorResponse } from "@/lib/api";
 
@@ -38,6 +39,12 @@ export async function GET() {
     const totalOrderVolume = monthOrders.reduce((s, o) => s + o.amount, 0);
     const feeCalc = await calculatePlatformFee(ctx.tenantId, totalOrderVolume);
 
+    // Phase 2B.1: reseller prepaid balance + recent transactions
+    const [balance, transactions] = await Promise.all([
+      getOrCreateTenantBalance(ctx.tenantId),
+      listTenantTransactions(ctx.tenantId, 10),
+    ]);
+
     return json({
       entitlements,
       subscription: subscription
@@ -63,7 +70,11 @@ export async function GET() {
         platformFeePercent: entitlements.platformFeePercent,
         perOrderFeeMinor: entitlements.perOrderFeeMinor,
         saasMonthlyPriceMinor: entitlements.monthlyPriceMinor,
+        balanceMinor: balance.balanceMinor,
+        totalDepositedMinor: balance.totalDepositedMinor,
+        totalSpentMinor: balance.totalSpentMinor,
       },
+      transactions,
     }, 200);
   } catch (err) {
     return errorResponse(err);

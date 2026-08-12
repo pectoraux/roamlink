@@ -46,8 +46,11 @@ export const ACCOUNT_CODES = {
   ACCOUNTS_PAYABLE: "2000",
   PROVIDER_CREDIT_LIABILITY: "2100",
   CUSTOMER_CREDIT_LIABILITY: "2200",
+  RESELLER_FUNDS_LIABILITY: "2300", // Phase 2B.1: reseller prepaid deposits (liability — RoamLink owes the reseller)
   CONTRIBUTED_CAPITAL: "3000",
   SALES_REVENUE: "4000",
+  PLATFORM_FEE_REVENUE: "4100", // Phase 2B.1: RoamLink platform fee revenue (distinct from connectivity sales)
+  SAAS_SUBSCRIPTION_REVENUE: "4200", // Phase 2B.1: SaaS subscription revenue
   COGS: "5000",
   PAYMENT_FEES: "6000",
   PROMOTIONAL_EXPENSE: "7000",
@@ -65,8 +68,11 @@ const CHART_OF_ACCOUNTS: Array<{
   { code: ACCOUNT_CODES.ACCOUNTS_PAYABLE, name: "Accounts Payable (Suppliers)", type: "liability", normalBalance: "credit" },
   { code: ACCOUNT_CODES.PROVIDER_CREDIT_LIABILITY, name: "Provider Credit Liability", type: "liability", normalBalance: "credit" },
   { code: ACCOUNT_CODES.CUSTOMER_CREDIT_LIABILITY, name: "Customer Credit Liability", type: "liability", normalBalance: "credit" },
+  { code: ACCOUNT_CODES.RESELLER_FUNDS_LIABILITY, name: "Reseller Funds Liability", type: "liability", normalBalance: "credit" },
   { code: ACCOUNT_CODES.CONTRIBUTED_CAPITAL, name: "Contributed Capital", type: "equity", normalBalance: "credit" },
   { code: ACCOUNT_CODES.SALES_REVENUE, name: "Sales Revenue", type: "revenue", normalBalance: "credit" },
+  { code: ACCOUNT_CODES.PLATFORM_FEE_REVENUE, name: "Platform Fee Revenue", type: "revenue", normalBalance: "credit" },
+  { code: ACCOUNT_CODES.SAAS_SUBSCRIPTION_REVENUE, name: "SaaS Subscription Revenue", type: "revenue", normalBalance: "credit" },
   { code: ACCOUNT_CODES.COGS, name: "Cost of Goods Sold", type: "expense", normalBalance: "debit" },
   { code: ACCOUNT_CODES.PAYMENT_FEES, name: "Payment Processing Fees", type: "expense", normalBalance: "debit" },
   { code: ACCOUNT_CODES.PROMOTIONAL_EXPENSE, name: "Promotional Expense", type: "expense", normalBalance: "debit" },
@@ -320,6 +326,105 @@ export async function ledgerCreditIssuance(input: {
     entries: [
       { accountCode: "7000", direction: "debit", amountMinor: input.amountMinor }, // Promotional Expense
       { accountCode: ACCOUNT_CODES.CUSTOMER_CREDIT_LIABILITY, direction: "credit", amountMinor: input.amountMinor },
+    ],
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2B.1 — Reseller financial accounting
+// ---------------------------------------------------------------------------
+
+/**
+ * Record a reseller prepaid deposit.
+ *   Debit  Cash                          amount
+ *   Credit Reseller Funds Liability      amount
+ *
+ * The reseller's prepaid balance is a LIABILITY — RoamLink owes the reseller
+ * connectivity services worth this amount.
+ */
+export async function ledgerResellerDeposit(input: {
+  tenantId: string;
+  userId?: string;
+  amountMinor: number;
+  reason?: string;
+  currency?: string;
+  idempotencyKey: string;
+}): Promise<string> {
+  return postLedgerTransaction({
+    type: "RESELLER_DEPOSIT",
+    description: input.reason ?? `Reseller deposit for tenant ${input.tenantId}`,
+    currency: input.currency,
+    idempotencyKey: input.idempotencyKey,
+    userId: input.userId,
+    entries: [
+      { accountCode: ACCOUNT_CODES.CASH, direction: "debit", amountMinor: input.amountMinor },
+      { accountCode: ACCOUNT_CODES.RESELLER_FUNDS_LIABILITY, direction: "credit", amountMinor: input.amountMinor },
+    ],
+  });
+}
+
+/**
+ * Record a reseller connectivity purchase (debit from reseller balance).
+ *
+ *   Debit  Reseller Funds Liability       retailPriceMinor (the full retail price)
+ *   Credit Sales Revenue                  retailPriceMinor - platformFeeMinor
+ *   Credit Platform Fee Revenue           platformFeeMinor
+ *
+ * Note: The supplier wholesale cost is recorded SEPARATELY by ledgerProviderPurchase
+ * (Dr COGS, Cr Provider Credit Liability). This keeps the reseller's retail price
+ * (what the reseller paid) distinct from the supplier cost (what RoamLink owes
+ * the supplier). RoamLink's gross margin = Sales Revenue - COGS.
+ */
+export async function ledgerResellerPurchase(input: {
+  tenantId: string;
+  userId?: string;
+  orderId?: string;
+  retailPriceMinor: number;
+  platformFeeMinor: number;
+  reason?: string;
+  currency?: string;
+  idempotencyKey: string;
+}): Promise<string> {
+  const connectivityRevenue = input.retailPriceMinor - input.platformFeeMinor;
+  return postLedgerTransaction({
+    type: "RESELLER_PURCHASE",
+    description: input.reason ?? `Reseller purchase for tenant ${input.tenantId}`,
+    currency: input.currency,
+    idempotencyKey: input.idempotencyKey,
+    userId: input.userId,
+    orderId: input.orderId,
+    entries: [
+      { accountCode: ACCOUNT_CODES.RESELLER_FUNDS_LIABILITY, direction: "debit", amountMinor: input.retailPriceMinor },
+      { accountCode: ACCOUNT_CODES.SALES_REVENUE, direction: "credit", amountMinor: connectivityRevenue },
+      ...(input.platformFeeMinor > 0
+        ? [{ accountCode: ACCOUNT_CODES.PLATFORM_FEE_REVENUE, direction: "credit" as const, amountMinor: input.platformFeeMinor }]
+        : []),
+    ],
+  });
+}
+
+/**
+ * Record a SaaS subscription payment.
+ *   Debit  Cash                           amount
+ *   Credit SaaS Subscription Revenue      amount
+ */
+export async function ledgerSaasSubscriptionPayment(input: {
+  tenantId: string;
+  userId?: string;
+  amountMinor: number;
+  reason?: string;
+  currency?: string;
+  idempotencyKey: string;
+}): Promise<string> {
+  return postLedgerTransaction({
+    type: "SAAS_SUBSCRIPTION_PAYMENT",
+    description: input.reason ?? `SaaS subscription for tenant ${input.tenantId}`,
+    currency: input.currency,
+    idempotencyKey: input.idempotencyKey,
+    userId: input.userId,
+    entries: [
+      { accountCode: ACCOUNT_CODES.CASH, direction: "debit", amountMinor: input.amountMinor },
+      { accountCode: ACCOUNT_CODES.SAAS_SUBSCRIPTION_REVENUE, direction: "credit", amountMinor: input.amountMinor },
     ],
   });
 }

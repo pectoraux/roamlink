@@ -215,12 +215,14 @@ describe("Phase 2B — Reseller SaaS Control Plane", () => {
     expect(offer?.retailPrice).toBe(1500); // frozen at creation
   }, 30000);
 
-  it("12. Tenant economics are calculated correctly (retail, wholesale, margin)", async () => {
+  it("12. Tenant economics are calculated correctly (retail, margin — NO wholesale leak)", async () => {
     if (!testDistOfferA_id) return;
     const economics = await getOfferEconomics(tenantA_id, testDistOfferA_id);
     expect(economics.retailPriceMinor).toBe(1500);
-    expect(economics.wholesaleCostMinor).toBeGreaterThanOrEqual(0);
-    expect(economics.grossProfitMinor).toBe(economics.retailPriceMinor - economics.wholesaleCostMinor);
+    // Phase 2B.1: wholesale cost must NOT be exposed
+    expect((economics as any).wholesaleCostMinor).toBeUndefined();
+    expect(economics.minimumRetailPriceMinor).toBeGreaterThan(0);
+    expect(economics.grossProfitMinor).toBeGreaterThanOrEqual(0);
     expect(economics.grossMarginPercent).toBeGreaterThanOrEqual(0);
   }, 30000);
 

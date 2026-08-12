@@ -1023,6 +1023,9 @@ model Tenant {
   customers       TenantCustomer[]
   subscription    TenantSubscription?
   apiKeys         ApiKey[]
+  // Phase 2B.1: reseller balance + transactions
+  balance         TenantBalance?
+  transactions    TenantTransaction[]
 
   @@index([status])
 }
@@ -1226,4 +1229,40 @@ model ApiKey {
 
   @@index([tenantId])
   @@index([hashedKey])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2B.1 — Reseller Balance & Transactions
+// ---------------------------------------------------------------------------
+
+model TenantBalance {
+  id              String   @id @default(cuid())
+  tenantId        String   @unique
+  balanceMinor    Int      @default(0) // current prepaid balance in minor units
+  currency        String   @default("USD")
+  totalDepositedMinor Int  @default(0) // lifetime deposits
+  totalSpentMinor Int      @default(0) // lifetime connectivity purchases
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+}
+
+model TenantTransaction {
+  id              String   @id @default(cuid())
+  tenantId        String
+  type            String   // deposit | purchase | saas_payment | refund | adjustment
+  amountMinor     Int      // positive = credit added, negative = debit
+  balanceAfter    Int      // balance after this transaction
+  orderId         String?  // linked order (for purchases)
+  ledgerTransactionId String? // linked ledger transaction
+  description     String?
+  idempotencyKey  String   @unique // durable identity (prevents duplicate deposits/purchases)
+  createdAt       DateTime @default(now())
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([type])
+  @@index([createdAt])
 }

@@ -3,20 +3,27 @@
  *   GET  /api/tenant/orders       — list tenant orders
  *   POST /api/tenant/orders       — create order for a tenant customer
  *   GET  /api/tenant/orders/:id   — get order detail
+ *
+ * Phase 2B.1:
+ *   - Canonical product resolution: DistributionOffer → ConnectivityProduct → sourcePlanId → Plan
+ *     (NOT fuzzy attribute lookup by country/dataAmount/validityDays)
+ *   - Real idempotency: client-supplied Idempotency-Key header (NOT Date.now())
+ *   - Reseller balance: debits from TenantBalance (NOT mock B2C payment)
+ *   - Platform fee: calculated and posted to a separate ledger revenue account
  */
 
 import { NextRequest } from "next/server";
 import { requireUser } from "@/lib/auth";
 import { requireTenantContext, requireTenantRole, TENANT_WRITE_ROLES, TENANT_VIEW_ROLES } from "@/lib/tenant/context";
-import { getTenantOrders, getTenantOrder } from "@/lib/tenant/service";
+import { getTenantOrders, getTenantOrder, getDistributionOfferForTenant } from "@/lib/tenant/service";
 import { getTenantCustomer } from "@/lib/tenant/customers";
-import { getDistributionOfferForTenant } from "@/lib/tenant/service";
-import { assertCanCreateOrder } from "@/lib/tenant/entitlements";
+import { assertCanCreateOrder, calculatePlatformFee } from "@/lib/tenant/entitlements";
+import { debitResellerBalance, getTenantBalanceMinor } from "@/lib/tenant/balance";
 import { createOrder, confirmAndProvision } from "@/lib/orders/service";
-import { generateIdempotencyKey } from "@/lib/orders/idempotency";
 import { json, errorResponse } from "@/lib/api";
 import { db } from "@/lib/db";
 import { AppError } from "@/lib/errors";
+import { logger } from "@/lib/logger";
 
 export async function GET(req: NextRequest) {
   try {
@@ -43,6 +50,13 @@ export async function POST(req: NextRequest) {
       return json({ error: "tenantCustomerId and distributionOfferId are required" }, 400);
     }
 
+    // Phase 2B.1 §4: Real idempotency — client MUST supply a stable key.
+    // Repeated requests with the same key return the same order.
+    const idempotencyKey = req.headers.get("idempotency-key");
+    if (!idempotencyKey || idempotencyKey.length < 8) {
+      return json({ error: "Idempotency-Key header is required (min 8 characters)" }, 400);
+    }
+
     // Entitlement check
     await assertCanCreateOrder(ctx.tenantId);
 
@@ -52,21 +66,38 @@ export async function POST(req: NextRequest) {
     // Verify the distribution offer belongs to this tenant + get the product
     const distOffer = await getDistributionOfferForTenant(distributionOfferId, ctx.tenantId);
 
-    // Get the canonical plan from the product (for the order service)
-    const plan = await db.plan.findFirst({
-      where: {
-        country: distOffer.product.country,
-        dataAmount: distOffer.product.dataAmount,
-        validityDays: distOffer.product.validityDays,
-        status: "active",
-      },
+    // Phase 2B.1 §2: Canonical product resolution.
+    // DistributionOffer → ConnectivityProduct → sourcePlanId → Plan
+    // (NOT fuzzy attribute lookup by country/dataAmount/validityDays)
+    const product = await db.connectivityProduct.findUnique({
+      where: { id: distOffer.productId },
     });
-    if (!plan) {
-      throw new AppError("not_found", "No matching plan for this product", 404, "The underlying plan is not available.");
+    if (!product) {
+      throw new AppError("not_found", "Connectivity product not found", 404, "The underlying product is not available.");
+    }
+    if (!product.sourcePlanId) {
+      throw new AppError("not_found", "Product has no source plan", 404, "This product is not linked to a plan.");
+    }
+    const plan = await db.plan.findUnique({
+      where: { id: product.sourcePlanId },
+    });
+    if (!plan || plan.status !== "active") {
+      throw new AppError("not_found", "Source plan not available", 404, "The underlying plan is not available.");
     }
 
-    // Create the order with tenant context
-    const idempotencyKey = `tenant_order_${ctx.tenantId}_${tenantCustomerId}_${distributionOfferId}_${Date.now()}`;
+    // Phase 2B.1 P0: Check reseller balance BEFORE creating the order.
+    const retailPrice = distOffer.retailPrice;
+    const balance = await getTenantBalanceMinor(ctx.tenantId);
+    if (balance < retailPrice) {
+      throw new AppError(
+        "validation",
+        `Insufficient balance: ${balance} < ${retailPrice}`,
+        402,
+        `Insufficient reseller balance. Current: $${(balance / 100).toFixed(2)}, required: $${(retailPrice / 100).toFixed(2)}. Please deposit more funds.`,
+      );
+    }
+
+    // Create the order with tenant context (idempotent via the client key)
     const order = await createOrder({
       userId: user.id,
       planId: plan.id,
@@ -77,18 +108,43 @@ export async function POST(req: NextRequest) {
       ip: undefined,
     });
 
-    // Auto-confirm with mock payment (reseller orders are invoiced, not card-paid)
-    // In production, this would go through a reseller-billing path.
+    // Phase 2B.1 P0: Debit the reseller balance (NOT mock B2C payment).
+    // This is a real financial transaction:
+    //   - Dr Reseller Funds Liability (reduces what RoamLink owes the reseller)
+    //   - Cr Sales Revenue (connectivity revenue)
+    //   - Cr Platform Fee Revenue (RoamLink's platform fee, separated)
+    const platformFee = await calculatePlatformFee(ctx.tenantId, retailPrice);
+    const debit = await debitResellerBalance({
+      tenantId: ctx.tenantId,
+      userId: user.id,
+      orderId: order.id,
+      amountMinor: retailPrice,
+      platformFeeMinor: platformFee.totalFeeMinor,
+      idempotencyKey: `reseller_purchase_${order.id}`,
+      description: `Connectivity purchase: ${plan.name} for ${customer.name}`,
+    });
+
+    // Confirm the order payment (paymentProvider = "reseller_balance" — NOT "mock")
+    // and provision through the existing orchestration engine.
     const result = await confirmAndProvision({
       orderId: order.id,
-      paymentProvider: "mock",
-      paymentReference: `tenant_pay_${order.id}`,
+      paymentProvider: "reseller_balance",
+      paymentReference: debit.transactionId,
       paymentFee: 0,
       idempotencyKey: `confirm_${idempotencyKey}`,
       ip: undefined,
     });
 
-    return json({ order, result }, 201);
+    logger.info("reseller.order_completed", {
+      tenantId: ctx.tenantId,
+      orderId: order.id,
+      customerId: tenantCustomerId,
+      retailPrice,
+      platformFee: platformFee.totalFeeMinor,
+      balanceAfter: debit.balanceMinor,
+    });
+
+    return json({ order, result, balanceAfter: debit.balanceMinor }, 201);
   } catch (err) {
     return errorResponse(err);
   }

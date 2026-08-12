@@ -1,22 +1,22 @@
 /**
  * Tenant context — active-tenant resolution for the reseller control plane.
  *
- * Phase 2B: A user may belong to multiple tenants. The active tenant is
- * stored on the Session (session.activeTenantId) and validated server-side
- * against TenantUser membership on every request.
+ * Phase 2B.1: PER-SESSION active tenant.
  *
- * This module provides:
- *   - getActiveTenant(user) — resolve + validate the active tenant
- *   - setActiveTenant(userId, tenantId) — switch active tenant
- *   - requireTenantContext(user) — require an active tenant or throw
- *   - requireTenantRole(user, roles) — require a specific tenant role
+ * The active tenant belongs to the SPECIFIC authenticated session, not the
+ * user globally. A user logged in on two devices can have a different active
+ * tenant on each device. Changing the active tenant on one device does NOT
+ * affect the other device's session.
  *
- * The tenant context is the authorization boundary for ALL /api/tenant/* routes.
+ * The session token (from the `esim_session` cookie) is the key — we resolve
+ * the session by token, read/update its `activeTenantId` field.
  */
 
 import { db } from "@/lib/db";
 import { AppError } from "@/lib/errors";
 import type { AuthUser } from "@/lib/auth";
+import { SESSION_COOKIE } from "@/lib/auth";
+import { cookies } from "next/headers";
 
 export type TenantContext = {
   tenantId: string;
@@ -30,23 +30,40 @@ export type TenantContext = {
 };
 
 /**
- * Resolve the active tenant for a user. Validates that:
- *   1. The user is a member of the active tenant (TenantUser row exists)
- *   2. The tenant is active
+ * Get the session token from the current request's cookies.
+ * Returns null if no session cookie is present.
+ */
+async function getSessionToken(): Promise<string | null> {
+  const store = await cookies();
+  return store.get(SESSION_COOKIE)?.value ?? null;
+}
+
+/**
+ * Resolve the active tenant for a user FROM THE CURRENT SESSION.
+ *
+ * Phase 2B.1: Uses the session token from cookies to find the SPECIFIC session.
+ * The activeTenantId on that session is the active tenant — not a global
+ * user-level setting.
  *
  * Returns null if the user has no active tenant or no tenant memberships.
  */
 export async function getActiveTenant(user: AuthUser): Promise<TenantContext | null> {
-  // Get the user's sessions to find activeTenantId
-  const session = await db.session.findFirst({
-    where: { userId: user.id, activeTenantId: { not: null } },
-    orderBy: { createdAt: "desc" },
-    select: { activeTenantId: true },
-  });
+  const token = await getSessionToken();
 
-  const activeTenantId = session?.activeTenantId;
+  // Resolve the active tenant from THIS session (per-session, not per-user)
+  let activeTenantId: string | null = null;
+  if (token) {
+    const session = await db.session.findUnique({
+      where: { token },
+      select: { activeTenantId: true },
+    });
+    activeTenantId = session?.activeTenantId ?? null;
+  }
+
   if (!activeTenantId) {
-    // No active tenant set — try first membership (convenience for single-tenant users)
+    // No active tenant on this session — try first membership (convenience
+    // for single-tenant users). We do NOT persist this to the session here;
+    // setActiveTenant must be called explicitly to persist.
     const firstMembership = await db.tenantUser.findFirst({
       where: { userId: user.id, tenant: { status: "active" } },
       include: { tenant: { select: { id: true, name: true, slug: true, status: true } } },
@@ -118,7 +135,12 @@ export const TENANT_WRITE_ROLES = ["owner", "admin", "sales", "operations"];
 export const TENANT_VIEW_ROLES = ["owner", "admin", "sales", "support", "billing", "operations", "viewer"];
 
 /**
- * Set the active tenant for a user's current session.
+ * Set the active tenant for the CURRENT SESSION ONLY.
+ *
+ * Phase 2B.1: Updates only the session identified by the current request's
+ * cookie, NOT all sessions for the user. A user on another device keeps
+ * their own active tenant.
+ *
  * Validates that the user is a member of the target tenant.
  */
 export async function setActiveTenant(userId: string, tenantId: string): Promise<void> {
@@ -134,11 +156,21 @@ export async function setActiveTenant(userId: string, tenantId: string): Promise
       "You don't have access to this tenant.",
     );
   }
-  // Update the user's most recent session
-  await db.session.updateMany({
-    where: { userId },
+
+  // Update ONLY the current session (identified by the cookie token)
+  const token = await getSessionToken();
+  if (!token) {
+    throw new AppError("auth", "No active session", 401, "No active session found.");
+  }
+
+  const result = await db.session.updateMany({
+    where: { token, userId }, // scoped to THIS session AND this user
     data: { activeTenantId: tenantId },
   });
+
+  if (result.count === 0) {
+    throw new AppError("auth", "Session not found", 404, "Your session could not be found. Please sign in again.");
+  }
 }
 
 /**

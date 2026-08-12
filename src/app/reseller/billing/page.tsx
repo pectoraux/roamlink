@@ -321,6 +321,76 @@ export default function BillingPage() {
               </CardContent>
             </Card>
 
+            {/* Reseller Balance card */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base flex items-center gap-2">
+                  <CreditCard className="h-4 w-4 text-muted-foreground" />
+                  Reseller Balance
+                </CardTitle>
+                <CardDescription>
+                  Prepaid funds for connectivity purchases
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div>
+                  <p className="text-2xl font-bold">
+                    {formatPrice(data.billing?.balanceMinor ?? 0)}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Current available balance
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-4 pt-2 border-t">
+                  <div>
+                    <p className="text-xs text-muted-foreground">Total deposited</p>
+                    <p className="text-sm font-medium mt-0.5">
+                      {formatPrice(data.billing?.totalDepositedMinor ?? 0)}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-muted-foreground">Total spent</p>
+                    <p className="text-sm font-medium mt-0.5">
+                      {formatPrice(data.billing?.totalSpentMinor ?? 0)}
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  size="sm"
+                  onClick={async () => {
+                    const amount = prompt("Enter deposit amount in cents (e.g. 10000 = $100.00):");
+                    if (!amount) return;
+                    const amountMinor = parseInt(amount, 10);
+                    if (isNaN(amountMinor) || amountMinor <= 0) {
+                      alert("Please enter a valid positive amount in cents");
+                      return;
+                    }
+                    const key = `deposit_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+                    try {
+                      const res = await fetch("/api/tenant/balance/deposit", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ amountMinor, idempotencyKey: key }),
+                      });
+                      if (res.ok) {
+                        const result = await res.json();
+                        alert(`Deposited ${formatPrice(amountMinor)}. New balance: ${formatPrice(result.balanceMinor)}`);
+                        window.location.reload();
+                      } else {
+                        const err = await res.json();
+                        alert(`Error: ${err.error ?? "Deposit failed"}`);
+                      }
+                    } catch (e) {
+                      alert("Network error");
+                    }
+                  }}
+                >
+                  <Plus className="h-4 w-4 mr-1" />
+                  Add Funds
+                </Button>
+              </CardContent>
+            </Card>
+
             {/* Usage card */}
             <Card>
               <CardHeader>

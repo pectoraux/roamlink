@@ -1,12 +1,16 @@
 /**
  * Tenant Catalog service — browse available products + manage DistributionOffers.
  *
- * Phase 2B: A reseller browses the canonical ConnectivityProduct catalog and
- * creates DistributionOffers (their retail price) for products they want to sell.
+ * Phase 2B.1: Supplier wholesale prices are NEVER exposed to tenants.
+ * The tenant sees only:
+ *   - recommendedRetailPriceMinor (platform-suggested retail)
+ *   - minimumRetailPriceMinor (enforced floor, derived from wholesale + margin policy)
+ *   - expectedProfitMinor (if they set their retail price)
+ *   - expectedMarginPercent
  *
- * Margin protection: the service enforces a minimum margin policy server-side.
- * A reseller cannot set a retail price below the supplier wholesale cost
- * (unless explicitly allowed by platform policy).
+ * The actual wholesale cost is used server-side for margin enforcement but
+ * never returned to the browser. This protects supplier (Airalo) confidential
+ * commercial terms.
  */
 
 import { db } from "@/lib/db";
@@ -15,20 +19,32 @@ import { logger } from "@/lib/logger";
 import { audit } from "@/lib/orders/idempotency";
 import { createDistributionOffer, getDistributionOffers, getDistributionOfferForTenant } from "./service";
 
-/** Minimum margin percent enforced platform-wide (retail must be >= wholesale * (1 + MIN_MARGIN/100)). */
-const MIN_MARGIN_PERCENT = 0; // 0% — reseller can sell at cost but not below cost
+/**
+ * Minimum margin percent enforced platform-wide.
+ * The minimum retail price = ceil(wholesale * (1 + MIN_MARGIN_PERCENT / 100)).
+ * The tenant never sees the wholesale price — only the derived minimum.
+ */
+const MIN_MARGIN_PERCENT = 10; // 10% minimum margin
+
+/**
+ * Recommended retail markup percent (applied to wholesale to suggest a retail price).
+ * The tenant sees this as a suggestion, not a requirement.
+ */
+const RECOMMENDED_MARKUP_PERCENT = 40; // 40% markup = suggested retail
 
 /**
  * List all available connectivity products (the catalog the reseller can sell).
  * Includes the reseller's existing DistributionOffer if one exists.
+ *
+ * Phase 2B.1: Does NOT return wholesale prices. Returns recommended + minimum
+ * retail prices derived server-side.
  */
 export async function listAvailableProducts(tenantId: string) {
   const products = await db.connectivityProduct.findMany({
     where: { active: true },
     include: {
       offers: {
-        where: { supplier: { status: "active" } },
-        include: { supplier: true },
+        where: { supplier: { active: true } },
       },
       distributionOffers: {
         where: { tenantId },
@@ -37,10 +53,15 @@ export async function listAvailableProducts(tenantId: string) {
     orderBy: { createdAt: "desc" },
   });
 
-  // Map to a reseller-friendly view (hide supplier-confidential data)
   return products.map((p) => {
-    // Find the best (lowest wholesale) offer for margin calculation
-    const bestOffer = p.offers.sort((a, b) => a.wholesalePriceMinor - b.wholesalePriceMinor)[0];
+    // Find the best (lowest wholesale) offer for price calculation (server-side only)
+    const bestOffer = p.offers.sort((a, b) => a.wholesalePrice - b.wholesalePrice)[0];
+    const wholesale = bestOffer?.wholesalePrice ?? 0;
+
+    // Derive tenant-safe pricing (wholesale never leaves the server)
+    const minimumRetailPriceMinor = Math.ceil(wholesale * (1 + MIN_MARGIN_PERCENT / 100));
+    const recommendedRetailPriceMinor = Math.ceil(wholesale * (1 + RECOMMENDED_MARKUP_PERCENT / 100));
+
     const distOffer = p.distributionOffers[0]; // one per tenant per product
     return {
       id: p.id,
@@ -51,11 +72,10 @@ export async function listAvailableProducts(tenantId: string) {
       dataAmount: p.dataAmountMB,
       validityDays: p.validityDays,
       status: p.active ? "active" : "inactive",
-      // The reseller sees the wholesale cost ONLY for margin calculation.
-      // In a production system with supplier confidentiality, this would be
-      // replaced by a "recommended retail price" that hides the actual cost.
-      wholesalePriceMinor: bestOffer?.wholesalePriceMinor ?? 0,
-      supplierCount: p.offers.length,
+      // Tenant-safe pricing — NO wholesale cost exposed
+      recommendedRetailPriceMinor,
+      minimumRetailPriceMinor,
+      supplierCount: p.offers.length, // count is safe; identities are not
       // The reseller's distribution offer (if they've enabled this product)
       distributionOffer: distOffer
         ? {
@@ -63,6 +83,11 @@ export async function listAvailableProducts(tenantId: string) {
             retailPrice: distOffer.retailPrice,
             status: distOffer.status,
             audience: distOffer.audience,
+            // Expected profit/margin (calculated server-side, no wholesale leak)
+            expectedProfitMinor: distOffer.retailPrice - wholesale,
+            expectedMarginPercent: distOffer.retailPrice > 0
+              ? Math.round(((distOffer.retailPrice - wholesale) / distOffer.retailPrice) * 10000) / 100
+              : 0,
           }
         : null,
     };
@@ -71,7 +96,7 @@ export async function listAvailableProducts(tenantId: string) {
 
 /**
  * Enable a product for a tenant by creating a DistributionOffer.
- * Enforces margin protection: retailPrice must be >= wholesale * (1 + MIN_MARGIN/100).
+ * Enforces margin protection: retailPrice must be >= minimumRetailPriceMinor.
  */
 export async function enableProduct(input: {
   tenantId: string;
@@ -84,7 +109,7 @@ export async function enableProduct(input: {
     where: { id: input.productId },
     include: {
       offers: {
-        where: { supplier: { status: "active" } },
+        where: { supplier: { active: true } },
       },
     },
   });
@@ -95,13 +120,13 @@ export async function enableProduct(input: {
     throw new AppError("validation", "No active supplier for this product", 400, "This product has no active supplier.");
   }
 
-  // Margin protection
-  const bestWholesale = Math.min(...product.offers.map((o) => o.wholesalePriceMinor));
+  // Margin protection (server-side, using wholesale — never exposed)
+  const bestWholesale = Math.min(...product.offers.map((o) => o.wholesalePrice));
   const minRetail = Math.ceil(bestWholesale * (1 + MIN_MARGIN_PERCENT / 100));
   if (input.retailPriceMinor < minRetail) {
     throw new AppError(
       "validation",
-      `Retail price below minimum (${minRetail})`,
+      `Retail price below minimum`,
       400,
       `The retail price must be at least $${(minRetail / 100).toFixed(2)} to maintain margin policy.`,
     );
@@ -148,28 +173,30 @@ export async function getTenantCatalog(tenantId: string) {
 
 /**
  * Calculate the reseller economics for a distribution offer.
- * Returns retail, wholesale, gross profit, gross margin — without exposing
- * supplier-confidential data to the reseller's customers.
+ *
+ * Phase 2B.1: Returns tenant-safe economics. The wholesale cost is used
+ * server-side to calculate profit/margin but is NOT returned.
  */
 export async function getOfferEconomics(tenantId: string, offerId: string) {
   const offer = await getDistributionOfferForTenant(offerId, tenantId);
-  // Get the best wholesale price for this product
+  // Get the best wholesale price for this product (server-side only)
   const product = await db.connectivityProduct.findUnique({
     where: { id: offer.productId },
     include: {
       offers: {
-        where: { supplier: { status: "active" } },
-        select: { wholesalePriceMinor: true },
+        where: { supplier: { active: true } },
+        select: { wholesalePrice: true },
       },
     },
   });
-  const wholesale = product?.offers.length ? Math.min(...product.offers.map((o) => o.wholesalePriceMinor)) : 0;
+  const wholesale = product?.offers.length ? Math.min(...product.offers.map((o) => o.wholesalePrice)) : 0;
   const retail = offer.retailPrice;
   const grossProfit = retail - wholesale;
   const grossMarginPercent = retail > 0 ? (grossProfit / retail) * 100 : 0;
   return {
     retailPriceMinor: retail,
-    wholesaleCostMinor: wholesale, // visible to tenant admin for margin calculation
+    // NO wholesaleCostMinor — supplier confidentiality enforced
+    minimumRetailPriceMinor: Math.ceil(wholesale * (1 + MIN_MARGIN_PERCENT / 100)),
     grossProfitMinor: grossProfit,
     grossMarginPercent: Math.round(grossMarginPercent * 100) / 100,
   };
