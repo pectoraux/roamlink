@@ -90,6 +90,50 @@ export type UsageSample = {
   timestamp: string;
 };
 
+/** Result of provisioning a connectivity product via a supplier adapter. */
+export type ProvisioningResult = {
+  providerESIMId: string;
+  iccid: string;
+  smdpAddress: string;
+  activationCode: string;
+  matchId?: string;
+  dataAmountMB: number;
+  validityDays: number;
+  expiresAt: string;
+};
+
+/** Result of a top-up operation. */
+export type TopUpResult = {
+  providerTopUpId: string;
+  dataAddedMB: number;
+  newRemainingMB: number;
+  expiresAt?: string;
+};
+
+/** Canonical plan (internal — includes wholesale cost). */
+export type CanonicalPlan = {
+  id: string;
+  providerId: string;
+  providerPlanId: string;
+  name: string;
+  description: string | null;
+  country: string;
+  countryCode: string;
+  region: string;
+  dataAmountMB: number;
+  dataUnit: string;
+  validityDays: number;
+  priceMinor: number;
+  currency: Currency;
+  coverage: string | null;
+  networks: string[];
+  roaming: boolean;
+  hotspot: boolean;
+  speed: string | null;
+  topUpSupported: boolean;
+  status: "active" | "inactive";
+};
+
 export type AuthUser = {
   id: string;
   email: string;

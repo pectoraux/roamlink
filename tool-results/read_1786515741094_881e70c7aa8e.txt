@@ -1,0 +1,831 @@
+     1→// =============================================================================
+     2→// eSIM Marketplace — Prisma Schema
+     3→// -----------------------------------------------------------------------------
+     4→// DATABASE: PostgreSQL (Neon) is the canonical database for development,
+     5→// staging, and production. SQLite is NOT supported. Money is stored as Int
+     6→// (minor units) — never float.
+     7→// =============================================================================
+     8→
+     9→generator client {
+    10→  provider        = "prisma-client-js"
+    11→  binaryTargets   = ["native", "rhel-openssl-3.0.x", "linux-arm64-openssl-3.0.x"]
+    12→}
+    13→
+    14→datasource db {
+    15→  provider  = "postgresql"
+    16→  url       = env("DATABASE_URL")
+    17→  directUrl = env("DIRECT_URL")
+    18→}
+    19→
+    20→// ---------------------------------------------------------------------------
+    21→// User & Authentication
+    22→// ---------------------------------------------------------------------------
+    23→
+    24→model User {
+    25→  id            String   @id @default(cuid())
+    26→  email         String   @unique
+    27→  name          String?
+    28→  passwordHash  String
+    29→  role          String   @default("customer") // "customer" | "admin"
+    30→  isDemo        Boolean  @default(false) // demo accounts (quick-login)
+    31→  emailVerified DateTime?
+    32→  createdAt     DateTime @default(now())
+    33→  updatedAt     DateTime @updatedAt
+    34→
+    35→  sessions              Session[]
+    36→  orders                Order[]
+    37→  esims                 Esim[]
+    38→  payments              Payment[]
+    39→  topUps                TopUp[]
+    40→  auditLogs             AuditLog[]
+    41→  passwordResetTokens   PasswordResetToken[]
+    42→  emailVerificationTokens EmailVerificationToken[]
+    43→  approvedFrom          WaitlistEntry?
+    44→  approvedWaitlist      WaitlistEntry[] @relation("WaitlistApprover")
+    45→  orgMemberships        OrganizationMember[]
+    46→  virtualNumbers        VirtualNumber[]
+    47→  numberSubscriptions   NumberSubscription[]
+    48→  financialTxns         FinancialTransaction[]
+    49→  referral              Referral?             @relation("ReferralUser")
+    50→  referralUses          ReferralUse[]          @relation("RefereeUser")
+    51→  credit                CustomerCredit?
+    52→  creditTxns            CreditTransaction[]
+    53→}
+    54→
+    55→model WaitlistEntry {
+    56→  id          String   @id @default(cuid())
+    57→  email       String   @unique
+    58→  name        String?
+    59→  status      String   @default("pending") // pending | approved | rejected
+    60→  note        String?  // admin note
+    61→  approvedById String? // admin user who approved
+    62→  approvedAt  DateTime?
+    63→  createdUserId String? @unique // the User created when approved (1:1)
+    64→  createdAt   DateTime @default(now())
+    65→  updatedAt   DateTime @updatedAt
+    66→
+    67→  approvedBy  User?    @relation("WaitlistApprover", fields: [approvedById], references: [id])
+    68→  createdUser User?    @relation(fields: [createdUserId], references: [id])
+    69→
+    70→  @@index([status])
+    71→}
+    72→
+    73→model Session {
+    74→  id           String   @id @default(cuid())
+    75→  userId       String
+    76→  token        String   @unique
+    77→  expiresAt    DateTime
+    78→  userAgent    String?
+    79→  ip           String?
+    80→  createdAt    DateTime @default(now())
+    81→
+    82→  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+    83→
+    84→  @@index([userId])
+    85→}
+    86→
+    87→model PasswordResetToken {
+    88→  id        String   @id @default(cuid())
+    89→  userId    String
+    90→  token     String   @unique
+    91→  expiresAt DateTime
+    92→  usedAt    DateTime?
+    93→  createdAt DateTime @default(now())
+    94→
+    95→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+    96→
+    97→  @@index([userId])
+    98→}
+    99→
+   100→model EmailVerificationToken {
+   101→  id        String   @id @default(cuid())
+   102→  userId    String
+   103→  token     String   @unique
+   104→  expiresAt DateTime
+   105→  createdAt DateTime @default(now())
+   106→
+   107→  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   108→
+   109→  @@index([userId])
+   110→}
+   111→
+   112→// ---------------------------------------------------------------------------
+   113→// Plans (canonical marketplace model — never provider-native shape)
+   114→// ---------------------------------------------------------------------------
+   115→
+   116→model Plan {
+   117→  id              String   @id @default(cuid())
+   118→  providerId      String   // internal provider key, e.g. "mock"
+   119→  providerPlanId  String   // provider's native plan id
+   120→  name            String
+   121→  description     String?
+   122→  country         String
+   123→  countryCode     String   // ISO 3166-1 alpha-2
+   124→  region          String   // e.g. "Africa", "Europe", "North America"
+   125→  dataAmount      Int      // in MB (1024 = 1 GB)
+   126→  dataUnit        String   @default("MB")
+   127→  validityDays    Int
+   128→  // Money — integer minor units (cents). See lib/money.ts.
+   129→  price           Int      // retail price in minor units
+   130→  wholesalePrice  Int      // internal cost, NEVER exposed to customers
+   131→  currency        String   @default("USD")
+   132→  coverage        String?  // comma-separated countries / description
+   133→  networks        String?  // JSON string: ["MTN","Vodafone"]
+   134→  roaming         Boolean  @default(false)
+   135→  hotspot         Boolean  @default(true)
+   136→  speed           String?  // e.g. "4G/5G"
+   137→  topUpSupported  Boolean  @default(true)
+   138→  status          String   @default("active") // "active" | "inactive"
+   139→  // Pricing rule that produced `price` (audit). JSON string.
+   140→  pricingRule     String?
+   141→  // Provider-native payload (never sent to client). JSON string.
+   142→  metadata        String?
+   143→  createdAt       DateTime @default(now())
+   144→  updatedAt       DateTime @updatedAt
+   145→
+   146→  orders          Order[]
+   147→
+   148→  @@unique([providerId, providerPlanId])
+   149→  @@index([countryCode])
+   150→  @@index([region])
+   151→  @@index([status])
+   152→}
+   153→
+   154→// ---------------------------------------------------------------------------
+   155→// Orders
+   156→// ---------------------------------------------------------------------------
+   157→
+   158→model Order {
+   159→  id               String   @id @default(cuid())
+   160→  userId           String
+   161→  planId           String?  // nullable for virtual-number orders (no Plan row)
+   162→  productType      String   @default("esim") // esim | virtual_number
+   163→  // State machine: PLAN_SELECTED | CHECKOUT_CREATED | PAYMENT_PENDING |
+   164→  // PAYMENT_CONFIRMED | ESIM_PROVISIONING | ESIM_PROVISIONED | COMPLETED |
+   165→  // PAYMENT_FAILED | PROVISIONING_FAILED | CANCELLED | REFUNDED
+   166→  status           String   @default("PLAN_SELECTED")
+   167→  amount           Int      // total charged (minor units)
+   168→  currency         String   @default("USD")
+   169→  paymentStatus    String   @default("pending") // pending | succeeded | failed | refunded
+   170→  paymentProvider  String?
+   171→  paymentReference String?  // provider's payment intent / charge id
+   172→  providerOrderId  String?  // eSIM provider order id
+   173→  // Idempotency: prevents duplicate orders / payments / provisioning on retry.
+   174→  idempotencyKey   String   @unique
+   175→  // Snapshot of plan at purchase time (so historical orders stay accurate).
+   176→  planSnapshot     String?  // JSON string
+   177→  failureReason    String?
+   178→  createdAt        DateTime @default(now())
+   179→  updatedAt        DateTime @updatedAt
+   180→
+   181→  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   182→  plan             Plan?    @relation(fields: [planId], references: [id])
+   183→  payments         Payment[]
+   184→  esim             Esim?
+   185→  corporateOrder   CorporateOrder?
+   186→  virtualNumber    VirtualNumber? @relation("VirtualNumberOrder")
+   187→  financialTxns    FinancialTransaction[] @relation("FinancialOrder")
+   188→  promoRedemption  PromoRedemption?       @relation("PromoOrder")
+   189→
+   190→  @@index([userId])
+   191→  @@index([status])
+   192→  @@index([paymentStatus])
+   193→}
+   194→
+   195→// ---------------------------------------------------------------------------
+   196→// Payments
+   197→// ---------------------------------------------------------------------------
+   198→
+   199→model Payment {
+   200→  id               String   @id @default(cuid())
+   201→  userId           String
+   202→  orderId          String
+   203→  amount           Int
+   204→  currency         String   @default("USD")
+   205→  status           String   @default("pending") // pending | succeeded | failed | refunded
+   206→  provider         String
+   207→  providerReference String?
+   208→  // Idempotency key from the client payment attempt.
+   209→  idempotencyKey   String?  @unique
+   210→  raw              String?  // provider response (server-side only), JSON string
+   211→  createdAt        DateTime @default(now())
+   212→  updatedAt        DateTime @updatedAt
+   213→
+   214→  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   215→  order            Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+   216→
+   217→  @@index([orderId])
+   218→  @@index([status])
+   219→}
+   220→
+   221→// ---------------------------------------------------------------------------
+   222→// eSIMs
+   223→// ---------------------------------------------------------------------------
+   224→
+   225→model Esim {
+   226→  id              String    @id @default(cuid())
+   227→  userId          String
+   228→  orderId         String    @unique // one eSIM per order (1:1)
+   229→  provider        String
+   230→  providerESIMId  String?   // provider's native esim id
+   231→  iccid           String?   // 19-20 digit Integrated Circuit Card ID
+   232→  smdpAddress     String?   // SM-DP+ server address
+   233→  activationCode  String?   // LPA activation code
+   234→  matchId         String?   // optional confirmation code
+   235→  qrCode          String?   // generated QR payload (LPA string)
+   236→  status          String    @default("pending") // pending|active|expired|suspended|exhausted|cancelled
+   237→  dataAmount      Int       // total allowance in MB
+   238→  dataRemaining   Int       // remaining in MB
+   239→  validityDays    Int
+   240→  expiresAt       DateTime?
+   241→  createdAt       DateTime  @default(now())
+   242→  updatedAt       DateTime  @updatedAt
+   243→
+   244→  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+   245→  order           Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+   246→  usages          Usage[]
+   247→  topUps          TopUp[]
+   248→  orgAssignments  OrganizationESIM[]
+   249→
+   250→  @@index([userId])
+   251→  @@index([status])
+   252→  @@index([iccid])
+   253→}
+   254→
+   255→// ---------------------------------------------------------------------------
+   256→// Usage tracking
+   257→// ---------------------------------------------------------------------------
+   258→
+   259→model Usage {
+   260→  id            String   @id @default(cuid())
+   261→  esimId        String
+   262→  dataUsed      Int      // MB used in this sample
+   263→  dataRemaining Int      // MB remaining at sample time
+   264→  source        String   @default("provider") // provider | simulated
+   265→  timestamp     DateTime @default(now())
+   266→
+   267→  esim          Esim     @relation(fields: [esimId], references: [id], onDelete: Cascade)
+   268→
+   269→  @@index([esimId])
+   270→}
+   271→
+   272→// ---------------------------------------------------------------------------
+   273→// Top-ups
+   274→// ---------------------------------------------------------------------------
+   275→
+   276→model TopUp {
+   277→  id               String   @id @default(cuid())
+   278→  esimId           String
+   279→  userId           String
+   280→  amount           Int      // charged (minor units)
+   281→  currency         String   @default("USD")
+   282→  dataAmount       Int      // MB added
+   283→  paymentStatus    String   @default("pending") // pending | succeeded | failed
+   284→  providerReference String?
+   285→  idempotencyKey   String   @unique
+   286→  createdAt        DateTime @default(now())
+   287→
+   288→  esim             Esim     @relation(fields: [esimId], references: [id], onDelete: Cascade)
+   289→  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   290→
+   291→  @@index([esimId])
+   292→}
+   293→
+   294→// ---------------------------------------------------------------------------
+   295→// Webhook events (idempotent delivery log)
+   296→// ---------------------------------------------------------------------------
+   297→
+   298→model WebhookEvent {
+   299→  id          String   @id @default(cuid())
+   300→  provider    String
+   301→  eventType   String
+   302→  externalId  String?  // provider's event id, used for dedup
+   303→  payload     String   // JSON string
+   304→  processed   Boolean  @default(false)
+   305→  error       String?
+   306→  createdAt   DateTime @default(now())
+   307→  processedAt DateTime?
+   308→
+   309→  @@unique([provider, externalId])
+   310→  @@index([provider, eventType])
+   311→}
+   312→
+   313→// ---------------------------------------------------------------------------
+   314→// Audit log
+   315→// ---------------------------------------------------------------------------
+   316→
+   317→model AuditLog {
+   318→  id        String   @id @default(cuid())
+   319→  userId    String?
+   320→  orderId   String?
+   321→  action    String
+   322→  entity    String   // order | esim | payment | plan | user
+   323→  entityId  String?
+   324→  detail    String?  // JSON string
+   325→  ip        String?
+   326→  createdAt DateTime @default(now())
+   327→
+   328→  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+   329→
+   330→  @@index([userId])
+   331→  @@index([entity, entityId])
+   332→}
+   333→
+   334→// ---------------------------------------------------------------------------
+   335→// Pricing rules (markup engine)
+   336→// ---------------------------------------------------------------------------
+   337→
+   338→model PricingRule {
+   339→  id         String   @id @default(cuid())
+   340→  name       String
+   341→  type       String   // "fixed" | "percentage"
+   342→  value      Int      // fixed: minor units; percentage: basis points (30% = 3000)
+   343→  scope      String   @default("global") // global | country | region
+   344→  scopeValue String?  // countryCode / region when scoped
+   345→  priority   Int      @default(0) // higher wins
+   346→  active     Boolean  @default(true)
+   347→  createdAt  DateTime @default(now())
+   348→  updatedAt  DateTime @updatedAt
+   349→
+   350→  @@index([scope, scopeValue])
+   351→}
+   352→
+   353→// ---------------------------------------------------------------------------
+   354→// Notifications log (development implementation)
+   355→// ---------------------------------------------------------------------------
+   356→
+   357→model Notification {
+   358→  id        String   @id @default(cuid())
+   359→  userId    String?
+   360→  channel   String   // email | sms | push | whatsapp | log
+   361→  event     String
+   362→  recipient String?
+   363→  subject   String?
+   364→  body      String
+   365→  status    String   @default("sent") // sent | failed
+   366→  createdAt DateTime @default(now())
+   367→
+   368→  @@index([userId])
+   369→  @@index([event])
+   370→}
+   371→
+   372→// ---------------------------------------------------------------------------
+   373→// Installation tokens — short-lived, secure tokens for web→mobile deep linking.
+   374→// A web purchase generates a token; the mobile app consumes it to install the
+   375→// eSIM. Never expose raw activation secrets in permanent URLs.
+   376→// ---------------------------------------------------------------------------
+   377→
+   378→model InstallToken {
+   379→  id        String    @id @default(cuid())
+   380→  token     String    @unique
+   381→  userId    String
+   382→  esimId    String
+   383→  expiresAt DateTime
+   384→  usedAt    DateTime?
+   385→  createdAt DateTime  @default(now())
+   386→
+   387→  @@index([userId])
+   388→  @@index([esimId])
+   389→}
+   390→
+   391→// ---------------------------------------------------------------------------
+   392→// B2B foundation — organizations, members, corporate eSIMs.
+   393→// Built as a foundation so corporate features can be added without redesigning
+   394→// authentication. Not fully implemented yet.
+   395→// ---------------------------------------------------------------------------
+   396→
+   397→model Organization {
+   398→  id        String   @id @default(cuid())
+   399→  name      String
+   400→  slug      String   @unique
+   401→  status    String   @default("active") // active | suspended
+   402→  // Billing
+   403→  billingEmail   String?
+   404→  // Spending limits (in minor units, 0 = unlimited)
+   405→  monthlySpendLimit Int   @default(0) // 0 = no limit
+   406→  currentMonthSpend Int  @default(0)
+   407→  createdAt DateTime @default(now())
+   408→  updatedAt DateTime @updatedAt
+   409→
+   410→  members   OrganizationMember[]
+   411→  esims     OrganizationESIM[]
+   412→  orders    CorporateOrder[]
+   413→  numbers   VirtualNumber[] @relation("OrgNumbers")
+   414→}
+   415→
+   416→model OrganizationMember {
+   417→  id             String   @id @default(cuid())
+   418→  organizationId String
+   419→  userId         String
+   420→  role           String   @default("member") // owner | admin | member
+   421→  // Per-member spending limit (0 = use org default, -1 = no purchases allowed)
+   422→  spendLimit     Int      @default(0) // minor units per month
+   423→  currentSpend   Int      @default(0) // spent this month
+   424→  createdAt      DateTime @default(now())
+   425→
+   426→  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+   427→  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+   428→
+   429→  @@unique([organizationId, userId])
+   430→  @@index([userId])
+   431→}
+   432→
+   433→model OrganizationESIM {
+   434→  id             String   @id @default(cuid())
+   435→  organizationId String
+   436→  esimId         String
+   437→  assignedTo     String?  // employee name/email
+   438→  createdAt      DateTime @default(now())
+   439→
+   440→  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+   441→  esim           Esim        @relation(fields: [esimId], references: [id], onDelete: Cascade)
+   442→
+   443→  @@index([organizationId])
+   444→  @@index([esimId])
+   445→}
+   446→
+   447→model CorporateOrder {
+   448→  id             String   @id @default(cuid())
+   449→  organizationId String
+   450→  orderId        String   @unique
+   451→  createdAt      DateTime @default(now())
+   452→
+   453→  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+   454→  order          Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+   455→
+   456→  @@index([organizationId])
+   457→}
+   458→
+   459→// ---------------------------------------------------------------------------
+   460→// Virtual Numbers — second connectivity product alongside eSIMs.
+   461→// Reuses: User, Organization, Order, Payment, WebhookEvent, AuditLog.
+   462→// ---------------------------------------------------------------------------
+   463→
+   464→model VirtualNumber {
+   465→  id              String    @id @default(cuid())
+   466→  e164            String    @unique // e.g. "+233241234567"
+   467→  country         String
+   468→  countryCode     String
+   469→  region          String?
+   470→  city            String?
+   471→  numberType      String    @default("local") // local | toll_free | mobile | national
+   472→  smsEnabled      Boolean   @default(false)
+   473→  mmsEnabled      Boolean   @default(false)
+   474→  voiceEnabled    Boolean   @default(false)
+   475→  // Lifecycle: discovered | available | reserved | provisioning | configuring | active | suspended | releasing | released | failed
+   476→  status          String    @default("available")
+   477→  provider        String    // e.g. "mock", "telnyx", "twilio"
+   478→  providerNumberId String?  // provider's native number id
+   479→  providerCost    Int       // wholesale cost in minor units (monthly)
+   480→  sellingPrice    Int       // customer price in minor units (monthly)
+   481→  currency        String    @default("USD")
+   482→  userId          String?
+   483→  organizationId  String?
+   484→  orderId         String?   @unique // 1:1 with the order that purchased it
+   485→  activatedAt     DateTime?
+   486→  releasedAt      DateTime?
+   487→  expiresAt       DateTime? // subscription expiry
+   488→  createdAt       DateTime  @default(now())
+   489→  updatedAt       DateTime  @updatedAt
+   490→
+   491→  user            User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
+   492→  order           Order?          @relation("VirtualNumberOrder", fields: [orderId], references: [id], onDelete: SetNull)
+   493→  organization    Organization?   @relation("OrgNumbers", fields: [organizationId], references: [id], onDelete: SetNull)
+   494→  messages        Message[]
+   495→  calls           Call[]
+   496→  subscriptions   NumberSubscription[]
+   497→
+   498→  @@index([userId])
+   499→  @@index([organizationId])
+   500→  @@index([countryCode])
+   501→  @@index([status])
+   502→}
+   503→
+   504→model NumberSubscription {
+   505→  id              String    @id @default(cuid())
+   506→  virtualNumberId String
+   507→  userId          String
+   508→  status          String    @default("active") // active | past_due | suspended | cancelled | expired | trial
+   509→  billingCycle    String    @default("monthly") // monthly | yearly
+   510→  currentPeriodEnd DateTime
+   511→  trialEndsAt     DateTime?
+   512→  cancelledAt     DateTime?
+   513→  idempotencyKey  String    @unique
+   514→  createdAt       DateTime  @default(now())
+   515→  updatedAt       DateTime  @updatedAt
+   516→
+   517→  virtualNumber   VirtualNumber @relation(fields: [virtualNumberId], references: [id], onDelete: Cascade)
+   518→  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+   519→
+   520→  @@index([userId])
+   521→  @@index([virtualNumberId])
+   522→  @@index([status])
+   523→}
+   524→
+   525→model Message {
+   526→  id              String   @id @default(cuid())
+   527→  virtualNumberId String
+   528→  direction       String   // inbound | outbound
+   529→  fromNumber      String
+   530→  toNumber        String
+   531→  body            String
+   532→  status          String   @default("received") // received | sent | delivered | failed
+   533→  providerMessageId String?
+   534→  segments        Int      @default(1)
+   535→  createdAt       DateTime @default(now())
+   536→
+   537→  virtualNumber   VirtualNumber @relation(fields: [virtualNumberId], references: [id], onDelete: Cascade)
+   538→
+   539→  @@index([virtualNumberId])
+   540→  @@index([createdAt])
+   541→}
+   542→
+   543→model Call {
+   544→  id              String   @id @default(cuid())
+   545→  virtualNumberId String
+   546→  direction       String   // inbound | outbound
+   547→  fromNumber      String
+   548→  toNumber        String
+   549→  status          String   @default("completed") // ringing | in_progress | completed | failed | no_answer | busy
+   550→  durationSeconds Int      @default(0)
+   551→  providerCallId  String?
+   552→  recordingUrl    String?
+   553→  createdAt       DateTime @default(now())
+   554→
+   555→  virtualNumber   VirtualNumber @relation(fields: [virtualNumberId], references: [id], onDelete: Cascade)
+   556→
+   557→  @@index([virtualNumberId])
+   558→  @@index([createdAt])
+   559→}
+   560→
+   561→model TrialPolicy {
+   562→  id              String   @id @default(cuid())
+   563→  name            String   @unique
+   564→  durationHours   Int      @default(24)
+   565→  maxNumbers      Int      @default(1)
+   566→  maxInboundSMS   Int      @default(3)
+   567→  maxOutboundSMS  Int      @default(0)
+   568→  maxInboundMinutes Int    @default(5)
+   569→  maxOutboundMinutes Int   @default(0)
+   570→  apiAllowed      Boolean  @default(false)
+   571→  eligibleCountries String? // comma-separated country codes, null = all
+   572→  active          Boolean  @default(true)
+   573→  createdAt       DateTime @default(now())
+   574→  updatedAt       DateTime @updatedAt
+   575→}
+   576→
+   577→model CountryCapability {
+   578→  id              String   @id @default(cuid())
+   579→  countryCode     String   @unique
+   580→  country         String
+   581→  smsAllowed      Boolean  @default(true)
+   582→  voiceAllowed    Boolean  @default(true)
+   583→  mmsAllowed      Boolean  @default(false)
+   584→  identityRequired Boolean @default(false)
+   585→  notes           String?
+   586→  active          Boolean  @default(true)
+   587→  createdAt       DateTime @default(now())
+   588→  updatedAt       DateTime @updatedAt
+   589→}
+   590→
+   591→// ---------------------------------------------------------------------------
+   592→// Financial Ledger — immutable record of all financial events.
+   593→// Financial truth must not depend exclusively on mutable order records.
+   594→// ---------------------------------------------------------------------------
+   595→
+   596→model FinancialTransaction {
+   597→  id              String   @id @default(cuid())
+   598→  type            String   // CUSTOMER_PAYMENT | PAYMENT_FEE | PROVIDER_PURCHASE | PROVIDER_LIABILITY | PROVIDER_INVOICE | PROVIDER_PAYMENT | REFUND | CHARGEBACK | PROMOTIONAL_CREDIT | CUSTOMER_CREDIT | TRIAL_COST | COMMISSION | ADJUSTMENT
+   599→  userId          String?
+   600→  organizationId  String?
+   601→  orderId         String?
+   602→  provider        String?  // esim provider or payment provider
+   603→  providerTxnId   String?  // provider's transaction id
+   604→  amountMinor     Int      // positive = debit (cost), negative = credit (revenue). In minor units.
+   605→  currency        String   @default("USD")
+   606→  // Financial breakdown (all in minor units, may be 0 if not applicable)
+   607→  customerPrice   Int      @default(0)  // what customer paid
+   608→  providerCost    Int      @default(0)  // wholesale cost
+   609→  paymentFee      Int      @default(0)  // payment processing fee
+   610→  grossProfit     Int      @default(0)  // customerPrice - providerCost
+   611→  contributionProfit Int   @default(0)  // grossProfit - paymentFee - refundCost - fraudLoss
+   612→  refundCost      Int      @default(0)
+   613→  fraudLoss       Int      @default(0)
+   614→  // Metadata
+   615→  source          String   @default("system") // system | admin | provider | webhook
+   616→  reason          String?
+   617→  state           String   @default("pending") // pending | settled | disputed | reversed
+   618→  idempotencyKey  String?  @unique
+   619→  createdAt       DateTime @default(now())
+   620→  settledAt       DateTime?
+   621→
+   622→  user            User?          @relation(fields: [userId], references: [id], onDelete: SetNull)
+   623→  order           Order?         @relation("FinancialOrder", fields: [orderId], references: [id], onDelete: SetNull)
+   624→
+   625→  @@index([userId])
+   626→  @@index([orderId])
+   627→  @@index([type])
+   628→  @@index([createdAt])
+   629→}
+   630→
+   631→// ---------------------------------------------------------------------------
+   632→// Provider Credit Account — tracks provider credit facilities (e.g., Airalo $10K).
+   633→// This is a financial liability, NOT cash. Must be tracked for risk control.
+   634→// ---------------------------------------------------------------------------
+   635→
+   636→model ProviderCreditAccount {
+   637→  id              String   @id @default(cuid())
+   638→  provider        String   @unique // e.g. "airalo", "mock"
+   639→  creditLimit     Int      // in minor units (e.g., 1000000 = $10,000)
+   640→  currency        String   @default("USD")
+   641→  outstandingLiability Int  @default(0) // accumulated unbilled provider purchases
+   642→  pendingCommitments Int   @default(0) // in-flight provider orders not yet confirmed
+   643→  invoicedAmount  Int      @default(0) // amount invoiced by provider
+   644→  paidAmount      Int      @default(0) // amount paid to provider
+   645→  // Thresholds (percentage of credit limit)
+   646→  thresholdInfo   Int      @default(50) // informational
+   647→  thresholdWarn   Int      @default(75) // warning
+   648→  thresholdElevated Int    @default(80) // elevated
+   649→  thresholdCritical Int    @default(90) // critical — restrict new commitments
+   650→  thresholdEmergency Int   @default(95) // emergency
+   651→  // State
+   652→  active          Boolean  @default(true)
+   653→  lastInvoiceDate DateTime?
+   654→  nextPaymentDue  DateTime?
+   655→  createdAt       DateTime @default(now())
+   656→  updatedAt       DateTime @updatedAt
+   657→
+   658→  invoices        ProviderInvoice[]
+   659→}
+   660→
+   661→model ProviderInvoice {
+   662→  id              String   @id @default(cuid())
+   663→  providerAccountId String
+   664→  providerInvoiceId String? @unique // provider's invoice number
+   665→  amountMinor     Int      // invoiced amount in minor units
+   666→  currency        String   @default("USD")
+   667→  status          String   @default("pending") // pending | paid | overdue | disputed
+   668→  periodStart     DateTime?
+   669→  periodEnd       DateTime?
+   670→  dueDate         DateTime?
+   671→  paidAt          DateTime?
+   672→  // Reconciliation
+   673→  reconciledTransactions Int @default(0)
+   674→  mismatchedTransactions  Int @default(0)
+   675→  reconciled      Boolean  @default(false)
+   676→  createdAt       DateTime @default(now())
+   677→  updatedAt       DateTime @updatedAt
+   678→
+   679→  providerAccount ProviderCreditAccount @relation(fields: [providerAccountId], references: [id], onDelete: Cascade)
+   680→
+   681→  @@index([providerAccountId])
+   682→  @@index([status])
+   683→}
+   684→
+   685→// ---------------------------------------------------------------------------
+   686→// Pricing Snapshot — preserves the pricing used for each transaction so
+   687→// historical economics can't be retroactively changed.
+   688→// ---------------------------------------------------------------------------
+   689→
+   690→model PricingSnapshot {
+   691→  id              String   @id @default(cuid())
+   692→  orderId         String?  @unique
+   693→  productId       String?  // planId or virtualNumberId
+   694→  productType     String   // esim | virtual_number
+   695→  wholesaleMinor  Int      // provider cost at time of purchase
+   696→  retailMinor     Int      // customer price at time of purchase
+   697→  currency        String   @default("USD")
+   698→  markupPercent   Float    // (retail - wholesale) / wholesale * 100
+   699→  grossMarginPercent Float // (retail - wholesale) / retail * 100
+   700→  pricingRule     String?  // JSON of the rule that produced this price
+   701→  createdAt       DateTime @default(now())
+   702→
+   703→  @@index([productType])
+   704→}
+   705→
+   706→// ---------------------------------------------------------------------------
+   707→// Promo Codes — promotional discounts at checkout.
+   708→// ---------------------------------------------------------------------------
+   709→
+   710→model PromoCode {
+   711→  id              String   @id @default(cuid())
+   712→  code            String   @unique // e.g. "TRAVEL20"
+   713→  description     String?
+   714→  type            String   // "percentage" | "fixed"
+   715→  value           Int      // percentage: 20 = 20% off; fixed: 500 = $5.00 off (minor units)
+   716→  currency        String   @default("USD")
+   717→  minOrderAmount  Int      @default(0) // minimum order amount in minor units (0 = no minimum)
+   718→  maxDiscount     Int?     // cap on discount amount (minor units, null = no cap)
+   719→  maxUses         Int?     // null = unlimited
+   720→  maxUsesPerUser  Int      @default(1)
+   721→  usesCount       Int      @default(0)
+   722→  validFrom       DateTime @default(now())
+   723→  validUntil      DateTime?
+   724→  active          Boolean  @default(true)
+   725→  // Profitability guardrail
+   726→  minMarginPercent Float?  // reject if discount would push margin below this
+   727→  createdAt       DateTime @default(now())
+   728→  updatedAt       DateTime @updatedAt
+   729→
+   730→  redemptions     PromoRedemption[]
+   731→
+   732→  @@index([active])
+   733→}
+   734→
+   735→model PromoRedemption {
+   736→  id              String   @id @default(cuid())
+   737→  promoCodeId     String
+   738→  orderId         String   @unique
+   739→  userId          String
+   740→  discountAmount  Int      // actual discount applied (minor units)
+   741→  currency        String   @default("USD")
+   742→  createdAt       DateTime @default(now())
+   743→
+   744→  promoCode       PromoCode @relation(fields: [promoCodeId], references: [id], onDelete: Cascade)
+   745→  order           Order     @relation("PromoOrder", fields: [orderId], references: [id], onDelete: Cascade)
+   746→
+   747→  @@index([userId])
+   748→  @@index([promoCodeId])
+   749→}
+   750→
+   751→// ---------------------------------------------------------------------------
+   752→// Referrals — customer referral codes + credit rewards.
+   753→// ---------------------------------------------------------------------------
+   754→
+   755→model Referral {
+   756→  id              String   @id @default(cuid())
+   757→  referrerUserId  String   @unique // each user has one referral code
+   758→  referralCode    String   @unique // e.g. "ROAM-ABC123"
+   759→  // Reward config (in minor units)
+   760→  referrerReward  Int      @default(200) // $2.00 credit for referrer
+   761→  refereeReward   Int      @default(200) // $2.00 credit for referee
+   762→  currency        String   @default("USD")
+   763→  // Stats
+   764→  totalReferrals  Int      @default(0)
+   765→  completedReferrals Int   @default(0) // referee made a purchase
+   766→  totalRewardPaid Int      @default(0)
+   767→  createdAt       DateTime @default(now())
+   768→
+   769→  referrer        User     @relation("ReferralUser", fields: [referrerUserId], references: [id], onDelete: Cascade)
+   770→  referrals       ReferralUse[]
+   771→
+   772→  @@index([referrerUserId])
+   773→}
+   774→
+   775→model ReferralUse {
+   776→  id              String   @id @default(cuid())
+   777→  referralId      String
+   778→  refereeUserId   String
+   779→  orderId         String?  // first purchase that completed the referral
+   780→  status          String   @default("pending") // pending | completed | rejected
+   781→  referrerCredited Boolean @default(false)
+   782→  refereeCredited Boolean @default(false)
+   783→  createdAt       DateTime @default(now())
+   784→
+   785→  referral        Referral @relation(fields: [referralId], references: [id], onDelete: Cascade)
+   786→  referee         User     @relation("RefereeUser", fields: [refereeUserId], references: [id], onDelete: Cascade)
+   787→
+   788→  @@unique([referralId, refereeUserId])
+   789→  @@index([refereeUserId])
+   790→}
+   791→
+   792→// ---------------------------------------------------------------------------
+   793→// Customer Credit / Wallet — unified balance across products.
+   794→// ---------------------------------------------------------------------------
+   795→
+   796→model CustomerCredit {
+   797→  id              String   @id @default(cuid())
+   798→  userId          String   @unique
+   799→  balanceMinor    Int      @default(0) // current balance in minor units
+   800→  currency        String   @default("USD")
+   801→  totalEarned     Int      @default(0) // lifetime credits earned
+   802→  totalSpent      Int      @default(0) // lifetime credits spent
+   803→  createdAt       DateTime @default(now())
+   804→  updatedAt       DateTime @updatedAt
+   805→
+   806→  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+   807→  transactions    CreditTransaction[]
+   808→
+   809→  @@index([userId])
+   810→}
+   811→
+   812→model CreditTransaction {
+   813→  id              String   @id @default(cuid())
+   814→  creditId        String
+   815→  userId          String
+   816→  type            String   // referral_reward | promo_credit | admin_adjustment | purchase_credit | refund_credit
+   817→  amountMinor     Int      // positive = credit added, negative = credit spent
+   818→  balanceAfter    Int      // balance after this transaction
+   819→  reason          String?
+   820→  orderId         String?
+   821→  referrerId      String?
+   822→  createdAt       DateTime @default(now())
+   823→
+   824→  credit          CustomerCredit @relation(fields: [creditId], references: [id], onDelete: Cascade)
+   825→  user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+   826→
+   827→  @@index([userId])
+   828→  @@index([creditId])
+   829→}
+
+[showing lines 1-829 of 830; use offset=830 with limit to continue reading]

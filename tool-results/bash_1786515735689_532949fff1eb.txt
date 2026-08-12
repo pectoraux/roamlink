@@ -1,8 +1,9 @@
 // =============================================================================
 // eSIM Marketplace — Prisma Schema
 // -----------------------------------------------------------------------------
-// DATABASE: SQLite is used in development (sandbox constraint). Money is stored
-// as Int (minor units) — never float.
+// DATABASE: PostgreSQL (Neon) is the canonical database for development,
+// staging, and production. SQLite is NOT supported. Money is stored as Int
+// (minor units) — never float.
 // =============================================================================
 
 generator client {
@@ -11,8 +12,9 @@ generator client {
 }
 
 datasource db {
-  provider  = "sqlite"
+  provider  = "postgresql"
   url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +164,7 @@ model Order {
   // PAYMENT_CONFIRMED | ESIM_PROVISIONING | ESIM_PROVISIONED | COMPLETED |
   // PAYMENT_FAILED | PROVISIONING_FAILED | CANCELLED | REFUNDED
   status           String   @default("PLAN_SELECTED")
-  amount           Int      // total charged (minor units) — frozen from DistributionOffer
+  amount           Int      // total charged (minor units)
   currency         String   @default("USD")
   paymentStatus    String   @default("pending") // pending | succeeded | failed | refunded
   paymentProvider  String?
@@ -173,19 +175,11 @@ model Order {
   // Snapshot of plan at purchase time (so historical orders stay accurate).
   planSnapshot     String?  // JSON string
   failureReason    String?
-  // --- Phase 2C: Connectivity Orchestration Convergence ---
-  tenantId         String?  // null = RoamLink Direct
-  fulfillmentStatus String  @default("pending") // pending|provisioning|success|failed|unknown|reconciliation_required
-  financialStatus  String   @default("pending") // pending | settled | failed
-  fulfillmentExternalReference String? // provider's external fulfillment ref
-  fulfillmentEntityId String?  // id of persisted fulfillment entity (e.g. Esim.id)
-  supplierOfferId  String?  // the ConnectivityOffer selected by the orchestrator
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
 
   user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   plan             Plan?    @relation(fields: [planId], references: [id])
-  tenant           Tenant?  @relation(fields: [tenantId], references: [id], onDelete: SetNull)
   payments         Payment[]
   esim             Esim?
   corporateOrder   CorporateOrder?
@@ -196,7 +190,6 @@ model Order {
   @@index([userId])
   @@index([status])
   @@index([paymentStatus])
-  @@index([tenantId])
 }
 
 // ---------------------------------------------------------------------------
@@ -833,201 +826,4 @@ model CreditTransaction {
 
   @@index([userId])
   @@index([creditId])
-}
-
-// ===========================================================================
-// Phase 2C — Connectivity Orchestration Convergence
-// ===========================================================================
-// These models make Tenant, DistributionOffer, canonical product identity,
-// and the orchestration engine load-bearing in the real purchase path.
-//
-//   Plan (legacy provider-native catalog)
-//     → ConnectivityProduct (canonical, identity-hashed)
-//       → ConnectivityOffer (per-Supplier wholesale price)
-//       → DistributionOffer (per-Tenant retail price — what the customer pays)
-//     → Order (captures canonicalProductId + distributionOfferId at checkout)
-//       → Orchestrator selects a ConnectivityOffer at fulfillment time
-//       → FulfillmentAdapter provisions the product
-//       → FulfillmentPersistenceHandler stores the entity (Esim, etc.)
-//       → Double-entry ledger records the commercial transaction
-// ===========================================================================
-
-model ConnectivityProduct {
-  id              String   @id @default(cuid())
-  type            String   // ESIM | VIRTUAL_NUMBER | WIFI | LOCAL_DATA | BUNDLE
-  name            String
-  description     String?
-  country         String?
-  countryCode     String?
-  region          String?
-  dataAmountMB    Int?
-  validityDays    Int?
-  capabilities    String?
-  sourcePlanId    String?  @unique
-  canonicalSpecification String?
-  identityHash    String?
-  active          Boolean  @default(true)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  offers          ConnectivityOffer[]
-  distributionOffers DistributionOffer[]
-
-  @@index([type])
-  @@index([identityHash])
-}
-
-model Supplier {
-  id              String   @id @default(cuid())
-  name            String   @unique
-  type            String
-  providerKey     String?
-  redistributionPolicy String @default("B2C_ONLY")
-  supportedCapabilities String?
-  healthStatus    String   @default("healthy")
-  failureCount    Int      @default(0)
-  successCount    Int      @default(0)
-  lastFailureAt   DateTime?
-  lastSuccessAt   DateTime?
-  cooldownUntil   DateTime?
-  active          Boolean  @default(true)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  offers          ConnectivityOffer[]
-}
-
-model ConnectivityOffer {
-  id              String   @id @default(cuid())
-  productId       String
-  supplierId      String
-  wholesalePrice  Int
-  retailPrice     Int
-  currency        String   @default("USD")
-  status          String   @default("active")
-  audiences       String   @default("B2C")
-  availableIn     String?
-  validFrom       DateTime @default(now())
-  validUntil      DateTime?
-  supplierProductId String?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  product         ConnectivityProduct @relation(fields: [productId], references: [id])
-  supplier        Supplier            @relation(fields: [supplierId], references: [id])
-
-  @@index([productId])
-  @@index([supplierId])
-}
-
-model Tenant {
-  id              String   @id @default(cuid())
-  name            String
-  slug            String   @unique
-  status          String   @default("active")
-  brandName       String?
-  brandColor      String?
-  customDomain    String?  @unique
-  billingEmail    String?
-  monthlySpendLimit Int    @default(0)
-  defaultMarkupPercent Float @default(0)
-  apiKey          String?  @unique
-  metadata        String?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  distributionOffers DistributionOffer[]
-  orders          Order[]
-  users           TenantUser[]
-
-  @@index([status])
-}
-
-model TenantUser {
-  id              String   @id @default(cuid())
-  tenantId        String
-  userId          String
-  role            String   @default("admin") // admin | member
-  createdAt       DateTime @default(now())
-  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-
-  @@unique([tenantId, userId])
-  @@index([userId])
-}
-
-model DistributionOffer {
-  id              String   @id @default(cuid())
-  productId       String
-  tenantId        String?  // null = RoamLink Direct
-  retailPrice     Int
-  currency        String   @default("USD")
-  markupPercent   Float    @default(0)
-  status          String   @default("active")
-  audience        String   @default("B2C")
-  validFrom       DateTime @default(now())
-  validUntil      DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  product         ConnectivityProduct @relation(fields: [productId], references: [id])
-  tenant          Tenant?             @relation(fields: [tenantId], references: [id], onDelete: SetNull)
-
-  @@unique([productId, tenantId])
-  @@index([productId])
-  @@index([tenantId])
-}
-
-model ProviderCreditReservation {
-  id              String   @id @default(cuid())
-  reservationId   String   @unique
-  provider        String
-  amountMinor     Int
-  status          String   @default("reserved") // reserved | settled | released
-  orderId         String?
-  createdAt       DateTime @default(now())
-  settledAt       DateTime?
-  releasedAt      DateTime?
-
-  @@index([provider, status])
-}
-
-model LedgerAccount {
-  id              String   @id @default(cuid())
-  code            String   @unique
-  name            String
-  type            String
-  normalBalance   String
-  active          Boolean  @default(true)
-  createdAt       DateTime @default(now())
-  entries         LedgerEntry[]
-}
-
-model LedgerTransaction {
-  id              String   @id @default(cuid())
-  reference       String?
-  type            String
-  description     String?
-  currency        String   @default("USD")
-  status          String   @default("posted")
-  idempotencyKey  String?  @unique
-  userId          String?
-  organizationId  String?
-  orderId         String?
-  provider        String?
-  providerTxnId   String?
-  createdAt       DateTime @default(now())
-  postedAt        DateTime?
-  entries         LedgerEntry[]
-
-  @@index([orderId])
-  @@index([type])
-}
-
-model LedgerEntry {
-  id              String   @id @default(cuid())
-  transactionId   String
-  accountId       String
-  direction       String
-  amountMinor     Int
-  currency        String   @default("USD")
-  createdAt       DateTime @default(now())
-  transaction     LedgerTransaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
-  account         LedgerAccount     @relation(fields: [accountId], references: [id])
-
-  @@index([transactionId])
 }

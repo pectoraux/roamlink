@@ -179,3 +179,221 @@ export async function getAllProviderAccounts() {
     };
   });
 }
+
+// ===========================================================================
+// Phase 2C — Provider Credit Reservations
+// ===========================================================================
+// A reservation atomically moves `amountMinor` from a provider's available
+// credit into `pendingCommitments` while the orchestrator is fulfilling an
+// order. The reservation is either:
+//   - settled (pendingCommitments → outstandingLiability) when fulfillment
+//     succeeds, OR
+//   - released (pendingCommitments → available credit) when fulfillment fails.
+//
+// All three operations are idempotent via reservationId / reservation status.
+
+/**
+ * Atomically reserve a provider credit commitment. Idempotent via
+ * reservationId — re-calling with the same id returns the existing record.
+ *
+ * Conditional UPDATE: only succeeds if the provider has enough available
+ * credit. If the provider has no ProviderCreditAccount, the reservation is
+ * still recorded (assumes pay-as-you-go) but no account balance is touched.
+ */
+export async function reserveProviderCommitment(input: {
+  reservationId: string;
+  provider: string;
+  amountMinor: number;
+  orderId?: string;
+}): Promise<{ reservationId: string; status: string; amountMinor: number }> {
+  // Idempotency: return existing reservation if present.
+  const existing = await db.providerCreditReservation.findUnique({
+    where: { reservationId: input.reservationId },
+  });
+  if (existing) {
+    logger.info("provider_credit.reservation_replay", {
+      reservationId: input.reservationId,
+      status: existing.status,
+    });
+    return {
+      reservationId: existing.reservationId,
+      status: existing.status,
+      amountMinor: existing.amountMinor,
+    };
+  }
+
+  await ensureProviderAccount(input.provider);
+
+  // Atomic conditional UPDATE: only increment pendingCommitments if the
+  // available credit (creditLimit - outstandingLiability - pendingCommitments)
+  // is >= amountMinor. If not, throw.
+  //
+  // SQLite/Prisma: we read-then-update inside a transaction; the conditional
+  // is enforced by re-checking inside the transaction.
+  const result = await db.$transaction(async (tx) => {
+    const account = await tx.providerCreditAccount.findUnique({
+      where: { provider: input.provider },
+    });
+    if (!account) {
+      // No account → record reservation only (pay-as-you-go).
+      return { reserved: true, account: null };
+    }
+
+    const available = account.creditLimit - account.outstandingLiability - account.pendingCommitments;
+    if (available < input.amountMinor) {
+      throw new AppError(
+        "conflict",
+        `Insufficient provider credit for ${input.provider}: need ${input.amountMinor}, available ${available}`,
+        409,
+        "The supplier cannot accept this commitment right now.",
+      );
+    }
+
+    // Threshold guard: don't reserve if it would push past critical threshold.
+    const newUtilization = ((account.outstandingLiability + account.pendingCommitments + input.amountMinor) / account.creditLimit) * 100;
+    if (newUtilization >= account.thresholdCritical) {
+      throw new AppError(
+        "conflict",
+        `Provider ${input.provider} at critical utilization (${Math.round(newUtilization)}%)`,
+        409,
+        "The supplier is at critical credit utilization.",
+      );
+    }
+
+    await tx.providerCreditAccount.update({
+      where: { id: account.id },
+      data: { pendingCommitments: { increment: input.amountMinor } },
+    });
+    return { reserved: true, account };
+  });
+
+  const reservation = await db.providerCreditReservation.create({
+    data: {
+      reservationId: input.reservationId,
+      provider: input.provider,
+      amountMinor: input.amountMinor,
+      status: "reserved",
+      orderId: input.orderId ?? null,
+    },
+  });
+
+  logger.info("provider_credit.reserved", {
+    reservationId: reservation.reservationId,
+    provider: input.provider,
+    amount: input.amountMinor,
+    hadAccount: result.account != null,
+  });
+  return {
+    reservationId: reservation.reservationId,
+    status: reservation.status,
+    amountMinor: reservation.amountMinor,
+  };
+}
+
+/**
+ * Settle a reservation: move the reserved amount from pendingCommitments to
+ * outstandingLiability. Idempotent — a settled reservation cannot be re-settled.
+ */
+export async function settleReservation(reservationId: string): Promise<void> {
+  const reservation = await db.providerCreditReservation.findUnique({
+    where: { reservationId },
+  });
+  if (!reservation) {
+    logger.warn("provider_credit.settle_missing", { reservationId });
+    return;
+  }
+  if (reservation.status === "settled") {
+    logger.info("provider_credit.settle_replay", { reservationId });
+    return;
+  }
+  if (reservation.status === "released") {
+    throw new AppError(
+      "conflict",
+      `Cannot settle released reservation ${reservationId}`,
+      409,
+      "Reservation was already released.",
+    );
+  }
+
+  await db.$transaction(async (tx) => {
+    const account = await tx.providerCreditAccount.findUnique({
+      where: { provider: reservation.provider },
+    });
+    if (account) {
+      await tx.providerCreditAccount.update({
+        where: { id: account.id },
+        data: {
+          pendingCommitments: { decrement: Math.min(account.pendingCommitments, reservation.amountMinor) },
+          outstandingLiability: { increment: reservation.amountMinor },
+        },
+      });
+    }
+    await tx.providerCreditReservation.update({
+      where: { id: reservation.id },
+      data: { status: "settled", settledAt: new Date() },
+    });
+  });
+
+  logger.info("provider_credit.settled", {
+    reservationId,
+    provider: reservation.provider,
+    amount: reservation.amountMinor,
+  });
+}
+
+/**
+ * Release a reservation: return the reserved amount to available credit.
+ * Idempotent — a released reservation cannot be re-released or settled.
+ */
+export async function releaseReservation(reservationId: string): Promise<void> {
+  const reservation = await db.providerCreditReservation.findUnique({
+    where: { reservationId },
+  });
+  if (!reservation) {
+    logger.warn("provider_credit.release_missing", { reservationId });
+    return;
+  }
+  if (reservation.status === "released") {
+    logger.info("provider_credit.release_replay", { reservationId });
+    return;
+  }
+  if (reservation.status === "settled") {
+    throw new AppError(
+      "conflict",
+      `Cannot release settled reservation ${reservationId}`,
+      409,
+      "Reservation was already settled.",
+    );
+  }
+
+  await db.$transaction(async (tx) => {
+    const account = await tx.providerCreditAccount.findUnique({
+      where: { provider: reservation.provider },
+    });
+    if (account) {
+      await tx.providerCreditAccount.update({
+        where: { id: account.id },
+        data: {
+          pendingCommitments: { decrement: Math.min(account.pendingCommitments, reservation.amountMinor) },
+        },
+      });
+    }
+    await tx.providerCreditReservation.update({
+      where: { id: reservation.id },
+      data: { status: "released", releasedAt: new Date() },
+    });
+  });
+
+  logger.info("provider_credit.released", {
+    reservationId,
+    provider: reservation.provider,
+    amount: reservation.amountMinor,
+  });
+}
+
+/** Look up a reservation by id (for status checks). */
+export async function getReservation(reservationId: string) {
+  return db.providerCreditReservation.findUnique({
+    where: { reservationId },
+  });
+}

@@ -11,6 +11,7 @@ import { computeRetailPrice, ensureDefaultPricingRules } from "./pricing";
 import { logger } from "@/lib/logger";
 import type { CanonicalPlan, PublicPlan } from "@/types";
 import type { Currency } from "@/lib/money";
+import { computeProductIdentity } from "@/lib/catalog/identity";
 
 /** Convert a DB Plan row into a canonical plan (internal). */
 export function dbPlanToCanonical(p: {
@@ -327,18 +328,233 @@ export async function syncPlansFromProvider(): Promise<{
     const existing = await db.plan.findUnique({
       where: { providerId_providerPlanId: { providerId: provider.id, providerPlanId: pp.providerPlanId } },
     });
+    let planId: string;
     if (existing) {
       await db.plan.update({
         where: { id: existing.id },
         data: { ...data, status: existing.status }, // preserve admin status toggles
       });
+      planId = existing.id;
       updated += 1;
     } else {
-      await db.plan.create({ data });
+      const created_row = await db.plan.create({ data });
+      planId = created_row.id;
       created += 1;
     }
+
+    // Phase 2C: sync this Plan into the canonical catalog. This creates (or
+    // converges onto) a ConnectivityProduct with a stable identityHash, then
+    // upserts a ConnectivityOffer for the active supplier. Two suppliers
+    // syncing the same canonical product will end up sharing one
+    // ConnectivityProduct row, each with their own ConnectivityOffer.
+    await syncPlanToCatalog({
+      planId,
+      name: pp.name,
+      country: pp.country,
+      countryCode: pp.countryCode,
+      region: pp.region,
+      dataAmountMB: pp.dataAmountMB,
+      validityDays: pp.validityDays,
+      wholesalePriceMinor: pp.wholesalePriceMinor,
+      currency: pp.currency,
+      supplierProviderKey: provider.id,
+      supplierName: provider.label,
+    });
   }
 
   logger.info("sync.completed", { provider: provider.id, created, updated, total: providerPlans.length });
   return { created, updated, total: providerPlans.length };
+}
+
+// ===========================================================================
+// Phase 2C — Catalog sync convergence
+// ===========================================================================
+
+/**
+ * Ensure a Supplier row exists for the given provider key. The Supplier is
+ * the orchestration-engine-facing entity that the engine selects between.
+ */
+async function ensureSupplier(input: {
+  providerKey: string;
+  name: string;
+  type?: string;
+}): Promise<{ id: string; providerKey: string | null; name: string }> {
+  const existing = await db.supplier.findUnique({ where: { name: input.name } });
+  if (existing) return existing;
+  const supplier = await db.supplier.create({
+    data: {
+      name: input.name,
+      type: input.type ?? "ESIM",
+      providerKey: input.providerKey,
+      redistributionPolicy: "B2C_AND_B2B",
+      healthStatus: "healthy",
+      active: true,
+    },
+  });
+  logger.info("catalog.supplier.created", { supplierId: supplier.id, providerKey: input.providerKey });
+  return supplier;
+}
+
+/**
+ * Sync a single Plan into the canonical connectivity catalog.
+ *
+ *   1. Compute the canonical identity hash from the plan's normalized attributes.
+ *   2. Look up an existing ConnectivityProduct by identityHash. If found, this
+ *      supplier is being converged onto an already-known canonical product.
+ *   3. Otherwise, look up by sourcePlanId (the Plan that originated this sync).
+ *      If found, update its identityHash. Otherwise create a new product.
+ *   4. Ensure a ConnectivityOffer exists for (product, supplier) with this
+ *      supplier's wholesale price.
+ *
+ * This is what makes "two independent supplier catalog syncs actually
+ * converge onto one ConnectivityProduct" (test scenario 7).
+ */
+export async function syncPlanToCatalog(input: {
+  planId: string;
+  name: string;
+  country: string;
+  countryCode: string;
+  region: string;
+  dataAmountMB: number;
+  validityDays: number;
+  wholesalePriceMinor: number;
+  currency: string;
+  supplierProviderKey: string;
+  supplierName: string;
+}): Promise<{
+  productId: string;
+  offerId: string;
+  converged: boolean; // true if the product already existed (from another supplier)
+}> {
+  const identity = computeProductIdentity({
+    type: "ESIM",
+    name: input.name,
+    country: input.country,
+    countryCode: input.countryCode,
+    region: input.region,
+    dataAmountMB: input.dataAmountMB,
+    validityDays: input.validityDays,
+    capabilities: ["DATA", "ESIM"],
+  });
+
+  // 1. Look up by identityHash — supplier convergence path.
+  let product = await db.connectivityProduct.findFirst({
+    where: { identityHash: identity.identityHash },
+  });
+
+  let converged = false;
+  if (product) {
+    converged = true;
+    // If this product was originally created from a different sourcePlanId,
+    // we keep the original sourcePlanId (canonical identity wins). Otherwise
+    // stamp it.
+    if (!product.sourcePlanId) {
+      product = await db.connectivityProduct.update({
+        where: { id: product.id },
+        data: { sourcePlanId: input.planId },
+      });
+    }
+  } else {
+    // 2. Look up by sourcePlanId — the Plan that originated this product.
+    product = await db.connectivityProduct.findUnique({
+      where: { sourcePlanId: input.planId },
+    });
+
+    if (product) {
+      // Update the identity hash (in case the plan was re-synced with new attributes).
+      product = await db.connectivityProduct.update({
+        where: { id: product.id },
+        data: {
+          name: input.name,
+          country: input.country,
+          countryCode: input.countryCode,
+          region: input.region,
+          dataAmountMB: input.dataAmountMB,
+          validityDays: input.validityDays,
+          canonicalSpecification: identity.canonicalSpecification,
+          identityHash: identity.identityHash,
+        },
+      });
+    } else {
+      // 3. Create a new canonical product.
+      product = await db.connectivityProduct.create({
+        data: {
+          type: "ESIM",
+          name: input.name,
+          description: `${input.name} — canonical connectivity product`,
+          country: input.country,
+          countryCode: input.countryCode,
+          region: input.region,
+          dataAmountMB: input.dataAmountMB,
+          validityDays: input.validityDays,
+          capabilities: JSON.stringify(["DATA", "ESIM"]),
+          sourcePlanId: input.planId,
+          canonicalSpecification: identity.canonicalSpecification,
+          identityHash: identity.identityHash,
+          active: true,
+        },
+      });
+      logger.info("catalog.product.created", {
+        productId: product.id,
+        sourcePlanId: input.planId,
+        identityHash: identity.identityHash,
+      });
+    }
+  }
+
+  // 4. Ensure a ConnectivityOffer for (product, supplier).
+  const supplier = await ensureSupplier({
+    providerKey: input.supplierProviderKey,
+    name: input.supplierName,
+    type: "ESIM",
+  });
+
+  // ConnectivityOffer unique on (productId, supplierId)? No — only the
+  // DistributionOffer has that unique constraint. A supplier can have multiple
+  // offers for the same product (e.g. wholesale tiers). We upsert by
+  // (productId, supplierId) via findFirst + create/update.
+  const existingOffer = await db.connectivityOffer.findFirst({
+    where: { productId: product.id, supplierId: supplier.id },
+  });
+
+  // Retail price for the ConnectivityOffer is the wholesale + a small margin
+  // (used only as a fallback when no DistributionOffer exists). The actual
+  // tenant retail price is always sourced from the DistributionOffer.
+  const fallbackRetail = Math.round(input.wholesalePriceMinor * 1.3);
+
+  let offer;
+  if (existingOffer) {
+    offer = await db.connectivityOffer.update({
+      where: { id: existingOffer.id },
+      data: {
+        wholesalePrice: input.wholesalePriceMinor,
+        retailPrice: fallbackRetail,
+        currency: input.currency,
+        status: "active",
+      },
+    });
+  } else {
+    offer = await db.connectivityOffer.create({
+      data: {
+        productId: product.id,
+        supplierId: supplier.id,
+        wholesalePrice: input.wholesalePriceMinor,
+        retailPrice: fallbackRetail,
+        currency: input.currency,
+        status: "active",
+        audiences: "B2C,B2B",
+        supplierProductId: input.planId,
+      },
+    });
+  }
+
+  logger.info("catalog.synced", {
+    planId: input.planId,
+    productId: product.id,
+    offerId: offer.id,
+    converged,
+    supplierId: supplier.id,
+  });
+
+  return { productId: product.id, offerId: offer.id, converged };
 }

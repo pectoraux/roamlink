@@ -4,12 +4,27 @@
  *   PLAN_SELECTED -> CHECKOUT_CREATED -> PAYMENT_PENDING -> PAYMENT_CONFIRMED
  *     -> ESIM_PROVISIONING -> ESIM_PROVISIONED -> COMPLETED
  *
+ * Phase 2C — Connectivity Orchestration Convergence:
+ *
+ *   1. createOrder resolves the canonical ConnectivityProduct (by sourcePlanId)
+ *      and the DistributionOffer for (product, tenant). The retail price is
+ *      FROZEN from the DistributionOffer at checkout time — it never depends
+ *      on which supplier will eventually fulfill the order.
+ *
+ *   2. confirmAndProvision verifies payment (existing hardening) then calls
+ *      fulfillOrder(), which runs the orchestrator, picks a supplier offer,
+ *      reserves provider credit, provisions via the FulfillmentAdapter,
+ *      persists via the FulfillmentPersistenceHandler, settles the credit
+ *      reservation, and finalizes the commercial transaction in the double-
+ *      entry ledger.
+ *
  * Critical business rules enforced here:
  *   - Rule 1/2: eSIM is NEVER provisioned because the frontend says payment
  *     succeeded. Payment is verified server-side.
  *   - Rule 3: An order can only provision once (1:1 order->esim, DB unique).
  *   - Rule 6: Provider data isolated behind adapters.
  *   - Rule 9: Wholesale pricing never exposed (PublicPlan strips it).
+ *   - Phase 2C: The supplier never determines the tenant's retail price.
  */
 
 import { db } from "@/lib/db";
@@ -17,13 +32,39 @@ import { getESIMProvider } from "@/lib/esim";
 import { getPaymentProvider } from "@/lib/payments";
 import { getCanonicalPlan } from "@/lib/plans/service";
 import { assertTransition } from "./state-machine";
+import {
+  canTransitionFulfillment,
+  transitionFulfillment,
+  getFulfillmentStatus,
+  type FulfillmentStatus,
+} from "./fulfillment-state-machine";
 import { generateIdempotencyKey, audit } from "./idempotency";
 import { logger } from "@/lib/logger";
 import { AppError, classifyProviderError } from "@/lib/errors";
-import { recordFinancialEvent } from "@/lib/finance/ledger";
-import type { OrderStatus, ProvisioningResult } from "@/types";
+import { recordProviderResult } from "@/lib/providers/routing";
+import { computeProductIdentity } from "@/lib/catalog/identity";
+import { selectSupplierForProduct } from "@/lib/orchestration/engine";
+import {
+  resolveProviderKey,
+  getAdapter,
+  getPersistenceHandler,
+  type FulfillmentContext,
+} from "@/lib/fulfillment/adapter";
+// Side-effect import: ensures default adapters + persistence are registered.
+import "@/lib/fulfillment/registry";
+import {
+  reserveProviderCommitment,
+  settleReservation,
+  releaseReservation,
+  ensureProviderAccount,
+} from "@/lib/finance/provider-credit";
+import { finalizeCommercialTransaction } from "@/lib/finance/finalize";
+import type { OrderStatus } from "@/types";
 import type { Currency } from "@/lib/money";
-import QRCode from "qrcode";
+
+// ---------------------------------------------------------------------------
+// Snapshot types
+// ---------------------------------------------------------------------------
 
 export type OrderSnapshot = {
   id: string;
@@ -42,11 +83,18 @@ export type OrderSnapshot = {
   validityDays: number;
   esimId: string | null;
   failureReason: string | null;
+  // Phase 2C additions
+  tenantId: string | null;
+  fulfillmentStatus: FulfillmentStatus;
+  financialStatus: string;
+  distributionOfferId: string | null;
+  canonicalProductId: string | null;
+  supplierOfferId: string | null;
   createdAt: string;
   updatedAt: string;
 };
 
-function toSnapshot(o: {
+type OrderWithIncludes = {
   id: string;
   status: string;
   amount: number;
@@ -55,13 +103,30 @@ function toSnapshot(o: {
   paymentProvider: string | null;
   paymentReference: string | null;
   providerOrderId: string | null;
-  planId: string;
+  planId: string | null;
+  planSnapshot: string | null;
   failureReason: string | null;
+  tenantId: string | null;
+  fulfillmentStatus: string;
+  financialStatus: string;
+  fulfillmentExternalReference: string | null;
+  fulfillmentEntityId: string | null;
+  supplierOfferId: string | null;
   createdAt: Date;
   updatedAt: Date;
-  plan: { id: string; name: string; country: string; countryCode: string; dataAmount: number; validityDays: number };
+  plan: {
+    id: string;
+    name: string;
+    country: string;
+    countryCode: string;
+    dataAmount: number;
+    validityDays: number;
+  } | null;
   esim: { id: string } | null;
-}): OrderSnapshot {
+};
+
+function toSnapshot(o: OrderWithIncludes): OrderSnapshot {
+  const snapshot = parseOrderSnapshot(o.planSnapshot);
   return {
     id: o.id,
     status: o.status as OrderStatus,
@@ -71,70 +136,350 @@ function toSnapshot(o: {
     paymentProvider: o.paymentProvider,
     paymentReference: o.paymentReference,
     providerOrderId: o.providerOrderId,
-    planId: o.planId,
-    planName: o.plan.name,
-    country: o.plan.country,
-    countryCode: o.plan.countryCode,
-    dataAmountMB: o.plan.dataAmount,
-    validityDays: o.plan.validityDays,
+    planId: o.planId ?? "",
+    planName: o.plan?.name ?? "",
+    country: o.plan?.country ?? "",
+    countryCode: o.plan?.countryCode ?? "",
+    dataAmountMB: o.plan?.dataAmount ?? 0,
+    validityDays: o.plan?.validityDays ?? 0,
     esimId: o.esim?.id ?? null,
     failureReason: o.failureReason,
+    tenantId: o.tenantId,
+    fulfillmentStatus: o.fulfillmentStatus as FulfillmentStatus,
+    financialStatus: o.financialStatus,
+    distributionOfferId: snapshot.distributionOfferId ?? null,
+    canonicalProductId: snapshot.canonicalProductId ?? null,
+    supplierOfferId: o.supplierOfferId,
     createdAt: o.createdAt.toISOString(),
     updatedAt: o.updatedAt.toISOString(),
   };
 }
 
 /**
+ * Read canonical-product / distribution-offer fields from the order's
+ * planSnapshot JSON. These are captured at checkout time and frozen.
+ */
+function parseOrderSnapshot(raw: string | null): OrderSnapshotParsed {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as OrderSnapshotParsed;
+  } catch {
+    return {};
+  }
+}
+
+type OrderSnapshotParsed = {
+  canonicalProductId?: string;
+  canonicalSpecification?: string | null;
+  identityHash?: string | null;
+  productType?: string;
+  distributionOfferId?: string;
+  retailPriceMinor?: number;
+  tenantId?: string | null;
+};
+
+// ---------------------------------------------------------------------------
+// Catalog helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Find or create the canonical ConnectivityProduct for a Plan.
+ * The Plan's `id` becomes the ConnectivityProduct's `sourcePlanId`.
+ */
+async function ensureConnectivityProductForPlan(plan: {
+  id: string;
+  name: string;
+  country: string;
+  countryCode: string;
+  region: string;
+  dataAmount: number;
+  validityDays: number;
+}): Promise<{ id: string; identityHash: string | null; canonicalSpecification: string | null; type: string }> {
+  // 1. Look up by sourcePlanId (the Plan that originated this product).
+  const existing = await db.connectivityProduct.findUnique({
+    where: { sourcePlanId: plan.id },
+  });
+  if (existing) {
+    return {
+      id: existing.id,
+      identityHash: existing.identityHash,
+      canonicalSpecification: existing.canonicalSpecification,
+      type: existing.type,
+    };
+  }
+
+  // 2. Compute the canonical identity.
+  const identity = computeProductIdentity({
+    type: "ESIM",
+    name: plan.name,
+    country: plan.country,
+    countryCode: plan.countryCode,
+    region: plan.region,
+    dataAmountMB: plan.dataAmount,
+    validityDays: plan.validityDays,
+    capabilities: ["DATA", "ESIM"],
+  });
+
+  // 3. Look up by identityHash — supplier convergence path.
+  // If a product with the same canonical identity already exists (from a
+  // different supplier's plan), reuse it rather than creating a duplicate.
+  const converged = await db.connectivityProduct.findFirst({
+    where: { identityHash: identity.identityHash },
+  });
+  if (converged) {
+    logger.info("catalog.product.converged", {
+      productId: converged.id,
+      identityHash: identity.identityHash,
+      sourcePlanId: plan.id,
+    });
+    return {
+      id: converged.id,
+      identityHash: converged.identityHash,
+      canonicalSpecification: converged.canonicalSpecification,
+      type: converged.type,
+    };
+  }
+
+  const product = await db.connectivityProduct.create({
+    data: {
+      type: "ESIM",
+      name: plan.name,
+      description: `${plan.name} — canonical connectivity product`,
+      country: plan.country,
+      countryCode: plan.countryCode,
+      region: plan.region,
+      dataAmountMB: plan.dataAmount,
+      validityDays: plan.validityDays,
+      capabilities: JSON.stringify(["DATA", "ESIM"]),
+      sourcePlanId: plan.id,
+      canonicalSpecification: identity.canonicalSpecification,
+      identityHash: identity.identityHash,
+      active: true,
+    },
+  });
+
+  logger.info("catalog.product.created", {
+    productId: product.id,
+    sourcePlanId: plan.id,
+    identityHash: identity.identityHash,
+  });
+
+  return {
+    id: product.id,
+    identityHash: product.identityHash,
+    canonicalSpecification: product.canonicalSpecification,
+    type: product.type,
+  };
+}
+
+/**
+ * Resolve the DistributionOffer for (product, tenant).
+ * - tenantId null → RoamLink Direct (find or create with retailPrice = planPrice)
+ * - tenantId set → must already exist (tenants configure their own pricing)
+ *
+ * The retail price comes from the DistributionOffer, NEVER from the Plan or
+ * ConnectivityOffer.
+ */
+async function resolveDistributionOffer(input: {
+  productId: string;
+  tenantId: string | null;
+  fallbackRetailPriceMinor: number;
+  currency: string;
+  distributionOfferId?: string;
+}): Promise<{ id: string; retailPrice: number; currency: string }> {
+  // Explicit override.
+  if (input.distributionOfferId) {
+    const offer = await db.distributionOffer.findUnique({
+      where: { id: input.distributionOfferId },
+    });
+    if (!offer) {
+      throw new AppError("not_found", "DistributionOffer not found", 404, "This distribution offer is no longer available.");
+    }
+    // The offer must match the (product, tenant) pair — prevents a tenant
+    // from checking out using another tenant's offer.
+    if (offer.productId !== input.productId) {
+      throw new AppError("conflict", "DistributionOffer does not match product", 409, "This distribution offer is for a different product.");
+    }
+    if ((offer.tenantId ?? null) !== (input.tenantId ?? null)) {
+      throw new AppError("authorization", "DistributionOffer belongs to a different tenant", 403, "You cannot use this distribution offer.");
+    }
+    if (offer.status !== "active") {
+      throw new AppError("conflict", "DistributionOffer inactive", 409, "This distribution offer is no longer active.");
+    }
+    return { id: offer.id, retailPrice: offer.retailPrice, currency: offer.currency };
+  }
+
+  // Look up by (productId, tenantId).
+  const offer = await db.distributionOffer.findUnique({
+    where: {
+      productId_tenantId: {
+        productId: input.productId,
+        tenantId: input.tenantId ?? "",
+      },
+    },
+  });
+
+  if (offer) {
+    if (offer.status !== "active") {
+      throw new AppError("conflict", "DistributionOffer inactive", 409, "This distribution offer is no longer active.");
+    }
+    return { id: offer.id, retailPrice: offer.retailPrice, currency: offer.currency };
+  }
+
+  // RoamLink Direct fallback: auto-create a DistributionOffer at the plan's price.
+  if (input.tenantId == null) {
+    const created = await db.distributionOffer.create({
+      data: {
+        productId: input.productId,
+        tenantId: null,
+        retailPrice: input.fallbackRetailPriceMinor,
+        currency: input.currency,
+        markupPercent: 0,
+        status: "active",
+        audience: "B2C",
+      },
+    });
+    logger.info("catalog.distribution_offer.auto_created", {
+      offerId: created.id,
+      productId: input.productId,
+      tenantId: null,
+      retailPrice: input.fallbackRetailPriceMinor,
+    });
+    return { id: created.id, retailPrice: created.retailPrice, currency: created.currency };
+  }
+
+  // Tenant must configure their own pricing.
+  throw new AppError(
+    "not_found",
+    `No DistributionOffer for product ${input.productId} under tenant ${input.tenantId}`,
+    404,
+    "This product is not available for your tenant. Please contact your administrator.",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// createOrder
+// ---------------------------------------------------------------------------
+
+/**
  * Create an order (checkout). Idempotent via client-supplied idempotency key.
  * If the key already exists, the existing order is returned.
+ *
+ * Phase 2C:
+ *   1. Look up the Plan → find the ConnectivityProduct (by sourcePlanId)
+ *   2. If no ConnectivityProduct exists, create one (with identityHash)
+ *   3. Resolve the DistributionOffer for (product, tenant)
+ *   4. Capture immutable snapshot (canonical product identity, distribution offer, retail price)
+ *   5. Create the Order with tenantId, amount = DistributionOffer.retailPrice
  */
 export async function createOrder(input: {
   userId: string;
   planId: string;
+  tenantId?: string | null; // null/undefined = RoamLink Direct
+  distributionOfferId?: string;
   idempotencyKey: string;
   ip?: string;
 }): Promise<OrderSnapshot> {
   // Idempotency: return existing order for this key.
-  const existing = await db.order.findUnique({ where: { idempotencyKey: input.idempotencyKey }, include: { plan: true, esim: true } });
+  const existing = await db.order.findUnique({
+    where: { idempotencyKey: input.idempotencyKey },
+    include: { plan: true, esim: true },
+  });
   if (existing) {
-    return toSnapshot(existing);
+    return toSnapshot(existing as OrderWithIncludes);
   }
 
   const plan = await getCanonicalPlan(input.planId);
   if (!plan) throw new AppError("not_found", "Plan not found", 404, "This plan is no longer available.");
   if (plan.status !== "active") throw new AppError("conflict", "Plan inactive", 409, "This plan is no longer available.");
 
-  const planSnapshot = JSON.stringify({
+  // 1+2. Ensure the canonical ConnectivityProduct exists for this Plan.
+  const product = await ensureConnectivityProductForPlan({
     id: plan.id,
     name: plan.name,
     country: plan.country,
     countryCode: plan.countryCode,
-    dataAmountMB: plan.dataAmountMB,
+    region: plan.region,
+    dataAmount: plan.dataAmountMB,
     validityDays: plan.validityDays,
-    priceMinor: plan.priceMinor,
-    currency: plan.currency,
-    networks: plan.networks,
-    speed: plan.speed,
   });
 
+  // 3. Resolve the DistributionOffer (retail price is FROZEN here).
+  const distOffer = await resolveDistributionOffer({
+    productId: product.id,
+    tenantId: input.tenantId ?? null,
+    fallbackRetailPriceMinor: plan.priceMinor,
+    currency: plan.currency,
+    distributionOfferId: input.distributionOfferId,
+  });
+
+  // 4. Capture immutable snapshot. The retail price comes from the
+  //    DistributionOffer — NOT from the Plan or ConnectivityOffer. The
+  //    supplier is intentionally NOT captured here (orchestration happens
+  //    at fulfillment time).
+  const snapshot = {
+    planId: plan.id,
+    planName: plan.name,
+    country: plan.country,
+    countryCode: plan.countryCode,
+    dataAmountMB: plan.dataAmountMB,
+    validityDays: plan.validityDays,
+    currency: plan.currency,
+    canonicalProductId: product.id,
+    canonicalSpecification: product.canonicalSpecification,
+    identityHash: product.identityHash,
+    productType: product.type,
+    distributionOfferId: distOffer.id,
+    retailPriceMinor: distOffer.retailPrice,
+    tenantId: input.tenantId ?? null,
+  };
+  const planSnapshot = JSON.stringify(snapshot);
+
+  // 5. Create the Order.
   const order = await db.order.create({
     data: {
       userId: input.userId,
       planId: input.planId,
       status: "CHECKOUT_CREATED",
-      amount: plan.priceMinor,
-      currency: plan.currency,
+      amount: distOffer.retailPrice,
+      currency: distOffer.currency,
       paymentStatus: "pending",
       idempotencyKey: input.idempotencyKey,
       planSnapshot,
+      tenantId: input.tenantId ?? null,
+      fulfillmentStatus: "pending",
+      financialStatus: "pending",
     },
     include: { plan: true, esim: true },
   });
 
-  await audit({ userId: input.userId, orderId: order.id, action: "order.created", entity: "order", entityId: order.id, ip: input.ip });
-  logger.info("order.created", { orderId: order.id, userId: input.userId, planId: input.planId });
-  return toSnapshot(order);
+  await audit({
+    userId: input.userId,
+    orderId: order.id,
+    action: "order.created",
+    entity: "order",
+    entityId: order.id,
+    ip: input.ip,
+    detail: {
+      canonicalProductId: product.id,
+      distributionOfferId: distOffer.id,
+      tenantId: input.tenantId ?? null,
+    },
+  });
+  logger.info("order.created", {
+    orderId: order.id,
+    userId: input.userId,
+    planId: input.planId,
+    canonicalProductId: product.id,
+    distributionOfferId: distOffer.id,
+    tenantId: input.tenantId ?? null,
+  });
+  return toSnapshot(order as OrderWithIncludes);
 }
+
+// ---------------------------------------------------------------------------
+// initiatePayment (unchanged from baseline — preserved hardening)
+// ---------------------------------------------------------------------------
 
 /**
  * Initiate payment for an order. Creates a payment intent with the provider.
@@ -172,7 +517,7 @@ export async function initiatePayment(input: {
   const intent = await paymentProvider.createPaymentIntent({
     amountMinor: order.amount,
     currency: order.currency as Currency,
-    description: `eSIM ${order.plan.name}`,
+    description: `eSIM ${order.plan?.name ?? ""}`,
     idempotencyKey: input.idempotencyKey,
     metadata: { orderId: order.id, userId: input.userId },
   });
@@ -217,13 +562,14 @@ export async function initiatePayment(input: {
   };
 }
 
+// ---------------------------------------------------------------------------
+// confirmAndProvision + fulfillOrder (Phase 2C)
+// ---------------------------------------------------------------------------
+
 /**
  * Confirm payment — SERVER-SIDE verification. This is the single trusted path.
- * After verification, kicks off provisioning.
- *
- * For the mock provider, the client calls /api/payments/confirm which calls
- * mockPaymentProvider.confirmIntent() first (simulating the provider's own
- * confirmation), then this method verifies.
+ * After verification, calls fulfillOrder() which runs the orchestration engine,
+ * the fulfillment adapter, the persistence handler, and the double-entry ledger.
  */
 export async function confirmAndProvision(input: {
   orderId: string;
@@ -231,7 +577,10 @@ export async function confirmAndProvision(input: {
   idempotencyKey: string;
   ip?: string;
 }): Promise<{ status: OrderStatus; paymentStatus: string; esimId: string | null }> {
-  const order = await db.order.findUnique({ where: { id: input.orderId }, include: { plan: true, esim: true } });
+  const order = await db.order.findUnique({
+    where: { id: input.orderId },
+    include: { plan: true, esim: true },
+  });
   if (!order || order.userId !== input.userId) throw new AppError("not_found", "Order not found", 404, "Order not found.");
 
   // Already completed? Idempotent return.
@@ -269,11 +618,9 @@ export async function confirmAndProvision(input: {
   }
 
   // verification.status === "succeeded"
-  // Only transition to PAYMENT_CONFIRMED if we haven't already passed it. This
-  // allows retrying provisioning for a PROVISIONING_FAILED order without
-  // re-running the (illegal) PAYMENT_CONFIRMED transition.
-  const alreadyPaid = order.paymentStatus === "succeeded" &&
-    ["PAYMENT_CONFIRMED", "ESIM_PROVISIONING", "ESIM_PROVISIONED", "PROVISIONING_FAILED"].includes(order.status);
+  const alreadyPaid =
+    order.paymentStatus === "succeeded" &&
+    ["PAYMENT_CONFIRMED", "ESIM_PROVISIONING", "ESIM_PROVISIONED", "COMPLETED", "PROVISIONING_FAILED"].includes(order.status);
   if (!alreadyPaid) {
     assertTransition(order.status as OrderStatus, "PAYMENT_CONFIRMED");
     await db.order.update({
@@ -285,43 +632,16 @@ export async function confirmAndProvision(input: {
     logger.info("payment.confirmed", { orderId: order.id });
   }
 
-  // --- Provisioning ---
+  // --- Fulfillment (orchestration + adapter + persistence + ledger) ---
   try {
-    const esimId = await provisionOrderESIM({ orderId: order.id, userId: input.userId, idempotencyKey: `prov_${input.idempotencyKey}`, ip: input.ip });
+    const result = await fulfillOrder({
+      orderId: order.id,
+      userId: input.userId,
+      idempotencyKey: `fulfill_${input.idempotencyKey}`,
+      ip: input.ip,
+    });
 
-    // --- Record financial events in the ledger ---
-    // Get the plan's wholesale cost for profit calculation
-    const plan = order.plan ?? await db.plan.findUnique({ where: { id: order.planId ?? "" } });
-    if (plan) {
-      const paymentFee = Math.round(order.amount * 0.029 + 30); // ~2.9% + $0.30 (Stripe-like)
-      await recordFinancialEvent({
-        type: "CUSTOMER_PAYMENT",
-        userId: input.userId,
-        orderId: order.id,
-        provider: order.paymentProvider ?? undefined,
-        customerPrice: order.amount,
-        providerCost: 0, // payment revenue, not provider cost
-        paymentFee,
-        currency: order.currency,
-        reason: `Customer payment for ${plan.name}`,
-        idempotencyKey: `ledger_pay_${order.id}`,
-      });
-
-      await recordFinancialEvent({
-        type: "PROVIDER_PURCHASE",
-        userId: input.userId,
-        orderId: order.id,
-        provider: "mock", // eSIM provider
-        providerTxnId: order.providerOrderId ?? undefined,
-        customerPrice: 0,
-        providerCost: plan.wholesalePrice,
-        currency: order.currency,
-        reason: `Provider purchase for ${plan.name}`,
-        idempotencyKey: `ledger_prov_${order.id}`,
-      });
-    }
-
-    // --- Complete any pending referral (awards credits to both parties) ---
+    // Complete any pending referral (awards credits to both parties).
     try {
       const { completeReferral } = await import("@/lib/promotions/referral-service");
       await completeReferral({ refereeUserId: input.userId, orderId: order.id });
@@ -329,26 +649,262 @@ export async function confirmAndProvision(input: {
       logger.warn("referral.completion_failed", { orderId: order.id, error: e instanceof Error ? e.message : String(e) });
     }
 
-    return { status: "COMPLETED", paymentStatus: "succeeded", esimId };
+    return { status: "COMPLETED", paymentStatus: "succeeded", esimId: result.entityId };
   } catch (err) {
-    logger.error("provisioning.failed", { orderId: order.id, error: err instanceof Error ? err.message : String(err) });
-    // Record provider failure
-    try {
-      const { recordProviderResult } = await import("@/lib/providers/routing");
-      recordProviderResult(getESIMProvider().id, false, 0);
-    } catch { /* noop */ }
+    logger.error("fulfillment.failed", { orderId: order.id, error: err instanceof Error ? err.message : String(err) });
     await db.order.update({
       where: { id: order.id },
-      data: { status: "PROVISIONING_FAILED", failureReason: err instanceof Error ? err.message : "Provisioning failed" },
+      data: { status: "PROVISIONING_FAILED", failureReason: err instanceof Error ? err.message : "Fulfillment failed" },
     });
-    await audit({ userId: input.userId, orderId: order.id, action: "provisioning.failed", entity: "order", entityId: order.id, ip: input.ip });
+    await audit({ userId: input.userId, orderId: order.id, action: "fulfillment.failed", entity: "order", entityId: order.id, ip: input.ip });
     throw classifyProviderError("activating your eSIM", err);
   }
 }
 
+type OrderSnapshotParsed = {
+  canonicalProductId?: string;
+  canonicalSpecification?: string | null;
+  identityHash?: string | null;
+  productType?: string;
+  distributionOfferId?: string;
+  retailPriceMinor?: number;
+  tenantId?: string | null;
+};
+
+function parseOrderSnapshot(raw: string | null): OrderSnapshotParsed {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as OrderSnapshotParsed;
+  } catch {
+    return {};
+  }
+}
+
 /**
- * Provision (or re-provision after a failure) an eSIM for an order.
- * Idempotent: an order can only provision once (Order.esim is 1:1 unique).
+ * Fulfill an order via the orchestration engine + fulfillment adapter +
+ * persistence handler + double-entry ledger.
+ *
+ * This is THE KEY CHANGE in Phase 2C. The supplier is selected HERE, not at
+ * checkout time. The retail price was already frozen at checkout (in the
+ * DistributionOffer); the wholesale price is read from the SELECTED supplier's
+ * ConnectivityOffer and used to finalize the commercial transaction.
+ *
+ * Idempotent: if the order is already in fulfillmentStatus="success" with a
+ * fulfillmentEntityId, returns immediately.
+ */
+export async function fulfillOrder(input: {
+  orderId: string;
+  userId: string;
+  idempotencyKey: string;
+  ip?: string;
+}): Promise<{ entityId: string; supplierOfferId: string }> {
+  const order = await db.order.findUnique({
+    where: { id: input.orderId },
+    include: { plan: true, esim: true },
+  });
+  if (!order || order.userId !== input.userId) {
+    throw new AppError("not_found", "Order not found", 404, "Order not found.");
+  }
+
+  // Idempotent: already fulfilled.
+  if (order.fulfillmentStatus === "success" && order.fulfillmentEntityId) {
+    logger.info("fulfillment.idempotent_skip", { orderId: order.id, entityId: order.fulfillmentEntityId });
+    return { entityId: order.fulfillmentEntityId, supplierOfferId: order.supplierOfferId ?? "" };
+  }
+
+  // Payment must be confirmed first (preserved hardening).
+  if (order.paymentStatus !== "succeeded") {
+    throw new AppError("conflict", "Payment not confirmed", 409, "Payment must be confirmed before fulfillment.");
+  }
+
+  // State machine: must be in PAYMENT_CONFIRMED, ESIM_PROVISIONING,
+  // PROVISIONING_FAILED, or ESIM_PROVISIONED to fulfill. CHECKOUT_CREATED or
+  // PAYMENT_PENDING would skip payment verification.
+  const allowedStatuses: OrderStatus[] = ["PAYMENT_CONFIRMED", "ESIM_PROVISIONING", "PROVISIONING_FAILED", "ESIM_PROVISIONED"];
+  if (!allowedStatuses.includes(order.status as OrderStatus)) {
+    throw new AppError("conflict", `Cannot fulfill from ${order.status}`, 409, "This order is not ready for fulfillment.");
+  }
+
+  const snapshot = parseOrderSnapshot(order.planSnapshot);
+  if (!snapshot.canonicalProductId) {
+    throw new AppError("internal", "Order snapshot missing canonicalProductId", 500, "Order is missing canonical product identity.");
+  }
+
+  // Transition order status: PAYMENT_CONFIRMED -> ESIM_PROVISIONING (preserved hardening).
+  if (order.status === "PAYMENT_CONFIRMED" || order.status === "PROVISIONING_FAILED") {
+    assertTransition(order.status as OrderStatus, "ESIM_PROVISIONING");
+    await db.order.update({ where: { id: order.id }, data: { status: "ESIM_PROVISIONING" } });
+  }
+
+  // 1. Fulfillment state machine: pending|failed -> provisioning.
+  const currentFs = order.fulfillmentStatus as FulfillmentStatus;
+  if (canTransitionFulfillment(currentFs, "provisioning")) {
+    await transitionFulfillment(order.id, currentFs, "provisioning");
+  }
+
+  // 2. Orchestrate: select the best supplier offer for the canonical product.
+  const selected = await selectSupplierForProduct(snapshot.canonicalProductId);
+
+  // 3. Reserve provider credit (atomic conditional update, idempotent).
+  const reservationId = `res_${order.id}_${selected.offerId}`;
+  const providerKey = selected.providerKey ?? (await resolveProviderKey(selected.supplierId));
+  await ensureProviderAccount(providerKey);
+  await reserveProviderCommitment({
+    reservationId,
+    provider: providerKey,
+    amountMinor: selected.wholesalePrice,
+    orderId: order.id,
+  });
+
+  // 4. Record the selected supplier offer on the order (so subsequent
+  //    fulfillments of the same order use the same supplier).
+  await db.order.update({
+    where: { id: order.id },
+    data: { supplierOfferId: selected.offerId },
+  });
+
+  // 5. Resolve the fulfillment adapter (from supplier.providerKey).
+  const adapter = getAdapter(providerKey);
+
+  // 6. Resolve the persistence handler (from snapshot.productType).
+  const productType = (snapshot.productType ?? "ESIM").toUpperCase();
+  const persistence = getPersistenceHandler(productType);
+
+  // 7. Build the fulfillment context.
+  const ctx: FulfillmentContext = {
+    orderId: order.id,
+    userId: order.userId,
+    productId: snapshot.canonicalProductId,
+    productType,
+    sourcePlanId: order.planId,
+    canonicalSpecification: snapshot.canonicalSpecification ?? null,
+    supplierOfferId: selected.offerId,
+    supplierId: selected.supplierId,
+    idempotencyKey: input.idempotencyKey,
+  };
+
+  try {
+    // 8. Create provider order + provision.
+    const plan = order.plan;
+    if (!plan) {
+      throw new AppError("internal", "Order has no Plan", 500, "Order is missing the source plan.");
+    }
+    const { providerOrderId } = await adapter.createProviderOrder({
+      context: ctx,
+      providerPlanId: plan.providerPlanId,
+    });
+
+    const result = await adapter.provision({ context: ctx, providerOrderId });
+
+    // 9. Persist the fulfillment entity (Esim, VirtualNumber, ...).
+    const persisted = await persistence.persist({
+      context: ctx,
+      result,
+      providerOrderId,
+    });
+
+    // 10. Transition fulfillment: provisioning -> success.
+    await transitionFulfillment(order.id, "provisioning", "success", {
+      fulfillmentExternalReference: result.externalReference,
+      fulfillmentEntityId: persisted.entityId,
+    });
+
+    // 11. Transition order status: ESIM_PROVISIONING -> ESIM_PROVISIONED -> COMPLETED.
+    assertTransition("ESIM_PROVISIONING", "ESIM_PROVISIONED");
+    await db.order.update({
+      where: { id: order.id },
+      data: { status: "ESIM_PROVISIONED" },
+    });
+    assertTransition("ESIM_PROVISIONED", "COMPLETED");
+    await db.order.update({
+      where: { id: order.id },
+      data: { status: "COMPLETED" },
+    });
+
+    // 12. Settle the credit reservation.
+    await settleReservation(reservationId);
+
+    // 13. Finalize the commercial transaction in the double-entry ledger.
+    //     Uses the customer price (frozen at checkout) and the wholesale price
+    //     from the SELECTED supplier offer.
+    const customerPrice = order.amount; // frozen from DistributionOffer
+    const paymentFee = Math.round(customerPrice * 0.029 + 30); // ~2.9% + $0.30
+    await finalizeCommercialTransaction({
+      orderId: order.id,
+      userId: order.userId,
+      customerPriceMinor: customerPrice,
+      wholesalePriceMinor: selected.wholesalePrice,
+      paymentFeeMinor: paymentFee,
+      currency: order.currency,
+      provider: providerKey,
+      providerTxnId: providerOrderId,
+      idempotencyKey: `fin_${order.id}`,
+    });
+
+    // Record provider reliability (legacy hardening).
+    recordProviderResult(providerKey, true, 0);
+
+    await audit({
+      userId: input.userId,
+      orderId: order.id,
+      action: "fulfillment.succeeded",
+      entity: "order",
+      entityId: order.id,
+      ip: input.ip,
+      detail: {
+        supplierOfferId: selected.offerId,
+        supplierId: selected.supplierId,
+        providerKey,
+        entityId: persisted.entityId,
+        wholesalePrice: selected.wholesalePrice,
+      },
+    });
+
+    logger.info("fulfillment.succeeded", {
+      orderId: order.id,
+      supplierOfferId: selected.offerId,
+      supplierId: selected.supplierId,
+      entityId: persisted.entityId,
+    });
+
+    return { entityId: persisted.entityId, supplierOfferId: selected.offerId };
+  } catch (err) {
+    logger.error("fulfillment.error", {
+      orderId: order.id,
+      supplierOfferId: selected.offerId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+
+    // Definitive failure: release the credit reservation and mark failed.
+    await releaseReservation(reservationId);
+    await transitionFulfillment(order.id, "provisioning", "failed", {
+      failureReason: err instanceof Error ? err.message : "Fulfillment failed",
+    });
+
+    // Record provider failure (legacy hardening).
+    recordProviderResult(providerKey, false, 0);
+
+    await db.order.update({
+      where: { id: order.id },
+      data: {
+        status: "PROVISIONING_FAILED",
+        failureReason: err instanceof Error ? err.message : "Fulfillment failed",
+      },
+    });
+
+    throw err;
+  }
+  // NOTE: If the adapter returns status="unknown" (e.g. timeout), we do NOT
+  // release the reservation here. The caller can re-run fulfillOrder, which
+  // will detect the existing supplierOfferId and retry the same supplier.
+  // A reconciliation job (not implemented here) would handle truly stuck
+  // orders by transitioning them to "reconciliation_required".
+}
+
+/**
+ * Backward-compatible alias for fulfillOrder. Existing callers (tests, retry
+ * paths) can continue to call provisionOrderESIM; it now routes through the
+ * new orchestration-driven fulfillment path.
  */
 export async function provisionOrderESIM(input: {
   orderId: string;
@@ -356,101 +912,54 @@ export async function provisionOrderESIM(input: {
   idempotencyKey: string;
   ip?: string;
 }): Promise<string> {
-  const order = await db.order.findUnique({ where: { id: input.orderId }, include: { plan: true, esim: true } });
-  if (!order || order.userId !== input.userId) throw new AppError("not_found", "Order not found", 404, "Order not found.");
-
-  // Rule 3: an order can only provision once.
-  if (order.esim) {
-    logger.info("provision.idempotent_skip", { orderId: order.id, esimId: order.esim.id });
-    return order.esim.id;
+  const order = await db.order.findUnique({ where: { id: input.orderId } });
+  if (!order || order.userId !== input.userId) {
+    throw new AppError("not_found", "Order not found", 404, "Order not found.");
   }
 
-  if (order.status === "PROVISIONING_FAILED" || order.status === "PAYMENT_CONFIRMED") {
-    assertTransition(order.status as OrderStatus, "ESIM_PROVISIONING");
-  } else if (order.status !== "ESIM_PROVISIONING") {
-    throw new AppError("conflict", `Cannot provision from ${order.status}`, 409, "This order is not ready for provisioning.");
+  // Already provisioned? Idempotent return.
+  if (order.fulfillmentStatus === "success" && order.fulfillmentEntityId) {
+    return order.fulfillmentEntityId;
   }
 
-  await db.order.update({ where: { id: order.id }, data: { status: "ESIM_PROVISIONING" } });
+  // Payment must be confirmed first.
+  if (order.paymentStatus !== "succeeded") {
+    throw new AppError("conflict", "Payment not confirmed", 409, "Payment must be confirmed before provisioning.");
+  }
 
-  const provider = getESIMProvider();
-  const startTime = Date.now();
-
-  // Create provider order (idempotent). We use a stable key derived from orderId.
-  const orderKey = `po_${order.id}`;
-  const { providerOrderId } = await provider.createOrder({
-    providerPlanId: order.plan.providerPlanId,
-    idempotencyKey: orderKey,
-  });
-
-  // Provision eSIM (idempotent).
-  const result: ProvisioningResult = await provider.provisionESIM({
-    providerOrderId,
-    idempotencyKey: input.idempotencyKey,
-  });
-
-  // Record provider reliability
-  const { recordProviderResult } = await import("@/lib/providers/routing");
-  recordProviderResult(provider.id, true, Date.now() - startTime);
-
-  // Build LPA QR payload: LPA:1<smdpAddress>&<activationCode>
-  const qrPayload = `LPA:1${result.smdpAddress}&${result.activationCode}`;
-  const qrCode = await QRCode.toDataURL(qrPayload, { margin: 2, width: 480 });
-
-  // Persist the eSIM (1:1 with order via unique orderId).
-  const esim = await db.esim.create({
-    data: {
-      userId: order.userId,
-      orderId: order.id,
-      provider: provider.id,
-      providerESIMId: result.providerESIMId,
-      iccid: result.iccid,
-      smdpAddress: result.smdpAddress,
-      activationCode: result.activationCode,
-      matchId: result.matchId ?? null,
-      qrCode,
-      status: "active",
-      dataAmount: result.dataAmountMB,
-      dataRemaining: result.dataAmountMB,
-      validityDays: result.validityDays,
-      expiresAt: new Date(result.expiresAt),
-    },
-  });
-
-  await db.order.update({
-    where: { id: order.id },
-    data: { status: "COMPLETED", providerOrderId, esim: { connect: { id: esim.id } } },
-  });
-
-  // Record initial usage sample.
-  await db.usage.create({
-    data: { esimId: esim.id, dataUsed: 0, dataRemaining: result.dataAmountMB, source: "provider" },
-  });
-
-  await audit({ userId: input.userId, orderId: order.id, action: "esim.provisioned", entity: "esim", entityId: esim.id, ip: input.ip });
-  logger.info("esim.provisioned", { orderId: order.id, esimId: esim.id, iccid: result.iccid });
-  return esim.id;
+  const result = await fulfillOrder(input);
+  return result.entityId;
 }
 
 /** Get an order snapshot. */
 export async function getOrder(orderId: string, userId: string): Promise<OrderSnapshot> {
   const order = await db.order.findUnique({ where: { id: orderId }, include: { plan: true, esim: true } });
   if (!order || order.userId !== userId) throw new AppError("not_found", "Order not found", 404, "Order not found.");
-  return toSnapshot(order);
+  return toSnapshot(order as OrderWithIncludes);
 }
 
 /** List a user's orders. */
 export async function listUserOrders(userId: string): Promise<OrderSnapshot[]> {
   const orders = await db.order.findMany({ where: { userId }, include: { plan: true, esim: true }, orderBy: { createdAt: "desc" } });
-  return orders.map(toSnapshot);
+  return orders.map((o) => toSnapshot(o as OrderWithIncludes));
 }
 
 /** Retry provisioning for a PROVISIONING_FAILED order. */
 export async function retryProvisioning(orderId: string, userId: string, ip?: string): Promise<{ status: OrderStatus; esimId: string | null }> {
   const order = await db.order.findUnique({ where: { id: orderId }, include: { esim: true } });
   if (!order || order.userId !== userId) throw new AppError("not_found", "Order not found", 404, "Order not found.");
-  if (order.esim) return { status: "COMPLETED", esimId: order.esim.id };
+  if (order.fulfillmentStatus === "success" && order.fulfillmentEntityId) {
+    return { status: "COMPLETED", esimId: order.fulfillmentEntityId };
+  }
   if (order.paymentStatus !== "succeeded") throw new AppError("conflict", "Payment not confirmed", 409, "Payment must be confirmed before retrying.");
-  const esimId = await provisionOrderESIM({ orderId, userId, idempotencyKey: `prov_retry_${order.id}_${Date.now()}`, ip });
-  return { status: "COMPLETED", esimId };
+  const result = await fulfillOrder({
+    orderId,
+    userId,
+    idempotencyKey: `prov_retry_${order.id}_${Date.now()}`,
+    ip,
+  });
+  return { status: "COMPLETED", esimId: result.entityId };
 }
+
+// Re-export for tests / admin.
+export { getFulfillmentStatus };
