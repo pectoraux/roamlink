@@ -93,35 +93,68 @@ export async function renewSubscription(subscriptionId: string): Promise<{
   const newPeriodEnd = new Date(sub.currentPeriodEnd);
   newPeriodEnd.setMonth(newPeriodEnd.getMonth() + 1);
 
-  await db.numberSubscription.update({
-    where: { id: sub.id },
-    data: { status: "active", currentPeriodEnd: newPeriodEnd },
-  });
-
-  await db.virtualNumber.update({
-    where: { id: vn.id },
-    data: { expiresAt: newPeriodEnd },
-  });
-
-  // Phase 2E.2: Use the CANONICAL double-entry ledger path with
-  // referenceType = SUBSCRIPTION_RENEWAL. This does NOT create or update
-  // an Order — the financial finalization is reference-type agnostic.
-  // The subscription's own state is updated separately below.
+  // Phase 2E.3: FINANCIAL FINALIZATION FIRST, then domain state.
+  // The invariant is: PAYMENT → LEDGER → DOMAIN STATE.
+  // If the ledger fails, the subscription must NOT be extended.
+  // If the domain state update fails after the ledger succeeds,
+  // the subscription is set to "reconciliation_required" for retry.
   const renewalRef = `sub_renewal_${sub.id}_${sub.currentPeriodEnd.getTime()}`;
   const { finalizeCommercialTransaction } = await import("@/lib/finance/finalize");
   const paymentFee = paidFromCredit > 0 ? 0 : Math.round(remaining * 0.029 + 30);
-  const finResult = await finalizeCommercialTransaction({
-    referenceType: "SUBSCRIPTION_RENEWAL",
-    referenceId: renewalRef,
-    userId,
-    customerPriceMinor: amount,
-    wholesalePriceMinor: vn.providerCost,
-    paymentFeeMinor: paymentFee,
-    currency: vn.currency,
-    provider: "subscription_renewal",
-    providerTxnId: vn.providerNumberId ?? undefined,
-    idempotencyKey: `fin_sub_${sub.id}_${sub.currentPeriodEnd.getTime()}`,
-  });
+
+  let finResult;
+  try {
+    finResult = await finalizeCommercialTransaction({
+      referenceType: "SUBSCRIPTION_RENEWAL",
+      referenceId: renewalRef,
+      userId,
+      customerPriceMinor: amount,
+      wholesalePriceMinor: vn.providerCost,
+      paymentFeeMinor: paymentFee,
+      currency: vn.currency,
+      provider: "subscription_renewal",
+      providerTxnId: vn.providerNumberId ?? undefined,
+      idempotencyKey: `fin_sub_${sub.id}_${sub.currentPeriodEnd.getTime()}`,
+    });
+  } catch (finErr) {
+    // Financial finalization failed — do NOT extend the subscription.
+    // Set to reconciliation_required so the inconsistency is visible.
+    logger.error("subscription.financial_failed", {
+      subId: sub.id, renewalRef,
+      error: finErr instanceof Error ? finErr.message : String(finErr),
+    });
+    await db.numberSubscription.update({
+      where: { id: sub.id },
+      data: { status: "reconciliation_required" },
+    }).catch(() => {});
+    return { success: false, status: "reconciliation_required", reason: "Financial finalization failed. The subscription will be retried." };
+  }
+
+  // Financial finalization succeeded — NOW update domain state.
+  // If this fails, the ledger is posted but the subscription isn't extended.
+  // Set to reconciliation_required so a retry can extend without double-posting.
+  try {
+    await db.numberSubscription.update({
+      where: { id: sub.id },
+      data: { status: "active", currentPeriodEnd: newPeriodEnd },
+    });
+
+    await db.virtualNumber.update({
+      where: { id: vn.id },
+      data: { expiresAt: newPeriodEnd },
+    });
+  } catch (domainErr) {
+    // Domain update failed after ledger succeeded — reconciliation needed.
+    logger.error("subscription.domain_update_failed", {
+      subId: sub.id, renewalRef,
+      error: domainErr instanceof Error ? domainErr.message : String(domainErr),
+    });
+    await db.numberSubscription.update({
+      where: { id: sub.id },
+      data: { status: "reconciliation_required" },
+    }).catch(() => {});
+    return { success: false, status: "reconciliation_required", reason: "Financial posted but domain update failed. Will be retried." };
+  }
 
   await audit({ userId, action: "subscription.renewed", entity: "virtual_number", entityId: vn.id, detail: { subscriptionId: sub.id, newPeriodEnd } });
   logger.info("subscription.renewed", { subId: sub.id, newPeriodEnd, paidFromCredit, remaining });

@@ -99,16 +99,33 @@ export async function finalizeCommercialTransaction(input: {
   // Subscription renewals manage their own state (NumberSubscription.status).
   // This prevents the "fake Order" problem where a synthetic ID would
   // cause db.order.update to fail.
+  //
+  // Phase 2E.3: Do NOT silently swallow errors. If the ledger is posted but
+  // the Order.financialStatus update fails, we must NOT return success.
+  // Instead, set the Order to "reconciliation_required" so the inconsistency
+  // is visible and retriable.
   if (referenceType === "ORDER" && input.orderId) {
-    // Only update if the order exists and isn't already settled.
-    await db.order.updateMany({
+    const result = await db.order.updateMany({
       where: { id: input.orderId, financialStatus: { not: "settled" } },
       data: { financialStatus: "settled" },
-    }).catch(() => {
-      // Best-effort: if the order doesn't exist (shouldn't happen for ORDER type),
-      // the ledger entries are still posted and idempotent.
-      logger.warn("finance.order_update_skipped", { orderId: input.orderId });
+    }).catch(async (err) => {
+      // The update failed — set reconciliation_required so the inconsistency
+      // is visible and retriable. Do NOT silently swallow the error.
+      logger.error("finance.order_update_failed", {
+        orderId: input.orderId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      await db.order.updateMany({
+        where: { id: input.orderId },
+        data: { financialStatus: "reconciliation_required" },
+      }).catch(() => {}); // best-effort — if this also fails, it's in the logs
+      throw new Error(`Financial finalization succeeded but Order state update failed: ${err instanceof Error ? err.message : String(err)}`);
     });
+
+    if (result.count === 0) {
+      // The order was already settled (concurrent request) — idempotent, no-op.
+      logger.info("finance.order_already_settled", { orderId: input.orderId });
+    }
   }
 
   logger.info("finance.finalized", {
