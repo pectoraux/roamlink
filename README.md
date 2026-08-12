@@ -76,8 +76,8 @@ bun install
 cp .env.example .env
 # Edit .env — at minimum set AUTH_SECRET (see below)
 
-# 3. Push the Prisma schema to PostgreSQL (Neon)
-bun run db:push
+# 3. Apply Prisma migrations to PostgreSQL (Neon)
+bun run db:deploy
 
 # 4. Seed demo data (pricing rules + 24 plans across 11 countries + admin + demo users)
 bun run db:seed
@@ -196,10 +196,10 @@ DATABASE_URL="postgresql://USER:PASS@HOST-pooler.REGION.aws.neon.tech/DB?sslmode
 DIRECT_URL="postgresql://USER:PASS@HOST.REGION.aws.neon.tech/DB?sslmode=require"
 ```
 
-Then push the schema and seed:
+Then apply migrations and seed:
 
 ```bash
-bun run db:push     # push schema to PostgreSQL (idempotent)
+bun run db:deploy   # apply pending Prisma migrations (production-safe)
 bun run db:seed     # seed plans + admin + demo accounts
 ```
 
@@ -361,7 +361,7 @@ DB rows — `ESIM`, `Usage`, `TopUp` — persist). For a fully repeatable demo,
 re-seed after restart:
 
 ```bash
-bun run db:push && bun run db:seed
+bun run db:deploy && bun run db:seed
 ```
 
 ---
@@ -679,9 +679,9 @@ should show:
 ```bash
 # 1. Switch DB provider to postgresql in prisma/schema.prisma
 # 2. Set DATABASE_URL to a real PostgreSQL connection string in .env
-# 3. Generate the Prisma client and migrate
+# 3. Generate the Prisma client and apply migrations
 bun run db:generate
-bun run db:migrate
+bun run db:deploy
 
 # 4. Set production env vars (ESIM_PROVIDER, PAYMENT_PROVIDER, secrets, AUTH_SECRET)
 # 5. Build

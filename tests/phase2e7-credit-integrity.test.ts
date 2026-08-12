@@ -366,6 +366,63 @@ describe("Phase 2E.7 — Credit Transaction Integrity", () => {
     await db.user.deleteMany({ where: { id: { in: [referrerUser.id, refereeUser.id] } } }).catch(() => {});
   }, 180000);
 
+  it("D2. Stale-pending backstop: worker recovers records stuck in 'pending' (status-update failed)", async () => {
+    // Phase 2E.7.2: If postCreditIssuance's status-update to reconciliation_required
+    // itself failed, the CreditIssuance stays "pending" with no durable signal.
+    // The worker's stale-pending scan (updatedAt > 5 min ago) catches these.
+    await ensureSetup();
+
+    const referrerUser = await db.user.create({ data: { email: `referrer_2e7d2_${Date.now()}@test.com`, name: "Referrer D2", passwordHash: "$2a$10$test", role: "customer" } });
+    const referrerReward = 200;
+    const referrer = await db.referral.create({ data: { referrerUserId: referrerUser.id, referralCode: `TESTD2-${Date.now()}`, referrerReward, refereeReward: 200 } });
+
+    // Create a CreditIssuance stuck in "pending" with an OLD updatedAt
+    // (simulating: operational credit was posted, ledger failed, status-update
+    // to reconciliation_required also failed → stuck pending).
+    const staleTime = new Date(Date.now() - 10 * 60 * 1000); // 10 min ago
+    const stuckIssuance = await db.creditIssuance.create({
+      data: {
+        userId: referrerUser.id,
+        amountMinor: referrerReward,
+        sourceType: "referral_reward",
+        sourceId: "stale-pending-test",
+        idempotencyKey: `stale_pending_test_${Date.now()}`,
+        status: "pending",
+        updatedAt: staleTime,
+      },
+    });
+
+    // Verify: operational credit exists (simulated — we just create the issuance,
+    // not the full balance mutation, since we're testing the worker's scan).
+    const balanceBefore = (await getCreditBalance(referrerUser.id)).balanceMinor;
+
+    // Run the worker — should find the stale pending record via the age-based scan
+    const recon = await processDueCreditIssuances();
+    expect(recon.retried).toBeGreaterThanOrEqual(1);
+    expect(recon.repaired).toBeGreaterThanOrEqual(1);
+
+    // Verify: the stuck issuance is now completed
+    const after = await db.creditIssuance.findUnique({ where: { id: stuckIssuance.id } });
+    expect(after!.status).toBe("completed");
+    expect(after!.ledgerTransactionId).toBeTruthy();
+
+    // Verify: ledger transaction was created (exactly one)
+    const ledgerTxns = await db.ledgerTransaction.findMany({ where: { idempotencyKey: `${stuckIssuance.idempotencyKey}:ledger` } });
+    expect(ledgerTxns.length).toBe(1);
+
+    // Verify: operational credit UNCHANGED (worker only posts ledger, doesn't touch balance)
+    const balanceAfter = (await getCreditBalance(referrerUser.id)).balanceMinor;
+    expect(balanceAfter).toBe(balanceBefore);
+
+    // Cleanup
+    await db.ledgerEntry.deleteMany({ where: { transactionId: ledgerTxns[0].id } }).catch(() => {});
+    await db.ledgerTransaction.deleteMany({ where: { id: ledgerTxns[0].id } }).catch(() => {});
+    await db.creditIssuance.deleteMany({ where: { id: stuckIssuance.id } }).catch(() => {});
+    await db.customerCredit.deleteMany({ where: { userId: referrerUser.id } }).catch(() => {});
+    await db.referral.deleteMany({ where: { id: referrer.id } }).catch(() => {});
+    await db.user.deleteMany({ where: { id: referrerUser.id } }).catch(() => {});
+  }, 120000);
+
   it("E. Admin credit idempotency: same operationId → no duplicate", async () => {
     await ensureSetup();
     const balanceBefore = await getCreditBalance(testUserId);
@@ -448,6 +505,12 @@ describe("Phase 2E.7 — Credit Transaction Integrity", () => {
     // The reconciliation worker exists
     expect(source).toContain("processDueCreditIssuances");
     expect(source).toContain("reconciliation_required");
+    // Phase 2E.7.2: stale-pending backstop scan exists
+    expect(source).toContain("STALE_PENDING_THRESHOLD_MS");
+    expect(source).toContain('status: "pending", updatedAt: { lt: staleCutoff }');
+    // Phase 2E.7.2: status-update failure is logged at CRITICAL, not swallowed
+    expect(source).toContain("credit.issuance_status_update_failed");
+    expect(source).toContain("CRITICAL");
     // addCredit uses INSERT ... ON CONFLICT DO NOTHING (concurrency-safe)
     expect(source).toContain("ON CONFLICT (\"idempotencyKey\") DO NOTHING");
   }, 10000);

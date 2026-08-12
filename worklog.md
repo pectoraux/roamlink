@@ -527,3 +527,26 @@ Stage Summary:
 - Concurrency fix: conditional UPDATE WHERE status='pending' (PostgreSQL atomic claim)
 - Reconciliation worker: processDueCreditIssuances() — actual recovery path, not just a status field
 - Financial architecture preserved: Tenant → DistributionOffer → ConnectivityProduct → ConnectivityOffer → Supplier → Routing → FulfillmentAdapter → Provider → Service → Ledger
+
+---
+Task ID: 2E.7.2
+Agent: Lead engineer (main) — final cleanup before Phase 2B
+Task: Phase 2E.7.2 — Fix swallowed error in reconciliation status-update + add stale-pending backstop + fix README migration drift
+
+Work Log:
+- Verified remote main pointer: `git ls-remote origin refs/heads/main` = d59057e (matches local after reset). A spurious auto-deploy commit (c912fa2, adding tool-results artifact) was local-only; reset to origin/main before starting.
+- Fixed the swallowed `.catch(() => {})` in postCreditIssuance: now logs at CRITICAL severity with `credit.issuance_status_update_failed` including both the ledger error and the update error, plus a message explaining the stale-pending scan will recover it.
+- Enhanced processDueCreditIssuances() with a stale-pending backstop scan: queries `status='pending' AND updatedAt < (now - 5min)` in addition to `reconciliation_required`. This is the guaranteed recovery mechanism for the worst-case divergence (operational credit posted, ledger missing, status-update to reconciliation_required also failed → stuck pending with no signal). The 5-minute threshold avoids racing with an in-flight postCreditIssuance call.
+- Added test D2: creates a CreditIssuance stuck in "pending" with a 10-min-old updatedAt, runs the worker, verifies it's recovered (status→completed, ledger posted, operational credit unchanged).
+- Updated static test to verify STALE_PENDING_THRESHOLD_MS, the stale-pending OR clause, the CRITICAL log, and the `credit.issuance_status_update_failed` log key all exist in source.
+- Fixed README migration drift: replaced all 3 `bun run db:push` references with `bun run db:deploy` (the production-safe migration command). Also fixed the production deployment section which used `db:migrate` (dev command) → `db:deploy`.
+- Fixed docs/database.md: replaced `db:push` with `db:deploy` and added a warning block: "Never use db:push in this project" explaining that the migration baseline is the source of truth.
+- Fixed docs/esim-provider.md: replaced `db:push` with `db:deploy`.
+- Left tests/database-runtime-build.sh unchanged — it's an infrastructure test for a .zscripts/ build script, unrelated to the RoamLink app's migration workflow.
+
+Stage Summary:
+- 4 files changed: src/lib/promotions/referral-service.ts, tests/phase2e7-credit-integrity.test.ts, README.md, docs/database.md, docs/esim-provider.md (5 files)
+- All tests pass: D2 (stale-pending backstop, 6 expects), E (admin idempotency, 3 expects), 3 static tests (14 expects)
+- The failure-path hole is closed: a stuck "pending" record is now both (a) logged at CRITICAL severity and (b) guaranteed to be recovered by the worker's stale-pending scan
+- README no longer instructs developers to use the unsafe db:push workflow
+- Financial foundation is now sufficiently mature for Phase 2B: Reseller SaaS Control Plane

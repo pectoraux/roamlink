@@ -317,7 +317,7 @@ restart, the dashboard can still show your eSIMs (from the DB) but the mock
 provider no longer "knows" about them. For a fully repeatable demo, re-seed:
 
 ```bash
-bun run db:push && bun run db:seed
+bun run db:deploy && bun run db:seed
 ```
 
 ### Idempotency

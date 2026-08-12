@@ -275,22 +275,45 @@ async function postCreditIssuance(input: {
     // The processDueCreditIssuances() worker will retry the ledger posting.
     const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("credit.issuance_ledger_failed", { idempotencyKey: input.idempotencyKey, error: errorMsg });
+    // Phase 2E.7.2: If THIS update also fails, log at CRITICAL severity.
+    // A stuck "pending" record (operational credit posted, ledger missing,
+    // no reconciliation_required signal) is the worst-case divergence.
+    // The processDueCreditIssuances() worker also scans for stale "pending"
+    // records (updatedAt older than STALE_PENDING_THRESHOLD_MS) as a
+    // guaranteed recovery backstop, so even a total status-update failure
+    // will eventually be repaired.
     await db.creditIssuance.updateMany({
       where: { id: issuance.id, status: { in: ["pending", "reconciliation_required"] } },
       data: { status: "reconciliation_required" },
-    }).catch(() => {});
+    }).catch((updateErr) => {
+      const updateMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
+      logger.error("credit.issuance_status_update_failed", {
+        idempotencyKey: input.idempotencyKey,
+        issuanceId: issuance.id,
+        ledgerError: errorMsg,
+        updateError: updateMsg,
+        message: "CRITICAL: CreditIssuance status update failed after ledger failure. Record is stuck in pending. The reconciliation worker will recover it via the stale-pending scan.",
+      });
+    });
     // Do NOT throw — the operational credit was already posted in the claim
-    // transaction. The reconciliation_required status makes the divergence
-    // visible and retriable by processDueCreditIssuances().
+    // transaction. The reconciliation_required status (or the stale-pending
+    // scan backstop) makes the divergence visible and retriable by
+    // processDueCreditIssuances().
   }
 }
 
 /**
  * Phase 2E.7.1: Reconciliation worker for CreditIssuance records.
  *
- * Queries all CreditIssuance records with status = 'reconciliation_required'
- * and retries the ledger posting for each. This is the actual recovery
- * mechanism referenced by postCreditIssuance's catch block.
+ * Phase 2E.7.2: Also scans for STALE "pending" records as a guaranteed
+ * recovery backstop. If postCreditIssuance's status-update to
+ * reconciliation_required itself failed (the .catch logged CRITICAL but
+ * could not write the status), the record stays "pending" with no durable
+ * signal. This scan catches those records by age (updatedAt older than
+ * STALE_PENDING_THRESHOLD_MS) and retries them.
+ *
+ * The threshold ensures we don't retry a "pending" record that a concurrent
+ * postCreditIssuance call is actively processing.
  *
  * Idempotency:
  * - ledgerCreditIssuance replays if the ledger idempotencyKey already exists
@@ -300,6 +323,8 @@ async function postCreditIssuance(input: {
  *
  * Returns counts for observability.
  */
+const STALE_PENDING_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
 export async function processDueCreditIssuances(): Promise<{
   retried: number;
   repaired: number;
@@ -307,9 +332,18 @@ export async function processDueCreditIssuances(): Promise<{
 }> {
   const result = { retried: 0, repaired: 0, stillFailing: 0 };
 
+  // 1. Records explicitly marked reconciliation_required.
+  // 2. Stale "pending" records (age > threshold) — the guaranteed backstop
+  //    for the case where the status-update to reconciliation_required failed.
+  const staleCutoff = new Date(Date.now() - STALE_PENDING_THRESHOLD_MS);
   const due = await db.creditIssuance.findMany({
-    where: { status: "reconciliation_required" },
-    select: { id: true, userId: true, amountMinor: true, sourceType: true, sourceId: true, idempotencyKey: true },
+    where: {
+      OR: [
+        { status: "reconciliation_required" },
+        { status: "pending", updatedAt: { lt: staleCutoff } },
+      ],
+    },
+    select: { id: true, userId: true, amountMinor: true, sourceType: true, sourceId: true, idempotencyKey: true, status: true },
   });
 
   for (const issuance of due) {
@@ -323,15 +357,17 @@ export async function processDueCreditIssuances(): Promise<{
         idempotencyKey: `${issuance.idempotencyKey}:ledger`,
       });
 
-      // Status-guarded: only reconciliation_required → completed.
+      // Status-guarded: only pending/reconciliation_required → completed.
+      // This prevents clobbering a record that a concurrent postCreditIssuance
+      // call completed between our findMany and our update.
       const update = await db.creditIssuance.updateMany({
-        where: { id: issuance.id, status: "reconciliation_required" },
+        where: { id: issuance.id, status: { in: ["pending", "reconciliation_required"] } },
         data: { status: "completed", ledgerTransactionId: ledgerTxnId },
       });
 
       if (update.count > 0) {
         result.repaired++;
-        logger.info("credit.issuance_reconciled", { idempotencyKey: issuance.idempotencyKey, ledgerTxnId });
+        logger.info("credit.issuance_reconciled", { idempotencyKey: issuance.idempotencyKey, ledgerTxnId, wasStalePending: issuance.status === "pending" });
       } else {
         // Already completed by a concurrent path — not a failure, just a no-op.
         logger.info("credit.issuance_already_completed_during_reconciliation", { idempotencyKey: issuance.idempotencyKey });
@@ -339,8 +375,8 @@ export async function processDueCreditIssuances(): Promise<{
     } catch (err) {
       result.stillFailing++;
       const errorMsg = err instanceof Error ? err.message : String(err);
-      logger.error("credit.issuance_reconciliation_still_failing", { idempotencyKey: issuance.idempotencyKey, error: errorMsg });
-      // Leave status as reconciliation_required for the next worker run.
+      logger.error("credit.issuance_reconciliation_still_failing", { idempotencyKey: issuance.idempotencyKey, error: errorMsg, wasStalePending: issuance.status === "pending" });
+      // Leave status as-is (reconciliation_required or pending) for the next worker run.
     }
   }
 

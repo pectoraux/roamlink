@@ -52,12 +52,17 @@ DIRECT_URL="postgresql://USER:PASS@HOST.REGION.aws.neon.tech/DB?sslmode=require"
 ### Migration commands
 
 ```bash
-bun run db:push       # Push schema to PostgreSQL (idempotent, accepts data loss)
+bun run db:deploy     # Apply pending Prisma migrations (production-safe, no data loss)
 bun run db:generate   # Regenerate the Prisma client
-bun run db:migrate    # Create + apply a migration (dev)
+bun run db:migrate    # Create + apply a new migration (dev only — prompts for name)
 bun run db:reset      # Drop and recreate (dev)
 bun run db:seed       # Populate demo data
 ```
+
+> **Never use `db:push` in this project.** The migration baseline
+> (`prisma/migrations/0001_baseline` + subsequent phases) is the source of
+> truth for schema evolution. `db:push` bypasses migrations and can cause
+> schema drift between environments.
 
 ---
 
