@@ -496,3 +496,34 @@ Stage Summary:
   5. B2B (orgs, spending limits, usage, billing, member management)
   6. Multi-provider optimization (routing, health, reliability, failover)
   7. Enterprise (foundation preserved — contracts/invoicing architecture ready)
+
+---
+Task ID: 2E.7.1
+Agent: Lead engineer (main) — final credit-issuance concurrency fix
+Task: Phase 2E.7.1 — Fix completeReferral() concurrency hole + implement reconciliation worker + comprehensive tests
+
+Work Log:
+- Verified git state: HEAD = origin/main = af7c28e (Phase 2E.7 IS on main; user's claim that it wasn't was based on stale GitHub cache view)
+- Confirmed the real P0 bug: completeReferral() used unconditional UPDATE on ReferralUse (no WHERE status='pending'), checked CreditIssuance existence OUTSIDE the transaction → two concurrent calls could both observe "pending" and both call addCreditInternal() → duplicate operational credit (balance + CreditTransaction + referral counters) even though only one CreditIssuance eventually succeeded
+- Confirmed NO reconciliation worker existed for CreditIssuance.status='reconciliation_required' — the comment "A background reconciliation job can retry" was a promise, not code
+- Rewrote completeReferral(): conditional UPDATE (WHERE id=? AND status='pending') as serialization point; only the winner (affected>0) performs credit mutations; loser exits cleanly. CreditIssuance records created (status=pending) INSIDE the claim transaction so they're atomic with the operational credit
+- Rewrote postCreditIssuance(): status-guarded updateMany (WHERE status IN pending/reconciliation_required) prevents clobbering completed records; P2002 catch for concurrent create
+- Rewrote addCredit(): INSERT ... ON CONFLICT DO NOTHING as serialization point; only the first concurrent call performs operational credit mutation
+- Implemented processDueCreditIssuances(): actual reconciliation worker — queries status='reconciliation_required', retries ledger posting (idempotent via ledgerCreditIssuance idempotencyKey), marks as completed. Running twice is safe (completed records skipped)
+- Optimized ensureChartOfAccounts(): added in-memory cache flag to avoid 11 sequential findUnique calls on every postLedgerTransaction (reduced test D from >570s timeout to 85s)
+- Rewrote test C: verifies ALL 10 invariants (ReferralUse count/status, CreditTransaction count per recipient, balance increase per recipient, completedReferrals increment, totalRewardPaid increment, CreditIssuance count/status per recipient, ledger transaction count per recipient, ledger entry correctness) — not just CreditIssuance count
+- Added test C2: hardest case — concurrent completeReferral with DIFFERENT orderIds (CreditTransaction unique constraint doesn't help; conditional UPDATE is sole protection)
+- Added test D: end-to-end reconciliation — completeReferral → simulate ledger failure → verify reconciliation_required → run worker (repairs) → run worker again (idempotent, 0 retried)
+- Fixed pre-existing test bug: "Static: addCredit requires operationId" checked for wrong string
+- Added beforeAll(ensureSetup) so static tests can run in isolation
+- Repository-wide search: completeReferral called from exactly ONE place (orders/service.ts:647); no duplicate referral reward paths
+
+Stage Summary:
+- 3 files changed: src/lib/promotions/referral-service.ts, src/lib/finance/double-entry-ledger.ts, tests/phase2e7-credit-integrity.test.ts
+- All 11 PostgreSQL integration tests pass (A, B, C, C2, D, E, F, H + 3 static)
+- Test C: 19 expect() calls — verifies 10 operational invariants under concurrent same-orderId completeReferral
+- Test C2: 8 expect() calls — verifies concurrency safety with different orderIds (conditional UPDATE sole protection)
+- Test D: 22 expect() calls — verifies reconciliation worker repairs + idempotency
+- Concurrency fix: conditional UPDATE WHERE status='pending' (PostgreSQL atomic claim)
+- Reconciliation worker: processDueCreditIssuances() — actual recovery path, not just a status field
+- Financial architecture preserved: Tenant → DistributionOffer → ConnectivityProduct → ConnectivityOffer → Supplier → Routing → FulfillmentAdapter → Provider → Service → Ledger

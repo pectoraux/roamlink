@@ -72,8 +72,18 @@ const CHART_OF_ACCOUNTS: Array<{
   { code: ACCOUNT_CODES.PROMOTIONAL_EXPENSE, name: "Promotional Expense", type: "expense", normalBalance: "debit" },
 ];
 
-/** Idempotently ensure the standard chart of accounts exists. */
+/**
+ * Idempotently ensure the standard chart of accounts exists.
+ *
+ * Phase 2E.7.1: In-memory cache to avoid 11 sequential findUnique queries on
+ * every postLedgerTransaction call. The chart of accounts is static (defined
+ * in CHART_OF_ACCOUNTS above) and accounts are never deleted in normal
+ * operation, so caching is safe. The cache is per-process; a new process
+ * will re-ensure on its first call.
+ */
+let _chartOfAccountsEnsured = false;
 export async function ensureChartOfAccounts(): Promise<void> {
+  if (_chartOfAccountsEnsured) return;
   for (const a of CHART_OF_ACCOUNTS) {
     const existing = await db.ledgerAccount.findUnique({ where: { code: a.code } });
     if (!existing) {
@@ -87,6 +97,7 @@ export async function ensureChartOfAccounts(): Promise<void> {
       });
     }
   }
+  _chartOfAccountsEnsured = true;
 }
 
 // ---------------------------------------------------------------------------

@@ -59,8 +59,36 @@ export async function trackReferralUse(input: { referralCode: string; refereeUse
   logger.info("referral.tracked", { referralId: referral.id, refereeUserId: input.refereeUserId });
 }
 
-/** Complete a referral (when the referee makes their first purchase). Awards credits. */
+/**
+ * Complete a referral (when the referee makes their first purchase). Awards credits.
+ *
+ * Phase 2E.7.1: CONCURRENCY-SAFE via conditional UPDATE.
+ *
+ * The serialization point is a conditional UPDATE:
+ *   UPDATE ReferralUse SET status='completed' WHERE id=? AND status='pending'
+ *
+ * Only ONE concurrent call can claim a pending ReferralUse. The loser sees
+ * 0 rows affected and exits WITHOUT performing any credit mutations.
+ *
+ * This guarantees that two concurrent completeReferral() calls for the same
+ * ReferralUse produce EXACTLY:
+ *   - one ReferralUse completion
+ *   - one referrer reward (CustomerCredit + CreditTransaction)
+ *   - one referee reward (CustomerCredit + CreditTransaction)
+ *   - one increment to Referral.completedReferrals
+ *   - one increment to Referral.totalRewardPaid
+ *   - one CreditIssuance per recipient (created inside the claim transaction)
+ *   - one ledger posting per recipient (via postCreditIssuance, idempotent)
+ *
+ * The previous implementation (Phase 2E.7) checked CreditIssuance existence
+ * OUTSIDE the transaction and used an unconditional UPDATE on ReferralUse,
+ * which allowed two concurrent calls to both observe "pending" and both
+ * proceed to addCreditInternal() — producing duplicate operational credit
+ * even though only one CreditIssuance eventually succeeded.
+ */
 export async function completeReferral(input: { refereeUserId: string; orderId: string }): Promise<void> {
+  // Read-only lookup — no lock held here. The lock is acquired inside the
+  // transaction via the conditional UPDATE below.
   const referralUse = await db.referralUse.findFirst({
     where: { refereeUserId: input.refereeUserId, status: "pending" },
     include: { referral: true },
@@ -68,73 +96,119 @@ export async function completeReferral(input: { refereeUserId: string; orderId: 
   if (!referralUse) return;
 
   const referral = referralUse.referral;
-
-  // Phase 2E.7: Use durable CreditIssuance records for idempotency.
-  // Each issuance has a stable identity: credit_issuance_referral_{referralUseId}_{recipient}
   const referrerIssuanceKey = `credit_issuance_referral_${referralUse.id}_referrer`;
   const refereeIssuanceKey = `credit_issuance_referral_${referralUse.id}_referee`;
 
-  // Check if already completed (idempotent)
-  const existingReferrer = await db.creditIssuance.findUnique({ where: { idempotencyKey: referrerIssuanceKey } });
-  const existingReferee = await db.creditIssuance.findUnique({ where: { idempotencyKey: refereeIssuanceKey } });
-  if (existingReferrer?.status === "completed" && existingReferee?.status === "completed") {
-    logger.info("referral.already_completed", { referralUseId: referralUse.id });
+  // Phase 2E.7.1: Atomically CLAIM the ReferralUse from pending → completed.
+  // The conditional UPDATE (WHERE status = 'pending') is the serialization point.
+  // Both concurrent calls may enter the transaction, but only ONE can match
+  // the WHERE clause — the other gets 0 rows affected and exits cleanly.
+  let claimed = false;
+  await db.$transaction(async (tx) => {
+    const affected: number = await tx.$executeRaw`
+      UPDATE "ReferralUse"
+      SET status = 'completed',
+          "orderId" = ${input.orderId},
+          "referrerCredited" = true,
+          "refereeCredited" = true
+      WHERE id = ${referralUse.id} AND status = 'pending'
+    `;
+    if (affected === 0) {
+      // Lost the race — another concurrent call already completed this referral.
+      // Do NOT touch counters, balance, or CreditIssuance. Exit cleanly.
+      return;
+    }
+    claimed = true;
+
+    // We are the sole winner. All mutations below are atomic with the claim.
+    await tx.referral.update({
+      where: { id: referral.id },
+      data: {
+        completedReferrals: { increment: 1 },
+        totalRewardPaid: { increment: referral.referrerReward + referral.refereeReward },
+      },
+    });
+
+    // Create durable CreditIssuance records (pending state) INSIDE this
+    // transaction so they are atomically tied to the claim. Upsert guards
+    // against the edge case where a record already exists from a prior
+    // partial attempt that was rolled back.
+    await tx.creditIssuance.upsert({
+      where: { idempotencyKey: referrerIssuanceKey },
+      create: {
+        userId: referral.referrerUserId,
+        amountMinor: referral.referrerReward,
+        sourceType: "referral_reward",
+        sourceId: referralUse.id,
+        idempotencyKey: referrerIssuanceKey,
+        status: "pending",
+      },
+      update: {},
+    });
+    await tx.creditIssuance.upsert({
+      where: { idempotencyKey: refereeIssuanceKey },
+      create: {
+        userId: input.refereeUserId,
+        amountMinor: referral.refereeReward,
+        sourceType: "referral_reward",
+        sourceId: referralUse.id,
+        idempotencyKey: refereeIssuanceKey,
+        status: "pending",
+      },
+      update: {},
+    });
+
+    // Add operational credit (balance + CreditTransaction) for both recipients.
+    await addCreditInternal(tx, referral.referrerUserId, referral.referrerReward, "referral_reward", `Referral reward for inviting a friend`, input.orderId, referral.referrerUserId);
+    await addCreditInternal(tx, input.refereeUserId, referral.refereeReward, "referral_reward", `Welcome credit from referral`, input.orderId, referral.referrerUserId);
+  }, { timeout: 30000, maxWait: 15000 });
+
+  if (!claimed) {
+    // Another concurrent call won the race and completed this referral.
+    logger.info("referral.lost_race", { referralUseId: referralUse.id, orderId: input.orderId });
     return;
   }
 
-  // Mark referral as completed (inside a transaction with the credit updates)
-  await db.$transaction(async (tx) => {
-    await tx.referralUse.update({
-      where: { id: referralUse.id },
-      data: { status: "completed", orderId: input.orderId, referrerCredited: true, refereeCredited: true },
-    });
-    await tx.referral.update({
-      where: { id: referral.id },
-      data: { completedReferrals: { increment: 1 }, totalRewardPaid: { increment: referral.referrerReward + referral.refereeReward } },
-    });
-
-    // Credit referrer
-    if (!existingReferrer) {
-      await addCreditInternal(tx, referral.referrerUserId, referral.referrerReward, "referral_reward", `Referral reward for inviting a friend`, input.orderId, referral.referrerUserId);
-    }
-    // Credit referee
-    if (!existingReferee) {
-      await addCreditInternal(tx, input.refereeUserId, referral.refereeReward, "referral_reward", `Welcome credit from referral`, input.orderId, referral.referrerUserId);
-    }
+  // Phase 2E.7.1: Post ledger entries via durable CreditIssuance records.
+  // The CreditIssuance records were created (status=pending) inside the
+  // claim transaction above. postCreditIssuance finds them, posts the
+  // idempotent ledger entry, and marks as completed. On ledger failure,
+  // status → reconciliation_required, retried by processDueCreditIssuances().
+  await postCreditIssuance({
+    userId: referral.referrerUserId,
+    amountMinor: referral.referrerReward,
+    sourceType: "referral_reward",
+    sourceId: referralUse.id,
+    idempotencyKey: referrerIssuanceKey,
+    reason: `Referral reward for ${referral.referralCode}`,
+    orderId: input.orderId,
   });
-
-  // Phase 2E.7: Post ledger entries via durable CreditIssuance records.
-  // If the ledger call fails, the issuance is marked reconciliation_required.
-  if (!existingReferrer || existingReferrer.status !== "completed") {
-    await postCreditIssuance({
-      userId: referral.referrerUserId,
-      amountMinor: referral.referrerReward,
-      sourceType: "referral_reward",
-      sourceId: referralUse.id,
-      idempotencyKey: referrerIssuanceKey,
-      reason: `Referral reward for ${referral.referralCode}`,
-      orderId: input.orderId,
-    });
-  }
-  if (!existingReferee || existingReferee.status !== "completed") {
-    await postCreditIssuance({
-      userId: input.refereeUserId,
-      amountMinor: referral.refereeReward,
-      sourceType: "referral_reward",
-      sourceId: referralUse.id,
-      idempotencyKey: refereeIssuanceKey,
-      reason: `Welcome credit from referral ${referral.referralCode}`,
-      orderId: input.orderId,
-    });
-  }
+  await postCreditIssuance({
+    userId: input.refereeUserId,
+    amountMinor: referral.refereeReward,
+    sourceType: "referral_reward",
+    sourceId: referralUse.id,
+    idempotencyKey: refereeIssuanceKey,
+    reason: `Welcome credit from referral ${referral.referralCode}`,
+    orderId: input.orderId,
+  });
 
   logger.info("referral.completed", { referralId: referral.id, refereeUserId: input.refereeUserId, orderId: input.orderId });
 }
 
 /**
  * Post a credit issuance with a durable lifecycle.
- * Creates a CreditIssuance record, posts the ledger entry, and marks as completed.
- * If the ledger fails, the issuance is marked reconciliation_required (NOT silently swallowed).
+ *
+ * Phase 2E.7.1:
+ * - Finds the CreditIssuance record (pre-created in the claim transaction,
+ *   or created here as a fallback for non-referral paths like addCredit).
+ * - Posts the idempotent ledger entry (ledgerCreditIssuance replays if the
+ *   idempotencyKey already exists, so concurrent/retry calls are safe).
+ * - Uses a status-guarded updateMany (WHERE status IN pending/reconciliation_required)
+ *   so concurrent postCreditIssuance calls or reconciliation-worker retries
+ *   cannot clobber a "completed" record.
+ * - On ledger failure, status → reconciliation_required. The
+ *   processDueCreditIssuances() worker retries these until completed.
  */
 async function postCreditIssuance(input: {
   userId: string;
@@ -145,27 +219,41 @@ async function postCreditIssuance(input: {
   reason: string;
   orderId?: string;
 }): Promise<void> {
-  // Find or create the CreditIssuance record
+  // Find the CreditIssuance record. For referrals, it was already created
+  // (status=pending) inside the claim transaction. For addCredit, it may not
+  // exist yet — create it as a fallback.
   let issuance = await db.creditIssuance.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
   if (!issuance) {
-    issuance = await db.creditIssuance.create({
-      data: {
-        userId: input.userId,
-        amountMinor: input.amountMinor,
-        sourceType: input.sourceType,
-        sourceId: input.sourceId,
-        idempotencyKey: input.idempotencyKey,
-        status: "pending",
-      },
-    });
+    try {
+      issuance = await db.creditIssuance.create({
+        data: {
+          userId: input.userId,
+          amountMinor: input.amountMinor,
+          sourceType: input.sourceType,
+          sourceId: input.sourceId,
+          idempotencyKey: input.idempotencyKey,
+          status: "pending",
+        },
+      });
+    } catch (err: any) {
+      // P2002 = another concurrent call created it. Re-fetch.
+      if (err?.code === "P2002") {
+        issuance = await db.creditIssuance.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
+      } else {
+        throw err;
+      }
+    }
   }
+  if (!issuance) return; // unreachable, but satisfies TS
 
   if (issuance.status === "completed") {
     logger.info("credit.issuance_already_completed", { idempotencyKey: input.idempotencyKey });
     return;
   }
 
-  // Post the ledger entry
+  // Post the idempotent ledger entry. If this idempotencyKey was already
+  // posted (by a concurrent call or a prior attempt), postLedgerTransaction
+  // returns the existing txnId without creating a duplicate.
   try {
     const ledgerTxnId = await ledgerCreditIssuance({
       userId: input.userId,
@@ -175,22 +263,88 @@ async function postCreditIssuance(input: {
       idempotencyKey: `${input.idempotencyKey}:ledger`,
     });
 
-    await db.creditIssuance.update({
-      where: { id: issuance.id },
+    // Status-guarded transition: only pending/reconciliation_required → completed.
+    // This prevents a late retry from clobbering a record that another path
+    // already completed. updateMany returns count; we don't need it.
+    await db.creditIssuance.updateMany({
+      where: { id: issuance.id, status: { in: ["pending", "reconciliation_required"] } },
       data: { status: "completed", ledgerTransactionId: ledgerTxnId },
     });
   } catch (err) {
-    // Phase 2E.7: Do NOT silently swallow. Mark as reconciliation_required.
+    // Phase 2E.7.1: Do NOT silently swallow. Mark as reconciliation_required.
+    // The processDueCreditIssuances() worker will retry the ledger posting.
     const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("credit.issuance_ledger_failed", { idempotencyKey: input.idempotencyKey, error: errorMsg });
-    await db.creditIssuance.update({
-      where: { id: issuance.id },
+    await db.creditIssuance.updateMany({
+      where: { id: issuance.id, status: { in: ["pending", "reconciliation_required"] } },
       data: { status: "reconciliation_required" },
     }).catch(() => {});
-    // Do NOT throw — the operational credit was already posted in the transaction.
-    // The reconciliation_required status makes the divergence visible and retriable.
-    // A background reconciliation job can retry the ledger posting.
+    // Do NOT throw — the operational credit was already posted in the claim
+    // transaction. The reconciliation_required status makes the divergence
+    // visible and retriable by processDueCreditIssuances().
   }
+}
+
+/**
+ * Phase 2E.7.1: Reconciliation worker for CreditIssuance records.
+ *
+ * Queries all CreditIssuance records with status = 'reconciliation_required'
+ * and retries the ledger posting for each. This is the actual recovery
+ * mechanism referenced by postCreditIssuance's catch block.
+ *
+ * Idempotency:
+ * - ledgerCreditIssuance replays if the ledger idempotencyKey already exists
+ *   (so a retry that partially succeeded does not double-post).
+ * - The status-guarded updateMany ensures a record is only marked completed once.
+ * - Running this worker twice is safe — completed records are skipped.
+ *
+ * Returns counts for observability.
+ */
+export async function processDueCreditIssuances(): Promise<{
+  retried: number;
+  repaired: number;
+  stillFailing: number;
+}> {
+  const result = { retried: 0, repaired: 0, stillFailing: 0 };
+
+  const due = await db.creditIssuance.findMany({
+    where: { status: "reconciliation_required" },
+    select: { id: true, userId: true, amountMinor: true, sourceType: true, sourceId: true, idempotencyKey: true },
+  });
+
+  for (const issuance of due) {
+    result.retried++;
+    try {
+      const ledgerTxnId = await ledgerCreditIssuance({
+        userId: issuance.userId,
+        orderId: undefined,
+        amountMinor: issuance.amountMinor,
+        reason: `Reconciliation retry for ${issuance.sourceType} (${issuance.idempotencyKey})`,
+        idempotencyKey: `${issuance.idempotencyKey}:ledger`,
+      });
+
+      // Status-guarded: only reconciliation_required → completed.
+      const update = await db.creditIssuance.updateMany({
+        where: { id: issuance.id, status: "reconciliation_required" },
+        data: { status: "completed", ledgerTransactionId: ledgerTxnId },
+      });
+
+      if (update.count > 0) {
+        result.repaired++;
+        logger.info("credit.issuance_reconciled", { idempotencyKey: issuance.idempotencyKey, ledgerTxnId });
+      } else {
+        // Already completed by a concurrent path — not a failure, just a no-op.
+        logger.info("credit.issuance_already_completed_during_reconciliation", { idempotencyKey: issuance.idempotencyKey });
+      }
+    } catch (err) {
+      result.stillFailing++;
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error("credit.issuance_reconciliation_still_failing", { idempotencyKey: issuance.idempotencyKey, error: errorMsg });
+      // Leave status as reconciliation_required for the next worker run.
+    }
+  }
+
+  return result;
 }
 
 /** Get the user's credit balance. Creates the credit account if it doesn't exist. */
@@ -236,7 +390,16 @@ async function addCreditInternal(tx: any, userId: string, amountMinor: number, t
   });
 }
 
-/** Add credit to a user's account (public, for admin/manual adjustments). */
+/**
+ * Add credit to a user's account (public, for admin/manual adjustments).
+ *
+ * Phase 2E.7.1: Concurrency-safe via INSERT ... ON CONFLICT DO NOTHING.
+ * The CreditIssuance record creation is the serialization point — only the
+ * first concurrent call creates it and performs the operational credit
+ * mutation. Duplicate/retry calls find the existing record and skip the
+ * balance increment (but still call postCreditIssuance to ensure the
+ * ledger is posted, which is idempotent).
+ */
 export async function addCredit(input: { userId: string; amountMinor: number; type: string; reason: string; orderId?: string; operationId?: string }): Promise<void> {
   // Phase 2E.7: Require a stable operation identity (no Date.now fallback).
   const operationId = input.operationId ?? input.orderId;
@@ -246,17 +409,39 @@ export async function addCredit(input: { userId: string; amountMinor: number; ty
 
   const idempotencyKey = `credit_issuance_${input.type}_${operationId}_${input.userId}`;
 
-  // Check if already done (idempotent)
+  // Phase 2E.7.1: Fast-path — if already completed, skip entirely.
   const existing = await db.creditIssuance.findUnique({ where: { idempotencyKey } });
   if (existing?.status === "completed") {
     logger.info("credit.add_already_completed", { idempotencyKey });
     return;
   }
 
+  // Phase 2E.7.1: Atomically claim the CreditIssuance slot inside a
+  // transaction. INSERT ... ON CONFLICT DO NOTHING ensures only ONE
+  // concurrent call creates the record and performs the operational credit.
+  // The loser gets 0 rows affected and skips addCreditInternal.
+  let performedCredit = false;
   await db.$transaction(async (tx) => {
+    const claimed: number = await tx.$executeRaw`
+      INSERT INTO "CreditIssuance" ("id", "userId", "amountMinor", "sourceType", "sourceId", "idempotencyKey", "status", "createdAt", "updatedAt")
+      VALUES (
+        ${crypto.randomUUID()}, ${input.userId}, ${input.amountMinor}, ${input.type}, ${operationId},
+        ${idempotencyKey}, 'pending', NOW(), NOW()
+      )
+      ON CONFLICT ("idempotencyKey") DO NOTHING
+    `;
+    if (claimed === 0) {
+      // Duplicate concurrent call — CreditIssuance already exists.
+      // Do NOT add operational credit (the winner already did).
+      return;
+    }
+    performedCredit = true;
     await addCreditInternal(tx, input.userId, input.amountMinor, input.type, input.reason, input.orderId);
-  });
+  }, { timeout: 30000, maxWait: 15000 });
 
+  // Post the ledger entry (idempotent — safe even if this is a duplicate call
+  // that didn't perform the operational credit; postCreditIssuance handles
+  // the "already completed" case internally).
   await postCreditIssuance({
     userId: input.userId,
     amountMinor: input.amountMinor,
@@ -267,8 +452,12 @@ export async function addCredit(input: { userId: string; amountMinor: number; ty
     orderId: input.orderId,
   });
 
-  await audit({ userId: input.userId, action: "credit.added", entity: "user", entityId: input.userId, detail: { amount: input.amountMinor, type: input.type, operationId } });
-  logger.info("credit.added", { userId: input.userId, amount: input.amountMinor, type: input.type, operationId });
+  if (performedCredit) {
+    await audit({ userId: input.userId, action: "credit.added", entity: "user", entityId: input.userId, detail: { amount: input.amountMinor, type: input.type, operationId } });
+    logger.info("credit.added", { userId: input.userId, amount: input.amountMinor, type: input.type, operationId });
+  } else {
+    logger.info("credit.add_skipped_duplicate", { userId: input.userId, operationId, idempotencyKey });
+  }
 }
 
 /**
@@ -328,7 +517,7 @@ export async function spendCredit(input: { userId: string; amountMinor: number; 
 
       logger.info("credit.spent", { userId: input.userId, amount: spendAmount, orderId: input.orderId });
       return spendAmount;
-    });
+    }, { timeout: 30000, maxWait: 15000 });
   } catch (err: any) {
     // P2002 = unique constraint violation — another concurrent call already
     // created the CreditTransaction for this orderId. Return the existing amount.
