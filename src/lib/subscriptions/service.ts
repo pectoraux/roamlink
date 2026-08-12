@@ -210,7 +210,7 @@ export async function renewSubscription(subscriptionId: string): Promise<{
         state: "payment_confirmed",
         paidFromCreditMinor: paidFromCredit,
         paidFromCashMinor: remaining,
-        paymentFeeMinor: paidFromCredit > 0 ? 0 : Math.round(remaining * 0.029 + 30),
+        paymentFeeMinor: remaining > 0 ? Math.round(remaining * 0.029 + 30) : 0,
       },
     });
   }
