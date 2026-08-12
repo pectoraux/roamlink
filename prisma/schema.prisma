@@ -1026,6 +1026,9 @@ model Tenant {
   // Phase 2B.1: reseller balance + transactions
   balance         TenantBalance?
   transactions    TenantTransaction[]
+  // Phase 2B.2: reservations + deposit payments
+  reservations    TenantBalanceReservation[]
+  depositPayments TenantDepositPayment[]
 
   @@index([status])
 }
@@ -1265,4 +1268,53 @@ model TenantTransaction {
   @@index([tenantId])
   @@index([type])
   @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2B.2 — Reseller Balance Reservation + Deposit Payment Lifecycle
+// ---------------------------------------------------------------------------
+
+model TenantBalanceReservation {
+  id              String   @id @default(cuid())
+  tenantId        String
+  orderId         String   @unique // one reservation per order
+  amountMinor     Int      // reserved amount (retail price)
+  platformFeeMinor Int     // platform fee at reservation time
+  state           String   @default("RESERVED") // RESERVED | SETTLED | RELEASED
+  idempotencyKey  String   @unique // durable identity
+  ledgerTransactionId String? // ledger posting (set on SETTLE)
+  releasedAt      DateTime?
+  settledAt       DateTime?
+  failureReason   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([state])
+  @@index([orderId])
+}
+
+model TenantDepositPayment {
+  id              String   @id @default(cuid())
+  tenantId        String
+  userId          String
+  amountMinor     Int
+  currency        String   @default("USD")
+  paymentProvider String   // mock | paystack | flutterwave | stripe
+  providerReference String? // provider's payment intent/charge reference
+  status          String   @default("DEPOSIT_CREATED") // DEPOSIT_CREATED | PAYMENT_PENDING | PAYMENT_SUCCEEDED | PAYMENT_FAILED | BALANCE_POSTED | COMPLETED | CANCELLED | RECONCILIATION_REQUIRED
+  idempotencyKey  String   @unique // durable identity for the deposit operation
+  tenantTransactionId String? // linked TenantTransaction (set when balance is credited)
+  ledgerTransactionId String? // linked ledger transaction
+  failureReason   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status])
+  @@index([providerReference])
 }

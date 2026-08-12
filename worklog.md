@@ -890,3 +890,25 @@ Stage Summary:
 - Tests: 19 tests in phase2b1-reseller-commerce.test.ts — all pass (deposit→ledger, catalog no-wholesale, economics, canonical product, order debit, platform fee separation, idempotency, insufficient balance, concurrent, margin protection + 9 static)
 - Architecture preserved: reseller orders flow through existing ConnectivityProduct → ConnectivityOffer → Supplier → Routing → FulfillmentAdapter → Provider → Service → Ledger pipeline. No parallel commerce/billing/ledger system.
 - Supplier confidentiality enforced: wholesale prices never exposed to tenants.
+
+---
+Task ID: 2B.2
+Agent: Lead engineer (main) — Reseller Balance Lifecycle + Real Payment Convergence
+Task: Fix the 3 financial lifecycle gaps from independent code review
+
+Work Log:
+- P0-1 (reservation lifecycle): Created TenantBalanceReservation model (RESERVED/SETTLED/RELEASED). Implemented reserveResellerBalance (moves funds from available to reserved, no revenue recognized), settleResellerReservation (on success: posts Dr Reseller Funds Liability / Cr Sales Revenue + Cr Platform Fee Revenue), releaseResellerReservation (on failure: returns funds to available balance, no revenue). Rewrote tenant orders route to use reserve → fulfill → settle/release. If fulfillment fails, the reservation is released and the balance is restored.
+- P0-2 (real deposit payment): Created TenantDepositPayment model with lifecycle (DEPOSIT_CREATED → PAYMENT_PENDING → PAYMENT_SUCCEEDED → BALANCE_POSTED → COMPLETED / RECONCILIATION_REQUIRED). Implemented createDepositIntent (creates payment provider intent via existing PaymentProvider abstraction), confirmDepositPayment (server-side verifies payment, then credits balance), handleDepositWebhook (idempotent webhook handler). The balance is ONLY credited after a real payment event — never just because a client requested a deposit.
+- §3 (financial atomicity): Replaced all silent .catch(() => {}) with CRITICAL log handlers. If a ledger posting fails, the deposit is marked RECONCILIATION_REQUIRED. If a status update fails, a CRITICAL log is emitted. Added processDueDepositReconciliation worker that retries stuck RECONCILIATION_REQUIRED/BALANCE_POSTED deposits. Wired into the existing /api/internal/reconcile cron endpoint.
+- §9 (production mock block): createDepositIntent throws 403 if the mock provider is used in production (NODE_ENV=production). The legacy depositResellerBalance function is deprecated and also blocks in production.
+- Mock provider integration: confirmDepositPayment calls mockPaymentProvider.confirmIntent() before verifyPayment() to simulate the client-side confirmation step (development only).
+- Migration 0007: TenantBalanceReservation + TenantDepositPayment models.
+- Reconciliation cron: Updated /api/internal/reconcile to also run processDueDepositReconciliation.
+
+Stage Summary:
+- Migration: 0007_phase2b2_reseller_lifecycle (TenantBalanceReservation, TenantDepositPayment)
+- New functions: reserveResellerBalance, settleResellerReservation, releaseResellerReservation, createDepositIntent, confirmDepositPayment, handleDepositWebhook, processDueDepositReconciliation
+- Rewritten: tenant orders route (reserve/settle/release lifecycle), deposit route (real payment flow), reconciliation cron (includes deposit reconciliation)
+- Tests: 19 tests in phase2b2-reseller-lifecycle.test.ts — all pass (deposit lifecycle, duplicate webhook idempotency, failed payment, reservation, settle, release, retry, concurrent duplicate, concurrent different, reconciliation, wallet/ledger reconciliation + 8 static)
+- Architecture preserved: TenantBalance is a fast operational projection; the canonical financial truth remains the double-entry ledger. No parallel wallet ledger.
+- The reseller wallet is now financially real: deposits require payment, purchases reserve before fulfillment, failures release funds, ledger postings are never silently swallowed.
