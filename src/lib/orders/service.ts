@@ -827,14 +827,17 @@ export async function fulfillOrder(input: {
   }
 
   // 3. Reserve provider credit (atomic conditional update, idempotent).
-  const reservationId = `res_${order.id}_${selected.offerId}`;
+  // The reservationId may change on retry (if the previous reservation was
+  // released after a failure). Use the returned reservationId for settle/release.
+  const baseReservationId = `res_${order.id}_${selected.offerId}`;
   await ensureProviderAccount(providerKey);
-  await reserveProviderCommitment({
-    reservationId,
+  const reservation = await reserveProviderCommitment({
+    reservationId: baseReservationId,
     provider: providerKey,
     amountMinor: wholesalePrice,
     orderId: order.id,
   });
+  const reservationId = reservation.reservationId;
 
   // 5. Resolve the fulfillment adapter (from the FROZEN providerKey).
   // The adapter is bound to a specific provider instance at registration time.
@@ -896,8 +899,10 @@ export async function fulfillOrder(input: {
       data: { status: "COMPLETED" },
     });
 
-    // 12. Settle the credit reservation.
-    await settleReservation(reservationId);
+    // 12. Settle the credit reservation (idempotent — skips if already settled).
+    if (reservation.status !== "settled") {
+      await settleReservation(reservationId);
+    }
 
     // 13. Finalize the commercial transaction in the double-entry ledger.
     //     Uses the customer price (frozen at checkout) and the wholesale price

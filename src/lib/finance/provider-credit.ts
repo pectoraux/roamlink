@@ -206,20 +206,32 @@ export async function reserveProviderCommitment(input: {
   amountMinor: number;
   orderId?: string;
 }): Promise<{ reservationId: string; status: string; amountMinor: number }> {
-  // Idempotency: return existing reservation if present.
+  // Idempotency: return existing reservation if present and still active.
   const existing = await db.providerCreditReservation.findUnique({
     where: { reservationId: input.reservationId },
   });
   if (existing) {
-    logger.info("provider_credit.reservation_replay", {
-      reservationId: input.reservationId,
-      status: existing.status,
-    });
-    return {
-      reservationId: existing.reservationId,
-      status: existing.status,
-      amountMinor: existing.amountMinor,
-    };
+    if (existing.status === "released") {
+      // The reservation was released (previous failure). We need to re-reserve
+      // by creating a NEW reservation with a unique ID for this retry attempt.
+      logger.info("provider_credit.reservation_re_reserve", {
+        oldReservationId: input.reservationId,
+        note: "Previous reservation was released; creating new one for retry",
+      });
+      // Fall through to create a new reservation with a retry-suffixed ID.
+      input.reservationId = `${input.reservationId}_retry_${Date.now()}`;
+    } else {
+      // Reserved or settled — return as-is (idempotent).
+      logger.info("provider_credit.reservation_replay", {
+        reservationId: input.reservationId,
+        status: existing.status,
+      });
+      return {
+        reservationId: existing.reservationId,
+        status: existing.status,
+        amountMinor: existing.amountMinor,
+      };
+    }
   }
 
   await ensureProviderAccount(input.provider);
