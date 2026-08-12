@@ -49,10 +49,13 @@ export interface FulfillmentAdapter {
   /** Stable key identifying this adapter (matches Supplier.providerKey). */
   readonly providerKey: string;
 
-  /** Create the provider-side order and provision the product. */
+  /** Create the provider-side order and provision the product.
+   * `supplierProductId` is the supplier-native product identifier (frozen at
+   * selection time). It is NOT the Plan's providerPlanId — it comes from the
+   * selected ConnectivityOffer.supplierProductId. */
   createProviderOrder(input: {
     context: FulfillmentContext;
-    providerPlanId: string;
+    supplierProductId: string;
   }): Promise<{ providerOrderId: string }>;
 
   /** Provision the product (e.g. mint an eSIM, reserve a phone number). */

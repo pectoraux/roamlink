@@ -743,36 +743,50 @@ export async function fulfillOrder(input: {
   }
 
   // 2. Orchestrate: select the best supplier offer for the canonical product.
-  //    If the order already has a frozen supplierOfferId (from a previous
-  //    fulfillment attempt), reuse it — do NOT re-select. This ensures that
-  //    mutating catalog state after the first fulfillment attempt does not
-  //    change which supplier fulfills the order.
+  //    If the order already has a frozen selection (from a previous fulfillment
+  //    attempt), reuse ALL frozen values — do NOT re-select, and do NOT re-read
+  //    ANYTHING from mutable Supplier/ConnectivityOffer rows.
+  //
+  //    Frozen values (captured atomically on first selection):
+  //      - supplierOfferId
+  //      - frozenSupplierProductId
+  //      - frozenProviderKey
+  //      - frozenWholesalePriceMinor
+  //
+  //    On retry, ALL four are used from the order record. The live Supplier.providerKey,
+  //    ConnectivityOffer.supplierProductId, and ConnectivityOffer.wholesalePrice are
+  //    NEVER re-read after the first selection.
   let selected: SelectedSupplierOffer;
   let frozenSupplierProductId: string;
+  let providerKey: string;
+  let wholesalePrice: number;
 
-  if (order.supplierOfferId && order.frozenSupplierProductId) {
-    // Reuse the previously frozen selection.
+  if (order.supplierOfferId && order.frozenSupplierProductId && order.frozenProviderKey && order.frozenWholesalePriceMinor != null) {
+    // REUSE the previously frozen selection — ALL values from the order record.
     logger.info("fulfillment.reusing_frozen_selection", {
       orderId: order.id,
       supplierOfferId: order.supplierOfferId,
       frozenSupplierProductId: order.frozenSupplierProductId,
+      frozenProviderKey: order.frozenProviderKey,
+      frozenWholesalePriceMinor: order.frozenWholesalePriceMinor,
     });
-    // Re-fetch the offer to get the wholesale price (needed for credit reservation).
+    // We still need the supplierId for the context — read it from the offer
+    // (supplierId doesn't change; it's the FK, not a mutable field).
     const frozenOffer = await db.connectivityOffer.findUnique({
       where: { id: order.supplierOfferId },
-      include: { supplier: true },
+      select: { supplierId: true, productId: true, currency: true, retailPrice: true },
     });
     if (!frozenOffer) {
       throw new AppError("internal", `Frozen ConnectivityOffer ${order.supplierOfferId} not found`, 500, "The previously selected supplier offer no longer exists.");
     }
     selected = {
-      offerId: frozenOffer.id,
+      offerId: order.supplierOfferId,
       productId: frozenOffer.productId,
       supplierId: frozenOffer.supplierId,
-      supplierName: frozenOffer.supplier.name,
-      providerKey: frozenOffer.supplier.providerKey,
-      supplierProductId: order.frozenSupplierProductId, // FROZEN — not re-read from offer
-      wholesalePrice: frozenOffer.wholesalePrice,
+      supplierName: "", // not needed for retry
+      providerKey: order.frozenProviderKey, // FROZEN — not re-read from Supplier
+      supplierProductId: order.frozenSupplierProductId, // FROZEN
+      wholesalePrice: order.frozenWholesalePriceMinor, // FROZEN — not re-read from Offer
       retailPrice: frozenOffer.retailPrice,
       currency: frozenOffer.currency,
       reliability: 0,
@@ -780,8 +794,10 @@ export async function fulfillOrder(input: {
       reason: "Reusing frozen selection from previous fulfillment attempt",
     };
     frozenSupplierProductId = order.frozenSupplierProductId;
+    providerKey = order.frozenProviderKey;
+    wholesalePrice = order.frozenWholesalePriceMinor;
   } else {
-    // First fulfillment attempt — select the best supplier.
+    // FIRST fulfillment attempt — select the best supplier.
     selected = await selectSupplierForProduct(snapshot.canonicalProductId);
     frozenSupplierProductId = selected.supplierProductId ?? "";
     if (!frozenSupplierProductId) {
@@ -792,24 +808,31 @@ export async function fulfillOrder(input: {
         "The selected supplier offer is missing the provider-native product identifier.",
       );
     }
-    // Freeze the selection on the order atomically.
+    providerKey = selected.providerKey ?? (await resolveProviderKey(selected.supplierId));
+    if (!providerKey) {
+      throw new AppError("internal", `Selected supplier has no providerKey`, 500, "The selected supplier has no provider key.");
+    }
+    wholesalePrice = selected.wholesalePrice;
+
+    // Freeze ALL four values on the order atomically.
     await db.order.update({
       where: { id: order.id },
       data: {
         supplierOfferId: selected.offerId,
         frozenSupplierProductId,
+        frozenProviderKey: providerKey,
+        frozenWholesalePriceMinor: wholesalePrice,
       },
     });
   }
 
   // 3. Reserve provider credit (atomic conditional update, idempotent).
   const reservationId = `res_${order.id}_${selected.offerId}`;
-  const providerKey = selected.providerKey ?? (await resolveProviderKey(selected.supplierId));
   await ensureProviderAccount(providerKey);
   await reserveProviderCommitment({
     reservationId,
     provider: providerKey,
-    amountMinor: selected.wholesalePrice,
+    amountMinor: wholesalePrice,
     orderId: order.id,
   });
 
@@ -843,7 +866,7 @@ export async function fulfillOrder(input: {
     // captured at supplier-selection time, not a mutable Plan field.
     const { providerOrderId } = await adapter.createProviderOrder({
       context: ctx,
-      providerPlanId: frozenSupplierProductId,
+      supplierProductId: frozenSupplierProductId,
     });
 
     const result = await adapter.provision({ context: ctx, providerOrderId });
@@ -885,7 +908,7 @@ export async function fulfillOrder(input: {
       orderId: order.id,
       userId: order.userId,
       customerPriceMinor: customerPrice,
-      wholesalePriceMinor: selected.wholesalePrice,
+      wholesalePriceMinor: wholesalePrice,
       paymentFeeMinor: paymentFee,
       currency: order.currency,
       provider: providerKey,
@@ -908,7 +931,7 @@ export async function fulfillOrder(input: {
         supplierId: selected.supplierId,
         providerKey,
         entityId: persisted.entityId,
-        wholesalePrice: selected.wholesalePrice,
+        wholesalePrice: wholesalePrice,
       },
     });
 

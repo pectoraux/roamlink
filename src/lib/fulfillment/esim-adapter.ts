@@ -31,9 +31,9 @@ export function makeESIMFulfillmentAdapter(
   return {
     providerKey,
 
-    async createProviderOrder({ context, providerPlanId }) {
+    async createProviderOrder({ context, supplierProductId }) {
       const result = await provider.createOrder({
-        providerPlanId,
+        providerPlanId: supplierProductId,
         idempotencyKey: `po_${context.orderId}`,
       });
       return { providerOrderId: result.providerOrderId };
