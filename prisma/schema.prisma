@@ -516,7 +516,7 @@ model NumberSubscription {
   id              String    @id @default(cuid())
   virtualNumberId String
   userId          String
-  status          String    @default("active") // active | past_due | suspended | cancelled | expired | trial
+  status          String    @default("active") // active | past_due | suspended | cancelled | expired | trial | reconciliation_required
   billingCycle    String    @default("monthly") // monthly | yearly
   currentPeriodEnd DateTime
   trialEndsAt     DateTime?
@@ -527,10 +527,50 @@ model NumberSubscription {
 
   virtualNumber   VirtualNumber @relation(fields: [virtualNumberId], references: [id], onDelete: Cascade)
   user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  renewalCycles   SubscriptionRenewalCycle[]
 
   @@index([userId])
   @@index([virtualNumberId])
   @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Subscription Renewal Cycle — durable identity for each renewal attempt.
+// Phase 2E.4: The renewal cycle identity is stable across retries. It does
+// NOT depend on mutable currentPeriodEnd. If a renewal partially succeeds
+// (financial posted, domain partially updated), the retry uses the SAME
+// cycle identity — no duplicate financial transaction, no duplicate extension.
+// ---------------------------------------------------------------------------
+
+model SubscriptionRenewalCycle {
+  id              String   @id @default(cuid())
+  subscriptionId  String
+  // The IMMUTABLE period boundaries for this renewal cycle.
+  // periodStart = the currentPeriodEnd BEFORE renewal.
+  // periodEnd = the target currentPeriodEnd AFTER renewal.
+  periodStart     DateTime
+  periodEnd       DateTime
+  // The stable identity used for idempotency keys and ledger references.
+  cycleKey        String   @unique // e.g. "renewal_{subId}_{periodStart.getTime()}"
+  // State machine: pending → payment_confirmed → financial_posted → domain_updated → completed
+  //                pending → failed
+  //                financial_posted → reconciliation_required (if domain update fails)
+  state           String   @default("pending") // pending | payment_confirmed | financial_posted | domain_updated | completed | reconciliation_required | failed
+  // Financial tracking
+  paidFromCreditMinor Int  @default(0)
+  paidFromCashMinor    Int  @default(0)
+  paymentFeeMinor      Int  @default(0)
+  // Error tracking for retries
+  lastError       String?
+  retryCount      Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  subscription    NumberSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId])
+  @@index([state])
+  @@index([periodStart])
 }
 
 model Message {
