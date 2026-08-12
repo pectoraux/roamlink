@@ -51,8 +51,12 @@ async function persistEsim(input: {
   const activationCode = String(meta.activationCode ?? "");
   const matchId = meta.matchId ? String(meta.matchId) : null;
   const providerESIMId = String(meta.providerESIMId ?? result.externalReference);
-  const dataAmount = Number(meta.dataAmountMB ?? order.plan?.dataAmount ?? 0);
-  const validityDays = Number(meta.validityDays ?? order.plan?.validityDays ?? 0);
+  // Phase 2E.2: Use the immutable order snapshot for data/validity, NOT the
+  // live Plan. The snapshot was captured at checkout and contains all
+  // product-defining facts. The Plan may be mutated after checkout.
+  const snapshot = order.planSnapshot ? JSON.parse(order.planSnapshot) : {};
+  const dataAmount = Number(meta.dataAmountMB ?? snapshot.dataAmountMB ?? 0);
+  const validityDays = Number(meta.validityDays ?? snapshot.validityDays ?? 0);
   const expiresAt = result.expiresAt ? new Date(result.expiresAt) : new Date(Date.now() + validityDays * 86400_000);
 
   // Build LPA QR payload: LPA:1<smdpAddress>&<activationCode>

@@ -1,23 +1,35 @@
 /**
  * Finalize Commercial Transaction — the single entry point that records a
- * completed purchase as a balanced set of ledger entries.
+ * completed commercial event as a balanced set of ledger entries.
+ *
+ * Phase 2E.2: Refactored to be reference-type agnostic. The financial
+ * finalization no longer assumes every commercial event is an Order.
+ * It supports:
+ *   - Order purchases (referenceType = "ORDER")
+ *   - Subscription renewals (referenceType = "SUBSCRIPTION_RENEWAL")
+ *   - Future recurring/usage transactions
+ *
+ * The caller is responsible for updating its own domain state
+ * (Order.financialStatus, NumberSubscription.status, etc.) AFTER the
+ * financial finalization succeeds. This prevents partial financial
+ * lifecycles where the ledger is posted but the domain update fails.
  *
  *   finalizeCommercialTransaction({
- *     orderId, userId,
- *     customerPriceMinor,     // what the customer paid (DistributionOffer.retailPrice)
- *     wholesalePriceMinor,    // what the supplier charges (ConnectivityOffer.wholesalePrice)
- *     paymentFeeMinor,        // payment processor fee
- *     provider, providerTxnId,
+ *     referenceType: "ORDER" | "SUBSCRIPTION_RENEWAL",
+ *     referenceId: string,         // orderId or subscriptionRenewalId
+ *     userId,
+ *     customerPriceMinor,
+ *     wholesalePriceMinor,
+ *     paymentFeeMinor,
+ *     currency, provider, providerTxnId,
  *     idempotencyKey,
  *   })
  *
  *   → posts:
- *     1. Customer payment (Cash + Payment Fees + Sales Revenue)
- *     2. Provider purchase (COGS + Provider Credit Liability)
+ *     1. Customer payment (Dr Cash, Cr Revenue)
+ *     2. Provider purchase (Dr COGS, Cr Provider Payable)
  *
- * Idempotent via idempotencyKey prefixing (each sub-entry has its own derived
- * idempotency key, and each is independently idempotent). The whole call is
- * safe to retry.
+ * Idempotent via idempotencyKey prefixing. Safe to retry.
  */
 
 import { db } from "@/lib/db";
@@ -28,8 +40,15 @@ import {
 } from "./double-entry-ledger";
 import { logger } from "@/lib/logger";
 
+export type CommercialReferenceType = "ORDER" | "SUBSCRIPTION_RENEWAL";
+
 export async function finalizeCommercialTransaction(input: {
-  orderId: string;
+  /** Backward-compatible alias for referenceId (when referenceType = ORDER) */
+  orderId?: string;
+  /** The type of commercial event being finalized */
+  referenceType?: CommercialReferenceType;
+  /** The ID of the commercial reference (orderId, subscriptionRenewalId, etc.) */
+  referenceId?: string;
   userId?: string;
   customerPriceMinor: number;
   wholesalePriceMinor: number;
@@ -45,21 +64,22 @@ export async function finalizeCommercialTransaction(input: {
 }> {
   await ensureChartOfAccounts();
 
-  // Update the order's financialStatus to "settling" first, so concurrent
-  // retries can detect in-flight finalization.
-  await db.order.updateMany({
-    where: { id: input.orderId, financialStatus: "pending" },
-    data: { financialStatus: "settling" },
-  });
+  // Resolve the reference type and ID.
+  // Backward compatibility: if only orderId is provided, treat as ORDER.
+  const referenceType = input.referenceType ?? "ORDER";
+  const referenceId = input.referenceId ?? input.orderId ?? "";
+  if (!referenceId) {
+    throw new Error("finalizeCommercialTransaction: referenceId (or orderId) is required");
+  }
 
   // Post customer payment (idempotent).
   const paymentTxnId = await ledgerCustomerPayment({
     userId: input.userId,
-    orderId: input.orderId,
+    orderId: referenceId, // stored on LedgerTransaction.orderId for queryability
     customerPriceMinor: input.customerPriceMinor,
     paymentFeeMinor: input.paymentFeeMinor,
     currency: input.currency,
-    provider: "payment", // payment processor
+    provider: "payment",
     providerTxnId: input.providerTxnId,
     idempotencyKey: `${input.idempotencyKey}:pay`,
   });
@@ -67,7 +87,7 @@ export async function finalizeCommercialTransaction(input: {
   // Post provider purchase (idempotent).
   const providerPurchaseTxnId = await ledgerProviderPurchase({
     userId: input.userId,
-    orderId: input.orderId,
+    orderId: referenceId,
     provider: input.provider,
     providerTxnId: input.providerTxnId,
     wholesalePriceMinor: input.wholesalePriceMinor,
@@ -75,14 +95,25 @@ export async function finalizeCommercialTransaction(input: {
     idempotencyKey: `${input.idempotencyKey}:prov`,
   });
 
-  // Mark the order as financially settled.
-  await db.order.update({
-    where: { id: input.orderId },
-    data: { financialStatus: "settled" },
-  });
+  // Update domain financial state — ONLY for ORDER references.
+  // Subscription renewals manage their own state (NumberSubscription.status).
+  // This prevents the "fake Order" problem where a synthetic ID would
+  // cause db.order.update to fail.
+  if (referenceType === "ORDER" && input.orderId) {
+    // Only update if the order exists and isn't already settled.
+    await db.order.updateMany({
+      where: { id: input.orderId, financialStatus: { not: "settled" } },
+      data: { financialStatus: "settled" },
+    }).catch(() => {
+      // Best-effort: if the order doesn't exist (shouldn't happen for ORDER type),
+      // the ledger entries are still posted and idempotent.
+      logger.warn("finance.order_update_skipped", { orderId: input.orderId });
+    });
+  }
 
   logger.info("finance.finalized", {
-    orderId: input.orderId,
+    referenceType,
+    referenceId,
     paymentTxnId,
     providerPurchaseTxnId,
     customerPrice: input.customerPriceMinor,

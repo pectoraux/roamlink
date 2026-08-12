@@ -103,14 +103,16 @@ export async function renewSubscription(subscriptionId: string): Promise<{
     data: { expiresAt: newPeriodEnd },
   });
 
-  // Phase 2E P1 FIX: Use the CANONICAL double-entry ledger path
-  // (finalizeCommercialTransaction), NOT the legacy recordFinancialEvent.
-  // This converges subscription renewal onto the same financial posting
-  // path as the purchase flow — one authoritative ledger.
+  // Phase 2E.2: Use the CANONICAL double-entry ledger path with
+  // referenceType = SUBSCRIPTION_RENEWAL. This does NOT create or update
+  // an Order — the financial finalization is reference-type agnostic.
+  // The subscription's own state is updated separately below.
+  const renewalRef = `sub_renewal_${sub.id}_${sub.currentPeriodEnd.getTime()}`;
   const { finalizeCommercialTransaction } = await import("@/lib/finance/finalize");
   const paymentFee = paidFromCredit > 0 ? 0 : Math.round(remaining * 0.029 + 30);
-  await finalizeCommercialTransaction({
-    orderId: `sub_renewal_${sub.id}_${sub.currentPeriodEnd.getTime()}`,
+  const finResult = await finalizeCommercialTransaction({
+    referenceType: "SUBSCRIPTION_RENEWAL",
+    referenceId: renewalRef,
     userId,
     customerPriceMinor: amount,
     wholesalePriceMinor: vn.providerCost,
