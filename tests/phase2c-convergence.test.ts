@@ -1,8 +1,8 @@
 /**
  * Phase 2C — Connectivity Orchestration Convergence integration tests.
  *
- * These tests exercise the REAL purchase path against the real SQLite
- * database (file:/home/z/my-project/db/custom.db):
+ * These tests exercise the REAL purchase path against the real PostgreSQL
+ * database (Neon PostgreSQL):
  *
  *   Tenant → DistributionOffer → Canonical Product → Orchestrator
  *         → Supplier Offer → Fulfillment Adapter → Persistence → Ledger
@@ -118,7 +118,7 @@ async function makePlan(nameSuffix: string) {
   const plan = await db.plan.create({
     data: {
       providerId: `test_${nameSuffix}_${makePlanCounter}`,
-      providerPlanId: def.providerPlanId,
+      providerPlanId: `${def.providerPlanId}_${Date.now()}_${makePlanCounter}`,
       name: `${def.name} ${nameSuffix} ${Date.now()}`,
       country: def.country,
       countryCode: def.countryCode,
@@ -343,7 +343,7 @@ describe("Phase 2C — Connectivity Orchestration Convergence", () => {
     expect(orderARes.amountMinor).toBe(priceA);
     expect(orderBRes.amountMinor).toBe(priceB);
     expect(orderARes.amountMinor).not.toBe(orderBRes.amountMinor);
-  }, 60000);
+  }, 120000);
 
   // -------------------------------------------------------------------------
   // 2. Both orders resolve the same canonical product
@@ -414,7 +414,7 @@ describe("Phase 2C — Connectivity Orchestration Convergence", () => {
     const snapA = readSnapshot(orderA!);
     const snapB = readSnapshot(orderB!);
     expect(snapA.canonicalProductId).toBe(snapB.canonicalProductId);
-  }, 60000);
+  }, 120000);
 
   // -------------------------------------------------------------------------
   // 3. They can be fulfilled by different suppliers
@@ -543,7 +543,7 @@ describe("Phase 2C — Connectivity Orchestration Convergence", () => {
       where: { id: supplier1.id },
       data: { healthStatus: "healthy" },
     });
-  }, 60000);
+  }, 120000);
 
   // -------------------------------------------------------------------------
   // 4. The supplier never determines the tenant's retail price
@@ -598,7 +598,7 @@ describe("Phase 2C — Connectivity Orchestration Convergence", () => {
 
     expect(orderRes.amountMinor).toBe(1000);
     expect(orderRes.amountMinor).not.toBe(9999);
-  }, 60000);
+  }, 120000);
 
   // -------------------------------------------------------------------------
   // 5. Changing a supplier's retail price after checkout does not change the tenant's frozen retail price
@@ -665,7 +665,7 @@ describe("Phase 2C — Connectivity Orchestration Convergence", () => {
     const refetched = await db.order.findUnique({ where: { id: orderRes.id } });
     expect(refetched!.amount).toBe(originalAmount);
     expect(refetched!.amount).toBe(1800);
-  }, 60000);
+  }, 120000);
 
   // -------------------------------------------------------------------------
   // 6. Changing a supplier's offer does not cause a different supplier to be selected after the order has been committed
@@ -742,19 +742,22 @@ describe("Phase 2C — Connectivity Orchestration Convergence", () => {
     const reChecked = await db.order.findUnique({ where: { id: order.id } });
     expect(reChecked!.supplierOfferId).toBe(offer1.id);
     expect(reChecked!.supplierOfferId).not.toBe(freshSelection.offerId);
-  }, 60000);
+  }, 120000);
 
   // -------------------------------------------------------------------------
   // 7. Two independent supplier catalog syncs actually converge onto one ConnectivityProduct
   // -------------------------------------------------------------------------
   it("Two independent supplier catalog syncs actually converge onto one ConnectivityProduct", async () => {
-    // Use a unique set of attributes so we don't collide with seeded plans.
+    // Use a unique set of attributes so we don't collide with seeded plans
+    // or previous test runs. The identityHash is derived from these attributes,
+    // so they must be unique per run.
+    const uniqueMB = 2000 + Math.floor(Math.random() * 8000);
     const attrs = {
       name: `Converge Test ${Date.now()}`,
       country: "Atlantis",
       countryCode: "AT",
       region: "Atlantic",
-      dataAmountMB: 2048,
+      dataAmountMB: uniqueMB,
       validityDays: 14,
     };
 
@@ -850,7 +853,7 @@ describe("Phase 2C — Connectivity Orchestration Convergence", () => {
     } finally {
       await db.plan.deleteMany({ where: { id: { in: createdPlanIds } } }).catch(() => {});
     }
-  }, 60000);
+  }, 120000);
 
   // -------------------------------------------------------------------------
   // 8. A tenant cannot read or modify another tenant's DistributionOffer or Order
@@ -928,5 +931,5 @@ describe("Phase 2C — Connectivity Orchestration Convergence", () => {
     expect(ownOffer.id).toBe(distA.id);
     const ownOrder = await getTenantOrder(orderRes.id, tenantA.id);
     expect(ownOrder.id).toBe(orderRes.id);
-  }, 60000);
+  }, 120000);
 });

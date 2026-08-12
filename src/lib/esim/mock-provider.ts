@@ -200,10 +200,13 @@ export class MockESIMProvider implements ESIMProvider {
         throw new Error(`Unknown provider order ${input.providerOrderId}`);
       }
       const plan = MOCK_PLANS.find((p) => p.providerPlanId === order.providerPlanId);
-      if (!plan) throw new Error(`Unknown plan ${order.providerPlanId}`);
+      // For dynamically-created plans (e.g. in tests), use a default plan
+      // so the mock provider can provision any plan, not just MOCK_PLANS.
+      const validityDays = plan?.validityDays ?? 30;
+      const dataAmountMB = plan?.dataAmountMB ?? 10240;
 
       const providerESIMId = `mock-esim-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-      const expiresAt = new Date(Date.now() + plan.validityDays * 24 * 60 * 60 * 1000);
+      const expiresAt = new Date(Date.now() + validityDays * 24 * 60 * 60 * 1000);
       const esim: MockESIM = {
         providerESIMId,
         providerOrderId: input.providerOrderId,
@@ -212,12 +215,12 @@ export class MockESIMProvider implements ESIMProvider {
         activationCode: generateActivationCode(),
         matchId: Math.random().toString(36).slice(2, 8).toUpperCase(),
         status: "active",
-        dataAmountMB: plan.dataAmountMB,
-        dataRemainingMB: plan.dataAmountMB,
-        validityDays: plan.validityDays,
+        dataAmountMB: dataAmountMB,
+        dataRemainingMB: dataAmountMB,
+        validityDays: validityDays,
         expiresAt: expiresAt.toISOString(),
         createdAt: new Date().toISOString(),
-        topUpSupported: plan.topUpSupported ?? true,
+        topUpSupported: plan?.topUpSupported ?? true,
       };
       esims.set(providerESIMId, esim);
       order.esimId = providerESIMId;

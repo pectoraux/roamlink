@@ -1,9 +1,8 @@
 /**
  * Test env loader — ensures DATABASE_URL is loaded from .env before tests run.
  *
- * In the Phase 2C convergence the canonical database is SQLite
- * (file:/home/z/my-project/db/custom.db). Tests execute against the real
- * SQLite database. Referenced in bunfig.toml as a preload.
+ * Phase 2D: the canonical database is PostgreSQL (Neon). Tests execute
+ * against the real PostgreSQL database. Referenced in bunfig.toml as a preload.
  */
 
 import { config } from "dotenv";
@@ -12,13 +11,13 @@ import { config } from "dotenv";
 config({ override: true });
 
 if (!process.env.DATABASE_URL) {
-  // Fallback to the canonical sandbox SQLite database.
-  process.env.DATABASE_URL = "file:/home/z/my-project/db/custom.db";
+  console.error("DATABASE_URL is not set. Copy .env.example to .env and fill in the PostgreSQL connection string.");
+  process.exit(1);
 }
 
-if (!process.env.DATABASE_URL.startsWith("file:")) {
+if (!process.env.DATABASE_URL.startsWith("postgresql://") && !process.env.DATABASE_URL.startsWith("postgres://")) {
   console.error(
-    "DATABASE_URL must point to a SQLite file: URL for Phase 2C tests. Got: " +
+    "DATABASE_URL must point to a PostgreSQL database. Got: " +
       process.env.DATABASE_URL,
   );
   process.exit(1);
