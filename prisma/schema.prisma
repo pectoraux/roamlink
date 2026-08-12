@@ -875,8 +875,38 @@ model CreditTransaction {
   credit          CustomerCredit @relation(fields: [creditId], references: [id], onDelete: Cascade)
   user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  // Phase 2E.7: Unique constraint for spend idempotency.
+  // For spending (type = "purchase_credit"), (userId, orderId, type) must be unique.
+  // For issuance, the CreditIssuance model provides the idempotency identity.
+  // This constraint prevents duplicate spending for the same business event.
+  @@unique([userId, orderId, type])
   @@index([userId])
   @@index([creditId])
+}
+
+// ---------------------------------------------------------------------------
+// Credit Issuance — durable, idempotent credit issuance lifecycle.
+// Phase 2E.7: Ensures credit issuance cannot silently diverge from the ledger.
+// The issuance has a stable identity, a state machine, and tracks both the
+// operational credit transaction and the financial ledger transaction.
+// ---------------------------------------------------------------------------
+
+model CreditIssuance {
+  id                  String   @id @default(cuid())
+  userId              String
+  amountMinor         Int
+  sourceType          String   // referral_reward | promo_credit | admin_adjustment | refund_credit
+  sourceId            String   // referralUseId | promoCodeId | adminOperationId | refundId
+  idempotencyKey      String   @unique // stable business identity
+  status              String   @default("pending") // pending | posted | completed | reconciliation_required
+  creditTransactionId String?
+  ledgerTransactionId String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([userId])
+  @@index([sourceType, sourceId])
+  @@index([status])
 }
 
 // ===========================================================================
