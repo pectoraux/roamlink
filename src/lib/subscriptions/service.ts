@@ -68,29 +68,47 @@ export async function renewSubscription(subscriptionId: string): Promise<{
   periodEnd.setMonth(periodEnd.getMonth() + 1);
   const cycleKey = `renewal_${sub.id}_${periodStart.getTime()}`;
 
-  // Find or create the renewal cycle
+  // Phase 2E.5: Concurrency-safe get-or-create.
+  // Two simultaneous renewal workers can both observe "not found" and race
+  // to create. Use create + catch P2002 (unique constraint) + re-read.
   let cycle = await db.subscriptionRenewalCycle.findUnique({
     where: { cycleKey },
   });
 
   if (!cycle) {
-    cycle = await db.subscriptionRenewalCycle.create({
-      data: {
-        subscriptionId: sub.id,
-        periodStart,
-        periodEnd,
-        cycleKey,
-        state: "pending",
-      },
-    });
-    logger.info("renewal.cycle_created", { cycleKey, subscriptionId: sub.id, periodStart, periodEnd });
+    try {
+      cycle = await db.subscriptionRenewalCycle.create({
+        data: {
+          subscriptionId: sub.id,
+          periodStart,
+          periodEnd,
+          cycleKey,
+          state: "pending",
+        },
+      });
+      logger.info("renewal.cycle_created", { cycleKey, subscriptionId: sub.id, periodStart, periodEnd });
+    } catch (err: any) {
+      // P2002 = unique constraint violation — another concurrent request
+      // created the cycle. Re-read it.
+      if (err?.code === "P2002") {
+        logger.info("renewal.cycle_concurrent_create", { cycleKey, note: "Another worker created this cycle; resuming" });
+        cycle = await db.subscriptionRenewalCycle.findUnique({
+          where: { cycleKey },
+        });
+        if (!cycle) {
+          throw new AppError("internal", "Cycle disappeared after P2002", 500, "Internal error.");
+        }
+      } else {
+        throw err;
+      }
+    }
   } else {
     logger.info("renewal.cycle_resumed", { cycleKey, subscriptionId: sub.id, state: cycle.state, retryCount: cycle.retryCount });
     // Increment retry count
     await db.subscriptionRenewalCycle.update({
       where: { id: cycle.id },
       data: { retryCount: { increment: 1 } },
-    });
+    }).catch(() => {}); // best-effort — concurrent retry count increments don't matter
   }
 
   // --- 2. If already completed, verify domain state is consistent ---
@@ -208,15 +226,16 @@ export async function renewSubscription(subscriptionId: string): Promise<{
       const { finalizeCommercialTransaction } = await import("@/lib/finance/finalize");
       await finalizeCommercialTransaction({
         referenceType: "SUBSCRIPTION_RENEWAL",
-        referenceId: cycleKey, // STABLE identity — not derived from mutable currentPeriodEnd
+        referenceId: cycleKey,
         userId,
         customerPriceMinor: amount,
         wholesalePriceMinor: vn.providerCost,
         paymentFeeMinor: cycle.paymentFeeMinor,
+        paidFromCreditMinor: cycle.paidFromCreditMinor, // Phase 2E.5: credit vs cash
         currency: vn.currency,
         provider: "subscription_renewal",
         providerTxnId: vn.providerNumberId ?? undefined,
-        idempotencyKey: `fin_${cycleKey}`, // STABLE
+        idempotencyKey: `fin_${cycleKey}`,
       });
 
       await db.subscriptionRenewalCycle.update({

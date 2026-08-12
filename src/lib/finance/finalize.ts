@@ -53,6 +53,8 @@ export async function finalizeCommercialTransaction(input: {
   customerPriceMinor: number;
   wholesalePriceMinor: number;
   paymentFeeMinor: number;
+  /** Phase 2E.5: The portion of customerPriceMinor funded by customer credit (not cash). */
+  paidFromCreditMinor?: number;
   currency?: string;
   provider: string;
   providerTxnId?: string;
@@ -65,7 +67,6 @@ export async function finalizeCommercialTransaction(input: {
   await ensureChartOfAccounts();
 
   // Resolve the reference type and ID.
-  // Backward compatibility: if only orderId is provided, treat as ORDER.
   const referenceType = input.referenceType ?? "ORDER";
   const referenceId = input.referenceId ?? input.orderId ?? "";
   if (!referenceId) {
@@ -73,11 +74,14 @@ export async function finalizeCommercialTransaction(input: {
   }
 
   // Post customer payment (idempotent).
+  // Phase 2E.5: Pass paidFromCreditMinor so the ledger correctly distinguishes
+  // cash from credit funding. Credit portion is NOT recorded as cash.
   const paymentTxnId = await ledgerCustomerPayment({
     userId: input.userId,
-    orderId: referenceId, // stored on LedgerTransaction.orderId for queryability
+    orderId: referenceId,
     customerPriceMinor: input.customerPriceMinor,
     paymentFeeMinor: input.paymentFeeMinor,
+    paidFromCreditMinor: input.paidFromCreditMinor,
     currency: input.currency,
     provider: "payment",
     providerTxnId: input.providerTxnId,

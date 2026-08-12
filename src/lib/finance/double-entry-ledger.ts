@@ -12,10 +12,19 @@
  *   1500 Inventory (eSIM credits prepaid)  asset     debit
  *   2000 Accounts Payable (suppliers)      liability credit
  *   2100 Provider Credit Liability         liability credit
+ *   2200 Customer Credit Liability         liability credit
  *   3000 Contributed Capital               equity    credit
  *   4000 Sales Revenue                     revenue   credit
  *   5000 Cost of Goods Sold (COGS)         expense   debit
  *   6000 Payment Processing Fees           expense   debit
+ *
+ * Phase 2E.5: Customer credit (referral rewards, promo credits, refunds-to-
+ * credit) is a LIABILITY, not cash. When a customer uses credit to pay for
+ * a purchase or renewal, the ledger must:
+ *   - Dr Customer Credit Liability (reducing the obligation)
+ *   - Cr Sales Revenue (recognizing the revenue)
+ *   - Dr Cash only for the cash portion (minus payment fee)
+ *   - Dr Payment Fees only on the cash portion
  *
  * The legacy single-entry `recordFinancialEvent` (FinancialTransaction) is
  * preserved for backward compatibility with admin dashboards; the double-
@@ -36,10 +45,12 @@ export const ACCOUNT_CODES = {
   INVENTORY: "1500",
   ACCOUNTS_PAYABLE: "2000",
   PROVIDER_CREDIT_LIABILITY: "2100",
+  CUSTOMER_CREDIT_LIABILITY: "2200",
   CONTRIBUTED_CAPITAL: "3000",
   SALES_REVENUE: "4000",
   COGS: "5000",
   PAYMENT_FEES: "6000",
+  PROMOTIONAL_EXPENSE: "7000",
 } as const;
 
 const CHART_OF_ACCOUNTS: Array<{
@@ -53,10 +64,12 @@ const CHART_OF_ACCOUNTS: Array<{
   { code: ACCOUNT_CODES.INVENTORY, name: "Inventory (eSIM Credits Prepaid)", type: "asset", normalBalance: "debit" },
   { code: ACCOUNT_CODES.ACCOUNTS_PAYABLE, name: "Accounts Payable (Suppliers)", type: "liability", normalBalance: "credit" },
   { code: ACCOUNT_CODES.PROVIDER_CREDIT_LIABILITY, name: "Provider Credit Liability", type: "liability", normalBalance: "credit" },
+  { code: ACCOUNT_CODES.CUSTOMER_CREDIT_LIABILITY, name: "Customer Credit Liability", type: "liability", normalBalance: "credit" },
   { code: ACCOUNT_CODES.CONTRIBUTED_CAPITAL, name: "Contributed Capital", type: "equity", normalBalance: "credit" },
   { code: ACCOUNT_CODES.SALES_REVENUE, name: "Sales Revenue", type: "revenue", normalBalance: "credit" },
   { code: ACCOUNT_CODES.COGS, name: "Cost of Goods Sold", type: "expense", normalBalance: "debit" },
   { code: ACCOUNT_CODES.PAYMENT_FEES, name: "Payment Processing Fees", type: "expense", normalBalance: "debit" },
+  { code: ACCOUNT_CODES.PROMOTIONAL_EXPENSE, name: "Promotional Expense", type: "expense", normalBalance: "debit" },
 ];
 
 /** Idempotently ensure the standard chart of accounts exists. */
@@ -205,11 +218,32 @@ export async function postLedgerTransaction(input: PostLedgerInput): Promise<str
  *   Debit  Payment Processing Fees       paymentFee
  *   Credit Sales Revenue                  customerPrice
  */
+/**
+ * Record a customer payment, correctly distinguishing cash vs credit funding.
+ *
+ * Phase 2E.5: When customer credit funds part of the payment, the ledger
+ * must NOT record the credit portion as cash. Instead:
+ *
+ *   For the cash portion:
+ *     Debit  Cash (Payment Processor)     cashPortion - paymentFee
+ *     Debit  Payment Processing Fees      paymentFee
+ *   For the credit portion:
+ *     Debit  Customer Credit Liability    creditPortion
+ *   For the total:
+ *     Credit Sales Revenue                cashPortion + creditPortion
+ *
+ * If paidFromCreditMinor is 0 (fully cash-funded), this is equivalent to the
+ * original behavior:
+ *     Debit  Cash                         revenue - fee
+ *     Debit  Payment Fees                 fee
+ *     Credit Sales Revenue                revenue
+ */
 export async function ledgerCustomerPayment(input: {
   userId?: string;
   orderId?: string;
   customerPriceMinor: number;
   paymentFeeMinor: number;
+  paidFromCreditMinor?: number;
   currency?: string;
   provider?: string;
   providerTxnId?: string;
@@ -217,20 +251,64 @@ export async function ledgerCustomerPayment(input: {
 }): Promise<string> {
   const revenue = input.customerPriceMinor;
   const fee = input.paymentFeeMinor;
-  const cash = revenue - fee;
+  const creditPortion = input.paidFromCreditMinor ?? 0;
+  const cashPortion = revenue - creditPortion;
+  const cashReceived = cashPortion - fee; // cash net of payment fee
+
+  const entries: Array<{ accountCode: string; direction: "debit" | "credit"; amountMinor: number }> = [];
+
+  // Cash portion (only if > 0)
+  if (cashReceived > 0) {
+    entries.push({ accountCode: ACCOUNT_CODES.CASH, direction: "debit", amountMinor: cashReceived });
+  }
+  // Payment fee (only on cash portion)
+  if (fee > 0) {
+    entries.push({ accountCode: ACCOUNT_CODES.PAYMENT_FEES, direction: "debit", amountMinor: fee });
+  }
+  // Credit portion (reduces customer credit liability)
+  if (creditPortion > 0) {
+    entries.push({ accountCode: ACCOUNT_CODES.CUSTOMER_CREDIT_LIABILITY, direction: "debit", amountMinor: creditPortion });
+  }
+  // Total revenue
+  entries.push({ accountCode: ACCOUNT_CODES.SALES_REVENUE, direction: "credit", amountMinor: revenue });
+
   return postLedgerTransaction({
     type: "CUSTOMER_PAYMENT",
-    description: `Customer payment for order ${input.orderId ?? "(none)"}`,
+    description: `Customer payment for ${input.orderId ?? "(none)"} (cash=${cashPortion}, credit=${creditPortion})`,
     currency: input.currency,
     idempotencyKey: input.idempotencyKey,
     userId: input.userId,
     orderId: input.orderId,
     provider: input.provider,
     providerTxnId: input.providerTxnId,
+    entries,
+  });
+}
+
+/**
+ * Record customer credit issuance (referral reward, promo credit, refund-to-credit).
+ *   Credit Customer Credit Liability   amount
+ *   Debit Promotional Expense           amount
+ * (or Debit Contributed Capital for non-expense credits)
+ */
+export async function ledgerCreditIssuance(input: {
+  userId?: string;
+  orderId?: string;
+  amountMinor: number;
+  reason?: string;
+  currency?: string;
+  idempotencyKey: string;
+}): Promise<string> {
+  return postLedgerTransaction({
+    type: "CREDIT_ISSUANCE",
+    description: input.reason ?? `Credit issuance for user ${input.userId ?? "(none)"}`,
+    currency: input.currency,
+    idempotencyKey: input.idempotencyKey,
+    userId: input.userId,
+    orderId: input.orderId,
     entries: [
-      { accountCode: ACCOUNT_CODES.CASH, direction: "debit", amountMinor: cash },
-      { accountCode: ACCOUNT_CODES.PAYMENT_FEES, direction: "debit", amountMinor: fee },
-      { accountCode: ACCOUNT_CODES.SALES_REVENUE, direction: "credit", amountMinor: revenue },
+      { accountCode: "7000", direction: "debit", amountMinor: input.amountMinor }, // Promotional Expense
+      { accountCode: ACCOUNT_CODES.CUSTOMER_CREDIT_LIABILITY, direction: "credit", amountMinor: input.amountMinor },
     ],
   });
 }
