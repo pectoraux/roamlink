@@ -34,6 +34,7 @@ export type FulfillmentContext = {
   supplierOfferId: string;
   supplierId: string;
   supplierProductId?: string | null;
+  providerKey: string;
   idempotencyKey: string;
 };
 

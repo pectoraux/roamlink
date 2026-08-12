@@ -832,6 +832,7 @@ export async function fulfillOrder(input: {
     canonicalSpecification: snapshot.canonicalSpecification ?? null,
     supplierOfferId: selected.offerId,
     supplierId: selected.supplierId,
+    providerKey,
     idempotencyKey: input.idempotencyKey,
   };
 

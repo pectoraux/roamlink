@@ -63,7 +63,7 @@ async function persistEsim(input: {
     data: {
       userId: order.userId,
       orderId: order.id,
-      provider: String(meta.provider ?? "mock"),
+      provider: context.providerKey,
       providerESIMId,
       iccid,
       smdpAddress,
