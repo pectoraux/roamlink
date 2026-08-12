@@ -377,6 +377,7 @@ export async function createOrder(input: {
   planId: string;
   tenantId?: string | null; // null/undefined = RoamLink Direct
   distributionOfferId?: string;
+  tenantCustomerId?: string; // Phase 2B: links order to a reseller's customer
   idempotencyKey: string;
   ip?: string;
 }): Promise<OrderSnapshot> {
@@ -447,6 +448,8 @@ export async function createOrder(input: {
       idempotencyKey: input.idempotencyKey,
       planSnapshot,
       tenantId: input.tenantId ?? null,
+      tenantCustomerId: input.tenantCustomerId ?? null,
+      distributionOfferId: distOffer.id,
       fulfillmentStatus: "pending",
       financialStatus: "pending",
     },

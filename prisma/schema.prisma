@@ -77,6 +77,9 @@ model Session {
   userAgent    String?
   ip           String?
   createdAt    DateTime @default(now())
+  // Phase 2B: active tenant context for reseller control plane.
+  // Validated server-side against TenantUser membership on every request.
+  activeTenantId String?
 
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -176,6 +179,10 @@ model Order {
   failureReason    String?
   // --- Phase 2C: Connectivity Orchestration Convergence ---
   tenantId         String?  // null = RoamLink Direct
+  // Phase 2B: links the order to a reseller's customer + the distribution offer
+  // that set the retail price. Both are nullable for RoamLink Direct orders.
+  tenantCustomerId String?
+  distributionOfferId String?
   fulfillmentStatus String  @default("pending") // pending|provisioning|success|failed|unknown|reconciliation_required
   financialStatus  String   @default("pending") // pending | settled | failed
   fulfillmentExternalReference String? // provider's external fulfillment ref
@@ -329,8 +336,10 @@ model AuditLog {
   id        String   @id @default(cuid())
   userId    String?
   orderId   String?
+  // Phase 2B: tenant-scoped audit trail for reseller operations.
+  tenantId  String?
   action    String
-  entity    String   // order | esim | payment | plan | user
+  entity    String   // order | esim | payment | plan | user | tenant | tenant_customer | distribution_offer | api_key
   entityId  String?
   detail    String?  // JSON string
   ip        String?
@@ -340,6 +349,7 @@ model AuditLog {
 
   @@index([userId])
   @@index([entity, entityId])
+  @@index([tenantId])
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,6 +1019,10 @@ model Tenant {
   distributionOffers DistributionOffer[]
   orders          Order[]
   users           TenantUser[]
+  // Phase 2B: reseller control plane relations
+  customers       TenantCustomer[]
+  subscription    TenantSubscription?
+  apiKeys         ApiKey[]
 
   @@index([status])
 }
@@ -1017,7 +1031,9 @@ model TenantUser {
   id              String   @id @default(cuid())
   tenantId        String
   userId          String
-  role            String   @default("admin") // admin | member
+  // Phase 2B: full reseller role set.
+  // owner | admin | sales | support | billing | operations | viewer
+  role            String   @default("admin")
   createdAt       DateTime @default(now())
   tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
@@ -1104,4 +1120,110 @@ model LedgerEntry {
   account         LedgerAccount     @relation(fields: [accountId], references: [id])
 
   @@index([transactionId])
+}
+
+// ===========================================================================
+// Phase 2B — Reseller SaaS Control Plane
+// ===========================================================================
+// These models sit ON TOP OF the canonical connectivity platform. They do NOT
+// replace Order, Ledger, ConnectivityProduct, or any existing primitive.
+// A reseller (Tenant) operates their business through these models, which
+// resolve down to the existing orchestration/fulfillment/ledger pipeline.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Tenant Customer — a reseller's customer (distinct from a RoamLink User).
+// A TenantCustomer MAY have a linked RoamLink User account (for self-service),
+// but can also exist as a reseller-managed record with no user account.
+// A global RoamLink user may belong to multiple tenants' customer lists.
+// ---------------------------------------------------------------------------
+
+model TenantCustomer {
+  id          String   @id @default(cuid())
+  tenantId    String
+  userId      String?  // optional link to a RoamLink User account
+  name        String
+  email       String
+  phone       String?
+  status      String   @default("active") // active | suspended | cancelled
+  metadata    String?  // JSON string for extensible fields
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, email])
+  @@index([tenantId])
+  @@index([userId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// SaaS Plan — configurable subscription tiers for resellers.
+// ---------------------------------------------------------------------------
+
+model SaaasPlan {
+  id              String   @id @default(cuid())
+  name            String   @unique // free | starter | business | enterprise
+  displayName     String
+  monthlyPriceMinor Int
+  currency        String   @default("USD")
+  includedStaff   Int      @default(1)
+  includedCustomers Int    @default(10)
+  includedOrdersPerMonth Int @default(100)
+  platformFeePercent Float @default(0) // percentage of transaction taken as platform fee
+  perOrderFeeMinor Int     @default(0) // flat fee per order in minor units
+  features        String?  // JSON string of feature flags
+  status          String   @default("active") // active | deprecated
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  subscriptions   TenantSubscription[]
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Tenant Subscription — a tenant's active SaaS subscription.
+// Uses the same durable renewal-cycle machinery as connectivity subscriptions.
+// ---------------------------------------------------------------------------
+
+model TenantSubscription {
+  id              String   @id @default(cuid())
+  tenantId        String   @unique // one active subscription per tenant
+  saaasPlanId     String
+  status          String   @default("active") // active | past_due | cancelled | expired
+  billingCycle    String   @default("monthly") // monthly | yearly
+  currentPeriodEnd DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  saaasPlan       SaaasPlan @relation(fields: [saaasPlanId], references: [id])
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// API Key — tenant-scoped API keys for programmatic access.
+// The raw key is shown ONCE at creation; only the hash is stored.
+// ---------------------------------------------------------------------------
+
+model ApiKey {
+  id          String   @id @default(cuid())
+  tenantId    String
+  name        String   // human-readable label
+  hashedKey   String   @unique // bcrypt or sha256 hash of the raw key
+  prefix      String   // first 8 chars shown in lists for identification
+  scopes      String   @default("read") // JSON array: ["read","write","orders","customers"]
+  lastUsedAt  DateTime?
+  expiresAt   DateTime?
+  revokedAt   DateTime?
+  createdBy   String   // userId
+  createdAt   DateTime @default(now())
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([hashedKey])
 }

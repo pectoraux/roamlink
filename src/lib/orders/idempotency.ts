@@ -50,6 +50,7 @@ export function generateIdempotencyKey(scope: string): string {
 export async function audit(input: {
   userId?: string;
   orderId?: string;
+  tenantId?: string;
   action: string;
   entity: string;
   entityId?: string;
@@ -60,6 +61,7 @@ export async function audit(input: {
     data: {
       userId: input.userId ?? null,
       orderId: input.orderId ?? null,
+      tenantId: input.tenantId ?? null,
       action: input.action,
       entity: input.entity,
       entityId: input.entityId ?? null,
