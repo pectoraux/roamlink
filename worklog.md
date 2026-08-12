@@ -550,3 +550,23 @@ Stage Summary:
 - The failure-path hole is closed: a stuck "pending" record is now both (a) logged at CRITICAL severity and (b) guaranteed to be recovered by the worker's stale-pending scan
 - README no longer instructs developers to use the unsafe db:push workflow
 - Financial foundation is now sufficiently mature for Phase 2B: Reseller SaaS Control Plane
+
+---
+Task ID: 2E.7.3 (prerequisite for Phase 2B)
+Agent: Lead engineer (main) — production scheduler + ESIM_PROVIDER doc fix
+Task: Verify/add production scheduler for processDueCreditIssuances + fix ESIM_PROVIDER documentation drift
+
+Work Log:
+- Confirmed the user's concern: processDueCreditIssuances() existed as a library function but had NO production caller. processDueSubscriptions() had an admin-gated POST route but no cron schedule either.
+- Created /api/internal/reconcile/route.ts — production cron endpoint (GET for Vercel Cron, POST for manual/admin). Runs BOTH processDueSubscriptions() and processDueCreditIssuances(). Secured with CRON_SECRET bearer token (fail-closed if unset).
+- Created vercel.json with cron schedule: */5 * * * * (every 5 minutes) → /api/internal/reconcile
+- Added CRON_SECRET to .env.example and .env
+- Wrote tests/phase2e7-cron-reconcile.test.ts — 6 tests, 19 expects: verifies 401 without secret, 401 with wrong secret, 200 with correct secret (runs both workers), POST manual trigger, POST without auth → 401, and static check that vercel.json schedules the endpoint. All 6 pass.
+- Fixed ESIM_PROVIDER documentation drift in README: added architectural note distinguishing "catalog ingestion / default provider" (ESIM_PROVIDER env var, getESIMProvider() singleton) from "per-supplier fulfillment routing" (ConnectivityOffer → Supplier.providerKey → fulfillment registry → FulfillmentAdapter). This prevents a future developer from reintroducing global-provider selection for the purchase path.
+
+Stage Summary:
+- 5 files changed: src/app/api/internal/reconcile/route.ts (new), vercel.json (new), tests/phase2e7-cron-reconcile.test.ts (new), .env.example, README.md
+- The reconciliation worker is now BOTH implemented AND production-scheduled (Vercel Cron every 5 min)
+- The stale-pending backstop is no longer dormant — it runs on every cron tick
+- ESIM_PROVIDER is now documented as catalog-only, not fulfillment routing
+- Financial foundation prerequisite complete — ready to begin Phase 2B: Reseller SaaS Control Plane

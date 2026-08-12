@@ -379,6 +379,27 @@ based on `ESIM_PROVIDER`:
 | `mock` (default)      | `MockESIMProvider`                              |
 | any other value       | `RealESIMProvider` (a structural boundary)      |
 
+> **Architectural note — `ESIM_PROVIDER` vs. per-supplier fulfillment routing**
+>
+> `ESIM_PROVIDER` is the **catalog ingestion / default provider** configuration.
+> It is used by the legacy `getESIMProvider()` singleton for:
+> - plan catalog sync (`/api/plans/sync`)
+> - usage tracking
+> - webhook signature verification
+>
+> It is **NOT** the canonical fulfillment routing mechanism. The purchase path
+> does not call `getESIMProvider()`. Per-order provider selection is driven by:
+>
+> ```text
+> ConnectivityOffer → Supplier.providerKey → fulfillment registry → FulfillmentAdapter
+> ```
+>
+> Each `Supplier` row carries a `providerKey` that maps to a registered
+> `FulfillmentAdapter` (see `src/lib/fulfillment/registry.ts`). Multiple
+> suppliers/providers can coexist simultaneously. Do NOT mistake `ESIM_PROVIDER`
+> for a global, per-order provider switch — it is only the catalog/bootstrap
+> default.
+
 ### Steps to wire in a real provider (Airalo / Soracom / eSIMX / …)
 
 1. **Read the provider's real API documentation.** Do NOT fabricate calls —
