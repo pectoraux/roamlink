@@ -1245,6 +1245,11 @@ model TenantBalance {
   currency        String   @default("USD")
   totalDepositedMinor Int  @default(0) // lifetime deposits
   totalSpentMinor Int      @default(0) // lifetime connectivity purchases
+  // Phase 2B.2.7: Per-tenant monotonic sequence counter for TenantTransaction.
+  // This is the authoritative sequence allocator — every TenantTransaction
+  // creation locks this row (FOR UPDATE), reads nextTransactionSequence,
+  // assigns it, and increments it. This prevents the MAX+1 race condition.
+  nextTransactionSequence Int @default(1)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 

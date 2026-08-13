@@ -52,18 +52,52 @@ export async function getOrCreateTenantBalance(tenantId: string) {
 }
 
 /**
- * Phase 2B.2.6: Get the next per-tenant sequence number for a TenantTransaction.
- * Uses MAX(sequenceNumber) + 1, which is safe within a transaction with a
- * FOR UPDATE lock on the TenantBalance row (or within a serializable transaction).
- * The unique constraint on (tenantId, sequenceNumber) prevents duplicates.
+ * Phase 2B.2.7: Concurrency-safe per-tenant sequence allocation.
+ *
+ * This MUST be called within a transaction that holds a FOR UPDATE lock on
+ * the TenantBalance row. The caller is responsible for acquiring the lock
+ * (either via an explicit $queryRaw`SELECT ... FOR UPDATE` or by being inside
+ * a transaction that already locked the balance row).
+ *
+ * The function reads nextTransactionSequence from TenantBalance, returns it,
+ * and increments it. Because the caller holds the FOR UPDATE lock, no other
+ * transaction can read/increment the same sequence number — this prevents
+ * the MAX+1 race condition.
+ *
+ * For call sites outside an existing transaction, use
+ * `allocateSequenceAndCreateTransaction()` which wraps the lock + allocate +
+ * create in a single transaction.
  */
 async function getNextSequenceNumber(tx: any, tenantId: string): Promise<number> {
-  const last = await tx.tenantTransaction.findFirst({
+  // Read and increment nextTransactionSequence atomically.
+  // The caller MUST hold a FOR UPDATE lock on the TenantBalance row.
+  const balance = await tx.tenantBalance.findUnique({
     where: { tenantId },
-    orderBy: { sequenceNumber: "desc" },
-    select: { sequenceNumber: true },
+    select: { nextTransactionSequence: true },
   });
-  return (last?.sequenceNumber ?? 0) + 1;
+
+  if (!balance) {
+    // Balance row doesn't exist — create it with sequence 1
+    await tx.tenantBalance.create({
+      data: { tenantId, nextTransactionSequence: 2 },
+    });
+    return 1;
+  }
+
+  const seq = balance.nextTransactionSequence;
+  await tx.tenantBalance.update({
+    where: { tenantId },
+    data: { nextTransactionSequence: seq + 1 },
+  });
+  return seq;
+}
+
+/**
+ * Phase 2B.2.7: Acquire a FOR UPDATE lock on the TenantBalance row.
+ * Must be called at the start of a transaction before any sequence allocation.
+ */
+async function lockTenantBalance(tx: any, tenantId: string): Promise<void> {
+  await tx.$executeRaw`SELECT 1 FROM "TenantBalance" WHERE "tenantId" = ${tenantId} FOR UPDATE`;
 }
 
 /**
@@ -314,23 +348,29 @@ export async function settleResellerReservation(input: {
   }
 
   // Phase 2B.2.1 §6: Create a TenantTransaction for the settlement.
+  // Phase 2B.2.7: Use a transaction with FOR UPDATE lock on TenantBalance
+  // for concurrency-safe sequence allocation.
   // Do NOT silently swallow — if this fails, the reconciliation worker will
   // repair it (the reservation is already SETTLED with the ledgerTransactionId).
   try {
-    const settleSeq = await getNextSequenceNumber(db, input.tenantId);
-    await db.tenantTransaction.create({
-      data: {
-        tenantId: input.tenantId,
-        type: "purchase",
-        amountMinor: -reservation.amountMinor,
-        balanceAfter: await getTenantBalanceMinor(input.tenantId),
-        orderId: input.orderId,
-        description: "Connectivity purchase settled",
-        idempotencyKey: `settle_${reservation.idempotencyKey}`,
-        ledgerTransactionId: ledgerTxnId,
-        sequenceNumber: settleSeq,
-      },
-    });
+    await db.$transaction(async (tx) => {
+      await lockTenantBalance(tx, input.tenantId);
+      const settleSeq = await getNextSequenceNumber(tx, input.tenantId);
+      const currentBalance = await getTenantBalanceMinor(input.tenantId);
+      await tx.tenantTransaction.create({
+        data: {
+          tenantId: input.tenantId,
+          type: "purchase",
+          amountMinor: -reservation.amountMinor,
+          balanceAfter: currentBalance,
+          orderId: input.orderId,
+          description: "Connectivity purchase settled",
+          idempotencyKey: `settle_${reservation.idempotencyKey}`,
+          ledgerTransactionId: ledgerTxnId,
+          sequenceNumber: settleSeq,
+        },
+      });
+    }, { timeout: 30000, maxWait: 15000 });
 
     // Phase 2B.2.5: Mark the projection as reconciled so the worker doesn't
     // need to scan this reservation on future cron runs.
@@ -671,6 +711,9 @@ export async function creditDepositBalance(input: {
       const bal = await tx.tenantBalance.findUnique({ where: { tenantId: input.tenantId } });
       return { balanceMinor: bal?.balanceMinor ?? 0, status: existing?.status ?? "COMPLETED", alreadyDone: true };
     }
+
+    // Phase 2B.2.7: Lock the balance row for concurrency-safe sequence allocation.
+    await lockTenantBalance(tx, input.tenantId);
 
     // Credit the balance
     const balance = await tx.tenantBalance.upsert({
@@ -1069,6 +1112,8 @@ export async function processDueResellerReservationReconciliation(): Promise<{
           if (updated.count === 0) {
             return { alreadyDone: true as const };
           }
+          // Phase 2B.2.7: Lock the balance row for concurrency-safe sequence allocation.
+          await lockTenantBalance(tx, reservation.tenantId);
           const balance = await tx.tenantBalance.upsert({
             where: { tenantId: reservation.tenantId },
             create: { tenantId: reservation.tenantId, balanceMinor: reservation.amountMinor },
@@ -1135,21 +1180,26 @@ export async function processDueResellerReservationReconciliation(): Promise<{
         });
 
         // Create the TenantTransaction if it doesn't exist (idempotent via unique key)
+        // Phase 2B.2.7: Use a transaction with FOR UPDATE lock for concurrency-safe sequence allocation.
         try {
-          const workerSettleSeq = await getNextSequenceNumber(db, reservation.tenantId);
-          await db.tenantTransaction.create({
-            data: {
-              tenantId: reservation.tenantId,
-              type: "purchase",
-              amountMinor: -reservation.amountMinor,
-              balanceAfter: await getTenantBalanceMinor(reservation.tenantId),
-              orderId: reservation.orderId,
-              description: "Connectivity purchase settled (reconciliation)",
-              idempotencyKey: `settle_${reservation.idempotencyKey}`,
-              ledgerTransactionId: ledgerTxnId,
-              sequenceNumber: workerSettleSeq,
-            },
-          });
+          await db.$transaction(async (tx) => {
+            await lockTenantBalance(tx, reservation.tenantId);
+            const workerSettleSeq = await getNextSequenceNumber(tx, reservation.tenantId);
+            const currentBalance = await getTenantBalanceMinor(reservation.tenantId);
+            await tx.tenantTransaction.create({
+              data: {
+                tenantId: reservation.tenantId,
+                type: "purchase",
+                amountMinor: -reservation.amountMinor,
+                balanceAfter: currentBalance,
+                orderId: reservation.orderId,
+                description: "Connectivity purchase settled (reconciliation)",
+                idempotencyKey: `settle_${reservation.idempotencyKey}`,
+                ledgerTransactionId: ledgerTxnId,
+                sequenceNumber: workerSettleSeq,
+              },
+            });
+          }, { timeout: 30000, maxWait: 15000 });
 
           // Phase 2B.2.5: Mark the projection as reconciled
           await db.tenantBalanceReservation.update({
@@ -1261,28 +1311,31 @@ export async function processDueResellerReservationReconciliation(): Promise<{
     const transactionAmount = -reservation.amountMinor; // purchase is negative
     const historicalBalanceAfter = historicalBalanceBefore + transactionAmount;
 
-    // The repaired transaction gets the next available sequenceNumber (at the end
-    // of the current history). This is correct because the repaired transaction
-    // is being created NOW by the reconciliation worker — its position in the
-    // operational history is the repair time, not the original settlement time.
-    // The historicalBalanceAfter field preserves the correct historical balance.
-    const repairSeq = await getNextSequenceNumber(db, reservation.tenantId);
-
-    // Repair: create the missing TenantTransaction with the HISTORICAL balanceAfter
+    // Phase 2B.2.7: Use a transaction with FOR UPDATE lock for concurrency-safe
+    // sequence allocation. The repaired transaction gets the next available
+    // sequenceNumber (at the end of the current history). This is correct
+    // because the repaired transaction is being created NOW by the reconciliation
+    // worker — its position in the operational history is the repair time, not
+    // the original settlement time. The historicalBalanceAfter field preserves
+    // the correct historical balance.
     try {
-      await db.tenantTransaction.create({
-        data: {
-          tenantId: reservation.tenantId,
-          type: "purchase",
-          amountMinor: transactionAmount,
-          balanceAfter: historicalBalanceAfter,
-          orderId: reservation.orderId,
-          description: "Connectivity purchase settled (projection repair)",
-          idempotencyKey: expectedTxnKey,
-          ledgerTransactionId: reservation.ledgerTransactionId,
-          sequenceNumber: repairSeq,
-        },
-      });
+      await db.$transaction(async (tx) => {
+        await lockTenantBalance(tx, reservation.tenantId);
+        const repairSeq = await getNextSequenceNumber(tx, reservation.tenantId);
+        await tx.tenantTransaction.create({
+          data: {
+            tenantId: reservation.tenantId,
+            type: "purchase",
+            amountMinor: transactionAmount,
+            balanceAfter: historicalBalanceAfter,
+            orderId: reservation.orderId,
+            description: "Connectivity purchase settled (projection repair)",
+            idempotencyKey: expectedTxnKey,
+            ledgerTransactionId: reservation.ledgerTransactionId,
+            sequenceNumber: repairSeq,
+          },
+        });
+      }, { timeout: 30000, maxWait: 15000 });
 
       // Mark the projection as reconciled so we don't scan this reservation again
       await db.tenantBalanceReservation.update({

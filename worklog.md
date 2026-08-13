@@ -1047,3 +1047,29 @@ Stage Summary:
   - Test C: sequenceNumber deterministic and per-tenant — EXECUTED + PASSED (3 expects)
   - 3 static tests — EXECUTED + PASSED (14 expects)
 - The invariant: a repaired TenantTransaction contains the correct HISTORICAL balanceAfter, determined by deterministic sequenceNumber ordering, not timestamp inference. No projectionReconciled update is silently swallowed.
+
+---
+Task ID: 2B.2.7
+Agent: Lead engineer (main) — Concurrency-Safe Sequence Allocation
+Task: Fix P0: MAX+1 sequence allocator races under concurrent transactions
+
+Work Log:
+- P0: The getNextSequenceNumber helper used MAX(sequenceNumber)+1, which races under concurrent transactions: two transactions can both read MAX=41, both choose 42, and one gets a P2002 failure. The unique constraint prevents corruption but doesn't make allocation concurrency-safe.
+- Fix: Added nextTransactionSequence to TenantBalance (migration 0011). The helper now reads + increments this counter. The caller MUST hold a FOR UPDATE lock on the TenantBalance row (via lockTenantBalance helper) before calling getNextSequenceNumber.
+- Added lockTenantBalance(tx, tenantId) helper that does SELECT 1 FROM TenantBalance WHERE tenantId = ? FOR UPDATE.
+- Fixed all 3 unsafe db. call sites (settleResellerReservation, worker settlement, projection repair) to wrap the sequence allocation + TenantTransaction creation in a $transaction with lockTenantBalance.
+- Added lockTenantBalance to the 2 inside-transaction paths that didn't have an explicit FOR UPDATE lock (creditDepositBalance, worker release).
+- The reserve and release paths already had explicit FOR UPDATE locks.
+- Repository-wide audit: 0 db.tenantTransaction.create calls, 7 tx.tenantTransaction.create calls (all inside transactions with FOR UPDATE locks). No MAX+1 pattern remains.
+- Migration backfills existing tenants: nextTransactionSequence = MAX(existing sequenceNumber) + 1.
+
+Stage Summary:
+- Migration: 0011_phase2b27_concurrency_safe_sequence (added nextTransactionSequence to TenantBalance)
+- Files changed: prisma/schema.prisma, prisma/migrations/0011_phase2b27_concurrency_safe_sequence/migration.sql, src/lib/tenant/balance.ts, tests/phase2b27-concurrency-safe-sequence.test.ts
+- Tests: 5 tests in phase2b27-concurrency-safe-sequence.test.ts — all EXECUTED + PASSED
+  - A. Concurrent same-tenant (4 parallel, all succeed, unique consecutive sequences) — 9 expects ✅
+  - B. Different tenants independent (no cross-tenant collision) — 6 expects ✅
+  - C. Repository-wide audit (0 db. calls, 7 tx. calls, no MAX+1) — 7 expects ✅
+  - 2 static tests ✅
+- The invariant: every successfully created TenantTransaction receives a unique per-tenant sequence number without MAX+1 races, timestamp inference, JavaScript mutexes, or best-effort retries. PostgreSQL FOR UPDATE enforces correctness.
+- The reseller wallet hardening sequence is now COMPLETE. Ready for Phase 2B.3: SaaS billing.
