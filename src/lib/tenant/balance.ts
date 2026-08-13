@@ -297,15 +297,28 @@ export async function settleResellerReservation(input: {
         ledgerTransactionId: ledgerTxnId,
       },
     });
+
+    // Phase 2B.2.5: Mark the projection as reconciled so the worker doesn't
+    // need to scan this reservation on future cron runs.
+    await db.tenantBalanceReservation.update({
+      where: { id: reservation.id },
+      data: { projectionReconciled: true },
+    }).catch(() => {});
   } catch (err) {
     // The unique constraint on idempotencyKey may have caught a duplicate
     // (concurrent settlement). If so, this is fine. If it's a real error,
     // log it — the reservation is SETTLED and the ledger is posted, so the
     // financial truth is correct. The operational projection (TenantTransaction)
     // can be repaired by the reconciliation worker.
+    // Phase 2B.2.5: projectionReconciled stays false, so the worker will check.
     const errMsg = err instanceof Error ? err.message : String(err);
     if (errMsg.includes("Unique constraint") || errMsg.includes("P2002")) {
       logger.info("reseller.settle_txn_idempotent_replay", { reservationId: reservation.id, orderId: input.orderId });
+      // The TenantTransaction already exists (concurrent call) — mark as reconciled
+      await db.tenantBalanceReservation.update({
+        where: { id: reservation.id },
+        data: { projectionReconciled: true },
+      }).catch(() => {});
     } else {
       logger.error("reseller.settle_txn_creation_failed", {
         reservationId: reservation.id,
@@ -1095,10 +1108,20 @@ export async function processDueResellerReservationReconciliation(): Promise<{
               ledgerTransactionId: ledgerTxnId,
             },
           });
+
+          // Phase 2B.2.5: Mark the projection as reconciled
+          await db.tenantBalanceReservation.update({
+            where: { id: reservation.id },
+            data: { projectionReconciled: true },
+          }).catch(() => {});
         } catch (txnErr) {
           const txnMsg = txnErr instanceof Error ? txnErr.message : String(txnErr);
           if (txnMsg.includes("Unique constraint") || txnMsg.includes("P2002")) {
-            // Already exists — fine
+            // Already exists — fine, mark as reconciled
+            await db.tenantBalanceReservation.update({
+              where: { id: reservation.id },
+              data: { projectionReconciled: true },
+            }).catch(() => {});
           } else {
             logger.error("reseller.reservation_reconcile_txn_failed", {
               reservationId: reservation.id,
@@ -1130,52 +1153,100 @@ export async function processDueResellerReservationReconciliation(): Promise<{
   // (in either the order route or the reconciliation worker). The ledger is already
   // correct (ledgerTransactionId is set), so we only need to repair the operational
   // projection — we do NOT repost the ledger or change the balance.
+  //
+  // Phase 2B.2.5: Use the projectionReconciled flag to avoid scanning every historical
+  // SETTLED reservation on every cron run. Only reservations with
+  // projectionReconciled=false are checked. Once the TenantTransaction is confirmed
+  // to exist (either it was already there or we just repaired it), the flag is set
+  // to true and the worker skips it on future runs.
+  //
+  // Phase 2B.2.5: The repaired balanceAfter is the HISTORICAL balance immediately
+  // after this transaction, NOT the current balance. We reconstruct it from the
+  // ordered TenantTransaction history: find the transaction immediately before this
+  // one (by createdAt), take its balanceAfter, add this transaction's amount.
   const settledReservations = await db.tenantBalanceReservation.findMany({
     where: {
       state: "SETTLED",
       ledgerTransactionId: { not: null },
+      projectionReconciled: false,
     },
     select: {
       id: true, tenantId: true, orderId: true, amountMinor: true,
-      idempotencyKey: true, ledgerTransactionId: true,
+      idempotencyKey: true, ledgerTransactionId: true, createdAt: true,
     },
   });
 
   for (const reservation of settledReservations) {
-    // Check if the TenantTransaction exists
+    // Check if the TenantTransaction already exists
     const expectedTxnKey = `settle_${reservation.idempotencyKey}`;
     const existingTxn = await db.tenantTransaction.findUnique({
       where: { idempotencyKey: expectedTxnKey },
     });
 
     if (existingTxn) {
-      continue; // already has its TenantTransaction — no repair needed
+      // The TenantTransaction already exists — mark the projection as reconciled
+      // so we don't scan this reservation again.
+      await db.tenantBalanceReservation.update({
+        where: { id: reservation.id },
+        data: { projectionReconciled: true },
+      }).catch(() => {});
+      continue;
     }
 
-    // Repair: create the missing TenantTransaction (idempotent via unique key)
+    // Phase 2B.2.5: Reconstruct the HISTORICAL balanceAfter.
+    // Find the TenantTransaction immediately BEFORE this reservation's creation.
+    // The historical balanceAfter = priorTxn.balanceAfter + thisTxn.amountMinor.
+    // If there's no prior transaction, the balanceBefore is 0 (or the initial deposit,
+    // but deposits are also TenantTransactions so they'd be in the history).
+    const priorTxn = await db.tenantTransaction.findFirst({
+      where: {
+        tenantId: reservation.tenantId,
+        createdAt: { lt: reservation.createdAt },
+      },
+      orderBy: { createdAt: "desc" },
+      select: { balanceAfter: true },
+    });
+
+    const historicalBalanceBefore = priorTxn?.balanceAfter ?? 0;
+    const transactionAmount = -reservation.amountMinor; // purchase is negative
+    const historicalBalanceAfter = historicalBalanceBefore + transactionAmount;
+
+    // Repair: create the missing TenantTransaction with the HISTORICAL balanceAfter
     try {
       await db.tenantTransaction.create({
         data: {
           tenantId: reservation.tenantId,
           type: "purchase",
-          amountMinor: -reservation.amountMinor,
-          balanceAfter: await getTenantBalanceMinor(reservation.tenantId),
+          amountMinor: transactionAmount,
+          balanceAfter: historicalBalanceAfter,
           orderId: reservation.orderId,
           description: "Connectivity purchase settled (projection repair)",
           idempotencyKey: expectedTxnKey,
           ledgerTransactionId: reservation.ledgerTransactionId,
         },
       });
+
+      // Mark the projection as reconciled so we don't scan this reservation again
+      await db.tenantBalanceReservation.update({
+        where: { id: reservation.id },
+        data: { projectionReconciled: true },
+      }).catch(() => {});
+
       result.projectionRepaired++;
       logger.info("reseller.projection_repaired", {
         reservationId: reservation.id,
         orderId: reservation.orderId,
         ledgerTxnId: reservation.ledgerTransactionId,
+        historicalBalanceAfter,
       });
     } catch (txnErr) {
       const txnMsg = txnErr instanceof Error ? txnErr.message : String(txnErr);
       if (txnMsg.includes("Unique constraint") || txnMsg.includes("P2002")) {
-        // Another concurrent call created it — fine
+        // Another concurrent call created it — mark as reconciled
+        await db.tenantBalanceReservation.update({
+          where: { id: reservation.id },
+          data: { projectionReconciled: true },
+        }).catch(() => {});
         logger.info("reseller.projection_repair_idempotent_replay", { reservationId: reservation.id });
       } else {
         result.stillFailing++;

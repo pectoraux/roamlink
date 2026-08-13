@@ -1291,6 +1291,10 @@ model TenantBalanceReservation {
   // This distinguishes "ledger failed after successful fulfillment" (safe to retry settlement)
   // from "fulfillment state unknown" (must NOT settle until fulfillment is confirmed).
   reconciliationReason String?
+  // Phase 2B.2.5: Marks whether the operational projection (TenantTransaction)
+  // has been confirmed to exist. When false, the reconciliation worker should
+  // check/repair it. When true, the worker skips it (scalability optimization).
+  projectionReconciled Boolean @default(false)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
