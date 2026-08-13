@@ -402,6 +402,91 @@ async function activateSubscriptionAndPostLedger(input: {
 }
 
 /**
+ * Phase 2B.3.6: Complete a SaaS renewal cycle — the SINGLE authoritative
+ * function that extends the subscription period after financial finalization.
+ *
+ * This function is called by ALL successful renewal paths:
+ *   - renewSubscription (direct path)
+ *   - handleSaasPaymentWebhook (webhook path)
+ *   - processDueSaasFinancialReconciliation (reconciliation path)
+ *
+ * It verifies the invoice is paid + ledger exists, then atomically:
+ *   1. Extends currentPeriodEnd to cycle.periodEnd
+ *   2. Sets subscription status to active
+ *   3. Marks SaasRenewalCycle COMPLETED
+ *
+ * Status-guarded: only transitions from non-COMPLETED states.
+ * Idempotent: if already COMPLETED, returns success without re-extending.
+ *
+ * This ensures the invariant:
+ *   IF cycle = COMPLETED
+ *   THEN subscription.currentPeriodEnd = cycle.periodEnd
+ */
+async function completeSaasRenewalCycle(input: {
+  invoiceId: string;
+  tenantId: string;
+}): Promise<{ completed: boolean }> {
+  // Find the renewal cycle linked to this invoice
+  const cycle = await db.saasRenewalCycle.findFirst({
+    where: { invoiceId: input.invoiceId },
+  });
+  if (!cycle) {
+    // No cycle — this is an initial subscription, not a renewal. Nothing to complete.
+    return { completed: false };
+  }
+
+  // Idempotent: if already completed, return
+  if (cycle.state === "COMPLETED") {
+    logger.info("saas.cycle_already_completed", { cycleId: cycle.id });
+    return { completed: true };
+  }
+
+  // Verify the invoice is financially ready (paid + ledger exists)
+  const invoice = await db.tenantInvoice.findUnique({ where: { id: input.invoiceId } });
+  if (!invoice || invoice.status !== "paid" || !invoice.ledgerTransactionId) {
+    logger.warn("saas.cycle_invoice_not_ready", { cycleId: cycle.id, invoiceStatus: invoice?.status });
+    return { completed: false };
+  }
+
+  // Atomically extend the period + complete the cycle
+  // Status-guarded: only non-COMPLETED cycles can be completed
+  try {
+    const updated = await db.saasRenewalCycle.updateMany({
+      where: { id: cycle.id, state: { not: "COMPLETED" } },
+      data: { state: "COMPLETED" },
+    });
+
+    if (updated.count === 0) {
+      // Another concurrent call completed it
+      logger.info("saas.cycle_concurrently_completed", { cycleId: cycle.id });
+      return { completed: true };
+    }
+
+    // Extend the subscription period
+    await db.tenantSubscription.update({
+      where: { id: cycle.subscriptionId },
+      data: {
+        status: "active",
+        currentPeriodEnd: cycle.periodEnd,
+      },
+    });
+
+    logger.info("saas.renewal_cycle_completed", {
+      cycleId: cycle.id,
+      subscriptionId: cycle.subscriptionId,
+      newPeriodEnd: cycle.periodEnd,
+    });
+    return { completed: true };
+  } catch (err) {
+    logger.error("saas.cycle_completion_failed", {
+      cycleId: cycle.id,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { completed: false };
+  }
+}
+
+/**
  * Cancel a subscription. The subscription remains active until the end of the
  * current period, then expires. No more renewals.
  */
@@ -532,21 +617,13 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     });
 
     if (result.activated) {
-      // Ledger succeeded — extend the period + complete the cycle
-      await db.tenantSubscription.update({
-        where: { id: subscription.id },
-        data: {
-          status: "active",
-          currentPeriodEnd: newPeriodEnd,
-          renewalIdempotencyKey: cycleKey,
-        },
-      });
-      await db.saasRenewalCycle.update({
-        where: { id: cycle.id },
-        data: { state: "COMPLETED" },
-      });
-      logger.info("saas.subscription_renewed_after_reconciliation", { tenantId, subscriptionId: subscription.id, cycleId: cycle.id, newPeriodEnd });
-      return { success: true, status: "active" };
+      // Phase 2B.3.6: Use the single authoritative completion function
+      const completion = await completeSaasRenewalCycle({ invoiceId: cycle.invoiceId!, tenantId });
+      if (completion.completed) {
+        return { success: true, status: "active" };
+      } else {
+        return { success: false, status: "financial_pending", reason: "Period extension failed during renewal retry" };
+      }
     } else {
       return { success: false, status: "financial_pending", reason: "Ledger posting still failing during renewal retry" };
     }
@@ -619,13 +696,13 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     });
 
     if (result.activated) {
-      await db.tenantSubscription.update({
-        where: { id: subscription.id },
-        data: { status: "active", currentPeriodEnd: newPeriodEnd, renewalIdempotencyKey: renewalKey },
-      });
-      await db.saasRenewalCycle.update({ where: { id: cycle.id }, data: { state: "COMPLETED" } });
-      logger.info("saas.subscription_renewed_after_reconciliation", { tenantId, subscriptionId: subscription.id, cycleId: cycle.id, newPeriodEnd });
-      return { success: true, status: "active" };
+      // Phase 2B.3.6: Use the single authoritative completion function
+      const completion = await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId });
+      if (completion.completed) {
+        return { success: true, status: "active" };
+      } else {
+        return { success: false, status: "financial_pending", reason: "Period extension failed" };
+      }
     } else {
       await db.saasRenewalCycle.update({ where: { id: cycle.id }, data: { state: "RECONCILIATION_REQUIRED" } });
       return { success: false, status: "financial_pending", reason: "Ledger posting still failing during renewal retry" };
@@ -707,23 +784,20 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     return { success: false, status: "financial_pending", reason: "Ledger posting failed during renewal — invoice is reconciliation_required" };
   }
 
-  // Phase 2B.3.5: Financial finalization succeeded — extend period + complete cycle
-  await db.tenantSubscription.update({
-    where: { id: subscription.id },
-    data: {
-      status: "active",
-      currentPeriodEnd: newPeriodEnd,
-      renewalIdempotencyKey: renewalKey,
-    },
-  });
-  await db.saasRenewalCycle.update({
-    where: { id: cycle.id },
-    data: { state: "COMPLETED" },
-  });
-
-  logger.info("saas.subscription_renewed", { tenantId, subscriptionId: subscription.id, cycleId: cycle.id, newPeriodEnd });
-
-  return { success: true, status: "active" };
+  // Phase 2B.3.6: Financial finalization succeeded — use the single
+  // authoritative completion function to extend the period + complete the cycle.
+  const completion = await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId });
+  if (completion.completed) {
+    logger.info("saas.subscription_renewed", { tenantId, subscriptionId: subscription.id, cycleId: cycle.id, newPeriodEnd });
+    return { success: true, status: "active" };
+  } else {
+    // Period extension failed — mark cycle for retry
+    await db.saasRenewalCycle.update({
+      where: { id: cycle.id, state: { not: "COMPLETED" } },
+      data: { state: "RECONCILIATION_REQUIRED", failureReason: "Period extension failed" },
+    });
+    return { success: false, status: "financial_pending", reason: "Period extension failed after successful ledger posting" };
+  }
 }
 
 /**
@@ -809,12 +883,19 @@ export async function handleSaasPaymentWebhook(input: {
   }
 
   if (input.status === "succeeded") {
-    await activateSubscriptionAndPostLedger({
+    const result = await activateSubscriptionAndPostLedger({
       subscriptionId: invoice.subscriptionId,
       invoiceId: invoice.id,
       tenantId: invoice.tenantId,
       userId: "webhook",
     });
+
+    // Phase 2B.3.6: If financial finalization succeeded, complete the renewal cycle
+    // (extend the subscription period). This is the SINGLE place where webhook-driven
+    // renewal period extension happens.
+    if (result.activated) {
+      await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId: invoice.tenantId });
+    }
     return { handled: true };
   }
 
@@ -940,17 +1021,9 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
         result.repaired++;
         logger.info("saas.invoice_reconciled", { invoiceId: invoice.id, subscriptionId: invoice.subscriptionId });
 
-        // Phase 2B.3.5: Complete the associated renewal cycle if one exists
-        const cycle = await db.saasRenewalCycle.findFirst({
-          where: { invoiceId: invoice.id },
-        });
-        if (cycle && cycle.state !== "COMPLETED") {
-          await db.saasRenewalCycle.update({
-            where: { id: cycle.id },
-            data: { state: "COMPLETED" },
-          });
-          logger.info("saas.renewal_cycle_completed", { cycleId: cycle.id, invoiceId: invoice.id });
-        }
+        // Phase 2B.3.6: Complete the renewal cycle — extends the subscription period.
+        // This is the SINGLE function that does period extension for reconciliation.
+        await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId: invoice.tenantId });
       } else {
         result.stillFailing++;
       }

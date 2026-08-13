@@ -1239,3 +1239,24 @@ Stage Summary:
   - O: legacy webhook returns 410 ✅
   - 3 static tests ✅
 - The invariant: ONE BILLING PERIOD → ONE SaasRenewalCycle → ONE TenantInvoice → ONE PAYMENT → ONE LEDGER → ONE PERIOD EXTENSION. Retries and concurrent workers converge on the same chain.
+
+---
+Task ID: 2B.3.6
+Agent: Lead engineer (main) — SaaS Renewal Finalization + Period Extension Integrity
+Task: Fix P0: successful renewal payment can leave the billing period unextended
+
+Work Log:
+- P0: activateSubscriptionAndPostLedger only set currentPeriodEnd for pending_payment (initial activation). For renewals (active/past_due), the period was NOT extended — the webhook and reconciliation paths didn't call any period-extension function.
+- Fix: Created completeSaasRenewalCycle() — the SINGLE authoritative function that extends the subscription period after financial finalization. It verifies the invoice is paid + ledger exists, then atomically: (1) extends currentPeriodEnd to cycle.periodEnd, (2) sets subscription active, (3) marks SaasRenewalCycle COMPLETED. Status-guarded (only non-COMPLETED → COMPLETED). Idempotent.
+- Replaced ALL 3 inline period-extension + cycle-completion code paths in renewSubscription with calls to completeSaasRenewalCycle.
+- Fixed the webhook success path to call completeSaasRenewalCycle after activateSubscriptionAndPostLedger succeeds.
+- Fixed the reconciliation success path to call completeSaasRenewalCycle instead of the inline cycle-completion code.
+
+Stage Summary:
+- Files changed: src/lib/tenant/saas-subscription.ts, tests/phase2b36-renewal-finalization.test.ts
+- No schema migration needed
+- Tests: 6 tests — all EXECUTED + PASSED
+  - B: normal renewal → cycle COMPLETED + currentPeriodEnd = cycle.periodEnd ✅ (4 expects)
+  - C: successful renewal webhook → period extended ✅ (5 expects)
+  - 4 static tests ✅
+- The invariant: IF cycle = COMPLETED THEN invoice = PAID AND ledgerTransactionId != null AND subscription.currentPeriodEnd = cycle.periodEnd. No path may stop after ledger/invoice finalization while leaving the subscription period expired.
