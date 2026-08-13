@@ -488,6 +488,35 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     return { success: true, status: "active" };
   }
 
+  // Phase 2B.3.2: If the invoice is reconciliation_required, the payment was
+  // already verified but the ledger failed. Don't create a new payment intent —
+  // attempt to finalize the existing invoice instead.
+  if (invoice.status === "reconciliation_required") {
+    const result = await activateSubscriptionAndPostLedger({
+      subscriptionId: subscription.id,
+      invoiceId: invoice.id,
+      tenantId,
+      userId: "renewal-worker",
+    });
+
+    if (result.activated) {
+      // Ledger succeeded — extend the period
+      await db.tenantSubscription.update({
+        where: { id: subscription.id },
+        data: {
+          status: "active",
+          currentPeriodEnd: newPeriodEnd,
+          renewalIdempotencyKey: renewalKey,
+        },
+      });
+      logger.info("saas.subscription_renewed_after_reconciliation", { tenantId, subscriptionId: subscription.id, newPeriodEnd });
+      return { success: true, status: "active" };
+    } else {
+      // Ledger still failing — don't extend the period
+      return { success: false, status: "financial_pending", reason: "Ledger posting still failing during renewal retry" };
+    }
+  }
+
   // Create a payment intent with the provider
   const provider = getPaymentProvider();
   const intent = await provider.createPaymentIntent({
@@ -535,15 +564,27 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     return { success: false, status: "past_due", reason: "Payment pending" };
   }
 
-  // Payment succeeded — post the ledger + activate
-  await activateSubscriptionAndPostLedger({
+  // Payment succeeded — attempt financial finalization
+  const result = await activateSubscriptionAndPostLedger({
     subscriptionId: subscription.id,
     invoiceId: invoice.id,
     tenantId,
     userId: "renewal-worker",
   });
 
-  // Extend the subscription period
+  if (!result.activated) {
+    // Phase 2B.3.2 P0-1: Ledger failed — do NOT extend the period.
+    // The invoice is now reconciliation_required. The subscription stays
+    // in its current state (not active for the new period). The
+    // processDueSaasFinancialReconciliation worker will retry the ledger
+    // posting and, if successful, the renewal will be retried on the
+    // next cron tick (the period hasn't advanced, so it will re-enter
+    // renewSubscription, find the existing reconciliation_required invoice,
+    // and attempt to finalize it).
+    return { success: false, status: "financial_pending", reason: "Ledger posting failed during renewal — invoice is reconciliation_required" };
+  }
+
+  // Phase 2B.3.2 P0-1: Only extend the period AFTER financial finalization succeeds.
   await db.tenantSubscription.update({
     where: { id: subscription.id },
     data: {
@@ -690,7 +731,52 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
   for (const invoice of due) {
     if (!invoice.subscription) continue;
     result.retried++;
+
     try {
+      // Phase 2B.3.2 P0-2: For stale "pending" invoices, we MUST verify the
+      // payment with the provider before posting any ledger entry.
+      // A providerReference only proves a payment intent exists — it does NOT
+      // prove the payment succeeded. Only reconciliation_required invoices
+      // have already been verified (the payment was confirmed by the caller
+      // before the ledger attempt failed).
+      if (invoice.status === "pending") {
+        if (!invoice.providerReference || !invoice.paymentProvider) {
+          // No provider reference — can't verify, skip
+          logger.warn("saas.reconciliation_no_provider_ref", { invoiceId: invoice.id });
+          continue;
+        }
+
+        const provider = getPaymentProvider();
+        const verification = await provider.verifyPayment({
+          providerReference: invoice.providerReference,
+          idempotencyKey: invoice.idempotencyKey,
+        });
+
+        if (verification.status === "failed") {
+          // Payment failed — mark the invoice as failed, do NOT post revenue
+          await db.tenantInvoice.update({
+            where: { id: invoice.id },
+            data: { status: "failed", failureReason: "Payment verification failed during reconciliation" },
+          });
+          await db.tenantSubscription.update({
+            where: { id: invoice.subscriptionId },
+            data: { status: "past_due" },
+          });
+          logger.info("saas.reconciliation_payment_failed", { invoiceId: invoice.id });
+          continue;
+        }
+
+        if (verification.status === "pending") {
+          // Payment still pending — do NOT post revenue, leave as pending
+          logger.info("saas.reconciliation_payment_pending", { invoiceId: invoice.id });
+          continue;
+        }
+
+        // verification.status === "succeeded" — proceed to financial finalization
+      }
+
+      // For reconciliation_required invoices, the payment was already verified
+      // by the original caller. The ledger just needs to be retried.
       const activated = await activateSubscriptionAndPostLedger({
         subscriptionId: invoice.subscriptionId,
         invoiceId: invoice.id,

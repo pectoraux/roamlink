@@ -1154,3 +1154,22 @@ Stage Summary:
   - I: subscribe idempotency (same key → same intent, no duplicate) (6 expects) ✅
   - 6 static tests ✅
 - The invariant: PAID + ACTIVE ⇒ CANONICAL LEDGER TRANSACTION EXISTS. No false activation without a ledger record.
+
+---
+Task ID: 2B.3.2
+Agent: Lead engineer (main) — SaaS Renewal + Payment Verification Safety
+Task: Fix P0-1: renewal extends period even when ledger fails. Fix P0-2: worker posts revenue for unverified payments.
+
+Work Log:
+- P0-1 (renewal extends period on ledger failure): Fixed renewSubscription to inspect the `activated` return value from activateSubscriptionAndPostLedger. If activated=false (ledger failed), the function returns `financial_pending` and does NOT extend currentPeriodEnd or set the subscription active. The reconciliation worker will retry the ledger on the next cron tick.
+- P0-1 (renewal retry for reconciliation_required invoices): Added a code path in renewSubscription that handles existing `reconciliation_required` invoices. Instead of creating a new payment intent, it attempts to finalize the existing invoice. If the ledger succeeds, the period is extended. If it still fails, the period is NOT extended.
+- P0-2 (worker posts revenue for unverified payments): Fixed processDueSaasFinancialReconciliation to verify payment status BEFORE posting the ledger for stale `pending` invoices. The worker now calls provider.verifyPayment() for pending invoices. If the payment is still "pending", no revenue is posted. If "failed", the invoice is marked as failed and the subscription is set to past_due. Only "succeeded" proceeds to financial finalization. `reconciliation_required` invoices are safe to retry without re-verification (the payment was already verified by the original caller).
+
+Stage Summary:
+- Files changed: src/lib/tenant/saas-subscription.ts, tests/phase2b32-renewal-payment-safety.test.ts
+- No schema migration needed
+- Tests: 6 tests in phase2b32-renewal-payment-safety.test.ts — all EXECUTED + PASSED
+  - K: renewal payment success + ledger failure → period NOT extended ✅
+  - D: stale pending invoice with payment still pending → NO revenue ✅
+  - 4 static tests ✅
+- The invariants: (1) payment success + ledger failure → period NOT extended. (2) providerReference alone does NOT prove payment → worker verifies before posting revenue.
