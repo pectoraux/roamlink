@@ -1234,9 +1234,11 @@ model TenantInvoice {
   amountMinor     Int
   currency        String   @default("USD")
   billingCycle    String   // monthly | yearly
-  periodStart     DateTime
-  periodEnd       DateTime
-  status          String   @default("pending") // pending | paid | failed | refunded
+  // Phase 2B.3.4: Nullable for unpaid invoices — no fake billing period.
+  // Set to actual payment-time period when the invoice is paid.
+  periodStart     DateTime?
+  periodEnd       DateTime?
+  status          String   @default("pending") // pending | paid | failed | refunded | reconciliation_required
   paymentProvider String?  // mock | stripe | paystack | flutterwave
   providerReference String? // provider's payment intent/charge reference
   ledgerTransactionId String?
@@ -1379,4 +1381,26 @@ model TenantDepositPayment {
   @@index([tenantId])
   @@index([status])
   @@index([providerReference])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2B.3.4 — Durable SaaS Renewal Cycle
+// ---------------------------------------------------------------------------
+
+model SaasRenewalCycle {
+  id              String   @id @default(cuid())
+  subscriptionId  String
+  tenantId        String
+  cycleKey        String   @unique // subscriptionId + immutable periodStart
+  state           String   @default("PENDING") // PENDING | PAYMENT_PENDING | PAYMENT_CONFIRMED | FINANCIAL_POSTED | COMPLETED | PAST_DUE | RECONCILIATION_REQUIRED | FAILED
+  invoiceId       String?  // linked TenantInvoice
+  periodStart     DateTime // immutable — the start of the billing period being renewed
+  periodEnd       DateTime // immutable — the end of the billing period being renewed
+  failureReason   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([subscriptionId])
+  @@index([tenantId])
+  @@index([state])
 }

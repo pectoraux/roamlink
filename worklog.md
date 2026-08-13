@@ -1194,3 +1194,24 @@ Stage Summary:
   - D: PENDING_PAYMENT excluded from renewal processing ✅
   - 4 static tests ✅
 - The invariants: (1) PENDING_PAYMENT can never enter processDueSaasRenewals(). (2) Paid period starts only after verified payment + ledger success. (3) Existing invoices always use their recorded payment provider.
+
+---
+Task ID: 2B.3.4
+Agent: Lead engineer (main) — Final SaaS Billing State + Billing-Record Integrity
+Task: Fix P1-1: fake billing period on unpaid invoices. P1-3: provider-bound webhooks. State monotonicity.
+
+Work Log:
+- P1-1 (fake billing period): Made TenantInvoice.periodStart/periodEnd nullable (migration 0013). Unpaid invoices now have null periodStart/periodEnd — no fake dates. The actual billing period is set in activateSubscriptionAndPostLedger when the invoice transitions to paid.
+- P1-2 (durable renewal cycle): Added SaasRenewalCycle model (migration 0013) with cycleKey (subscriptionId + immutable periodStart), state machine (PENDING | PAYMENT_PENDING | PAYMENT_CONFIRMED | FINANCIAL_POSTED | COMPLETED | PAST_DUE | RECONCILIATION_REQUIRED | FAILED), and invoiceId link. The model exists for future implementation of the full cycle-based renewal coordination.
+- P1-3 (provider-bound webhooks): Added /api/webhooks/saas/[provider]/route.ts — provider-scoped webhook route. The handler resolves the provider from the URL, verifies the webhook with that provider, and finds the invoice by (paymentProvider, providerReference) — not just providerReference alone. Updated handleSaasPaymentWebhook to require providerKey parameter. Updated the legacy /api/webhooks/saas/route.ts to pass the global provider's id as providerKey.
+- State monotonicity: handleSaasPaymentWebhook now checks: (1) if invoice is already paid → skip (don't roll back). (2) if invoice is reconciliation_required and webhook says failed → skip (payment was already verified). (3) failed webhooks use status-guarded updateMany (only pending → failed). (4) subscription past_due transition is also status-guarded.
+
+Stage Summary:
+- Migration: 0013_phase2b34_saas_final (nullable invoice periods + SaasRenewalCycle model)
+- Files changed: prisma/schema.prisma, src/lib/tenant/saas-subscription.ts, src/app/api/webhooks/saas/route.ts, src/app/api/webhooks/saas/[provider]/route.ts (new), tests/phase2b34-saas-final.test.ts
+- Tests: 8 tests in phase2b34-saas-final.test.ts — all EXECUTED + PASSED
+  - A: unpaid invoice has null periodStart/periodEnd ✅
+  - B: successful payment sets actual period ✅
+  - J: success→failed webhook does not regress state ✅
+  - 5 static tests ✅
+- The invariants: (1) No fake billing period on unpaid invoices. (2) Webhooks are provider-bound. (3) State is monotonic — paid cannot be rolled back. (4) SaasRenewalCycle model exists for durable renewal coordination.

@@ -147,8 +147,10 @@ export async function createSubscriptionIntent(input: {
       amountMinor,
       currency: plan.currency,
       billingCycle,
-      periodStart: new Date(),
-      periodEnd: new Date(Date.now() + 365 * 86400000), // placeholder — real period set on payment confirmation
+      // Phase 2B.3.4: No fake billing period for unpaid invoices.
+      // periodStart/periodEnd are null until payment is confirmed.
+      periodStart: null,
+      periodEnd: null,
       status: "pending",
       paymentProvider: provider.id,
       providerReference: intent.providerReference,
@@ -670,12 +672,23 @@ export async function processDueSaasRenewals(): Promise<{
  * Handle a SaaS subscription payment webhook (from the payment provider).
  * Idempotent: if the invoice is already paid, returns without re-charging.
  */
+/**
+ * Phase 2B.3.4: Handle a SaaS payment webhook with provider identity.
+ * The webhook must include the providerKey so we can find the invoice by
+ * (paymentProvider, providerReference) — not just providerReference alone.
+ * This prevents cross-provider collisions if two providers generate
+ * the same reference.
+ */
 export async function handleSaasPaymentWebhook(input: {
+  providerKey: string;
   providerReference: string;
   status: "succeeded" | "failed" | "pending";
 }): Promise<{ handled: boolean }> {
   const invoice = await db.tenantInvoice.findFirst({
-    where: { providerReference: input.providerReference },
+    where: {
+      paymentProvider: input.providerKey,
+      providerReference: input.providerReference,
+    },
     include: { subscription: true },
   });
   if (!invoice) {
@@ -683,9 +696,18 @@ export async function handleSaasPaymentWebhook(input: {
     return { handled: false };
   }
 
-  // Idempotent: if already paid, skip
+  // Phase 2B.3.4: State monotonicity — a paid invoice must NOT be rolled back.
+  // A "failed" webhook arriving after a "succeeded" webhook must NOT change
+  // the invoice from paid → failed.
   if (invoice.status === "paid") {
-    logger.info("saas.webhook_idempotent", { invoiceId: invoice.id, status: invoice.status });
+    logger.info("saas.webhook_idempotent_paid", { invoiceId: invoice.id, incomingStatus: input.status });
+    return { handled: true };
+  }
+
+  // Also protect reconciliation_required from being overwritten by "failed"
+  // (the payment was already verified — a later failed event shouldn't undo that)
+  if (invoice.status === "reconciliation_required" && input.status === "failed") {
+    logger.warn("saas.webhook_failed_after_reconciliation", { invoiceId: invoice.id });
     return { handled: true };
   }
 
@@ -700,14 +722,15 @@ export async function handleSaasPaymentWebhook(input: {
   }
 
   if (input.status === "failed") {
-    await db.tenantInvoice.update({
-      where: { id: invoice.id },
+    // Status-guarded: only pending → failed (don't overwrite paid/reconciliation_required)
+    await db.tenantInvoice.updateMany({
+      where: { id: invoice.id, status: "pending" },
       data: { status: "failed", failureReason: "Webhook reported payment failed" },
-    }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
-    await db.tenantSubscription.update({
-      where: { id: invoice.subscriptionId },
+    });
+    await db.tenantSubscription.updateMany({
+      where: { id: invoice.subscriptionId, status: { in: ["pending_payment", "active", "trialing"] } },
       data: { status: "past_due" },
-    }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+    });
     return { handled: true };
   }
 

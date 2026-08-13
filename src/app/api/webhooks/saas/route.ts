@@ -1,9 +1,12 @@
 /**
- * SaaS Payment Webhook Handler.
+ * SaaS Payment Webhook Handler (legacy route).
  *   POST /api/webhooks/saas — receives payment provider webhooks for SaaS subscriptions.
  *
- * Idempotent: if the invoice is already paid, returns 200 without re-charging.
- * Uses the existing payment provider's verifyWebhook for signature verification.
+ * Phase 2B.3.4: This route is deprecated. Use the provider-scoped route instead:
+ *   POST /api/webhooks/saas/[provider]
+ *
+ * This legacy route uses the global configured provider. It's kept for backward
+ * compatibility but new integrations should use the provider-scoped route.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -22,7 +25,6 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Invalid webhook signature" }, { status: 401 });
     }
 
-    // Extract the payment reference and status from the webhook event
     const providerReference = event.data.providerReference;
     const status = event.data.status;
 
@@ -31,7 +33,9 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true }, 200);
     }
 
+    // Phase 2B.3.4: Use the global provider's id as the providerKey
     const result = await handleSaasPaymentWebhook({
+      providerKey: provider.id,
       providerReference,
       status: status as "succeeded" | "failed" | "pending",
     });
