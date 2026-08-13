@@ -71,17 +71,22 @@ export async function getOrCreateTenantBalance(tenantId: string) {
 async function getNextSequenceNumber(tx: any, tenantId: string): Promise<number> {
   // Read and increment nextTransactionSequence atomically.
   // The caller MUST hold a FOR UPDATE lock on the TenantBalance row.
+  // Phase 2B.2.8: The TenantBalance row MUST already exist — the sequence
+  // allocator must NOT silently create financial state. If the row doesn't
+  // exist, throw explicitly so the caller can initialize it through the
+  // canonical getOrCreateTenantBalance path before any financial transaction.
   const balance = await tx.tenantBalance.findUnique({
     where: { tenantId },
     select: { nextTransactionSequence: true },
   });
 
   if (!balance) {
-    // Balance row doesn't exist — create it with sequence 1
-    await tx.tenantBalance.create({
-      data: { tenantId, nextTransactionSequence: 2 },
-    });
-    return 1;
+    throw new AppError(
+      "internal",
+      `TenantBalance not found for tenant ${tenantId}`,
+      500,
+      "TenantBalance row must be created before any financial transaction. The sequence allocator does not create financial state.",
+    );
   }
 
   const seq = balance.nextTransactionSequence;
@@ -119,6 +124,21 @@ function logProjectionUpdateFailure(reservationId: string, context: string, err:
 export async function getTenantBalanceMinor(tenantId: string): Promise<number> {
   const balance = await getOrCreateTenantBalance(tenantId);
   return balance.balanceMinor;
+}
+
+/**
+ * Phase 2B.2.8: Get the current available balance using a transaction client.
+ * This MUST be used inside a $transaction to ensure the balance read comes
+ * from the same transactional snapshot as the sequence allocation and
+ * TenantTransaction creation. Using the global db helper inside a transaction
+ * would read from a different connection/snapshot, breaking coherence.
+ */
+async function getTenantBalanceMinorTx(tx: any, tenantId: string): Promise<number> {
+  const balance = await tx.tenantBalance.findUnique({
+    where: { tenantId },
+    select: { balanceMinor: true },
+  });
+  return balance?.balanceMinor ?? 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +376,7 @@ export async function settleResellerReservation(input: {
     await db.$transaction(async (tx) => {
       await lockTenantBalance(tx, input.tenantId);
       const settleSeq = await getNextSequenceNumber(tx, input.tenantId);
-      const currentBalance = await getTenantBalanceMinor(input.tenantId);
+      const currentBalance = await getTenantBalanceMinorTx(tx, input.tenantId);
       await tx.tenantTransaction.create({
         data: {
           tenantId: input.tenantId,
@@ -466,6 +486,9 @@ export async function releaseResellerReservation(input: {
       const bal = await tx.tenantBalance.findUnique({ where: { tenantId: input.tenantId } });
       return { balanceMinor: bal?.balanceMinor ?? 0, state: existing?.state ?? "RELEASED", alreadyDone: true };
     }
+
+    // Phase 2B.2.8: Lock the balance row for concurrency-safe sequence allocation.
+    await lockTenantBalance(tx, input.tenantId);
 
     // Return funds to available balance
     const balance = await tx.tenantBalance.upsert({
@@ -1185,7 +1208,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
           await db.$transaction(async (tx) => {
             await lockTenantBalance(tx, reservation.tenantId);
             const workerSettleSeq = await getNextSequenceNumber(tx, reservation.tenantId);
-            const currentBalance = await getTenantBalanceMinor(reservation.tenantId);
+            const currentBalance = await getTenantBalanceMinorTx(tx, reservation.tenantId);
             await tx.tenantTransaction.create({
               data: {
                 tenantId: reservation.tenantId,

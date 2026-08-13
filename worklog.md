@@ -1073,3 +1073,26 @@ Stage Summary:
   - 2 static tests ✅
 - The invariant: every successfully created TenantTransaction receives a unique per-tenant sequence number without MAX+1 races, timestamp inference, JavaScript mutexes, or best-effort retries. PostgreSQL FOR UPDATE enforces correctness.
 - The reseller wallet hardening sequence is now COMPLETE. Ready for Phase 2B.3: SaaS billing.
+
+---
+Task ID: 2B.2.8
+Agent: Lead engineer (main) — Transactionally Coherent Projection
+Task: Fix: balanceAfter read via db instead of tx inside transactions
+
+Work Log:
+- Issue: In the settlement and worker-settlement paths, balanceAfter was read via getTenantBalanceMinor() (which uses the global db client), not the transaction client tx. This meant the sequence allocation was protected but the balanceAfter snapshot could come from a different transactional snapshot.
+- Fix: Created getTenantBalanceMinorTx(tx, tenantId) — a transaction-aware balance reader that uses the same tx client. Replaced getTenantBalanceMinor(input.tenantId) with getTenantBalanceMinorTx(tx, input.tenantId) in both the settlement path and the worker settlement path.
+- Also added lockTenantBalance to the release path (releaseResellerReservation) — it was missing the explicit FOR UPDATE lock before the sequence allocation.
+- Fixed getNextSequenceNumber to throw an explicit AppError if TenantBalance doesn't exist, instead of silently creating it. The sequence allocator must NOT create financial state.
+- Repository-wide audit: 0 getTenantBalanceMinor calls inside $transaction blocks (all use getTenantBalanceMinorTx). 4 remaining getTenantBalanceMinor calls are all outside transactions (early returns for idempotency checks).
+
+Stage Summary:
+- Files changed: src/lib/tenant/balance.ts, tests/phase2b28-transactional-coherence.test.ts
+- No schema migration needed
+- Tests: 5 tests in phase2b28-transactional-coherence.test.ts — all EXECUTED + PASSED
+  - A. Concurrent A+B: balanceAfter chain correct, final balance = $50 (8 expects) ✅
+  - B. Repository-wide audit: no getTenantBalanceMinor inside transactions ✅
+  - C. getNextSequenceNumber throws if TenantBalance doesn't exist ✅
+  - 2 static tests ✅
+- The invariant: for every TenantTransaction, TenantBalance state + balanceAfter + sequenceNumber + TenantTransaction row represent ONE coherent PostgreSQL transaction. No part reads through a separate connection.
+- The reseller wallet hardening sequence is NOW TRULY COMPLETE. Ready for Phase 2B.3: SaaS billing.
