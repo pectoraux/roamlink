@@ -931,3 +931,31 @@ Stage Summary:
 - No schema migration needed (state is a String field, RECONCILIATION_REQUIRED is a new value)
 - Tests: 14 tests in phase2b21-reservation-reconciliation.test.ts — all pass (successful settlement, failed fulfillment release, ledger failure → RECONCILIATION_REQUIRED, reconciliation repair, idempotency, concurrent settlement, balance invariants + 7 static)
 - The P0 is fixed: a successful fulfillment followed by a temporary ledger failure preserves the reservation (funds held, service active) and the reconciliation worker posts the ledger on the next cron tick. No reseller funds are lost. No duplicate revenue.
+
+---
+Task ID: 2B.2.2
+Agent: Lead engineer (main) — Safe Reservation Reconciliation
+Task: Fix P0: stale RESERVED reservations must not automatically settle based on age
+
+Work Log:
+- P0: The reconciliation worker previously scanned stale RESERVED reservations (updatedAt > 5 min) and settled them WITHOUT checking the Order's fulfillment state. This could recognize revenue for reservations where fulfillment never happened or was still in-flight.
+- Rewrote processDueResellerReservationReconciliation to classify each reservation by consulting the Order's authoritative fulfillmentStatus:
+  - RECONCILIATION_REQUIRED reservations → SETTLEMENT_ELIGIBLE (the order route already verified fulfillment before calling settleResellerReservation)
+  - Stale RESERVED + order.fulfillmentStatus = "success" → SETTLEMENT_ELIGIBLE (settle)
+  - Stale RESERVED + order.fulfillmentStatus = "failed" → RELEASE_ELIGIBLE (release, return funds)
+  - Stale RESERVED + order.fulfillmentStatus = "pending"/"provisioning" → FULFILLMENT_PENDING (do nothing, retry later)
+  - Stale RESERVED + order.fulfillmentStatus = "unknown"/"reconciliation_required" → FULFILLMENT_UNKNOWN (mark RECONCILIATION_REQUIRED, do not settle — fail closed)
+- The worker NEVER settles based on age alone. It always derives the financial action from the Order's fulfillment truth.
+- Inlined the release logic in the worker (rather than calling releaseResellerReservation) to avoid the FK constraint on AuditLog.userId (the worker doesn't have a real userId).
+- Updated the return type to include classification counts: retried, repaired, released, pending, unknown, stillFailing.
+- Updated the cron route to handle the new return type.
+
+Stage Summary:
+- Files changed: src/lib/tenant/balance.ts, src/app/api/internal/reconcile/route.ts, tests/phase2b22-safe-reconciliation.test.ts
+- Tests: 7 tests in phase2b22-safe-reconciliation.test.ts — all pass
+  - Test 4: stale RESERVED + pending fulfillment → NOT settled (no revenue) ✅
+  - Test 5: stale RESERVED + successful fulfillment → SETTLED ✅
+  - Test 6: stale RESERVED + failed fulfillment → RELEASED (funds returned) ✅
+  - Test 8: unknown fulfillment state → RECONCILIATION_REQUIRED (fail closed) ✅
+  - 3 static tests verifying the classification logic exists ✅
+- The P0 is fixed: revenue is only recognized when the Order's authoritative fulfillment state is "success". Age alone never triggers settlement.

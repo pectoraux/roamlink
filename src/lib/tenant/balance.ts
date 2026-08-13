@@ -863,39 +863,59 @@ export async function processDueDepositReconciliation(): Promise<{
 
 // ---------------------------------------------------------------------------
 // Phase 2B.2.1 — Reservation reconciliation worker
+// Phase 2B.2.2: Safe reconciliation — NEVER settle based on age alone.
 // ---------------------------------------------------------------------------
 
 /**
- * Process reservations stuck in RECONCILIATION_REQUIRED.
+ * Process reservations that need reconciliation.
  *
- * For each stuck reservation:
- *   1. Retry ledgerResellerPurchase (idempotent — replays if key exists)
- *   2. Transition RECONCILIATION_REQUIRED → SETTLED (status-guarded)
- *   3. Create the missing TenantTransaction if it doesn't exist
+ * Phase 2B.2.2: The worker NEVER infers fulfillment success from reservation
+ * age. It always consults the Order's authoritative fulfillment state before
+ * taking any financial action.
+ *
+ * Classification:
+ *   - RECONCILIATION_REQUIRED reservations:
+ *     → The order route already attempted settlement and the ledger failed.
+ *       The order's fulfillmentStatus is "success" (verified by the order route
+ *       before calling settleResellerReservation). So these are SETTLEMENT_ELIGIBLE.
+ *
+ *   - Stale RESERVED reservations (older than threshold):
+ *     → The order route may have crashed between reserve and settle.
+ *       We must inspect the Order's fulfillmentStatus:
+ *         "success"           → SETTLEMENT_ELIGIBLE (settle)
+ *         "failed"            → RELEASE_ELIGIBLE (release)
+ *         "pending"/"provisioning" → FULFILLMENT_PENDING (do nothing, retry later)
+ *         "unknown"/"reconciliation_required" → FULFILLMENT_UNKNOWN (mark RECONCILIATION_REQUIRED, do not settle)
  *
  * Idempotency:
  *   - ledgerResellerPurchase replays if the idempotencyKey already exists
- *   - The status-guarded updateMany prevents duplicate transitions
+ *   - Status-guarded updateMany prevents duplicate transitions
  *   - TenantTransaction creation uses a unique idempotencyKey
- *   - Running this worker twice is safe — SETTLED records are skipped
- *
- * Also scans for stale RESERVED reservations (older than STALE_RESERVED_THRESHOLD_MS)
- * where the order is COMPLETED but settlement was never attempted. This catches
- * the edge case where the order route crashed between fulfillment and settlement.
+ *   - Running this worker twice is safe — SETTLED/RELEASED records are skipped
  */
 const STALE_RESERVED_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+type ReservationClassification =
+  | "SETTLEMENT_ELIGIBLE"
+  | "RELEASE_ELIGIBLE"
+  | "FULFILLMENT_PENDING"
+  | "FULFILLMENT_UNKNOWN";
 
 export async function processDueResellerReservationReconciliation(): Promise<{
   retried: number;
   repaired: number;
+  released: number;
+  pending: number;
+  unknown: number;
   stillFailing: number;
 }> {
-  const result = { retried: 0, repaired: 0, stillFailing: 0 };
+  const result = { retried: 0, repaired: 0, released: 0, pending: 0, unknown: 0, stillFailing: 0 };
 
-  // 1. Reservations explicitly in RECONCILIATION_REQUIRED
-  // 2. Stale RESERVED reservations (older than threshold) — settlement was
-  //    never attempted (e.g., the order route crashed between fulfillment and
-  //    settlement). The 5-minute threshold avoids racing with in-flight settlements.
+  // 1. Reservations explicitly in RECONCILIATION_REQUIRED (settlement was
+  //    attempted but the ledger failed — the order route already verified
+  //    fulfillment success before calling settleResellerReservation).
+  // 2. Stale RESERVED reservations (older than threshold) — the order route
+  //    may have crashed. We MUST inspect the Order's fulfillment state.
   const staleCutoff = new Date(Date.now() - STALE_RESERVED_THRESHOLD_MS);
   const due = await db.tenantBalanceReservation.findMany({
     where: {
@@ -913,8 +933,124 @@ export async function processDueResellerReservationReconciliation(): Promise<{
 
   for (const reservation of due) {
     result.retried++;
+
+    // Phase 2B.2.2: For RECONCILIATION_REQUIRED reservations, the order route
+    // already verified fulfillment success before calling settleResellerReservation.
+    // So these are SETTLEMENT_ELIGIBLE.
+    // For stale RESERVED reservations, we MUST inspect the Order's fulfillment state.
+    let classification: ReservationClassification;
+
+    if (reservation.state === "RECONCILIATION_REQUIRED") {
+      // Settlement was attempted (fulfillment already verified by the order route).
+      classification = "SETTLEMENT_ELIGIBLE";
+    } else {
+      // Stale RESERVED — inspect the Order's authoritative fulfillment state.
+      const order = await db.order.findUnique({
+        where: { id: reservation.orderId },
+        select: { fulfillmentStatus: true, status: true },
+      });
+
+      if (!order) {
+        // Order not found — can't determine fulfillment state. Fail closed.
+        classification = "FULFILLMENT_UNKNOWN";
+      } else {
+        const fulfillmentStatus = order.fulfillmentStatus;
+        if (fulfillmentStatus === "success") {
+          classification = "SETTLEMENT_ELIGIBLE";
+        } else if (fulfillmentStatus === "failed") {
+          classification = "RELEASE_ELIGIBLE";
+        } else if (fulfillmentStatus === "pending" || fulfillmentStatus === "provisioning") {
+          classification = "FULFILLMENT_PENDING";
+        } else {
+          // "unknown" or "reconciliation_required" — can't determine. Fail closed.
+          classification = "FULFILLMENT_UNKNOWN";
+        }
+      }
+    }
+
+    // Act on the classification
+    if (classification === "FULFILLMENT_PENDING") {
+      result.pending++;
+      logger.info("reseller.reservation_fulfillment_pending", {
+        reservationId: reservation.id,
+        orderId: reservation.orderId,
+      });
+      continue; // do NOT settle, do NOT release
+    }
+
+    if (classification === "FULFILLMENT_UNKNOWN") {
+      result.unknown++;
+      // Transition to RECONCILIATION_REQUIRED so an operator can inspect.
+      // Do NOT settle, do NOT release.
+      await db.tenantBalanceReservation.updateMany({
+        where: { id: reservation.id, state: "RESERVED" },
+        data: { state: "RECONCILIATION_REQUIRED", failureReason: "Fulfillment state unknown — manual review required" },
+      }).catch((err) => {
+        logger.error("reseller.reservation_unknown_classification_failed", {
+          reservationId: reservation.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+      logger.warn("reseller.reservation_fulfillment_unknown", {
+        reservationId: reservation.id,
+        orderId: reservation.orderId,
+        message: "Cannot determine fulfillment state — moved to RECONCILIATION_REQUIRED for manual review.",
+      });
+      continue;
+    }
+
+    if (classification === "RELEASE_ELIGIBLE") {
+      // Fulfillment failed — release the reservation (return funds).
+      // We inline the release logic here (rather than calling releaseResellerReservation)
+      // because the worker doesn't have a real userId for the audit log.
+      try {
+        const releaseResult = await db.$transaction(async (tx) => {
+          const updated = await tx.tenantBalanceReservation.updateMany({
+            where: { id: reservation.id, state: "RESERVED" },
+            data: { state: "RELEASED", releasedAt: new Date(), failureReason: "Fulfillment failed (detected by reconciliation worker)" },
+          });
+          if (updated.count === 0) {
+            return { alreadyDone: true as const };
+          }
+          const balance = await tx.tenantBalance.upsert({
+            where: { tenantId: reservation.tenantId },
+            create: { tenantId: reservation.tenantId, balanceMinor: reservation.amountMinor },
+            update: { balanceMinor: { increment: reservation.amountMinor } },
+          });
+          await tx.tenantTransaction.create({
+            data: {
+              tenantId: reservation.tenantId,
+              type: "release",
+              amountMinor: reservation.amountMinor,
+              balanceAfter: balance.balanceMinor,
+              orderId: reservation.orderId,
+              description: "Reservation released by reconciliation worker (fulfillment failed)",
+              idempotencyKey: `release_${reservation.idempotencyKey}`,
+            },
+          });
+          return { alreadyDone: false as const, balanceMinor: balance.balanceMinor };
+        }, { timeout: 30000, maxWait: 15000 });
+
+        if (!releaseResult.alreadyDone) {
+          result.released++;
+          logger.info("reseller.reservation_released_by_reconciliation", {
+            reservationId: reservation.id,
+            orderId: reservation.orderId,
+            balanceMinor: releaseResult.balanceMinor,
+          });
+        }
+      } catch (err) {
+        result.stillFailing++;
+        logger.error("reseller.reservation_release_failed", {
+          reservationId: reservation.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      continue;
+    }
+
+    // SETTLEMENT_ELIGIBLE — retry the ledger posting (idempotent)
     try {
-      // Retry the ledger posting (idempotent)
       const ledgerTxnId = await ledgerResellerPurchase({
         tenantId: reservation.tenantId,
         orderId: reservation.orderId,
