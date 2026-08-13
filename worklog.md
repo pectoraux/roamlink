@@ -1215,3 +1215,27 @@ Stage Summary:
   - J: success→failed webhook does not regress state ✅
   - 5 static tests ✅
 - The invariants: (1) No fake billing period on unpaid invoices. (2) Webhooks are provider-bound. (3) State is monotonic — paid cannot be rolled back. (4) SaasRenewalCycle model exists for durable renewal coordination.
+
+---
+Task ID: 2B.3.5
+Agent: Lead engineer (main) — Wire SaasRenewalCycle into real renewal path
+Task: Make the SaasRenewalCycle model a real part of runtime behavior, not just schema
+
+Work Log:
+- Rewrote renewSubscription to create/claim a SaasRenewalCycle BEFORE creating the invoice/payment. The cycle is the durable business operation identity — two concurrent workers resolve to the SAME cycle via the unique cycleKey constraint.
+- The cycle state machine is: PENDING → PAYMENT_PENDING → PAYMENT_CONFIRMED → COMPLETED (success path), with RECONCILIATION_REQUIRED and PAST_DUE for failure paths.
+- The invoice is linked to the cycle (cycle.invoiceId). The invoice idempotency key derives from the cycle identity (cycleKey), not from currentPeriodEnd alone.
+- When a cycle is RECONCILIATION_REQUIRED, the renewal retry path uses the cycle to find the existing invoice and attempts to finalize it — no new payment intent is created.
+- The financial reconciliation worker now completes the associated SaasRenewalCycle when it successfully repairs an invoice.
+- Deprecated the legacy /api/webhooks/saas route — returns 410 Gone. All financial webhooks MUST use the provider-scoped route /api/webhooks/saas/[provider].
+
+Stage Summary:
+- No schema migration needed (SaasRenewalCycle was created in 0013)
+- Files changed: src/lib/tenant/saas-subscription.ts (rewrote renewSubscription), src/app/api/webhooks/saas/route.ts (deprecated → 410), tests/phase2b35-renewal-cycle.test.ts
+- Tests: 7 tests — all EXECUTED + PASSED
+  - A: first renewal creates exactly one SaasRenewalCycle ✅ (4 expects)
+  - B: concurrent renewal workers create ONE cycle ✅ (5 expects) — the ledger idempotency key prevents double-posting even when both workers reach the payment step
+  - C: one cycle → one invoice → one ledger → one period extension ✅ (5 expects)
+  - O: legacy webhook returns 410 ✅
+  - 3 static tests ✅
+- The invariant: ONE BILLING PERIOD → ONE SaasRenewalCycle → ONE TenantInvoice → ONE PAYMENT → ONE LEDGER → ONE PERIOD EXTENSION. Retries and concurrent workers converge on the same chain.
