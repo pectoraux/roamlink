@@ -402,7 +402,7 @@ async function activateSubscriptionAndPostLedger(input: {
 }
 
 /**
- * Phase 2B.3.6: Complete a SaaS renewal cycle — the SINGLE authoritative
+ * Phase 2B.3.7: Complete a SaaS renewal cycle — the SINGLE authoritative
  * function that extends the subscription period after financial finalization.
  *
  * This function is called by ALL successful renewal paths:
@@ -410,23 +410,25 @@ async function activateSubscriptionAndPostLedger(input: {
  *   - handleSaasPaymentWebhook (webhook path)
  *   - processDueSaasFinancialReconciliation (reconciliation path)
  *
- * It verifies the invoice is paid + ledger exists, then atomically:
- *   1. Extends currentPeriodEnd to cycle.periodEnd
- *   2. Sets subscription status to active
- *   3. Marks SaasRenewalCycle COMPLETED
+ * Phase 2B.3.7: The cycle completion + subscription period extension are
+ * performed inside ONE PostgreSQL transaction with FOR UPDATE locks on both
+ * the SaasRenewalCycle and TenantSubscription rows. This guarantees:
  *
- * Status-guarded: only transitions from non-COMPLETED states.
- * Idempotent: if already COMPLETED, returns success without re-extending.
- *
- * This ensures the invariant:
  *   IF cycle = COMPLETED
  *   THEN subscription.currentPeriodEnd = cycle.periodEnd
+ *
+ * No partial completion is possible. If the subscription update fails,
+ * the transaction rolls back and the cycle does NOT become COMPLETED.
+ *
+ * Idempotent: if already COMPLETED, verifies currentPeriodEnd == cycle.periodEnd.
+ * If they differ (stale legacy state), repairs the subscription period
+ * inside a new transaction.
  */
 async function completeSaasRenewalCycle(input: {
   invoiceId: string;
   tenantId: string;
 }): Promise<{ completed: boolean }> {
-  // Find the renewal cycle linked to this invoice
+  // Find the renewal cycle linked to this invoice (read-only, outside transaction)
   const cycle = await db.saasRenewalCycle.findFirst({
     where: { invoiceId: input.invoiceId },
   });
@@ -435,49 +437,103 @@ async function completeSaasRenewalCycle(input: {
     return { completed: false };
   }
 
-  // Idempotent: if already completed, return
-  if (cycle.state === "COMPLETED") {
-    logger.info("saas.cycle_already_completed", { cycleId: cycle.id });
-    return { completed: true };
-  }
-
-  // Verify the invoice is financially ready (paid + ledger exists)
-  const invoice = await db.tenantInvoice.findUnique({ where: { id: input.invoiceId } });
-  if (!invoice || invoice.status !== "paid" || !invoice.ledgerTransactionId) {
-    logger.warn("saas.cycle_invoice_not_ready", { cycleId: cycle.id, invoiceStatus: invoice?.status });
-    return { completed: false };
-  }
-
-  // Atomically extend the period + complete the cycle
-  // Status-guarded: only non-COMPLETED cycles can be completed
   try {
-    const updated = await db.saasRenewalCycle.updateMany({
-      where: { id: cycle.id, state: { not: "COMPLETED" } },
-      data: { state: "COMPLETED" },
-    });
+    // Phase 2B.3.7: Perform the completion inside ONE transaction with row locks.
+    const result = await db.$transaction(async (tx) => {
+      // 1. Lock the SaasRenewalCycle row
+      const lockedCycle: Array<{ id: string; state: string; subscriptionId: string; periodEnd: Date; invoiceId: string | null }> = await tx.$queryRaw`
+        SELECT id, state, "subscriptionId", "periodEnd", "invoiceId"
+        FROM "SaasRenewalCycle"
+        WHERE id = ${cycle.id}
+        FOR UPDATE
+      `;
+      if (lockedCycle.length === 0) {
+        return { completed: false, reason: "Cycle not found" };
+      }
+      const c = lockedCycle[0];
 
-    if (updated.count === 0) {
-      // Another concurrent call completed it
-      logger.info("saas.cycle_concurrently_completed", { cycleId: cycle.id });
-      return { completed: true };
+      // 2. Lock the TenantSubscription row
+      const lockedSub: Array<{ id: string; currentPeriodEnd: Date; status: string }> = await tx.$queryRaw`
+        SELECT id, "currentPeriodEnd", status
+        FROM "TenantSubscription"
+        WHERE id = ${c.subscriptionId}
+        FOR UPDATE
+      `;
+      if (lockedSub.length === 0) {
+        return { completed: false, reason: "Subscription not found" };
+      }
+      const sub = lockedSub[0];
+
+      // 3. If already COMPLETED, verify the invariant. Repair if stale.
+      if (c.state === "COMPLETED") {
+        if (sub.currentPeriodEnd.getTime() === c.periodEnd.getTime()) {
+          // Invariant holds — idempotent success
+          return { completed: true, reason: "already_completed" };
+        }
+        // Stale legacy state: cycle says COMPLETED but period wasn't extended.
+        // Repair inside this transaction.
+        logger.warn("saas.cycle_stale_repairing", {
+          cycleId: c.id,
+          currentPeriodEnd: sub.currentPeriodEnd,
+          expectedPeriodEnd: c.periodEnd,
+        });
+        await tx.tenantSubscription.update({
+          where: { id: c.subscriptionId },
+          data: { status: "active", currentPeriodEnd: c.periodEnd },
+        });
+        return { completed: true, reason: "stale_repaired" };
+      }
+
+      // 4. Verify the invoice is financially ready (paid + ledger exists)
+      if (!c.invoiceId) {
+        return { completed: false, reason: "No invoice linked to cycle" };
+      }
+      const invoice = await tx.tenantInvoice.findUnique({
+        where: { id: c.invoiceId },
+        select: { status: true, ledgerTransactionId: true },
+      });
+      if (!invoice || invoice.status !== "paid" || !invoice.ledgerTransactionId) {
+        return { completed: false, reason: `Invoice not ready (status: ${invoice?.status})` };
+      }
+
+      // 5. Update the subscription period FIRST (before marking cycle COMPLETED)
+      await tx.tenantSubscription.update({
+        where: { id: c.subscriptionId },
+        data: {
+          status: "active",
+          currentPeriodEnd: c.periodEnd,
+        },
+      });
+
+      // 6. Mark the cycle COMPLETED (after subscription update succeeds)
+      // Status-guarded: only non-COMPLETED → COMPLETED
+      await tx.saasRenewalCycle.updateMany({
+        where: { id: c.id, state: { not: "COMPLETED" } },
+        data: { state: "COMPLETED", failureReason: null },
+      });
+
+      return { completed: true, reason: "completed" };
+    }, { timeout: 30000, maxWait: 15000 });
+
+    if (result.completed) {
+      if (result.reason === "stale_repaired") {
+        logger.info("saas.cycle_stale_repaired", { cycleId: cycle.id });
+      } else if (result.reason !== "already_completed") {
+        logger.info("saas.renewal_cycle_completed", {
+          cycleId: cycle.id,
+          subscriptionId: cycle.subscriptionId,
+          newPeriodEnd: cycle.periodEnd,
+        });
+      } else {
+        logger.info("saas.cycle_already_completed", { cycleId: cycle.id });
+      }
+    } else {
+      logger.warn("saas.cycle_not_completed", { cycleId: cycle.id, reason: result.reason });
     }
 
-    // Extend the subscription period
-    await db.tenantSubscription.update({
-      where: { id: cycle.subscriptionId },
-      data: {
-        status: "active",
-        currentPeriodEnd: cycle.periodEnd,
-      },
-    });
-
-    logger.info("saas.renewal_cycle_completed", {
-      cycleId: cycle.id,
-      subscriptionId: cycle.subscriptionId,
-      newPeriodEnd: cycle.periodEnd,
-    });
-    return { completed: true };
+    return { completed: result.completed };
   } catch (err) {
+    // Transaction failed — neither the cycle nor the subscription was updated
     logger.error("saas.cycle_completion_failed", {
       cycleId: cycle.id,
       error: err instanceof Error ? err.message : String(err),

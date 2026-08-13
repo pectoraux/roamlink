@@ -1260,3 +1260,25 @@ Stage Summary:
   - C: successful renewal webhook → period extended ✅ (5 expects)
   - 4 static tests ✅
 - The invariant: IF cycle = COMPLETED THEN invoice = PAID AND ledgerTransactionId != null AND subscription.currentPeriodEnd = cycle.periodEnd. No path may stop after ledger/invoice finalization while leaving the subscription period expired.
+
+---
+Task ID: 2B.3.7
+Agent: Lead engineer (main) — Atomic SaaS Renewal Completion
+Task: Fix P0: cycle marked COMPLETED before subscription period updated (non-atomic)
+
+Work Log:
+- P0: completeSaasRenewalCycle marked the cycle COMPLETED first, then updated the subscription period as a separate DB operation. If the subscription update failed, the cycle was COMPLETED but currentPeriodEnd was stale — and the idempotent early-return prevented retry.
+- Fix: Rewrote completeSaasRenewalCycle to perform both operations inside ONE PostgreSQL $transaction with FOR UPDATE locks on both SaasRenewalCycle and TenantSubscription rows. The subscription period is updated FIRST, then the cycle is marked COMPLETED. If either fails, the transaction rolls back — neither commits.
+- Added COMPLETED-but-stale repair: if the cycle is already COMPLETED but currentPeriodEnd != cycle.periodEnd (legacy inconsistent state), the function repairs the subscription period inside a new transaction.
+- Status-guarded cycle transition: only non-COMPLETED → COMPLETED (via updateMany WHERE state != COMPLETED).
+- The idempotent path now verifies the invariant (currentPeriodEnd == cycle.periodEnd) rather than blindly trusting COMPLETED.
+
+Stage Summary:
+- Files changed: src/lib/tenant/saas-subscription.ts, tests/phase2b37-atomic-completion.test.ts
+- No schema migration needed
+- Tests: 8 tests — all EXECUTED + PASSED
+  - A: normal renewal → cycle COMPLETED + currentPeriodEnd = cycle.periodEnd (atomic) ✅ (3 expects)
+  - B: concurrent completion → one cycle, one period extension ✅ (4 expects)
+  - G: COMPLETED-but-stale repair ✅
+  - 5 static tests ✅
+- The invariant: IF cycle = COMPLETED THEN invoice = PAID AND ledgerTransactionId != null AND subscription.currentPeriodEnd = cycle.periodEnd. No partial completion is possible — both updates are in ONE transaction.
