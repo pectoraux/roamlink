@@ -1173,3 +1173,24 @@ Stage Summary:
   - D: stale pending invoice with payment still pending → NO revenue ✅
   - 4 static tests ✅
 - The invariants: (1) payment success + ledger failure → period NOT extended. (2) providerReference alone does NOT prove payment → worker verifies before posting revenue.
+
+---
+Task ID: 2B.3.3
+Agent: Lead engineer (main) — SaaS Subscription State + Provider-Routing Convergence
+Task: Fix P0-1: trialing used for unpaid subscriptions. Fix P0-2: provider resolved from global instead of invoice.
+
+Work Log:
+- P0-1 (trialing for unpaid): Replaced "trialing" with "pending_payment" for unpaid paid subscriptions. TRIALING is now reserved for actual free trials. PENDING_PAYMENT subscriptions are excluded from the renewal pipeline (processDueSaasRenewals only processes "active" and "past_due").
+- P0-1 (period set before payment): createSubscriptionIntent now sets currentPeriodEnd to epoch (new Date(0)) — not a real billing period. The real billing period is set in activateSubscriptionAndPostLedger when the subscription transitions from pending_payment to active. periodStart = payment confirmation time, periodEnd = periodStart + billingCycle.
+- P0-2 (provider from global): Added getPaymentProviderByKey(providerKey) to the payments module. All SaaS payment operations now resolve the provider from the invoice's or subscription's stored paymentProvider field, not from the global getPaymentProvider(). This ensures an invoice created under Provider A continues to use Provider A even if the platform's default changes.
+- Applied provider resolution to: confirmSubscriptionPayment, renewSubscription, processDueSaasFinancialReconciliation (stale pending invoice verification).
+
+Stage Summary:
+- Files changed: src/lib/payments/index.ts (added getPaymentProviderByKey), src/lib/tenant/saas-subscription.ts (3 P0 fixes), tests/phase2b33-saas-state-provider.test.ts
+- No schema migration needed
+- Tests: 7 tests in phase2b33-saas-state-provider.test.ts — all EXECUTED + PASSED
+  - A: unpaid subscription → pending_payment, NOT renewed ✅
+  - B: successful payment → period starts at payment time ✅
+  - D: PENDING_PAYMENT excluded from renewal processing ✅
+  - 4 static tests ✅
+- The invariants: (1) PENDING_PAYMENT can never enter processDueSaasRenewals(). (2) Paid period starts only after verified payment + ledger success. (3) Existing invoices always use their recorded payment provider.

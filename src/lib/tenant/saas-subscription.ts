@@ -45,7 +45,7 @@ import {
   ledgerSaasSubscriptionPayment,
   ensureChartOfAccounts,
 } from "@/lib/finance/double-entry-ledger";
-import { getPaymentProvider } from "@/lib/payments";
+import { getPaymentProvider, getPaymentProviderByKey } from "@/lib/payments";
 import type { Currency } from "@/lib/money";
 
 /**
@@ -110,30 +110,27 @@ export async function createSubscriptionIntent(input: {
     metadata: { tenantId, planName, type: "saas_subscription" },
   });
 
-  // Create or update the subscription record
-  const periodEnd = new Date();
-  if (billingCycle === "yearly") {
-    periodEnd.setFullYear(periodEnd.getFullYear() + 1);
-  } else {
-    periodEnd.setMonth(periodEnd.getMonth() + 1);
-  }
-
+  // Phase 2B.3.3 P0-1: Use PENDING_PAYMENT (not "trialing") for unpaid subscriptions.
+  // TRIALING is reserved for actual free trials.
+  // PENDING_PAYMENT subscriptions are NOT eligible for renewal processing.
+  // The period is NOT set until payment is confirmed — the billing clock
+  // starts when the customer pays, not when they express intent.
   const subscription = await db.tenantSubscription.upsert({
     where: { tenantId },
     create: {
       tenantId,
       saaasPlanId: plan.id,
-      status: "trialing", // not fully active until payment is confirmed
+      status: "pending_payment",
       billingCycle,
-      currentPeriodEnd: periodEnd,
+      currentPeriodEnd: new Date(0), // epoch — not a real period until payment
       paymentProvider: provider.id,
       providerReference: intent.providerReference,
     },
     update: {
       saaasPlanId: plan.id,
-      status: "trialing",
+      status: "pending_payment",
       billingCycle,
-      currentPeriodEnd: periodEnd,
+      currentPeriodEnd: new Date(0),
       paymentProvider: provider.id,
       providerReference: intent.providerReference,
       cancelledAt: null,
@@ -151,7 +148,7 @@ export async function createSubscriptionIntent(input: {
       currency: plan.currency,
       billingCycle,
       periodStart: new Date(),
-      periodEnd,
+      periodEnd: new Date(Date.now() + 365 * 86400000), // placeholder — real period set on payment confirmation
       status: "pending",
       paymentProvider: provider.id,
       providerReference: intent.providerReference,
@@ -212,8 +209,10 @@ export async function confirmSubscriptionPayment(input: {
     throw new AppError("not_found", "No pending invoice", 404, "No pending invoice found for this subscription.");
   }
 
-  // Server-side payment verification
-  const provider = getPaymentProvider();
+  // Phase 2B.3.3 P0-2: Resolve the provider from the invoice's paymentProvider field,
+  // NOT from the global getPaymentProvider(). This ensures an invoice created under
+  // Provider A continues to use Provider A even if the platform's default changes.
+  const provider = getPaymentProviderByKey(invoice.paymentProvider || "mock");
 
   // For the mock provider, simulate client-side confirmation
   if (provider.isMock && invoice.providerReference) {
@@ -239,7 +238,7 @@ export async function confirmSubscriptionPayment(input: {
   }
 
   if (verification.status === "pending") {
-    return { status: "trialing" };
+    return { status: "pending_payment" };
   }
 
   // Payment succeeded — attempt financial finalization + activation
@@ -353,9 +352,38 @@ async function activateSubscriptionAndPostLedger(input: {
   }
 
   // Step 3: Activate the subscription (only after ledger is confirmed + invoice is paid)
+  // Phase 2B.3.3 P0-1: Set the billing period based on payment confirmation time,
+  // not intent creation time. The billing clock starts when the customer pays.
+  const periodStart = new Date();
+  const periodEnd = new Date(periodStart);
+  if (invoice.billingCycle === "yearly") {
+    periodEnd.setFullYear(periodEnd.getFullYear() + 1);
+  } else {
+    periodEnd.setMonth(periodEnd.getMonth() + 1);
+  }
+
+  // Get the current subscription to check if this is the first activation
+  const currentSub = await db.tenantSubscription.findUnique({
+    where: { id: input.subscriptionId },
+    select: { status: true, currentPeriodEnd: true },
+  });
+
+  // If the subscription was pending_payment (first activation), set the real period.
+  // If it was already active/reconciliation_required (renewal), the caller (renewSubscription)
+  // handles the period extension.
+  const updateData: any = { status: "active" };
+  if (currentSub?.status === "pending_payment") {
+    updateData.currentPeriodEnd = periodEnd;
+    // Also update the invoice's period to match the real billing period
+    await db.tenantInvoice.update({
+      where: { id: input.invoiceId },
+      data: { periodStart, periodEnd },
+    }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+  }
+
   await db.tenantSubscription.update({
     where: { id: input.subscriptionId },
-    data: { status: "active" },
+    data: updateData,
   });
 
   await audit({
@@ -517,8 +545,8 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     }
   }
 
-  // Create a payment intent with the provider
-  const provider = getPaymentProvider();
+  // Phase 2B.3.3 P0-2: Use the subscription's stored payment provider, not the global one
+  const provider = getPaymentProviderByKey(subscription.paymentProvider || "mock");
   const intent = await provider.createPaymentIntent({
     amountMinor,
     currency: plan.currency as Currency,
@@ -611,11 +639,15 @@ export async function processDueSaasRenewals(): Promise<{
   const result = { renewed: 0, failed: 0, skipped: 0 };
   const now = new Date();
 
-  // Find subscriptions whose period has ended and aren't cancelled
+  // Phase 2B.3.3 P0-1: Only renew subscriptions that are active or past_due.
+  // PENDING_PAYMENT subscriptions must NOT enter the renewal pipeline —
+  // they haven't paid for their first period yet.
+  // TRIALING is reserved for actual free trials and should not be renewed
+  // by the paid renewal path.
   const due = await db.tenantSubscription.findMany({
     where: {
       currentPeriodEnd: { lt: now },
-      status: { in: ["active", "past_due", "trialing"] },
+      status: { in: ["active", "past_due"] },
     },
     select: { tenantId: true },
   });
@@ -746,7 +778,8 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
           continue;
         }
 
-        const provider = getPaymentProvider();
+        // Phase 2B.3.3 P0-2: Resolve provider from the invoice's paymentProvider field
+        const provider = getPaymentProviderByKey(invoice.paymentProvider || "mock");
         const verification = await provider.verifyPayment({
           providerReference: invoice.providerReference,
           idempotencyKey: invoice.idempotencyKey,

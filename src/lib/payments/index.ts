@@ -18,25 +18,45 @@ let cached: PaymentProvider | null = null;
 export function getPaymentProvider(): PaymentProvider {
   if (cached) return cached;
   const key = (process.env.PAYMENT_PROVIDER || "mock").toLowerCase();
+  cached = getPaymentProviderByKey(key);
+  return cached;
+}
+
+/**
+ * Phase 2B.3.3: Resolve a payment provider by its key string.
+ * Used to resolve the correct provider from an invoice's `paymentProvider` field,
+ * rather than using the global configured provider.
+ *
+ * This ensures that an invoice created under Provider A continues to use
+ * Provider A even if the platform's default provider changes to Provider B.
+ */
+const providerCache = new Map<string, PaymentProvider>();
+
+export function getPaymentProviderByKey(providerKey: string): PaymentProvider {
+  const key = providerKey.toLowerCase();
+  if (providerCache.has(key)) return providerCache.get(key)!;
+
+  let provider: PaymentProvider;
   switch (key) {
     case "mock":
-      cached = mockPaymentProvider;
+      provider = mockPaymentProvider;
       break;
     case "paystack":
-      cached = new PayStackProvider();
+      provider = new PayStackProvider();
       break;
     case "flutterwave":
-      cached = new FlutterwaveProvider();
+      provider = new FlutterwaveProvider();
       break;
     case "stripe":
-      cached = new StripeProvider();
+      provider = new StripeProvider();
       break;
     default:
       throw new Error(
-        `Unknown PAYMENT_PROVIDER "${key}". Supported: mock, paystack, flutterwave, stripe.`,
+        `Unknown payment provider "${providerKey}". Supported: mock, paystack, flutterwave, stripe.`,
       );
   }
-  return cached;
+  providerCache.set(key, provider);
+  return provider;
 }
 
 export type { PaymentProvider } from "./provider";
