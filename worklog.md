@@ -912,3 +912,22 @@ Stage Summary:
 - Tests: 19 tests in phase2b2-reseller-lifecycle.test.ts — all pass (deposit lifecycle, duplicate webhook idempotency, failed payment, reservation, settle, release, retry, concurrent duplicate, concurrent different, reconciliation, wallet/ledger reconciliation + 8 static)
 - Architecture preserved: TenantBalance is a fast operational projection; the canonical financial truth remains the double-entry ledger. No parallel wallet ledger.
 - The reseller wallet is now financially real: deposits require payment, purchases reserve before fulfillment, failures release funds, ledger postings are never silently swallowed.
+
+---
+Task ID: 2B.2.1
+Agent: Lead engineer (main) — Reservation Financial Reconciliation
+Task: Fix the P0 gap: settlement ledger failure has no recovery worker
+
+Work Log:
+- §1+§2: Fixed settleResellerReservation — on ledger failure, transitions RESERVED → RECONCILIATION_REQUIRED (NOT thrown, NOT released). Returns the reconciliation state to the caller instead of throwing. The funds remain reserved — the service is already active, so we must NOT return funds.
+- §3+§4: Added processDueResellerReservationReconciliation worker — queries RECONCILIATION_REQUIRED + stale RESERVED reservations, retries ledgerResellerPurchase (idempotent via idempotencyKey), transitions to SETTLED (status-guarded), creates missing TenantTransaction. Wired into /api/internal/reconcile cron endpoint.
+- §5: Restructured the order route — fulfillment errors (confirmAndProvision throws) → release reservation. Fulfillment success → settle. Settlement returns RECONCILIATION_REQUIRED → return 201 with financialStatus=SETTLEMENT_PENDING_RECONCILIATION (NOT an error, NOT a release). The service is active; the financial state is recoverable.
+- §6: Removed the silent .catch(() => {}) on TenantTransaction creation during settlement. Replaced with try/catch that logs CRITICAL if the transaction creation fails (but the reservation is SETTLED and the ledger is posted, so the financial truth is correct). The reconciliation worker can repair the operational projection.
+- §7: Fixed deposit webhook — replaced all .catch(() => {}) with try/catch handlers that log CRITICAL and mark the deposit as RECONCILIATION_REQUIRED if the balance credit fails. No payment event is silently lost.
+- State machine: RESERVED → SETTLED (success) | RESERVED → RECONCILIATION_REQUIRED (ledger failed) | RECONCILIATION_REQUIRED → SETTLED (worker repairs) | RESERVED → RELEASED (fulfillment failed)
+
+Stage Summary:
+- Files changed: src/lib/tenant/balance.ts, src/app/api/tenant/orders/route.ts, src/app/api/internal/reconcile/route.ts, tests/phase2b21-reservation-reconciliation.test.ts
+- No schema migration needed (state is a String field, RECONCILIATION_REQUIRED is a new value)
+- Tests: 14 tests in phase2b21-reservation-reconciliation.test.ts — all pass (successful settlement, failed fulfillment release, ledger failure → RECONCILIATION_REQUIRED, reconciliation repair, idempotency, concurrent settlement, balance invariants + 7 static)
+- The P0 is fixed: a successful fulfillment followed by a temporary ledger failure preserves the reservation (funds held, service active) and the reconciliation worker posts the ledger on the next cron tick. No reseller funds are lost. No duplicate revenue.

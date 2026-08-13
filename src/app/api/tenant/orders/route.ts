@@ -127,48 +127,9 @@ export async function POST(req: NextRequest) {
         idempotencyKey: `confirm_${idempotencyKey}`,
         ip: undefined,
       });
-
-      // Phase 2B.2: If fulfillment failed, RELEASE the reservation (return funds)
-      if (result.status === "PROVISIONING_FAILED" || result.status === "PAYMENT_FAILED") {
-        await releaseResellerReservation({
-          tenantId: ctx.tenantId,
-          userId: user.id,
-          orderId: order.id,
-          reason: `Fulfillment failed: ${result.status}`,
-        });
-        logger.warn("reseller.order_failed_released", {
-          tenantId: ctx.tenantId,
-          orderId: order.id,
-          status: result.status,
-        });
-        return json({ order, result, reservation: { state: "RELEASED" } }, 201);
-      }
-
-      // Phase 2B.2: Fulfillment succeeded — SETTLE the reservation (recognize revenue)
-      const settlement = await settleResellerReservation({
-        tenantId: ctx.tenantId,
-        userId: user.id,
-        orderId: order.id,
-      });
-
-      logger.info("reseller.order_completed_settled", {
-        tenantId: ctx.tenantId,
-        orderId: order.id,
-        customerId: tenantCustomerId,
-        retailPrice,
-        platformFee: platformFee.totalFeeMinor,
-        balanceAfter: reservation.balanceMinor,
-        ledgerTxnId: settlement.ledgerTransactionId,
-      });
-
-      return json({
-        order,
-        result,
-        reservation: { id: settlement.reservationId, state: settlement.state, ledgerTransactionId: settlement.ledgerTransactionId },
-        balanceAfter: reservation.balanceMinor,
-      }, 201);
     } catch (fulfillErr) {
-      // Fulfillment threw an error — RELEASE the reservation
+      // Phase 2B.2.1: Fulfillment threw an error — the service is NOT active.
+      // It is safe to RELEASE the reservation (return funds to the reseller).
       const errMsg = fulfillErr instanceof Error ? fulfillErr.message : String(fulfillErr);
       await releaseResellerReservation({
         tenantId: ctx.tenantId,
@@ -184,6 +145,73 @@ export async function POST(req: NextRequest) {
       });
       throw fulfillErr;
     }
+
+    // Phase 2B.2: If fulfillment failed (but didn't throw), RELEASE the reservation.
+    // The service is NOT active — it is safe to return funds.
+    if (result.status === "PROVISIONING_FAILED" || result.status === "PAYMENT_FAILED") {
+      await releaseResellerReservation({
+        tenantId: ctx.tenantId,
+        userId: user.id,
+        orderId: order.id,
+        reason: `Fulfillment failed: ${result.status}`,
+      });
+      logger.warn("reseller.order_failed_released", {
+        tenantId: ctx.tenantId,
+        orderId: order.id,
+        status: result.status,
+      });
+      return json({ order, result, reservation: { state: "RELEASED" } }, 201);
+    }
+
+    // Phase 2B.2.1: Fulfillment SUCCEEDED — SETTLE the reservation.
+    // If settlement fails (ledger posting error), settleResellerReservation
+    // returns state=RECONCILIATION_REQUIRED. We must NOT release the reservation
+    // — the service is already active. The reconciliation worker will retry
+    // the ledger posting. The order is financially recoverable, not failed.
+    const settlement = await settleResellerReservation({
+      tenantId: ctx.tenantId,
+      userId: user.id,
+      orderId: order.id,
+    });
+
+    if (settlement.state === "RECONCILIATION_REQUIRED") {
+      // Fulfillment succeeded but ledger posting is pending reconciliation.
+      // The connectivity service is ACTIVE. Funds remain reserved.
+      // The reconciliation worker will post the ledger and transition to SETTLED.
+      logger.warn("reseller.order_settlement_pending_reconciliation", {
+        tenantId: ctx.tenantId,
+        orderId: order.id,
+        reservationId: settlement.reservationId,
+      });
+      return json({
+        order,
+        result,
+        reservation: {
+          id: settlement.reservationId,
+          state: "RECONCILIATION_REQUIRED",
+          ledgerTransactionId: null,
+        },
+        balanceAfter: reservation.balanceMinor,
+        financialStatus: "SETTLEMENT_PENDING_RECONCILIATION",
+      }, 201);
+    }
+
+    logger.info("reseller.order_completed_settled", {
+      tenantId: ctx.tenantId,
+      orderId: order.id,
+      customerId: tenantCustomerId,
+      retailPrice,
+      platformFee: platformFee.totalFeeMinor,
+      balanceAfter: reservation.balanceMinor,
+      ledgerTxnId: settlement.ledgerTransactionId,
+    });
+
+    return json({
+      order,
+      result,
+      reservation: { id: settlement.reservationId, state: settlement.state, ledgerTransactionId: settlement.ledgerTransactionId },
+      balanceAfter: reservation.balanceMinor,
+    }, 201);
   } catch (err) {
     return errorResponse(err);
   }

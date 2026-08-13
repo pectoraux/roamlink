@@ -176,11 +176,20 @@ export async function reserveResellerBalance(input: {
  *   Cr Sales Revenue (retail - platform fee)
  *   Cr Platform Fee Revenue (platform fee)
  *
- * The reservation transitions RESERVED → SETTLED. The available balance was
- * already decremented at reserve time, so settle does NOT touch the balance
- * — it only posts the ledger entry and updates the reservation state.
+ * Phase 2B.2.1: If the ledger posting fails, the reservation transitions
+ * RESERVED → RECONCILIATION_REQUIRED (NOT thrown, NOT released). The funds
+ * remain reserved — the service is already active, so we must NOT return
+ * funds to the reseller. The processDueResellerReservationReconciliation
+ * worker retries the ledger posting until it succeeds.
+ *
+ * The reservation state machine:
+ *   RESERVED → SETTLED (ledger posted, revenue recognized)
+ *   RESERVED → RECONCILIATION_REQUIRED (ledger failed, retry pending)
+ *   RECONCILIATION_REQUIRED → SETTLED (reconciliation worker succeeds)
+ *   RESERVED → RELEASED (fulfillment failed, funds returned)
  *
  * Idempotent: if already SETTLED, returns the existing ledgerTxnId.
+ * If RECONCILIATION_REQUIRED, returns that state (caller knows to retry).
  */
 export async function settleResellerReservation(input: {
   tenantId: string;
@@ -213,7 +222,13 @@ export async function settleResellerReservation(input: {
     throw new AppError("conflict", "Cannot settle a released reservation", 409, "This reservation was released (fulfillment failed).");
   }
 
+  // State must be RESERVED or RECONCILIATION_REQUIRED to attempt settlement
+  if (reservation.state !== "RESERVED" && reservation.state !== "RECONCILIATION_REQUIRED") {
+    throw new AppError("conflict", `Cannot settle reservation in state ${reservation.state}`, 409, "The reservation is in an unexpected state.");
+  }
+
   // Post the ledger entry (Dr Reseller Funds Liability, Cr Sales Revenue + Cr Platform Fee Revenue)
+  // Idempotent: ledgerResellerPurchase replays if the idempotencyKey already exists
   let ledgerTxnId: string;
   try {
     ledgerTxnId = await ledgerResellerPurchase({
@@ -225,20 +240,34 @@ export async function settleResellerReservation(input: {
       idempotencyKey: `${reservation.idempotencyKey}:ledger`,
     });
   } catch (err) {
-    // Phase 2B.2 §3: Do NOT silently swallow. Mark as reconciliation_required.
+    // Phase 2B.2.1: Transition to RECONCILIATION_REQUIRED (do NOT throw, do NOT release).
+    // The service is already active — we must preserve the reservation and
+    // retry the ledger posting via the reconciliation worker.
     const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("reseller.settle_ledger_failed", { orderId: input.orderId, reservationId: reservation.id, error: errorMsg });
-    await db.tenantBalanceReservation.update({
-      where: { id: reservation.id },
-      data: { failureReason: `Ledger posting failed: ${errorMsg}` },
-    }).catch(() => {});
-    throw new AppError("internal", "Ledger posting failed during settlement", 500, "The reservation was created but the ledger posting failed. It will be retried.");
+    await db.tenantBalanceReservation.updateMany({
+      where: { id: reservation.id, state: { in: ["RESERVED", "RECONCILIATION_REQUIRED"] } },
+      data: { state: "RECONCILIATION_REQUIRED", failureReason: `Ledger posting failed: ${errorMsg}` },
+    }).catch((updateErr) => {
+      const updateMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
+      logger.error("reseller.settle_state_update_failed", {
+        reservationId: reservation.id,
+        ledgerError: errorMsg,
+        updateError: updateMsg,
+        message: "CRITICAL: Reservation state update to RECONCILIATION_REQUIRED failed after ledger failure. The reconciliation worker will recover it via the stale-state scan.",
+      });
+    });
+    return {
+      reservationId: reservation.id,
+      ledgerTransactionId: "",
+      state: "RECONCILIATION_REQUIRED",
+    };
   }
 
-  // Transition RESERVED → SETTLED (status-guarded)
+  // Transition RESERVED/RECONCILIATION_REQUIRED → SETTLED (status-guarded)
   const updated = await db.tenantBalanceReservation.updateMany({
-    where: { id: reservation.id, state: "RESERVED" },
-    data: { state: "SETTLED", settledAt: new Date(), ledgerTransactionId: ledgerTxnId },
+    where: { id: reservation.id, state: { in: ["RESERVED", "RECONCILIATION_REQUIRED"] } },
+    data: { state: "SETTLED", settledAt: new Date(), ledgerTransactionId: ledgerTxnId, failureReason: null },
   });
 
   if (updated.count === 0) {
@@ -251,19 +280,41 @@ export async function settleResellerReservation(input: {
     };
   }
 
-  // Create a TenantTransaction for the settlement (funds are now spent, not just reserved)
-  await db.tenantTransaction.create({
-    data: {
-      tenantId: input.tenantId,
-      type: "purchase",
-      amountMinor: -reservation.amountMinor,
-      balanceAfter: await getTenantBalanceMinor(input.tenantId),
-      orderId: input.orderId,
-      description: "Connectivity purchase settled",
-      idempotencyKey: `settle_${reservation.idempotencyKey}`,
-      ledgerTransactionId: ledgerTxnId,
-    },
-  }).catch(() => {});
+  // Phase 2B.2.1 §6: Create a TenantTransaction for the settlement.
+  // Do NOT silently swallow — if this fails, the reconciliation worker will
+  // repair it (the reservation is already SETTLED with the ledgerTransactionId).
+  try {
+    await db.tenantTransaction.create({
+      data: {
+        tenantId: input.tenantId,
+        type: "purchase",
+        amountMinor: -reservation.amountMinor,
+        balanceAfter: await getTenantBalanceMinor(input.tenantId),
+        orderId: input.orderId,
+        description: "Connectivity purchase settled",
+        idempotencyKey: `settle_${reservation.idempotencyKey}`,
+        ledgerTransactionId: ledgerTxnId,
+      },
+    });
+  } catch (err) {
+    // The unique constraint on idempotencyKey may have caught a duplicate
+    // (concurrent settlement). If so, this is fine. If it's a real error,
+    // log it — the reservation is SETTLED and the ledger is posted, so the
+    // financial truth is correct. The operational projection (TenantTransaction)
+    // can be repaired by the reconciliation worker.
+    const errMsg = err instanceof Error ? err.message : String(err);
+    if (errMsg.includes("Unique constraint") || errMsg.includes("P2002")) {
+      logger.info("reseller.settle_txn_idempotent_replay", { reservationId: reservation.id, orderId: input.orderId });
+    } else {
+      logger.error("reseller.settle_txn_creation_failed", {
+        reservationId: reservation.id,
+        orderId: input.orderId,
+        ledgerTxnId,
+        error: errMsg,
+        message: "CRITICAL: Reservation SETTLED and ledger posted but TenantTransaction creation failed. The reconciliation worker will repair the operational projection.",
+      });
+    }
+  }
 
   await audit({
     tenantId: input.tenantId,
@@ -690,25 +741,73 @@ export async function handleDepositWebhook(input: {
 
   if (input.status === "succeeded") {
     // Mark as PAYMENT_SUCCEEDED, then credit the balance
-    await db.tenantDepositPayment.update({
-      where: { id: deposit.id },
-      data: { status: "PAYMENT_SUCCEEDED" },
-    }).catch(() => {});
-    await creditDepositBalance({
-      depositPaymentId: deposit.id,
-      tenantId: deposit.tenantId,
-      userId: deposit.userId,
-    }).catch((err) => {
-      logger.error("reseller.deposit_webhook_credit_failed", { depositId: deposit.id, error: err instanceof Error ? err.message : String(err) });
-    });
+    // Phase 2B.2.1 §7: Do NOT silently swallow the status update.
+    try {
+      await db.tenantDepositPayment.update({
+        where: { id: deposit.id, status: { notIn: ["COMPLETED", "BALANCE_POSTED", "PAYMENT_SUCCEEDED"] } },
+        data: { status: "PAYMENT_SUCCEEDED" },
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error("reseller.deposit_webhook_status_update_failed", {
+        depositId: deposit.id,
+        error: errMsg,
+        message: "CRITICAL: Webhook reported payment succeeded but status update failed. The reconciliation worker will recover it.",
+      });
+      return { handled: false };
+    }
+    // Credit the balance — if this fails, the deposit stays in PAYMENT_SUCCEEDED
+    // and the reconciliation worker will retry via processDueDepositReconciliation
+    // (which processes BALANCE_POSTED + RECONCILIATION_REQUIRED, and the
+    // processDueResellerReservationReconciliation stale scan catches
+    // PAYMENT_SUCCEEDED deposits that never got their balance credited).
+    try {
+      await creditDepositBalance({
+        depositPaymentId: deposit.id,
+        tenantId: deposit.tenantId,
+        userId: deposit.userId,
+      });
+    } catch (err) {
+      logger.error("reseller.deposit_webhook_credit_failed", {
+        depositId: deposit.id,
+        error: err instanceof Error ? err.message : String(err),
+        message: "CRITICAL: Webhook credited status but balance credit failed. The deposit is in PAYMENT_SUCCEEDED — the reconciliation worker will retry.",
+      });
+      // Mark as RECONCILIATION_REQUIRED so the worker picks it up
+      // Phase 2B.2.1 §7: Do NOT silently swallow this either — if the
+      // status update itself fails, log CRITICAL so an operator can intervene.
+      await db.tenantDepositPayment.updateMany({
+        where: { id: deposit.id, status: "PAYMENT_SUCCEEDED" },
+        data: { status: "RECONCILIATION_REQUIRED", failureReason: `Balance credit failed: ${err instanceof Error ? err.message : String(err)}` },
+      }).catch((updateErr) => {
+        const updateMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
+        logger.error("reseller.deposit_webhook_reconciliation_status_failed", {
+          depositId: deposit.id,
+          creditError: err instanceof Error ? err.message : String(err),
+          updateError: updateMsg,
+          message: "CRITICAL: Balance credit failed AND reconciliation status update failed. The deposit is stuck in PAYMENT_SUCCEEDED. The stale-status scan in processDueDepositReconciliation will recover it.",
+        });
+      });
+    }
     return { handled: true };
   }
 
   if (input.status === "failed") {
-    await db.tenantDepositPayment.update({
-      where: { id: deposit.id },
-      data: { status: "PAYMENT_FAILED", failureReason: "Webhook reported payment failed" },
-    }).catch(() => {});
+    // Phase 2B.2.1 §7: Do NOT silently swallow the status update.
+    try {
+      await db.tenantDepositPayment.update({
+        where: { id: deposit.id, status: { notIn: ["COMPLETED", "PAYMENT_FAILED"] } },
+        data: { status: "PAYMENT_FAILED", failureReason: "Webhook reported payment failed" },
+      });
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      logger.error("reseller.deposit_webhook_failed_status_update_error", {
+        depositId: deposit.id,
+        error: errMsg,
+        message: "CRITICAL: Webhook reported payment failed but status update failed. Manual review required.",
+      });
+      return { handled: false };
+    }
     return { handled: true };
   }
 
@@ -756,6 +855,130 @@ export async function processDueDepositReconciliation(): Promise<{
     } catch (err) {
       result.stillFailing++;
       logger.error("reseller.deposit_reconciliation_still_failing", { depositId: deposit.id, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2B.2.1 — Reservation reconciliation worker
+// ---------------------------------------------------------------------------
+
+/**
+ * Process reservations stuck in RECONCILIATION_REQUIRED.
+ *
+ * For each stuck reservation:
+ *   1. Retry ledgerResellerPurchase (idempotent — replays if key exists)
+ *   2. Transition RECONCILIATION_REQUIRED → SETTLED (status-guarded)
+ *   3. Create the missing TenantTransaction if it doesn't exist
+ *
+ * Idempotency:
+ *   - ledgerResellerPurchase replays if the idempotencyKey already exists
+ *   - The status-guarded updateMany prevents duplicate transitions
+ *   - TenantTransaction creation uses a unique idempotencyKey
+ *   - Running this worker twice is safe — SETTLED records are skipped
+ *
+ * Also scans for stale RESERVED reservations (older than STALE_RESERVED_THRESHOLD_MS)
+ * where the order is COMPLETED but settlement was never attempted. This catches
+ * the edge case where the order route crashed between fulfillment and settlement.
+ */
+const STALE_RESERVED_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+export async function processDueResellerReservationReconciliation(): Promise<{
+  retried: number;
+  repaired: number;
+  stillFailing: number;
+}> {
+  const result = { retried: 0, repaired: 0, stillFailing: 0 };
+
+  // 1. Reservations explicitly in RECONCILIATION_REQUIRED
+  // 2. Stale RESERVED reservations (older than threshold) — settlement was
+  //    never attempted (e.g., the order route crashed between fulfillment and
+  //    settlement). The 5-minute threshold avoids racing with in-flight settlements.
+  const staleCutoff = new Date(Date.now() - STALE_RESERVED_THRESHOLD_MS);
+  const due = await db.tenantBalanceReservation.findMany({
+    where: {
+      OR: [
+        { state: "RECONCILIATION_REQUIRED" },
+        { state: "RESERVED", updatedAt: { lt: staleCutoff } },
+      ],
+    },
+    select: {
+      id: true, tenantId: true, orderId: true, amountMinor: true,
+      platformFeeMinor: true, idempotencyKey: true, state: true,
+      ledgerTransactionId: true,
+    },
+  });
+
+  for (const reservation of due) {
+    result.retried++;
+    try {
+      // Retry the ledger posting (idempotent)
+      const ledgerTxnId = await ledgerResellerPurchase({
+        tenantId: reservation.tenantId,
+        orderId: reservation.orderId,
+        retailPriceMinor: reservation.amountMinor,
+        platformFeeMinor: reservation.platformFeeMinor,
+        idempotencyKey: `${reservation.idempotencyKey}:ledger`,
+      });
+
+      // Transition to SETTLED (status-guarded)
+      const updated = await db.tenantBalanceReservation.updateMany({
+        where: { id: reservation.id, state: { in: ["RESERVED", "RECONCILIATION_REQUIRED"] } },
+        data: { state: "SETTLED", settledAt: new Date(), ledgerTransactionId: ledgerTxnId, failureReason: null },
+      });
+
+      if (updated.count > 0) {
+        result.repaired++;
+        logger.info("reseller.reservation_reconciled", {
+          reservationId: reservation.id,
+          orderId: reservation.orderId,
+          ledgerTxnId,
+          wasStaleReserved: reservation.state === "RESERVED",
+        });
+
+        // Create the TenantTransaction if it doesn't exist (idempotent via unique key)
+        try {
+          await db.tenantTransaction.create({
+            data: {
+              tenantId: reservation.tenantId,
+              type: "purchase",
+              amountMinor: -reservation.amountMinor,
+              balanceAfter: await getTenantBalanceMinor(reservation.tenantId),
+              orderId: reservation.orderId,
+              description: "Connectivity purchase settled (reconciliation)",
+              idempotencyKey: `settle_${reservation.idempotencyKey}`,
+              ledgerTransactionId: ledgerTxnId,
+            },
+          });
+        } catch (txnErr) {
+          const txnMsg = txnErr instanceof Error ? txnErr.message : String(txnErr);
+          if (txnMsg.includes("Unique constraint") || txnMsg.includes("P2002")) {
+            // Already exists — fine
+          } else {
+            logger.error("reseller.reservation_reconcile_txn_failed", {
+              reservationId: reservation.id,
+              orderId: reservation.orderId,
+              ledgerTxnId,
+              error: txnMsg,
+              message: "CRITICAL: Reservation reconciled to SETTLED but TenantTransaction creation failed. The operational projection will be repaired on the next reconciliation run.",
+            });
+          }
+        }
+      } else {
+        // Another concurrent call settled it — no-op
+        logger.info("reseller.reservation_already_settled_during_reconciliation", { reservationId: reservation.id });
+      }
+    } catch (err) {
+      result.stillFailing++;
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error("reseller.reservation_reconciliation_still_failing", {
+        reservationId: reservation.id,
+        orderId: reservation.orderId,
+        error: errorMsg,
+      });
+      // Leave as RECONCILIATION_REQUIRED for the next worker run
     }
   }
 

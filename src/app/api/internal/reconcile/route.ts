@@ -20,7 +20,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { processDueSubscriptions } from "@/lib/subscriptions/service";
 import { processDueCreditIssuances } from "@/lib/promotions/referral-service";
-import { processDueDepositReconciliation } from "@/lib/tenant/balance";
+import { processDueDepositReconciliation, processDueResellerReservationReconciliation } from "@/lib/tenant/balance";
 import { requireAdmin } from "@/lib/auth";
 import { logger } from "@/lib/logger";
 
@@ -86,8 +86,16 @@ async function runReconciliation() {
     deposits = { retried: 0, repaired: 0, stillFailing: 0 };
   }
 
+  let reservations: { retried: number; repaired: number; stillFailing: number };
+  try {
+    reservations = await processDueResellerReservationReconciliation();
+  } catch (err) {
+    logger.error("cron.reconciliation.reservations_failed", { error: err instanceof Error ? err.message : String(err) });
+    reservations = { retried: 0, repaired: 0, stillFailing: 0 };
+  }
+
   const durationMs = Date.now() - startedAt;
-  logger.info("cron.reconciliation.completed", { durationMs, subscriptions, creditIssuances, deposits });
+  logger.info("cron.reconciliation.completed", { durationMs, subscriptions, creditIssuances, deposits, reservations });
 
   return NextResponse.json({
     ok: true,
@@ -95,5 +103,6 @@ async function runReconciliation() {
     subscriptions,
     creditIssuances,
     deposits,
+    reservations,
   });
 }
