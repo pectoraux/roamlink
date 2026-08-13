@@ -86,12 +86,12 @@ async function runReconciliation() {
     deposits = { retried: 0, repaired: 0, stillFailing: 0 };
   }
 
-  let reservations: { retried: number; repaired: number; released: number; pending: number; unknown: number; stillFailing: number };
+  let reservations: { retried: number; repaired: number; released: number; pending: number; unknown: number; projectionRepaired: number; stillFailing: number };
   try {
     reservations = await processDueResellerReservationReconciliation();
   } catch (err) {
     logger.error("cron.reconciliation.reservations_failed", { error: err instanceof Error ? err.message : String(err) });
-    reservations = { retried: 0, repaired: 0, released: 0, pending: 0, unknown: 0, stillFailing: 0 };
+    reservations = { retried: 0, repaired: 0, released: 0, pending: 0, unknown: 0, projectionRepaired: 0, stillFailing: 0 };
   }
 
   const durationMs = Date.now() - startedAt;

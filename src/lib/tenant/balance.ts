@@ -265,9 +265,10 @@ export async function settleResellerReservation(input: {
   }
 
   // Transition RESERVED/RECONCILIATION_REQUIRED → SETTLED (status-guarded)
+  // Phase 2B.2.4: Clear BOTH failureReason AND reconciliationReason on successful settlement.
   const updated = await db.tenantBalanceReservation.updateMany({
     where: { id: reservation.id, state: { in: ["RESERVED", "RECONCILIATION_REQUIRED"] } },
-    data: { state: "SETTLED", settledAt: new Date(), ledgerTransactionId: ledgerTxnId, failureReason: null },
+    data: { state: "SETTLED", settledAt: new Date(), ledgerTransactionId: ledgerTxnId, failureReason: null, reconciliationReason: null },
   });
 
   if (updated.count === 0) {
@@ -907,9 +908,10 @@ export async function processDueResellerReservationReconciliation(): Promise<{
   released: number;
   pending: number;
   unknown: number;
+  projectionRepaired: number;
   stillFailing: number;
 }> {
-  const result = { retried: 0, repaired: 0, released: 0, pending: 0, unknown: 0, stillFailing: 0 };
+  const result = { retried: 0, repaired: 0, released: 0, pending: 0, unknown: 0, projectionRepaired: 0, stillFailing: 0 };
 
   // 1. Reservations explicitly in RECONCILIATION_REQUIRED (settlement was
   //    attempted but the ledger failed — the order route already verified
@@ -1064,9 +1066,10 @@ export async function processDueResellerReservationReconciliation(): Promise<{
       });
 
       // Transition to SETTLED (status-guarded)
+      // Phase 2B.2.4: Clear BOTH failureReason AND reconciliationReason on successful settlement.
       const updated = await db.tenantBalanceReservation.updateMany({
         where: { id: reservation.id, state: { in: ["RESERVED", "RECONCILIATION_REQUIRED"] } },
-        data: { state: "SETTLED", settledAt: new Date(), ledgerTransactionId: ledgerTxnId, failureReason: null },
+        data: { state: "SETTLED", settledAt: new Date(), ledgerTransactionId: ledgerTxnId, failureReason: null, reconciliationReason: null },
       });
 
       if (updated.count > 0) {
@@ -1119,6 +1122,71 @@ export async function processDueResellerReservationReconciliation(): Promise<{
         error: errorMsg,
       });
       // Leave as RECONCILIATION_REQUIRED for the next worker run
+    }
+  }
+
+  // Phase 2B.2.4: Repair SETTLED reservations that are missing their TenantTransaction.
+  // This can happen if the TenantTransaction.create() call failed during settlement
+  // (in either the order route or the reconciliation worker). The ledger is already
+  // correct (ledgerTransactionId is set), so we only need to repair the operational
+  // projection — we do NOT repost the ledger or change the balance.
+  const settledReservations = await db.tenantBalanceReservation.findMany({
+    where: {
+      state: "SETTLED",
+      ledgerTransactionId: { not: null },
+    },
+    select: {
+      id: true, tenantId: true, orderId: true, amountMinor: true,
+      idempotencyKey: true, ledgerTransactionId: true,
+    },
+  });
+
+  for (const reservation of settledReservations) {
+    // Check if the TenantTransaction exists
+    const expectedTxnKey = `settle_${reservation.idempotencyKey}`;
+    const existingTxn = await db.tenantTransaction.findUnique({
+      where: { idempotencyKey: expectedTxnKey },
+    });
+
+    if (existingTxn) {
+      continue; // already has its TenantTransaction — no repair needed
+    }
+
+    // Repair: create the missing TenantTransaction (idempotent via unique key)
+    try {
+      await db.tenantTransaction.create({
+        data: {
+          tenantId: reservation.tenantId,
+          type: "purchase",
+          amountMinor: -reservation.amountMinor,
+          balanceAfter: await getTenantBalanceMinor(reservation.tenantId),
+          orderId: reservation.orderId,
+          description: "Connectivity purchase settled (projection repair)",
+          idempotencyKey: expectedTxnKey,
+          ledgerTransactionId: reservation.ledgerTransactionId,
+        },
+      });
+      result.projectionRepaired++;
+      logger.info("reseller.projection_repaired", {
+        reservationId: reservation.id,
+        orderId: reservation.orderId,
+        ledgerTxnId: reservation.ledgerTransactionId,
+      });
+    } catch (txnErr) {
+      const txnMsg = txnErr instanceof Error ? txnErr.message : String(txnErr);
+      if (txnMsg.includes("Unique constraint") || txnMsg.includes("P2002")) {
+        // Another concurrent call created it — fine
+        logger.info("reseller.projection_repair_idempotent_replay", { reservationId: reservation.id });
+      } else {
+        result.stillFailing++;
+        logger.error("reseller.projection_repair_failed", {
+          reservationId: reservation.id,
+          orderId: reservation.orderId,
+          ledgerTxnId: reservation.ledgerTransactionId,
+          error: txnMsg,
+          message: "CRITICAL: SETTLED reservation has a ledger transaction but TenantTransaction creation failed. The ledger is correct; the operational projection will be retried on the next reconciliation run.",
+        });
+      }
     }
   }
 

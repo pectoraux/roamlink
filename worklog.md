@@ -980,3 +980,27 @@ Stage Summary:
   - Critical regression test: unknown → RECONCILIATION_REQUIRED → still unknown (NO settle) → later success → SETTLED ✅ (16 expects)
   - 3 static tests ✅
 - The invariant now holds: NO RESELLER CONNECTIVITY REVENUE unless AUTHORITATIVE ORDER FULFILLMENT SUCCESS — across normal execution, retries, crashes, reconciliation, concurrency, unknown states, and missing orders.
+
+---
+Task ID: 2B.2.4
+Agent: Lead engineer (main) — Settled-Projection Reconciliation
+Task: Fix P1: SETTLED reservations with missing TenantTransaction are never repaired
+
+Work Log:
+- P1: The settlement flow can produce Reservation=SETTLED + LedgerTransaction=exists + TenantTransaction=missing (if TenantTransaction.create() fails after the ledger posts). The reconciliation worker only processed RECONCILIATION_REQUIRED and stale RESERVED — it never scanned SETTLED reservations for missing projections.
+- Fix: Added a SETTLED projection repair section to processDueResellerReservationReconciliation. It scans SETTLED reservations with a ledgerTransactionId, checks if the corresponding TenantTransaction exists (via the unique idempotencyKey `settle_${reservation.idempotencyKey}`), and creates it if missing. The repair does NOT repost the ledger, does NOT change the balance, does NOT change the reservation state — it only repairs the operational projection.
+- Idempotency: The TenantTransaction unique constraint on idempotencyKey prevents duplicates. P2002 is treated as an idempotent success.
+- Stale metadata cleanup: Both settleResellerReservation and the worker now clear reconciliationReason (not just failureReason) on successful SETTLED transition. A settled reservation no longer carries stale reconciliation metadata.
+- Updated the worker return type to include projectionRepaired count.
+- Updated the cron route to handle the new return type.
+
+Stage Summary:
+- Files changed: src/lib/tenant/balance.ts, src/app/api/internal/reconcile/route.ts, tests/phase2b24-projection-reconciliation.test.ts
+- No schema migration needed (reconciliationReason was already added in 0008)
+- Tests: 7 tests in phase2b24-projection-reconciliation.test.ts — all pass
+  - Test 4: ledger success / TenantTransaction failure → repaired by worker ✅ (10 expects)
+  - Test 5: second reconciliation is idempotent ✅
+  - Test 6: normal settlement still works ✅
+  - Test 7: stale reconciliation metadata cleared on SETTLED ✅ (5 expects)
+  - 3 static tests ✅
+- The invariant now holds: IF reservation=SETTLED AND ledgerTransactionId exists THEN either TenantTransaction exists OR the worker can deterministically recreate it.
