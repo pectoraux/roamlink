@@ -247,7 +247,7 @@ export async function settleResellerReservation(input: {
     logger.error("reseller.settle_ledger_failed", { orderId: input.orderId, reservationId: reservation.id, error: errorMsg });
     await db.tenantBalanceReservation.updateMany({
       where: { id: reservation.id, state: { in: ["RESERVED", "RECONCILIATION_REQUIRED"] } },
-      data: { state: "RECONCILIATION_REQUIRED", failureReason: `Ledger posting failed: ${errorMsg}` },
+      data: { state: "RECONCILIATION_REQUIRED", reconciliationReason: "LEDGER_POSTING_FAILED", failureReason: `Ledger posting failed: ${errorMsg}` },
     }).catch((updateErr) => {
       const updateMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
       logger.error("reseller.settle_state_update_failed", {
@@ -934,37 +934,33 @@ export async function processDueResellerReservationReconciliation(): Promise<{
   for (const reservation of due) {
     result.retried++;
 
-    // Phase 2B.2.2: For RECONCILIATION_REQUIRED reservations, the order route
-    // already verified fulfillment success before calling settleResellerReservation.
-    // So these are SETTLEMENT_ELIGIBLE.
-    // For stale RESERVED reservations, we MUST inspect the Order's fulfillment state.
+    // Phase 2B.2.3: ALWAYS inspect the Order's authoritative fulfillment state,
+    // regardless of whether the reservation is RECONCILIATION_REQUIRED or stale RESERVED.
+    // The reservation state alone NEVER proves fulfillment success — only the
+    // Order's fulfillmentStatus does. This prevents the bug where a reservation
+    // moved to RECONCILIATION_REQUIRED due to FULFILLMENT_UNKNOWN would be
+    // incorrectly settled on the next worker run.
     let classification: ReservationClassification;
 
-    if (reservation.state === "RECONCILIATION_REQUIRED") {
-      // Settlement was attempted (fulfillment already verified by the order route).
-      classification = "SETTLEMENT_ELIGIBLE";
-    } else {
-      // Stale RESERVED — inspect the Order's authoritative fulfillment state.
-      const order = await db.order.findUnique({
-        where: { id: reservation.orderId },
-        select: { fulfillmentStatus: true, status: true },
-      });
+    const order = await db.order.findUnique({
+      where: { id: reservation.orderId },
+      select: { fulfillmentStatus: true, status: true },
+    });
 
-      if (!order) {
-        // Order not found — can't determine fulfillment state. Fail closed.
-        classification = "FULFILLMENT_UNKNOWN";
+    if (!order) {
+      // Order not found — can't determine fulfillment state. Fail closed.
+      classification = "FULFILLMENT_UNKNOWN";
+    } else {
+      const fulfillmentStatus = order.fulfillmentStatus;
+      if (fulfillmentStatus === "success") {
+        classification = "SETTLEMENT_ELIGIBLE";
+      } else if (fulfillmentStatus === "failed") {
+        classification = "RELEASE_ELIGIBLE";
+      } else if (fulfillmentStatus === "pending" || fulfillmentStatus === "provisioning") {
+        classification = "FULFILLMENT_PENDING";
       } else {
-        const fulfillmentStatus = order.fulfillmentStatus;
-        if (fulfillmentStatus === "success") {
-          classification = "SETTLEMENT_ELIGIBLE";
-        } else if (fulfillmentStatus === "failed") {
-          classification = "RELEASE_ELIGIBLE";
-        } else if (fulfillmentStatus === "pending" || fulfillmentStatus === "provisioning") {
-          classification = "FULFILLMENT_PENDING";
-        } else {
-          // "unknown" or "reconciliation_required" — can't determine. Fail closed.
-          classification = "FULFILLMENT_UNKNOWN";
-        }
+        // "unknown" or "reconciliation_required" — can't determine. Fail closed.
+        classification = "FULFILLMENT_UNKNOWN";
       }
     }
 
@@ -980,11 +976,19 @@ export async function processDueResellerReservationReconciliation(): Promise<{
 
     if (classification === "FULFILLMENT_UNKNOWN") {
       result.unknown++;
-      // Transition to RECONCILIATION_REQUIRED so an operator can inspect.
-      // Do NOT settle, do NOT release.
+      // Phase 2B.2.3: Transition to RECONCILIATION_REQUIRED with reason FULFILLMENT_UNKNOWN.
+      // Do NOT settle, do NOT release. The reservation stays here until the Order's
+      // fulfillmentStatus becomes "success" or "failed".
+      // On the next worker run, the classification will re-check the Order's
+      // fulfillmentStatus — if it's still unknown, it stays RECONCILIATION_REQUIRED.
+      // If it becomes "success", it becomes SETTLEMENT_ELIGIBLE. If "failed", RELEASE_ELIGIBLE.
       await db.tenantBalanceReservation.updateMany({
-        where: { id: reservation.id, state: "RESERVED" },
-        data: { state: "RECONCILIATION_REQUIRED", failureReason: "Fulfillment state unknown — manual review required" },
+        where: { id: reservation.id, state: { in: ["RESERVED", "RECONCILIATION_REQUIRED"] } },
+        data: {
+          state: "RECONCILIATION_REQUIRED",
+          reconciliationReason: "FULFILLMENT_UNKNOWN",
+          failureReason: "Fulfillment state unknown — manual review required",
+        },
       }).catch((err) => {
         logger.error("reseller.reservation_unknown_classification_failed", {
           reservationId: reservation.id,
@@ -994,7 +998,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
       logger.warn("reseller.reservation_fulfillment_unknown", {
         reservationId: reservation.id,
         orderId: reservation.orderId,
-        message: "Cannot determine fulfillment state — moved to RECONCILIATION_REQUIRED for manual review.",
+        message: "Cannot determine fulfillment state — moved to RECONCILIATION_REQUIRED (FULFILLMENT_UNKNOWN). Will NOT settle until fulfillment is confirmed.",
       });
       continue;
     }

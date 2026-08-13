@@ -1280,12 +1280,17 @@ model TenantBalanceReservation {
   orderId         String   @unique // one reservation per order
   amountMinor     Int      // reserved amount (retail price)
   platformFeeMinor Int     // platform fee at reservation time
-  state           String   @default("RESERVED") // RESERVED | SETTLED | RELEASED
+  state           String   @default("RESERVED") // RESERVED | SETTLED | RELEASED | RECONCILIATION_REQUIRED
   idempotencyKey  String   @unique // durable identity
   ledgerTransactionId String? // ledger posting (set on SETTLE)
   releasedAt      DateTime?
   settledAt       DateTime?
   failureReason   String?
+  // Phase 2B.2.3: Why the reservation is in RECONCILIATION_REQUIRED.
+  // LEDGER_POSTING_FAILED | FULFILLMENT_UNKNOWN | TENANT_TRANSACTION_FAILED | OTHER
+  // This distinguishes "ledger failed after successful fulfillment" (safe to retry settlement)
+  // from "fulfillment state unknown" (must NOT settle until fulfillment is confirmed).
+  reconciliationReason String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
