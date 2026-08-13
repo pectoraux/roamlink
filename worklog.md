@@ -1096,3 +1096,39 @@ Stage Summary:
   - 2 static tests ✅
 - The invariant: for every TenantTransaction, TenantBalance state + balanceAfter + sequenceNumber + TenantTransaction row represent ONE coherent PostgreSQL transaction. No part reads through a separate connection.
 - The reseller wallet hardening sequence is NOW TRULY COMPLETE. Ready for Phase 2B.3: SaaS billing.
+
+---
+Task ID: 2B.3
+Agent: Lead engineer (main) — SaaS Billing
+Task: Implement real SaaS subscription billing for tenant monetization
+
+Work Log:
+- Schema: Added TenantInvoice model (migration 0012) with fields for invoice/receipt records. Extended TenantSubscription with payment lifecycle fields: paymentProvider, providerReference, renewalIdempotencyKey, cancelledAt, cancelReason, trialEndsAt.
+- Service: Created src/lib/tenant/saas-subscription.ts with:
+  - createSubscriptionIntent: tenant chooses a plan → creates payment provider intent → creates pending invoice
+  - confirmSubscriptionPayment: server-side verifies payment → activates subscription → posts ledger (Dr Cash, Cr SaaS Subscription Revenue)
+  - cancelSubscription: ends at period end, no more renewals
+  - renewSubscription: creates invoice + payment intent + charges. Uses durable renewalIdempotencyKey derived from subscription ID + period end. Idempotent.
+  - processDueSaasRenewals: cron-friendly function that finds subscriptions whose period has ended and renews them
+  - handleSaasPaymentWebhook: idempotent webhook handler — duplicate deliveries don't double-charge
+  - listTenantInvoices: receipt history for the tenant
+- API routes: /api/tenant/saas/subscribe, /confirm, /cancel, /invoices, /api/webhooks/saas
+- Reconciliation cron: Updated /api/internal/reconcile to also run processDueSaasRenewals
+- Fixed AuditLog FK constraint: system identities (renewal-worker, webhook) pass userId: undefined to audit()
+- SaaS revenue separated: SAAS_SUBSCRIPTION_REVENUE (4200) is distinct from SALES_REVENUE (4000) and PLATFORM_FEE_REVENUE (4100)
+
+Stage Summary:
+- Migration: 0012_phase2b3_saas_billing (TenantInvoice + TenantSubscription payment lifecycle fields)
+- New service: src/lib/tenant/saas-subscription.ts
+- New API routes: 5 routes (subscribe, confirm, cancel, invoices, webhook)
+- Updated: reconciliation cron (includes SaaS renewals)
+- Tests: 12 tests in phase2b3-saas-billing.test.ts — all EXECUTED + PASSED
+  - A. Subscribe → payment → activation (9 expects) ✅
+  - B. Duplicate webhook idempotent ✅
+  - D. Renewal after period end ✅
+  - E. Renewal idempotency ✅
+  - F. Cancellation → no more renewals ✅
+  - G. Entitlement enforcement ✅
+  - H. SaaS revenue separated from connectivity revenue ✅
+  - 5 static tests ✅
+- The SaaS billing loop is complete: choose plan → pay → activate → renew → cancel, with idempotent webhooks and ledger posting.

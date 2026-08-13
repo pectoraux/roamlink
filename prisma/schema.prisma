@@ -1029,6 +1029,8 @@ model Tenant {
   // Phase 2B.2: reservations + deposit payments
   reservations    TenantBalanceReservation[]
   depositPayments TenantDepositPayment[]
+  // Phase 2B.3: SaaS invoices
+  invoices        TenantInvoice[]
 
   @@index([status])
 }
@@ -1198,21 +1200,61 @@ model TenantSubscription {
   id              String   @id @default(cuid())
   tenantId        String   @unique // one active subscription per tenant
   saaasPlanId     String
-  status          String   @default("active") // active | past_due | cancelled | expired
+  status          String   @default("active") // active | past_due | cancelled | expired | trialing
   billingCycle    String   @default("monthly") // monthly | yearly
   currentPeriodEnd DateTime
+  // Phase 2B.3: Payment lifecycle fields
+  paymentProvider String?  // mock | stripe | paystack | flutterwave
+  providerReference String? // provider's subscription/payment reference
+  // Durable renewal identity (like SubscriptionRenewalCycle for connectivity)
+  // Prevents duplicate renewal charges across retries
+  renewalIdempotencyKey String?
+  cancelledAt     DateTime?
+  cancelReason    String?
+  trialEndsAt     DateTime?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
   tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   saaasPlan       SaaasPlan @relation(fields: [saaasPlanId], references: [id])
+  invoices        TenantInvoice[]
 
   @@index([status])
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2B.3 — SaaS Invoice (receipt record for each subscription payment)
+// ---------------------------------------------------------------------------
+
+model TenantInvoice {
+  id              String   @id @default(cuid())
+  tenantId        String
+  subscriptionId  String
+  saaasPlanName   String   // snapshot of plan name at billing time
+  amountMinor     Int
+  currency        String   @default("USD")
+  billingCycle    String   // monthly | yearly
+  periodStart     DateTime
+  periodEnd       DateTime
+  status          String   @default("pending") // pending | paid | failed | refunded
+  paymentProvider String?  // mock | stripe | paystack | flutterwave
+  providerReference String? // provider's payment intent/charge reference
+  ledgerTransactionId String?
+  paidAt          DateTime?
+  failureReason   String?
+  idempotencyKey  String   @unique // durable identity (prevents duplicate invoices)
+  createdAt       DateTime @default(now())
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  subscription    TenantSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([subscriptionId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
 // API Key — tenant-scoped API keys for programmatic access.
-// The raw key is shown ONCE at creation; only the hash is stored.
 // ---------------------------------------------------------------------------
 
 model ApiKey {
