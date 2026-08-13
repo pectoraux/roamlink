@@ -51,6 +51,36 @@ export async function getOrCreateTenantBalance(tenantId: string) {
   return balance;
 }
 
+/**
+ * Phase 2B.2.6: Get the next per-tenant sequence number for a TenantTransaction.
+ * Uses MAX(sequenceNumber) + 1, which is safe within a transaction with a
+ * FOR UPDATE lock on the TenantBalance row (or within a serializable transaction).
+ * The unique constraint on (tenantId, sequenceNumber) prevents duplicates.
+ */
+async function getNextSequenceNumber(tx: any, tenantId: string): Promise<number> {
+  const last = await tx.tenantTransaction.findFirst({
+    where: { tenantId },
+    orderBy: { sequenceNumber: "desc" },
+    select: { sequenceNumber: true },
+  });
+  return (last?.sequenceNumber ?? 0) + 1;
+}
+
+/**
+ * Phase 2B.2.6: Log (not silently swallow) a projectionReconciled update failure.
+ * If this update fails, the worker will re-scan the reservation on the next cron
+ * run (projectionReconciled stays false). That's safe but wasteful, so we log it.
+ */
+function logProjectionUpdateFailure(reservationId: string, context: string, err: unknown) {
+  const errMsg = err instanceof Error ? err.message : String(err);
+  logger.warn("reseller.projection_reconciled_update_failed", {
+    reservationId,
+    context,
+    error: errMsg,
+    message: `projectionReconciled update failed (${context}). The worker will re-scan this reservation on the next cron run. This is safe but wasteful.`,
+  });
+}
+
 /** Get the current available balance (minor units). */
 export async function getTenantBalanceMinor(tenantId: string): Promise<number> {
   const balance = await getOrCreateTenantBalance(tenantId);
@@ -140,6 +170,7 @@ export async function reserveResellerBalance(input: {
     });
 
     // Create a TenantTransaction for the reservation (negative = funds held)
+    const reserveSeq = await getNextSequenceNumber(tx, input.tenantId);
     await tx.tenantTransaction.create({
       data: {
         tenantId: input.tenantId,
@@ -149,6 +180,7 @@ export async function reserveResellerBalance(input: {
         orderId: input.orderId,
         description: input.description ?? "Balance reserved for order",
         idempotencyKey: `reserve_${input.idempotencyKey}`,
+        sequenceNumber: reserveSeq,
       },
     });
 
@@ -285,6 +317,7 @@ export async function settleResellerReservation(input: {
   // Do NOT silently swallow — if this fails, the reconciliation worker will
   // repair it (the reservation is already SETTLED with the ledgerTransactionId).
   try {
+    const settleSeq = await getNextSequenceNumber(db, input.tenantId);
     await db.tenantTransaction.create({
       data: {
         tenantId: input.tenantId,
@@ -295,6 +328,7 @@ export async function settleResellerReservation(input: {
         description: "Connectivity purchase settled",
         idempotencyKey: `settle_${reservation.idempotencyKey}`,
         ledgerTransactionId: ledgerTxnId,
+        sequenceNumber: settleSeq,
       },
     });
 
@@ -303,7 +337,7 @@ export async function settleResellerReservation(input: {
     await db.tenantBalanceReservation.update({
       where: { id: reservation.id },
       data: { projectionReconciled: true },
-    }).catch(() => {});
+    }).catch((err) => logProjectionUpdateFailure(reservation.id, "settleResellerReservation.normal", err));
   } catch (err) {
     // The unique constraint on idempotencyKey may have caught a duplicate
     // (concurrent settlement). If so, this is fine. If it's a real error,
@@ -318,7 +352,7 @@ export async function settleResellerReservation(input: {
       await db.tenantBalanceReservation.update({
         where: { id: reservation.id },
         data: { projectionReconciled: true },
-      }).catch(() => {});
+      }).catch((err) => logProjectionUpdateFailure(reservation.id, "settleResellerReservation.idempotent_replay", err));
     } else {
       logger.error("reseller.settle_txn_creation_failed", {
         reservationId: reservation.id,
@@ -401,6 +435,7 @@ export async function releaseResellerReservation(input: {
     });
 
     // Create a TenantTransaction for the release (positive = funds returned)
+    const releaseSeq = await getNextSequenceNumber(tx, input.tenantId);
     await tx.tenantTransaction.create({
       data: {
         tenantId: input.tenantId,
@@ -410,6 +445,7 @@ export async function releaseResellerReservation(input: {
         orderId: input.orderId,
         description: "Reservation released (fulfillment failed)",
         idempotencyKey: `release_${reservation.idempotencyKey}`,
+        sequenceNumber: releaseSeq,
       },
     });
 
@@ -647,6 +683,7 @@ export async function creditDepositBalance(input: {
     });
 
     // Create transaction record
+    const depositSeq = await getNextSequenceNumber(tx, input.tenantId);
     const txn = await tx.tenantTransaction.create({
       data: {
         tenantId: input.tenantId,
@@ -655,6 +692,7 @@ export async function creditDepositBalance(input: {
         balanceAfter: balance.balanceMinor,
         description: `Deposit via ${deposit.paymentProvider}`,
         idempotencyKey: `deposit_${deposit.idempotencyKey}`,
+        sequenceNumber: depositSeq,
       },
     });
 
@@ -1036,6 +1074,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
             create: { tenantId: reservation.tenantId, balanceMinor: reservation.amountMinor },
             update: { balanceMinor: { increment: reservation.amountMinor } },
           });
+          const workerReleaseSeq = await getNextSequenceNumber(tx, reservation.tenantId);
           await tx.tenantTransaction.create({
             data: {
               tenantId: reservation.tenantId,
@@ -1045,6 +1084,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
               orderId: reservation.orderId,
               description: "Reservation released by reconciliation worker (fulfillment failed)",
               idempotencyKey: `release_${reservation.idempotencyKey}`,
+              sequenceNumber: workerReleaseSeq,
             },
           });
           return { alreadyDone: false as const, balanceMinor: balance.balanceMinor };
@@ -1096,6 +1136,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
 
         // Create the TenantTransaction if it doesn't exist (idempotent via unique key)
         try {
+          const workerSettleSeq = await getNextSequenceNumber(db, reservation.tenantId);
           await db.tenantTransaction.create({
             data: {
               tenantId: reservation.tenantId,
@@ -1106,6 +1147,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
               description: "Connectivity purchase settled (reconciliation)",
               idempotencyKey: `settle_${reservation.idempotencyKey}`,
               ledgerTransactionId: ledgerTxnId,
+              sequenceNumber: workerSettleSeq,
             },
           });
 
@@ -1113,7 +1155,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
           await db.tenantBalanceReservation.update({
             where: { id: reservation.id },
             data: { projectionReconciled: true },
-          }).catch(() => {});
+          }).catch((err) => logProjectionUpdateFailure(reservation.id, "worker.settle.normal", err));
         } catch (txnErr) {
           const txnMsg = txnErr instanceof Error ? txnErr.message : String(txnErr);
           if (txnMsg.includes("Unique constraint") || txnMsg.includes("P2002")) {
@@ -1121,7 +1163,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
             await db.tenantBalanceReservation.update({
               where: { id: reservation.id },
               data: { projectionReconciled: true },
-            }).catch(() => {});
+            }).catch((err) => logProjectionUpdateFailure(reservation.id, "worker.settle.idempotent_replay", err));
           } else {
             logger.error("reseller.reservation_reconcile_txn_failed", {
               reservationId: reservation.id,
@@ -1189,27 +1231,42 @@ export async function processDueResellerReservationReconciliation(): Promise<{
       await db.tenantBalanceReservation.update({
         where: { id: reservation.id },
         data: { projectionReconciled: true },
-      }).catch(() => {});
+      }).catch((err) => logProjectionUpdateFailure(reservation.id, "worker.existing_txn_check", err));
       continue;
     }
 
-    // Phase 2B.2.5: Reconstruct the HISTORICAL balanceAfter.
-    // Find the TenantTransaction immediately BEFORE this reservation's creation.
-    // The historical balanceAfter = priorTxn.balanceAfter + thisTxn.amountMinor.
-    // If there's no prior transaction, the balanceBefore is 0 (or the initial deposit,
-    // but deposits are also TenantTransactions so they'd be in the history).
+    // Phase 2B.2.6: Reconstruct the HISTORICAL balanceAfter using deterministic
+    // sequenceNumber ordering (NOT createdAt, which can collide under concurrent
+    // transactions). Find the TenantTransaction with the highest sequenceNumber
+    // that is lower than the sequence this transaction would have had.
+    //
+    // Since the missing transaction was never created, we don't know its exact
+    // sequenceNumber. But we can reconstruct the correct balanceAfter by finding
+    // the transaction that was immediately before it in the historical sequence.
+    // We use the reservation's createdAt as a rough filter to find the right
+    // epoch, then use sequenceNumber for deterministic ordering within that epoch.
+    //
+    // The prior transaction's balanceAfter + this transaction's amount = the
+    // correct historical balanceAfter for the repaired transaction.
     const priorTxn = await db.tenantTransaction.findFirst({
       where: {
         tenantId: reservation.tenantId,
         createdAt: { lt: reservation.createdAt },
       },
-      orderBy: { createdAt: "desc" },
-      select: { balanceAfter: true },
+      orderBy: [{ sequenceNumber: "desc" }],
+      select: { balanceAfter: true, sequenceNumber: true },
     });
 
     const historicalBalanceBefore = priorTxn?.balanceAfter ?? 0;
     const transactionAmount = -reservation.amountMinor; // purchase is negative
     const historicalBalanceAfter = historicalBalanceBefore + transactionAmount;
+
+    // The repaired transaction gets the next available sequenceNumber (at the end
+    // of the current history). This is correct because the repaired transaction
+    // is being created NOW by the reconciliation worker — its position in the
+    // operational history is the repair time, not the original settlement time.
+    // The historicalBalanceAfter field preserves the correct historical balance.
+    const repairSeq = await getNextSequenceNumber(db, reservation.tenantId);
 
     // Repair: create the missing TenantTransaction with the HISTORICAL balanceAfter
     try {
@@ -1223,6 +1280,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
           description: "Connectivity purchase settled (projection repair)",
           idempotencyKey: expectedTxnKey,
           ledgerTransactionId: reservation.ledgerTransactionId,
+          sequenceNumber: repairSeq,
         },
       });
 
@@ -1230,7 +1288,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
       await db.tenantBalanceReservation.update({
         where: { id: reservation.id },
         data: { projectionReconciled: true },
-      }).catch(() => {});
+      }).catch((err) => logProjectionUpdateFailure(reservation.id, "worker.repair.create", err));
 
       result.projectionRepaired++;
       logger.info("reseller.projection_repaired", {
@@ -1246,7 +1304,7 @@ export async function processDueResellerReservationReconciliation(): Promise<{
         await db.tenantBalanceReservation.update({
           where: { id: reservation.id },
           data: { projectionReconciled: true },
-        }).catch(() => {});
+        }).catch((err) => logProjectionUpdateFailure(reservation.id, "worker.repair.idempotent_replay", err));
         logger.info("reseller.projection_repair_idempotent_replay", { reservationId: reservation.id });
       } else {
         result.stillFailing++;

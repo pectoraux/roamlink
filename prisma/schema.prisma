@@ -1254,17 +1254,23 @@ model TenantBalance {
 model TenantTransaction {
   id              String   @id @default(cuid())
   tenantId        String
-  type            String   // deposit | purchase | saas_payment | refund | adjustment
+  type            String   // deposit | purchase | reservation | release | saas_payment | refund | adjustment
   amountMinor     Int      // positive = credit added, negative = debit
   balanceAfter    Int      // balance after this transaction
   orderId         String?  // linked order (for purchases)
   ledgerTransactionId String? // linked ledger transaction
   description     String?
   idempotencyKey  String   @unique // durable identity (prevents duplicate deposits/purchases)
+  // Phase 2B.2.6: Per-tenant monotonic sequence number for deterministic
+  // chronological ordering. Unlike createdAt (which can collide under concurrent
+  // transactions), sequenceNumber provides a durable total order for financial
+  // history reconstruction.
+  sequenceNumber  Int
   createdAt       DateTime @default(now())
 
   tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
+  @@unique([tenantId, sequenceNumber])
   @@index([tenantId])
   @@index([type])
   @@index([createdAt])

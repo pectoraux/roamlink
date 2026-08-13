@@ -1026,3 +1026,24 @@ Stage Summary:
   - Test B (idempotency) — depends on test A
   - Test D (projectionReconciled flag) — depends on test A
 - The invariant: a repaired TenantTransaction contains the correct HISTORICAL balanceAfter, not the current balance.
+
+---
+Task ID: 2B.2.6
+Agent: Lead engineer (main) — Deterministic Ordering + No Silent Catches
+Task: Fix 3 issues: timestamp-based ordering, silent catches, test execution
+
+Work Log:
+- Issue 1 (deterministic ordering): Added `sequenceNumber` field to TenantTransaction (migration 0010). Per-tenant monotonic sequence with a unique constraint on (tenantId, sequenceNumber). Added `getNextSequenceNumber(tx, tenantId)` helper that uses MAX(sequenceNumber) + 1. Updated all 7 TenantTransaction.create call sites to set sequenceNumber. The historical balance reconstruction now orders by sequenceNumber DESC (not createdAt DESC), providing deterministic chronological ordering even under concurrent transactions.
+- Issue 2 (silent catches): Replaced all 7 `.catch(() => {})` around projectionReconciled updates with `logProjectionUpdateFailure(reservationId, context, err)` — a helper that logs a warning with the reservation ID, context, and error message. No projectionReconciled update is silently swallowed.
+- Issue 3 (test execution): Rewrote the test to be more efficient — creates test data directly (product, supplier, offer, balance, deposit transaction) instead of going through the full payment/deposit flow. This reduced the test A runtime from >10 minutes to ~2 minutes, allowing it to actually execute and pass within the sandbox timeout.
+- Existing rows in the database were assigned sequence numbers via ROW_NUMBER() OVER (PARTITION BY tenantId ORDER BY createdAt) in the migration.
+
+Stage Summary:
+- Migration: 0010_phase2b26_sequence_number (added sequenceNumber column + unique index)
+- Files changed: prisma/schema.prisma, prisma/migrations/0010_phase2b26_sequence_number/migration.sql, src/lib/tenant/balance.ts, tests/phase2b26-deterministic-ordering.test.ts
+- Tests: 6 tests in phase2b26-deterministic-ordering.test.ts
+  - Test A: two sequential purchases + missing first → repaired with historical balance — EXECUTED + PASSED (12 expects, ~2 min)
+  - Test B: second reconciliation idempotency — EXECUTED + PASSED (when run after A)
+  - Test C: sequenceNumber deterministic and per-tenant — EXECUTED + PASSED (3 expects)
+  - 3 static tests — EXECUTED + PASSED (14 expects)
+- The invariant: a repaired TenantTransaction contains the correct HISTORICAL balanceAfter, determined by deterministic sequenceNumber ordering, not timestamp inference. No projectionReconciled update is silently swallowed.
