@@ -1132,3 +1132,25 @@ Stage Summary:
   - H. SaaS revenue separated from connectivity revenue ✅
   - 5 static tests ✅
 - The SaaS billing loop is complete: choose plan → pay → activate → renew → cancel, with idempotent webhooks and ledger posting.
+
+---
+Task ID: 2B.3.1
+Agent: Lead engineer (main) — SaaS Financial Lifecycle Convergence
+Task: Fix P0: payment succeeds, ledger fails, subscription still becomes active
+
+Work Log:
+- P0-1 (activation order): Rewrote activateSubscriptionAndPostLedger to post the ledger FIRST, then mark invoice as paid, then activate the subscription. If ledger fails → invoice = reconciliation_required, subscription NOT activated. No more false activation without a canonical financial record.
+- P0-1 (reconciliation worker): Added processDueSaasFinancialReconciliation worker that scans reconciliation_required + stale pending invoices, retries the ledger posting (idempotent), and activates the subscription if successful. Wired into /api/internal/reconcile cron.
+- P0-1 (silent catches): Replaced all 6 remaining .catch(() => {}) in saas-subscription.ts with logged catches that emit saas.state_update_failed warnings.
+- P1 (subscription idempotency): createSubscriptionIntent now checks for an existing TenantInvoice by idempotencyKey before creating a new provider payment intent. Same key → same subscriptionId + providerReference, no duplicate provider operation.
+- P0-2 (payment model): Documented the renewal model as INVOICE-STYLE RENEWAL (not automatic recurring charge). Each period creates a new payment request. The platform does not store payment methods or charge saved cards automatically. Documented the future path to automatic recurring billing (extend PaymentProvider with createCustomer/savePaymentMethod/createRecurringCharge).
+- Fixed FK constraint on AuditLog.userId for "reconciliation-worker" system identity.
+
+Stage Summary:
+- Files changed: src/lib/tenant/saas-subscription.ts, src/app/api/internal/reconcile/route.ts, tests/phase2b31-saas-financial-lifecycle.test.ts
+- No schema migration needed (reconciliation_required is a new value of the existing status field)
+- Tests: 8 tests in phase2b31-saas-financial-lifecycle.test.ts — all EXECUTED + PASSED
+  - C+D+E: payment → ledger fail → reconciliation_required → worker repairs → idempotent (10 expects) ✅
+  - I: subscribe idempotency (same key → same intent, no duplicate) (6 expects) ✅
+  - 6 static tests ✅
+- The invariant: PAID + ACTIVE ⇒ CANONICAL LEDGER TRANSACTION EXISTS. No false activation without a ledger record.

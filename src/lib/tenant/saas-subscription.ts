@@ -1,20 +1,40 @@
 /**
  * SaaS Subscription service — real payment lifecycle for tenant billing.
  *
- * Phase 2B.3: Implements the full SaaS monetization loop:
- *   1. createSubscriptionIntent (tenant chooses a plan, creates payment intent)
- *   2. confirmSubscriptionPayment (server-side verifies payment, activates subscription)
- *   3. renewSubscription (creates invoice + charges for next period)
- *   4. cancelSubscription (ends at period end, no more renewals)
- *   5. processDueSaasRenewals (cron: renews subscriptions whose period has ended)
+ * Phase 2B.3: Implements the SaaS monetization loop.
+ * Phase 2B.3.1: Financial lifecycle convergence — ledger before activation,
+ *   reconciliation worker, no silent catches, durable idempotency.
+ *
+ * Payment model: INVOICE-STYLE RENEWAL (not automatic recurring charge).
+ * Each billing period, a new payment request (PaymentIntent) is created.
+ * The tenant must complete the payment (via the API or webhook). This is
+ * NOT automatic recurring billing — the platform does not store payment
+ * methods or charge saved cards automatically.
+ *
+ * To support automatic recurring billing in the future, the PaymentProvider
+ * abstraction would need to be extended with:
+ *   - createCustomer()
+ *   - savePaymentMethod()
+ *   - createRecurringCharge() / createSubscription()
+ * The current model is honest about this limitation.
+ *
+ * Financial lifecycle:
+ *   1. createSubscriptionIntent (tenant chooses plan → payment intent → pending invoice)
+ *   2. confirmSubscriptionPayment (server verifies payment → posts ledger → activates)
+ *   3. If ledger fails → invoice = reconciliation_required, subscription NOT activated
+ *   4. processDueSaasFinancialReconciliation (cron: retries ledger for reconciliation_required)
+ *   5. renewSubscription (creates new invoice + payment request for next period)
+ *   6. cancelSubscription (ends at period end, no more renewals)
+ *   7. processDueSaasRenewals (cron: renews subscriptions whose period has ended)
  *
  * All financial events post to the canonical double-entry ledger via
- * ledgerSaasSubscriptionPayment. SaaS revenue is separated from connectivity
- * sales revenue and platform fee revenue.
+ * ledgerSaasSubscriptionPayment. SaaS revenue (4200) is separated from
+ * connectivity sales revenue (4000) and platform fee revenue (4100).
  *
- * Idempotency: every renewal uses a durable idempotencyKey derived from the
- * subscription ID + period end. Duplicate webhook deliveries or cron retries
- * cannot double-charge.
+ * Idempotency: every operation uses a durable idempotencyKey. Subscription
+ * creation checks for an existing invoice by key before creating a new provider
+ * intent. Renewal uses a key derived from subscriptionId + periodEnd. Duplicate
+ * webhook deliveries or cron retries cannot double-charge.
  */
 
 import { db } from "@/lib/db";
@@ -56,6 +76,21 @@ export async function createSubscriptionIntent(input: {
   }
 
   const provider = getPaymentProvider();
+
+  // Phase 2B.3.1: Idempotency — check for an existing invoice with this idempotencyKey.
+  // If found, return the existing subscription intent without creating a new provider operation.
+  const existingInvoice = await db.tenantInvoice.findUnique({
+    where: { idempotencyKey: input.idempotencyKey },
+    include: { subscription: true },
+  });
+  if (existingInvoice && existingInvoice.subscription) {
+    logger.info("saas.subscribe_idempotent_replay", { idempotencyKey: input.idempotencyKey, invoiceId: existingInvoice.id });
+    return {
+      subscriptionId: existingInvoice.subscription.id,
+      providerReference: existingInvoice.providerReference ?? "",
+      status: existingInvoice.subscription.status,
+    };
+  }
 
   // Check for existing subscription
   const existing = await db.tenantSubscription.findUnique({ where: { tenantId } });
@@ -199,7 +234,7 @@ export async function confirmSubscriptionPayment(input: {
     await db.tenantSubscription.update({
       where: { id: subscription.id },
       data: { status: "past_due" },
-    }).catch(() => {});
+    });
     return { status: "past_due" };
   }
 
@@ -207,47 +242,70 @@ export async function confirmSubscriptionPayment(input: {
     return { status: "trialing" };
   }
 
-  // Payment succeeded — activate the subscription + post the ledger
-  await activateSubscriptionAndPostLedger({
+  // Payment succeeded — attempt financial finalization + activation
+  const result = await activateSubscriptionAndPostLedger({
     subscriptionId: subscription.id,
     invoiceId: invoice.id,
     tenantId: input.tenantId,
     userId: input.userId,
   });
 
-  return { status: "active" };
+  if (result.activated) {
+    return { status: "active" };
+  } else {
+    // Ledger failed — invoice is reconciliation_required, subscription NOT activated
+    return { status: "financial_pending" };
+  }
 }
 
 /**
  * Activate the subscription and post the SaaS payment to the ledger.
  * Idempotent: status-guarded transitions.
  */
+/**
+ * Activate the subscription and post the SaaS payment to the ledger.
+ *
+ * Phase 2B.3.1: The activation order is now:
+ *   1. Post the ledger entry FIRST (the canonical financial truth)
+ *   2. If ledger succeeds → mark invoice as paid + activate subscription
+ *   3. If ledger fails → mark invoice as reconciliation_required (do NOT activate)
+ *
+ * This prevents the scenario where payment succeeds, ledger fails, and the
+ * subscription is falsely activated without a canonical financial record.
+ * The processDueSaasFinancialReconciliation worker repairs reconciliation_required
+ * invoices by retrying the ledger posting.
+ *
+ * Idempotent: status-guarded transitions. If already paid, returns early.
+ */
 async function activateSubscriptionAndPostLedger(input: {
   subscriptionId: string;
   invoiceId: string;
   tenantId: string;
   userId: string;
-}): Promise<void> {
+}): Promise<{ activated: boolean }> {
   await ensureChartOfAccounts();
 
-  // Mark the invoice as paid
-  const updatedInvoice = await db.tenantInvoice.updateMany({
-    where: { id: input.invoiceId, status: "pending" },
-    data: { status: "paid", paidAt: new Date() },
-  });
-
-  if (updatedInvoice.count === 0) {
-    // Already paid — idempotent return
-    logger.info("saas.invoice_already_paid", { invoiceId: input.invoiceId });
-    return;
+  // Get the invoice
+  const invoice = await db.tenantInvoice.findUnique({ where: { id: input.invoiceId } });
+  if (!invoice) {
+    throw new AppError("not_found", "Invoice not found", 404, "Invoice not found during activation.");
   }
 
-  // Get the invoice to know the amount
-  const invoice = await db.tenantInvoice.findUnique({ where: { id: input.invoiceId } });
-  if (!invoice) return;
+  // Idempotent: if already paid, return early
+  if (invoice.status === "paid") {
+    logger.info("saas.invoice_already_paid", { invoiceId: input.invoiceId });
+    return { activated: true };
+  }
 
-  // Post the ledger entry (idempotent via ledger idempotencyKey)
-  let ledgerTxnId: string | null = null;
+  // If invoice is in reconciliation_required, we're retrying — that's fine.
+  // If invoice is pending, this is the first attempt.
+  // If invoice is failed, we should not activate.
+  if (invoice.status === "failed") {
+    throw new AppError("conflict", "Cannot activate a failed invoice", 409, "The invoice payment failed.");
+  }
+
+  // Step 1: Post the ledger entry FIRST (idempotent via ledger idempotencyKey)
+  let ledgerTxnId: string;
   try {
     ledgerTxnId = await ledgerSaasSubscriptionPayment({
       tenantId: input.tenantId,
@@ -257,39 +315,60 @@ async function activateSubscriptionAndPostLedger(input: {
       idempotencyKey: `${invoice.idempotencyKey}:ledger`,
     });
   } catch (err) {
-    logger.error("saas.ledger_posting_failed", {
-      invoiceId: input.invoiceId,
-      error: err instanceof Error ? err.message : String(err),
+    // Phase 2B.3.1: Ledger failed — mark as reconciliation_required.
+    // Do NOT mark as paid. Do NOT activate the subscription.
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.error("saas.ledger_posting_failed", { invoiceId: input.invoiceId, error: errorMsg });
+    await db.tenantInvoice.updateMany({
+      where: { id: input.invoiceId, status: { in: ["pending", "reconciliation_required"] } },
+      data: { status: "reconciliation_required", failureReason: `Ledger posting failed: ${errorMsg}` },
+    }).catch((updateErr) => {
+      const updateMsg = updateErr instanceof Error ? updateErr.message : String(updateErr);
+      logger.error("saas.reconciliation_status_update_failed", {
+        invoiceId: input.invoiceId,
+        ledgerError: errorMsg,
+        updateError: updateMsg,
+        message: "CRITICAL: Ledger failed AND status update to reconciliation_required failed. The worker will recover it via the stale-status scan.",
+      });
     });
-    // Don't fail the activation — the reconciliation worker can retry the ledger
+    return { activated: false };
   }
 
-  // Link the ledger transaction to the invoice
-  if (ledgerTxnId) {
-    await db.tenantInvoice.update({
-      where: { id: input.invoiceId },
-      data: { ledgerTransactionId: ledgerTxnId },
-    }).catch(() => {});
+  // Step 2: Ledger succeeded — mark invoice as paid + link the ledger transaction
+  const updated = await db.tenantInvoice.updateMany({
+    where: { id: input.invoiceId, status: { in: ["pending", "reconciliation_required"] } },
+    data: { status: "paid", paidAt: new Date(), ledgerTransactionId: ledgerTxnId, failureReason: null },
+  });
+
+  if (updated.count === 0) {
+    // Another concurrent call paid it — check if it's already paid
+    const current = await db.tenantInvoice.findUnique({ where: { id: input.invoiceId } });
+    if (current?.status === "paid") {
+      logger.info("saas.invoice_concurrently_paid", { invoiceId: input.invoiceId });
+      return { activated: true };
+    }
+    // It's in some other state — don't activate
+    logger.warn("saas.invoice_unexpected_state", { invoiceId: input.invoiceId, status: current?.status });
+    return { activated: false };
   }
 
-  // Activate the subscription
+  // Step 3: Activate the subscription (only after ledger is confirmed + invoice is paid)
   await db.tenantSubscription.update({
     where: { id: input.subscriptionId },
     data: { status: "active" },
-  }).catch(() => {});
+  });
 
   await audit({
     tenantId: input.tenantId,
-    // System identities (renewal-worker, webhook) are not real users — pass null
-    // to avoid FK constraint violation on AuditLog.userId
-    userId: (input.userId === "renewal-worker" || input.userId === "webhook") ? undefined : input.userId,
+    userId: (input.userId === "renewal-worker" || input.userId === "webhook" || input.userId === "reconciliation-worker") ? undefined : input.userId,
     action: "saas.subscription_activated",
     entity: "tenant_subscription",
     entityId: input.subscriptionId,
     detail: { invoiceId: input.invoiceId, ledgerTxnId, amount: invoice.amountMinor },
   });
 
-  logger.info("saas.subscription_activated", { tenantId: input.tenantId, subscriptionId: input.subscriptionId, ledgerTxnId });
+  logger.info("saas.subscription_activated", { tenantId: input.tenantId, subscriptionId: input.subscriptionId, ledgerTxnId, invoiceId: input.invoiceId });
+  return { activated: true };
 }
 
 /**
@@ -370,7 +449,7 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     await db.tenantSubscription.update({
       where: { id: subscription.id },
       data: { status: "active", renewalIdempotencyKey: renewalKey },
-    }).catch(() => {});
+    }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
     return { success: true, status: "active" };
   }
 
@@ -422,7 +501,7 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
   await db.tenantInvoice.update({
     where: { id: invoice.id },
     data: { providerReference: intent.providerReference, paymentProvider: provider.id },
-  }).catch(() => {});
+  }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
 
   // For the mock provider, auto-confirm
   if (provider.isMock) {
@@ -444,7 +523,7 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     await db.tenantSubscription.update({
       where: { id: subscription.id },
       data: { status: "past_due" },
-    }).catch(() => {});
+    }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
     return { success: false, status: "past_due", reason: "Renewal payment failed" };
   }
 
@@ -452,7 +531,7 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     await db.tenantSubscription.update({
       where: { id: subscription.id },
       data: { status: "past_due" },
-    }).catch(() => {});
+    }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
     return { success: false, status: "past_due", reason: "Payment pending" };
   }
 
@@ -551,11 +630,11 @@ export async function handleSaasPaymentWebhook(input: {
     await db.tenantInvoice.update({
       where: { id: invoice.id },
       data: { status: "failed", failureReason: "Webhook reported payment failed" },
-    }).catch(() => {});
+    }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
     await db.tenantSubscription.update({
       where: { id: invoice.subscriptionId },
       data: { status: "past_due" },
-    }).catch(() => {});
+    }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
     return { handled: true };
   }
 
@@ -571,4 +650,67 @@ export async function listTenantInvoices(tenantId: string, limit = 20) {
     orderBy: { createdAt: "desc" },
     take: limit,
   });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2B.3.1 — SaaS Financial Reconciliation Worker
+// ---------------------------------------------------------------------------
+
+/**
+ * Process SaaS invoices stuck in reconciliation_required.
+ *
+ * For each stuck invoice:
+ *   1. Retry ledgerSaasSubscriptionPayment (idempotent — replays if key exists)
+ *   2. If ledger succeeds → mark invoice as paid + activate subscription
+ *   3. If ledger still fails → leave as reconciliation_required for next run
+ *
+ * Also scans for stale "pending" invoices (older than 5 minutes) whose payment
+ * was confirmed by the provider but never financially finalized.
+ *
+ * Idempotent: ledger replays via idempotencyKey, status-guarded transitions.
+ */
+export async function processDueSaasFinancialReconciliation(): Promise<{
+  retried: number;
+  repaired: number;
+  stillFailing: number;
+}> {
+  const result = { retried: 0, repaired: 0, stillFailing: 0 };
+
+  const staleCutoff = new Date(Date.now() - 5 * 60 * 1000);
+  const due = await db.tenantInvoice.findMany({
+    where: {
+      OR: [
+        { status: "reconciliation_required" },
+        { status: "pending", createdAt: { lt: staleCutoff }, providerReference: { not: null } },
+      ],
+    },
+    include: { subscription: true },
+  });
+
+  for (const invoice of due) {
+    if (!invoice.subscription) continue;
+    result.retried++;
+    try {
+      const activated = await activateSubscriptionAndPostLedger({
+        subscriptionId: invoice.subscriptionId,
+        invoiceId: invoice.id,
+        tenantId: invoice.tenantId,
+        userId: "reconciliation-worker",
+      });
+      if (activated.activated) {
+        result.repaired++;
+        logger.info("saas.invoice_reconciled", { invoiceId: invoice.id, subscriptionId: invoice.subscriptionId });
+      } else {
+        result.stillFailing++;
+      }
+    } catch (err) {
+      result.stillFailing++;
+      logger.error("saas.reconciliation_still_failing", {
+        invoiceId: invoice.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  return result;
 }

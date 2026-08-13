@@ -21,7 +21,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { processDueSubscriptions } from "@/lib/subscriptions/service";
 import { processDueCreditIssuances } from "@/lib/promotions/referral-service";
 import { processDueDepositReconciliation, processDueResellerReservationReconciliation } from "@/lib/tenant/balance";
-import { processDueSaasRenewals } from "@/lib/tenant/saas-subscription";
+import { processDueSaasRenewals, processDueSaasFinancialReconciliation } from "@/lib/tenant/saas-subscription";
 import { requireAdmin } from "@/lib/auth";
 import { logger } from "@/lib/logger";
 
@@ -103,8 +103,16 @@ async function runReconciliation() {
     saasRenewals = { renewed: 0, failed: 0, skipped: 0 };
   }
 
+  let saasFinancialReconciliation: { retried: number; repaired: number; stillFailing: number };
+  try {
+    saasFinancialReconciliation = await processDueSaasFinancialReconciliation();
+  } catch (err) {
+    logger.error("cron.reconciliation.saas_financial_failed", { error: err instanceof Error ? err.message : String(err) });
+    saasFinancialReconciliation = { retried: 0, repaired: 0, stillFailing: 0 };
+  }
+
   const durationMs = Date.now() - startedAt;
-  logger.info("cron.reconciliation.completed", { durationMs, subscriptions, creditIssuances, deposits, reservations, saasRenewals });
+  logger.info("cron.reconciliation.completed", { durationMs, subscriptions, creditIssuances, deposits, reservations, saasRenewals, saasFinancialReconciliation });
 
   return NextResponse.json({
     ok: true,
@@ -114,5 +122,6 @@ async function runReconciliation() {
     deposits,
     reservations,
     saasRenewals,
+    saasFinancialReconciliation,
   });
 }
