@@ -685,11 +685,16 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     });
 
     if (result.activated) {
-      // Phase 2B.3.6: Use the single authoritative completion function
+      // Phase 2B.3.10: Use the single authoritative completion function.
+      // If completion fails, mark cycle RECONCILIATION_REQUIRED for recovery.
       const completion = await completeSaasRenewalCycle({ invoiceId: cycle.invoiceId!, tenantId });
       if (completion.completed) {
         return { success: true, status: "active" };
       } else {
+        await db.saasRenewalCycle.updateMany({
+          where: { id: cycle.id, state: { not: "COMPLETED" } },
+          data: { state: "RECONCILIATION_REQUIRED", failureReason: "Period extension failed during renewal retry" },
+        }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
         return { success: false, status: "financial_pending", reason: "Period extension failed during renewal retry" };
       }
     } else {
@@ -724,6 +729,11 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     if (completion.completed) {
       return { success: true, status: "active" };
     } else {
+      // Phase 2B.3.10: Mark cycle for recovery
+      await db.saasRenewalCycle.updateMany({
+        where: { id: cycle.id, state: { not: "COMPLETED" } },
+        data: { state: "RECONCILIATION_REQUIRED", failureReason: "Completion failed for already-paid invoice" },
+      }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
       return { success: false, status: "financial_pending", reason: "Completion failed for already-paid invoice" };
     }
   }
@@ -753,11 +763,15 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
   });
 
   if (invoice.status === "paid") {
-    // Phase 2B.3.8: Use the single authoritative completion function.
+    // Phase 2B.3.10: Use the single authoritative completion function.
     const completion = await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId });
     if (completion.completed) {
       return { success: true, status: "active" };
     } else {
+      await db.saasRenewalCycle.updateMany({
+        where: { id: cycle.id, state: { not: "COMPLETED" } },
+        data: { state: "RECONCILIATION_REQUIRED", failureReason: "Completion failed for paid invoice" },
+      }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
       return { success: false, status: "financial_pending", reason: "Completion failed for paid invoice" };
     }
   }
@@ -773,11 +787,15 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     });
 
     if (result.activated) {
-      // Phase 2B.3.6: Use the single authoritative completion function
+      // Phase 2B.3.10: Use the single authoritative completion function.
       const completion = await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId });
       if (completion.completed) {
         return { success: true, status: "active" };
       } else {
+        await db.saasRenewalCycle.updateMany({
+          where: { id: cycle.id, state: { not: "COMPLETED" } },
+          data: { state: "RECONCILIATION_REQUIRED", failureReason: "Period extension failed" },
+        }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
         return { success: false, status: "financial_pending", reason: "Period extension failed" };
       }
     } else {
@@ -967,11 +985,26 @@ export async function handleSaasPaymentWebhook(input: {
       userId: "webhook",
     });
 
-    // Phase 2B.3.6: If financial finalization succeeded, complete the renewal cycle
-    // (extend the subscription period). This is the SINGLE place where webhook-driven
-    // renewal period extension happens.
+    // Phase 2B.3.10: If financial finalization succeeded, complete the renewal cycle.
+    // If completion FAILS, mark the cycle RECONCILIATION_REQUIRED so the worker
+    // can retry the domain completion (not the payment or ledger).
     if (result.activated) {
-      await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId: invoice.tenantId });
+      const completion = await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId: invoice.tenantId });
+      if (!completion.completed) {
+        // Financial work is done (invoice paid + ledger posted) but domain
+        // completion failed. Mark the cycle for recovery.
+        const cycle = await db.saasRenewalCycle.findFirst({ where: { invoiceId: invoice.id } });
+        if (cycle && cycle.state !== "COMPLETED") {
+          await db.saasRenewalCycle.updateMany({
+            where: { id: cycle.id, state: { not: "COMPLETED" } },
+            data: { state: "RECONCILIATION_REQUIRED", failureReason: "Domain completion failed after webhook" },
+          }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+        }
+        logger.error("saas.webhook_completion_failed", {
+          invoiceId: invoice.id,
+          message: "CRITICAL: Financial finalization succeeded but renewal cycle completion failed. Cycle marked RECONCILIATION_REQUIRED.",
+        });
+      }
     }
     return { handled: true };
   }
@@ -1098,9 +1131,19 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
         result.repaired++;
         logger.info("saas.invoice_reconciled", { invoiceId: invoice.id, subscriptionId: invoice.subscriptionId });
 
-        // Phase 2B.3.6: Complete the renewal cycle — extends the subscription period.
-        // This is the SINGLE function that does period extension for reconciliation.
-        await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId: invoice.tenantId });
+        // Phase 2B.3.10: Complete the renewal cycle. If completion fails,
+        // mark the cycle RECONCILIATION_REQUIRED for the cycle-driven scan.
+        const completion = await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId: invoice.tenantId });
+        if (!completion.completed) {
+          const cycle = await db.saasRenewalCycle.findFirst({ where: { invoiceId: invoice.id } });
+          if (cycle && cycle.state !== "COMPLETED") {
+            await db.saasRenewalCycle.updateMany({
+              where: { id: cycle.id, state: { not: "COMPLETED" } },
+              data: { state: "RECONCILIATION_REQUIRED", failureReason: "Domain completion failed during reconciliation" },
+            }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+          }
+          logger.error("saas.reconciliation_completion_failed", { invoiceId: invoice.id });
+        }
       } else {
         result.stillFailing++;
       }
@@ -1108,6 +1151,54 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
       result.stillFailing++;
       logger.error("saas.reconciliation_still_failing", {
         invoiceId: invoice.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Phase 2B.3.10: Cycle-driven scan — find cycles in RECONCILIATION_REQUIRED
+  // even when their invoice is already PAID. These represent paid renewals
+  // where the domain completion (period extension) failed.
+  // The worker retries ONLY the domain completion — no payment, no ledger.
+  const stuckCycles = await db.saasRenewalCycle.findMany({
+    where: { state: "RECONCILIATION_REQUIRED" },
+    select: { id: true, invoiceId: true, tenantId: true, subscriptionId: true },
+  });
+
+  for (const cycle of stuckCycles) {
+    if (!cycle.invoiceId) {
+      logger.warn("saas.reconciliation_cycle_no_invoice", { cycleId: cycle.id });
+      continue;
+    }
+
+    // Verify the invoice is paid + ledger exists before attempting completion
+    const inv = await db.tenantInvoice.findUnique({
+      where: { id: cycle.invoiceId },
+      select: { status: true, ledgerTransactionId: true },
+    });
+
+    if (!inv || inv.status !== "paid" || !inv.ledgerTransactionId) {
+      // Invoice isn't financially ready — leave for the invoice-driven scan
+      continue;
+    }
+
+    // Invoice is paid + ledger exists — retry ONLY the domain completion
+    result.retried++;
+    try {
+      const completion = await completeSaasRenewalCycle({
+        invoiceId: cycle.invoiceId,
+        tenantId: cycle.tenantId,
+      });
+      if (completion.completed) {
+        result.repaired++;
+        logger.info("saas.cycle_reconciled", { cycleId: cycle.id, invoiceId: cycle.invoiceId });
+      } else {
+        result.stillFailing++;
+      }
+    } catch (err) {
+      result.stillFailing++;
+      logger.error("saas.cycle_reconciliation_failed", {
+        cycleId: cycle.id,
         error: err instanceof Error ? err.message : String(err),
       });
     }

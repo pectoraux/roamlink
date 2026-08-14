@@ -1326,3 +1326,23 @@ Stage Summary:
   - D: completed without invoice → fails closed ✅
   - 2 static tests ✅
 - The invariant: cycle=COMPLETED ⇒ invoice=PAID AND ledgerTransactionId exists AND real LedgerTransaction exists AND subscription.currentPeriodEnd = cycle.periodEnd. Every caller enforces it.
+
+---
+Task ID: 2B.3.10
+Agent: Lead engineer (main) — SaaS Paid-But-Incomplete Renewal Recovery
+Task: Fix P0: paid invoice can become permanently stuck after renewal completion fails
+
+Work Log:
+- P0: When completeSaasRenewalCycle() failed after financial finalization (invoice paid + ledger posted), the callers (webhook, reconciliation worker, renewSubscription) ignored the failure. No recovery state was set. The reconciliation worker only scanned invoices by status — a PAID invoice was invisible to repair.
+- Fix 1 (webhook): completeSaasRenewalCycle() result is now checked. If completion fails, the cycle is marked RECONCILIATION_REQUIRED. A CRITICAL log is emitted.
+- Fix 2 (reconciliation worker): completeSaasRenewalCycle() result is now checked. If completion fails, the cycle is marked RECONCILIATION_REQUIRED.
+- Fix 3 (renewSubscription): All 4 completion-failure paths now mark the cycle RECONCILIATION_REQUIRED (previously only 1 did).
+- Fix 4 (cycle-driven scan): The reconciliation worker now ALSO scans SaasRenewalCycle.state = RECONCILIATION_REQUIRED — even when the invoice is already PAID. For these cycles, the worker verifies the invoice is paid + ledger exists, then retries ONLY the domain completion (completeSaasRenewalCycle). No payment, no ledger reposting.
+
+Stage Summary:
+- Files changed: src/lib/tenant/saas-subscription.ts, tests/phase2b310-paid-incomplete-recovery.test.ts
+- Tests: 6 tests — all EXECUTED + PASSED
+  - E+F: paid + RECONCILIATION_REQUIRED → worker discovers and repairs ✅ (5 expects, real ledger)
+  - G+H+I: idempotency — second run produces nothing ✅ (3 expects)
+  - 4 static tests ✅
+- The invariant: PAID + LEDGER + CYCLE != COMPLETED → cycle = RECONCILIATION_REQUIRED → worker discovers → retries domain completion only → COMPLETED. No second payment, no second ledger.
