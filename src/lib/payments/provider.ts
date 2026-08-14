@@ -27,14 +27,19 @@ export type PaymentVerification = {
   status: "succeeded" | "failed" | "pending";
   providerReference: string;
   /**
-   * Phase 2B.3.14 P1-4: The authoritative payment timestamp from the provider.
-   * Used as the source of truth for invoice.paidAt — NEVER the worker execution
-   * time. This prevents billing-period drift when reconciliation finalizes a
-   * stale-pending invoice days after the actual payment.
+   * Phase 2B.3.14 P1-4 / Phase 2B.3.19: The authoritative payment timestamp
+   * from the provider. Used as the source of truth for invoice.paidAt — NEVER
+   * the worker execution time. This prevents billing-period drift when
+   * reconciliation finalizes a stale-pending invoice days after the actual
+   * payment.
    *
-   * Providers should normalize their settlement/paid timestamp into this field.
-   * If the provider doesn't expose a timestamp, undefined is returned and the
-   * caller falls back to new Date() (with a warning log).
+   * Providers MUST normalize their settlement/paid timestamp into this field.
+   * If the provider does not expose a timestamp, `undefined` is returned — and
+   * the caller MUST fail closed (refuse to finalize the billing period) rather
+   * than falling back to `new Date()`. A missing payment timestamp is NOT a
+   * reason to invent one.
+   *
+   * Phase 2B.3.19: the previous `new Date()` fallback has been eliminated.
    */
   paidAt?: Date;
   /**

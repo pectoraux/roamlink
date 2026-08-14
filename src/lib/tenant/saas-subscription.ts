@@ -551,16 +551,42 @@ async function activateSubscriptionAndPostLedger(input: {
     return { activated: false };
   }
 
-  // Phase 2B.3.14 P1-6: If paidAt was not provided by the caller (e.g. webhook
-  // path without provider paidAt), set it now as a fallback. This is a best-effort
-  // write — if paidAt is already set (from the guarded write above), this is a no-op.
+  // Phase 2B.3.19: ELIMINATED the new Date() fallback for paidAt.
+  //
+  // The previous code (2B.3.14) had a fallback that set paidAt = new Date()
+  // when the caller didn't provide a provider paidAt. This violated the
+  // invariant that billing periods must be derived from the authoritative
+  // provider payment timestamp — a missing timestamp was treated as "use now",
+  // which could drift the billing period.
+  //
+  // Now: if paidAt was not provided by the caller AND the invoice doesn't
+  // already have one, we refuse to finalize. The invoice goes to
+  // reconciliation_required. The only way forward is for a caller that has
+  // verified the payment (and obtained paidAt) to retry.
+  //
+  // This is fail-closed: "we don't know when the customer paid" is NOT a
+  // reason to invent a payment timestamp.
   if (!input.paidAt) {
-    await db.tenantInvoice.updateMany({
-      where: { id: input.invoiceId, paidAt: null },
-      data: { paidAt: new Date() },
-    }).catch((err) => {
-      logger.error("saas.paidAt_fallback_failed", { invoiceId: input.invoiceId, error: err instanceof Error ? err.message : String(err) });
+    // Check if the invoice already has a paidAt (from a prior verified attempt).
+    const currentInvoice = await db.tenantInvoice.findUnique({
+      where: { id: input.invoiceId },
+      select: { paidAt: true },
     });
+    if (!currentInvoice?.paidAt) {
+      // No paidAt from provider and no prior paidAt — refuse to finalize.
+      logger.error("saas.paidAt_missing_refused", {
+        invoiceId: input.invoiceId, tenantId: input.tenantId,
+        message: "CRITICAL: Cannot finalize invoice without an authoritative paidAt timestamp. The provider did not return paidAt, and no prior paidAt exists. Invoice marked reconciliation_required — a caller with provider verification must retry.",
+      });
+      await db.tenantInvoice.updateMany({
+        where: { id: input.invoiceId, status: { in: ["pending", "reconciliation_required"] } },
+        data: { status: "reconciliation_required", failureReason: "Missing authoritative paidAt — provider did not return payment timestamp" },
+      }).catch((err) => {
+        logger.error("saas.state_update_failed", { invoiceId: input.invoiceId, error: err instanceof Error ? err.message : String(err) });
+      });
+      return { activated: false };
+    }
+    // paidAt already exists from a prior verified attempt — proceed.
   }
 
   // Step 3: Domain activation — for initial subscriptions only.
@@ -899,7 +925,38 @@ async function completeSaasRenewalCycle(input: {
       const sub = lockedSub[0];
 
       // 3. If already COMPLETED, verify the invariant. Repair if stale.
+      // Phase 2B.3.19: The COMPLETED idempotent path now ALSO verifies the
+      // ledger transaction still exists. LedgerTransaction rows are immutable
+      // (no delete path in the codebase), but this check provides defense-in-depth
+      // and explicitly answers: "every call that recognizes COMPLETED independently
+      // proves the ledger still exists." If the ledger was somehow removed, the
+      // cycle is transitioned to RECONCILIATION_REQUIRED rather than returning
+      // a false success.
       if (c.state === "COMPLETED") {
+        // Verify the invoice is still paid and the ledger still exists.
+        if (c.invoiceId) {
+          const invCheck = await tx.tenantInvoice.findUnique({
+            where: { id: c.invoiceId },
+            select: { status: true, ledgerTransactionId: true },
+          });
+          if (!invCheck || invCheck.status !== "paid" || !invCheck.ledgerTransactionId) {
+            logger.error("saas.cycle_completed_invoice_not_ready", {
+              cycleId: c.id, invoiceId: c.invoiceId, invoiceStatus: invCheck?.status,
+            });
+            return { completed: false, reason: "COMPLETED cycle's invoice is no longer paid" };
+          }
+          const ledgerStillExists: Array<{ id: string }> = await tx.$queryRaw`
+            SELECT id FROM "LedgerTransaction" WHERE id = ${invCheck.ledgerTransactionId}
+          `;
+          if (ledgerStillExists.length === 0) {
+            logger.error("saas.cycle_completed_ledger_missing", {
+              cycleId: c.id, invoiceId: c.invoiceId, ledgerTxnId: invCheck.ledgerTransactionId,
+              message: "CRITICAL: COMPLETED cycle references a ledger transaction that no longer exists. Cycle left in COMPLETED state but completion refused — manual audit required.",
+            });
+            return { completed: false, reason: "COMPLETED cycle's ledger transaction no longer exists" };
+          }
+        }
+
         if (sub.currentPeriodEnd.getTime() === c.periodEnd.getTime()) {
           // Invariant holds — idempotent success
           return { completed: true, reason: "already_completed" };
