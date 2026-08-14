@@ -325,12 +325,14 @@ export async function confirmSubscriptionPayment(input: {
 
   // Payment succeeded — attempt financial finalization + activation.
   // Phase 2B.3.14 P1-6: Thread the provider's authoritative paidAt through.
+  // Phase 2B.3.17 P0-4: Pass paymentVerified=true — verifyPayment returned "succeeded".
   const result = await activateSubscriptionAndPostLedger({
     subscriptionId: subscription.id,
     invoiceId: invoice.id,
     tenantId: input.tenantId,
     userId: input.userId,
     paidAt: verification.paidAt,
+    paymentVerified: true,
   });
 
   if (result.activated) {
@@ -367,6 +369,23 @@ async function activateSubscriptionAndPostLedger(input: {
   userId: string;
   /** Phase 2B.3.14 P1-6: Provider's authoritative payment timestamp. */
   paidAt?: Date;
+  /**
+   * Phase 2B.3.17 P0-4: Proof that the provider payment was verified.
+   *
+   * - `true`: the caller has verified the payment with the provider (either
+   *   via verifyPayment() or via a webhook). The ledger MAY be posted for
+   *   a "pending" invoice.
+   * - `false` / `undefined`: the caller has NOT verified the payment. The
+   *   ledger MUST NOT be posted for a "pending" invoice — only "paid" or
+   *   "reconciliation_required" invoices are allowed (these states prove
+   *   the payment was verified in a prior attempt).
+   *
+   * This guard prevents ambiguous payment states from becoming recognized
+   * revenue. An invoice in "pending" status without paymentVerified=true
+   * is refused — the caller must either verify the payment or use the
+   * ambiguous-payment resolution path.
+   */
+  paymentVerified?: boolean;
 }): Promise<{ activated: boolean }> {
   await ensureChartOfAccounts();
 
@@ -374,6 +393,36 @@ async function activateSubscriptionAndPostLedger(input: {
   const invoice = await db.tenantInvoice.findUnique({ where: { id: input.invoiceId } });
   if (!invoice) {
     throw new AppError("not_found", "Invoice not found", 404, "Invoice not found during activation.");
+  }
+
+  // Phase 2B.3.17 P0-4: GUARD — refuse to post revenue for an unverified payment.
+  //
+  // If the invoice is "pending" AND the caller did not provide
+  // paymentVerified=true, this is an ambiguous payment state. The payment
+  // was never confirmed by the provider. We MUST NOT post the ledger —
+  // that would recognize revenue without proof of payment.
+  //
+  // The only callers that may pass paymentVerified=true are:
+  //   - confirmSubscriptionPayment (after verifyPayment returns "succeeded")
+  //   - handleSaasPaymentWebhook (after webhook reports "succeeded")
+  //   - renewSubscription direct path (after verifyPayment returns "succeeded")
+  //   - processDueSaasFinancialReconciliation stale-pending scan (after
+  //     verifyPayment returns "succeeded")
+  //
+  // The renewal RECONCILIATION_REQUIRED path does NOT pass paymentVerified
+  // because it relies on the invoice being in "reconciliation_required" status
+  // (which proves the payment was verified in a prior attempt). If the invoice
+  // is "pending" in that path, it means the payment was NEVER verified —
+  // this is the ambiguous case, and it is refused here.
+  if (invoice.status === "pending" && !input.paymentVerified) {
+    logger.error("saas.activation_refused_unverified_payment", {
+      invoiceId: input.invoiceId,
+      invoiceStatus: invoice.status,
+      hasProviderReference: !!invoice.providerReference,
+      paymentVerified: input.paymentVerified ?? false,
+      message: "CRITICAL: Refused to post ledger for a pending invoice without payment verification. This prevents ambiguous payment states from becoming recognized revenue.",
+    });
+    return { activated: false };
   }
 
   // Phase 2B.3.14 P1-6: Record paidAt BEFORE attempting the ledger posting.
@@ -1101,11 +1150,35 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     }
   }
 
+  // Phase 2B.3.17 P0-1/P0-3: AMBIGUOUS_PAYMENT is a separate state from
+  // RECONCILIATION_REQUIRED. It represents a payment-operation creation that
+  // timed out without a providerReference — the payment may or may not exist
+  // at the provider. It MUST NOT be fed into activateSubscriptionAndPostLedger(),
+  // because that would post revenue without proof of payment.
+  if (cycle.state === "AMBIGUOUS_PAYMENT") {
+    logger.error("saas.renewal_refused_ambiguous_payment", {
+      cycleId: cycle.id, tenantId, subscriptionId: subscription.id,
+      message: "CRITICAL: Renewal refused for AMBIGUOUS_PAYMENT cycle. This state requires manual/provider audit to determine whether a payment operation was created. Revenue must NOT be recognized until the ambiguity is resolved.",
+    });
+    return {
+      success: false,
+      status: "error",
+      reason: "Cycle is in AMBIGUOUS_PAYMENT state — manual/provider audit required before renewal can proceed",
+    };
+  }
+
   // If the cycle is RECONCILIATION_REQUIRED, attempt to finalize the existing invoice.
+  // Phase 2B.3.17 P0-4: This path does NOT pass paymentVerified=true.
+  // The guard inside activateSubscriptionAndPostLedger() will refuse to post
+  // the ledger if the invoice is "pending" (unverified). Only invoices in
+  // "reconciliation_required" or "paid" status are allowed — these prove the
+  // payment was verified in a prior attempt.
   if (cycle.state === "RECONCILIATION_REQUIRED" || cycle.state === "FINANCIAL_POSTED") {
     if (!cycle.invoiceId) {
       return { success: false, status: "error", reason: "Cycle in financial state but no invoice" };
     }
+    // Phase 2B.3.17 P0-4: paymentVerified is intentionally NOT passed here.
+    // If the invoice is "pending", the guard refuses the ledger posting.
     const result = await activateSubscriptionAndPostLedger({
       subscriptionId: subscription.id,
       invoiceId: cycle.invoiceId,
@@ -1436,10 +1509,18 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     // PAYMENT_PENDING if it was in PAYMENT_CREATING — the payment intent exists
     // at the provider, we just don't have confirmation yet). The reconciliation
     // worker will pick it up and re-verify.
-    await db.saasRenewalCycle.updateMany({
+    // Phase 2B.3.17: Remove silent .catch(() => {}) — emit CRITICAL on failure.
+    const pendingTransition = await db.saasRenewalCycle.updateMany({
       where: { id: cycle.id, state: "PAYMENT_CREATING" },
       data: { state: "PAYMENT_PENDING" },
-    }).catch(() => {}); // If not in PAYMENT_CREATING, no-op
+    });
+    if (pendingTransition.count === 0) {
+      // Not in PAYMENT_CREATING — could be a concurrent transition. Log for visibility.
+      logger.info("saas.payment_creating_to_pending_noop", {
+        cycleId: cycle.id, tenantId, subscriptionId: subscription.id,
+        message: "Cycle was not in PAYMENT_CREATING — may have been concurrently transitioned.",
+      });
+    }
     return { success: false, status: "past_due", reason: "Payment pending" };
   }
 
@@ -1453,12 +1534,14 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
 
   // Attempt financial finalization.
   // Phase 2B.3.14 P1-6: Thread provider paidAt through.
+  // Phase 2B.3.17 P0-4: Pass paymentVerified=true — verifyPayment returned "succeeded".
   const result = await activateSubscriptionAndPostLedger({
     subscriptionId: subscription.id,
     invoiceId: invoice.id,
     tenantId,
     userId: "renewal-worker",
     paidAt: verification.paidAt,
+    paymentVerified: true,
   });
 
   if (!result.activated) {
@@ -1573,12 +1656,14 @@ export async function handleSaasPaymentWebhook(input: {
   }
 
   if (input.status === "succeeded") {
+    // Phase 2B.3.17 P0-4: Pass paymentVerified=true — webhook reports "succeeded".
     const result = await activateSubscriptionAndPostLedger({
       subscriptionId: invoice.subscriptionId,
       invoiceId: invoice.id,
       tenantId: invoice.tenantId,
       userId: "webhook",
       paidAt: input.paidAt,
+      paymentVerified: true,
     });
 
     // Phase 2B.3.10: If financial finalization succeeded, complete the renewal cycle.
@@ -1736,12 +1821,17 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
       // For reconciliation_required invoices, the payment was already verified
       // by the original caller. The ledger just needs to be retried.
       // For stale-pending invoices that just verified as succeeded, use the provider paidAt.
+      // Phase 2B.3.17 P0-4: Pass paymentVerified=true when we just verified the
+      // payment (stalePendingPaidAt is set). For reconciliation_required invoices,
+      // paymentVerified is false — but the invoice status is "reconciliation_required"
+      // (not "pending"), so the guard inside activateSubscriptionAndPostLedger allows it.
       const activated = await activateSubscriptionAndPostLedger({
         subscriptionId: invoice.subscriptionId,
         invoiceId: invoice.id,
         tenantId: invoice.tenantId,
         userId: "reconciliation-worker",
         paidAt: stalePendingPaidAt,
+        paymentVerified: !!stalePendingPaidAt,
       });
       if (activated.activated) {
         result.repaired++;
@@ -1799,10 +1889,18 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
   for (const cycle of stuckCreatingCycles) {
     if (!cycle.invoiceId) {
       // No invoice — reset to PENDING so renewSubscription can retry from scratch.
-      await db.saasRenewalCycle.updateMany({
+      // Phase 2B.3.17: Remove silent .catch(() => {}) — emit CRITICAL on failure.
+      const noInvResult = await db.saasRenewalCycle.updateMany({
         where: { id: cycle.id, state: "PAYMENT_CREATING" },
         data: { state: "PENDING", failureReason: "Payment creation timed out — no invoice linked" },
-      }).catch(() => {});
+      });
+      if (noInvResult.count === 0) {
+        logger.error("saas.stuck_creating_no_invoice_reset_failed", {
+          cycleId: cycle.id, tenantId: cycle.tenantId, subscriptionId: cycle.subscriptionId,
+          previousState: "PAYMENT_CREATING", intendedState: "PENDING",
+          message: "CRITICAL: Failed to reset stuck PAYMENT_CREATING cycle with no invoice.",
+        });
+      }
       continue;
     }
 
@@ -1820,10 +1918,19 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
       logger.info("saas.stuck_creating_has_reference", {
         cycleId: cycle.id, invoiceId: cycle.invoiceId, providerReference: inv.providerReference,
       });
-      await db.saasRenewalCycle.updateMany({
+      // Phase 2B.3.17: Remove silent .catch(() => {}) — emit CRITICAL on failure.
+      const hasRefResult = await db.saasRenewalCycle.updateMany({
         where: { id: cycle.id, state: "PAYMENT_CREATING" },
         data: { state: "PAYMENT_PENDING", failureReason: null },
-      }).catch(() => {});
+      });
+      if (hasRefResult.count === 0) {
+        logger.error("saas.stuck_creating_has_reference_reset_failed", {
+          cycleId: cycle.id, tenantId: cycle.tenantId, subscriptionId: cycle.subscriptionId,
+          invoiceId: cycle.invoiceId, providerReference: inv.providerReference,
+          previousState: "PAYMENT_CREATING", intendedState: "PAYMENT_PENDING",
+          message: "CRITICAL: Failed to transition stuck PAYMENT_CREATING cycle with reference to PAYMENT_PENDING.",
+        });
+      }
       result.retried++;
     } else {
       // The payment operation was NOT created (or we can't prove it was).
@@ -1832,22 +1939,31 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
       // the reference. In this case, we CANNOT safely call createPaymentIntent
       // again without risking a second payment operation.
       //
-      // Recovery strategy: transition to RECONCILIATION_REQUIRED with a
-      // specific failure reason. This requires manual intervention or a
-      // provider-level audit to determine whether the payment operation was
-      // created. The system does NOT automatically retry — that would risk
-      // a double charge.
+      // Phase 2B.3.17 P0-1/P0-3: Use AMBIGUOUS_PAYMENT (NOT RECONCILIATION_REQUIRED).
+      // This state is NOT eligible for activateSubscriptionAndPostLedger() —
+      // it must NOT post revenue. The only way out is a provider-resolution
+      // step (resolveAmbiguousPayment) that either recovers the reference or
+      // proves the operation doesn't exist.
       logger.error("saas.stuck_creating_ambiguous", {
-        cycleId: cycle.id, invoiceId: cycle.invoiceId,
+        cycleId: cycle.id, invoiceId: cycle.invoiceId, tenantId: cycle.tenantId,
+        subscriptionId: cycle.subscriptionId,
         message: "CRITICAL: Payment creation timed out with no providerReference. Cannot safely retry — may require manual provider audit to determine if a payment operation was created.",
       });
-      await db.saasRenewalCycle.updateMany({
+      const ambResult = await db.saasRenewalCycle.updateMany({
         where: { id: cycle.id, state: "PAYMENT_CREATING" },
         data: {
-          state: "RECONCILIATION_REQUIRED",
-          failureReason: "Payment creation timed out with no providerReference — ambiguous state, may require manual provider audit",
+          state: "AMBIGUOUS_PAYMENT",
+          failureReason: "Payment creation timed out with no providerReference — ambiguous state, requires provider audit or manual resolution",
         },
-      }).catch(() => {});
+      });
+      if (ambResult.count === 0) {
+        logger.error("saas.ambiguous_state_persist_failed", {
+          cycleId: cycle.id, tenantId: cycle.tenantId, subscriptionId: cycle.subscriptionId,
+          previousState: "PAYMENT_CREATING",
+          intendedState: "AMBIGUOUS_PAYMENT",
+          message: "CRITICAL: Failed to persist AMBIGUOUS_PAYMENT state. The cycle may remain stuck in PAYMENT_CREATING.",
+        });
+      }
       result.stillFailing++;
     }
   }
@@ -1953,4 +2069,134 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
   }
 
   return result;
+}
+
+/**
+ * Phase 2B.3.17 P0-2: Resolve an AMBIGUOUS_PAYMENT cycle.
+ *
+ * This is the ONLY safe way out of the AMBIGUOUS_PAYMENT state. It requires
+ * a providerReference that was recovered via a manual provider audit.
+ *
+ * The function:
+ *   1. Verifies the payment with the provider using the recovered reference.
+ *   2. If verification succeeds: persists the providerReference on the invoice,
+ *      transitions the cycle to PAYMENT_PENDING, and lets the normal flow proceed.
+ *   3. If verification fails: transitions the cycle to PENDING so a new payment
+ *      operation can be safely created (the provider confirmed no payment exists).
+ *   4. If verification is pending: leaves the cycle in AMBIGUOUS_PAYMENT —
+ *      the caller should retry later.
+ *
+ * This function is intentionally NOT called automatically by the reconciliation
+ * worker. It requires a human to recover the providerReference from the
+ * provider's dashboard/API. The system does NOT guess.
+ */
+export async function resolveAmbiguousPayment(input: {
+  cycleId: string;
+  tenantId: string;
+  /** The providerReference recovered from a manual provider audit. */
+  providerReference: string;
+}): Promise<{ resolved: boolean; status: string; reason?: string }> {
+  const cycle = await db.saasRenewalCycle.findUnique({
+    where: { id: input.cycleId },
+    select: { id: true, state: true, invoiceId: true, tenantId: true, subscriptionId: true },
+  });
+
+  if (!cycle) {
+    return { resolved: false, status: "error", reason: "Cycle not found" };
+  }
+
+  if (cycle.tenantId !== input.tenantId) {
+    return { resolved: false, status: "error", reason: "Cross-tenant access denied" };
+  }
+
+  if (cycle.state !== "AMBIGUOUS_PAYMENT") {
+    return { resolved: false, status: "error", reason: `Cycle is not in AMBIGUOUS_PAYMENT state (current: ${cycle.state})` };
+  }
+
+  if (!cycle.invoiceId) {
+    return { resolved: false, status: "error", reason: "No invoice linked to cycle" };
+  }
+
+  // Resolve the provider from the invoice's paymentProvider field.
+  const invoice = await db.tenantInvoice.findUnique({
+    where: { id: cycle.invoiceId },
+    select: { paymentProvider: true, idempotencyKey: true },
+  });
+  if (!invoice) {
+    return { resolved: false, status: "error", reason: "Invoice not found" };
+  }
+
+  const provider = getPaymentProviderByKey(invoice.paymentProvider || "mock");
+
+  // Verify the payment with the provider using the recovered reference.
+  const verification = await provider.verifyPayment({
+    providerReference: input.providerReference,
+    idempotencyKey: invoice.idempotencyKey,
+  });
+
+  if (verification.status === "succeeded") {
+    // The provider confirms the payment exists and succeeded.
+    // Persist the providerReference + paidAt, transition to PAYMENT_PENDING,
+    // then directly trigger financial finalization (we already verified the payment).
+    logger.info("saas.ambiguous_resolved_succeeded", {
+      cycleId: cycle.id, invoiceId: cycle.invoiceId, providerReference: input.providerReference,
+    });
+    await db.tenantInvoice.update({
+      where: { id: cycle.invoiceId },
+      data: { providerReference: input.providerReference },
+    });
+    if (verification.paidAt) {
+      await db.tenantInvoice.updateMany({
+        where: { id: cycle.invoiceId, paidAt: null },
+        data: { paidAt: verification.paidAt },
+      }).catch((err) => {
+        logger.error("saas.ambiguous_paidAt_failed", {
+          invoiceId: cycle.invoiceId, error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
+    await db.saasRenewalCycle.updateMany({
+      where: { id: cycle.id, state: "AMBIGUOUS_PAYMENT" },
+      data: { state: "PAYMENT_PENDING", failureReason: null },
+    });
+    // Phase 2B.3.17 P0-2: We already verified the payment — proceed directly
+    // to financial finalization. Don't wait for the reconciliation worker.
+    const activated = await activateSubscriptionAndPostLedger({
+      subscriptionId: cycle.subscriptionId,
+      invoiceId: cycle.invoiceId,
+      tenantId: cycle.tenantId,
+      userId: "ambiguous-resolver",
+      paidAt: verification.paidAt,
+      paymentVerified: true,
+    });
+    if (activated.activated) {
+      // Complete the renewal cycle.
+      const completion = await completeSaasRenewalCycle({ invoiceId: cycle.invoiceId, tenantId: cycle.tenantId });
+      if (completion.completed) {
+        return { resolved: true, status: "resolved_succeeded" };
+      }
+    }
+    // If finalization didn't complete, the cycle is in PAYMENT_PENDING — the
+    // reconciliation worker will pick it up on the next run.
+    return { resolved: true, status: "resolved_succeeded_pending_finalization" };
+  }
+
+  if (verification.status === "failed") {
+    // The provider confirms no payment exists (or it failed).
+    // Safe to retry — transition to PENDING so renewSubscription can create a new payment.
+    logger.info("saas.ambiguous_resolved_failed", {
+      cycleId: cycle.id, invoiceId: cycle.invoiceId, providerReference: input.providerReference,
+    });
+    await db.saasRenewalCycle.updateMany({
+      where: { id: cycle.id, state: "AMBIGUOUS_PAYMENT" },
+      data: { state: "PENDING", failureReason: "Provider audit confirmed no payment exists — safe to retry" },
+    });
+    return { resolved: true, status: "resolved_failed" };
+  }
+
+  // verification.status === "pending" — leave in AMBIGUOUS_PAYMENT
+  logger.info("saas.ambiguous_resolved_pending", {
+    cycleId: cycle.id, invoiceId: cycle.invoiceId, providerReference: input.providerReference,
+  });
+  return { resolved: false, status: "pending", reason: "Provider verification returned pending — retry later" };
 }
