@@ -105,9 +105,12 @@ export class PayStackProvider implements PaymentProvider {
     const status = data.data.status; // success | failed | abandoned | pending
     const mapped: PaymentVerification["status"] =
       status === "success" ? "succeeded" : status === "pending" ? "pending" : "failed";
+    // Phase 2B.3.14 P1-5: PayStack provides paidAt as `paid_at` (ISO string).
+    const paidAtStr = data.data.paid_at || data.data.paidAt;
     return {
       status: mapped,
       providerReference: input.providerReference,
+      paidAt: mapped === "succeeded" && paidAtStr ? new Date(paidAtStr) : undefined,
       raw: data.data,
     };
   }
@@ -125,6 +128,7 @@ export class PayStackProvider implements PaymentProvider {
       const evt = parsed.event; // charge.success, etc.
       const ref = parsed.data?.reference;
       const status = parsed.data?.status === "success" ? "succeeded" : parsed.data?.status === "pending" ? "pending" : "failed";
+      const paidAtStr = parsed.data?.paid_at || parsed.data?.paidAt;
       return {
         externalId: `${ref}-${evt}`,
         eventType: evt,
@@ -132,6 +136,8 @@ export class PayStackProvider implements PaymentProvider {
           providerReference: ref,
           status,
           amountMinor: parsed.data?.amount != null ? fromPaystackAmount(Number(parsed.data.amount)) : undefined,
+          // Phase 2B.3.14 P1-5: PayStack webhook provides paid_at
+          paidAt: status === "succeeded" && paidAtStr ? new Date(paidAtStr) : undefined,
         },
         raw: parsed,
       };

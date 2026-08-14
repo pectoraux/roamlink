@@ -26,6 +26,17 @@ export type PaymentIntentResult = {
 export type PaymentVerification = {
   status: "succeeded" | "failed" | "pending";
   providerReference: string;
+  /**
+   * Phase 2B.3.14 P1-4: The authoritative payment timestamp from the provider.
+   * Used as the source of truth for invoice.paidAt — NEVER the worker execution
+   * time. This prevents billing-period drift when reconciliation finalizes a
+   * stale-pending invoice days after the actual payment.
+   *
+   * Providers should normalize their settlement/paid timestamp into this field.
+   * If the provider doesn't expose a timestamp, undefined is returned and the
+   * caller falls back to new Date() (with a warning log).
+   */
+  paidAt?: Date;
   /** Raw provider response — server-side only. */
   raw?: unknown;
 };
@@ -67,6 +78,8 @@ export type PaymentWebhookEvent = {
     providerReference?: string;
     status?: "succeeded" | "failed" | "pending";
     amountMinor?: number;
+    /** Phase 2B.3.14 P1-5: Provider's authoritative payment timestamp. */
+    paidAt?: Date;
   };
   raw: unknown;
 };

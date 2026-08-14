@@ -54,6 +54,8 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ pro
       providerKey,
       providerReference,
       status: status as "succeeded" | "failed" | "pending",
+      // Phase 2B.3.14 P1-6: Thread the provider's authoritative paidAt through.
+      paidAt: event.data.paidAt,
     });
 
     return NextResponse.json({ ok: true, handled: result.handled }, 200);

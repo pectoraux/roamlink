@@ -560,8 +560,10 @@ describe("Phase 2B.3.13 — Deterministic Initial Billing Period", () => {
 
     // It MUST derive periodStart from invoice.paidAt (first activation) or
     // reuse the existing inv.periodStart (retry).
+    // Phase 2B.3.14: the reuse path now uses a local variable `ps` (from inv.periodStart)
+    // for validation, but the assignment still reads from inv.periodStart.
     expect(body).toContain("periodStart = inv.paidAt");
-    expect(body).toContain("periodStart = inv.periodStart");
+    expect(body).toContain("periodStart = ps");
   }, 10000);
 
   it("Static: activateInitialSaasSubscription reuses existing invoice period", async () => {

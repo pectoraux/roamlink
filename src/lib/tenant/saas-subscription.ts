@@ -71,7 +71,7 @@ export async function createSubscriptionIntent(input: {
   if (plan.status !== "active") {
     throw new AppError("conflict", "Plan not available", 409, `Plan "${planName}" is not active.`);
   }
-  if (plan.monthlyPriceMinor === 0) {
+  if (plan.monthlyPriceMinor <= 0) {
     throw new AppError("validation", "Cannot subscribe to free plan", 400, "The free plan does not require a subscription. It is the default when no paid subscription exists.");
   }
 
@@ -228,12 +228,31 @@ export async function confirmSubscriptionPayment(input: {
   });
 
   if (verification.status === "failed") {
-    await db.tenantInvoice.update({
-      where: { id: invoice.id },
+    // Phase 2B.3.14 P0-1: GUARDED transition — never overwrite a concurrently-paid invoice.
+    // The provider observation may be stale: a webhook may have finalized the invoice
+    // while verifyPayment() was in flight. The mutation must be PostgreSQL-atomic:
+    // only transition if the invoice is still in a pending state.
+    const guarded = await db.tenantInvoice.updateMany({
+      where: { id: invoice.id, status: "pending" },
       data: { status: "failed", failureReason: "Payment verification failed" },
     });
-    await db.tenantSubscription.update({
-      where: { id: subscription.id },
+    if (guarded.count === 0) {
+      // The invoice was no longer pending — a concurrent worker advanced it.
+      // Re-read to understand the current state and do NOT overwrite it.
+      const current = await db.tenantInvoice.findUnique({ where: { id: invoice.id }, select: { status: true } });
+      logger.info("saas.confirm_failed_invoice_already_advanced", {
+        invoiceId: invoice.id, currentStatus: current?.status,
+      });
+      // If it's now paid, the subscription should reflect that.
+      if (current?.status === "paid") {
+        return { status: "active" };
+      }
+      return { status: current?.status ?? "unknown" };
+    }
+    // Only transition the subscription to past_due if the invoice was actually
+    // transitioned to failed (guarded).
+    await db.tenantSubscription.updateMany({
+      where: { id: subscription.id, status: { in: ["pending_payment", "active", "trialing"] } },
       data: { status: "past_due" },
     });
     return { status: "past_due" };
@@ -243,12 +262,14 @@ export async function confirmSubscriptionPayment(input: {
     return { status: "pending_payment" };
   }
 
-  // Payment succeeded — attempt financial finalization + activation
+  // Payment succeeded — attempt financial finalization + activation.
+  // Phase 2B.3.14 P1-6: Thread the provider's authoritative paidAt through.
   const result = await activateSubscriptionAndPostLedger({
     subscriptionId: subscription.id,
     invoiceId: invoice.id,
     tenantId: input.tenantId,
     userId: input.userId,
+    paidAt: verification.paidAt,
   });
 
   if (result.activated) {
@@ -283,6 +304,8 @@ async function activateSubscriptionAndPostLedger(input: {
   invoiceId: string;
   tenantId: string;
   userId: string;
+  /** Phase 2B.3.14 P1-6: Provider's authoritative payment timestamp. */
+  paidAt?: Date;
 }): Promise<{ activated: boolean }> {
   await ensureChartOfAccounts();
 
@@ -290,6 +313,25 @@ async function activateSubscriptionAndPostLedger(input: {
   const invoice = await db.tenantInvoice.findUnique({ where: { id: input.invoiceId } });
   if (!invoice) {
     throw new AppError("not_found", "Invoice not found", 404, "Invoice not found during activation.");
+  }
+
+  // Phase 2B.3.14 P1-6: Record paidAt BEFORE attempting the ledger posting.
+  // This is a guarded, immutable write — only sets paidAt if it's not already set.
+  // This ensures that if the ledger fails and the invoice goes to reconciliation_required,
+  // paidAt is already captured from the original payment verification. On retry,
+  // paidAt is preserved (not overwritten with the retry time).
+  //
+  // The billing period (set by activateInitialSaasSubscription) is derived from
+  // this paidAt — so it reflects the actual payment time, not the recovery time.
+  if (input.paidAt) {
+    const paidAtResult = await db.tenantInvoice.updateMany({
+      where: { id: input.invoiceId, paidAt: null, status: { in: ["pending", "reconciliation_required"] } },
+      data: { paidAt: input.paidAt },
+    });
+    if (paidAtResult.count > 0) {
+      logger.info("saas.paidAt_recorded", { invoiceId: input.invoiceId, paidAt: input.paidAt });
+    }
+    // If count === 0, paidAt was already set (from a prior attempt) — preserve it.
   }
 
   // Phase 2B.3.11 P0-2: Idempotent fast path must verify ledger existence.
@@ -380,10 +422,13 @@ async function activateSubscriptionAndPostLedger(input: {
     return { activated: false };
   }
 
-  // Step 2: Ledger succeeded — mark invoice as paid + link the ledger transaction
+  // Step 2: Ledger succeeded — mark invoice as paid + link the ledger transaction.
+  // Phase 2B.3.14 P1-6: Do NOT set paidAt here — it was already set guardedly above
+  // (or was already set from a prior attempt). This prevents overwriting the
+  // authoritative provider payment timestamp with the ledger-posting time.
   const updated = await db.tenantInvoice.updateMany({
     where: { id: input.invoiceId, status: { in: ["pending", "reconciliation_required"] } },
-    data: { status: "paid", paidAt: new Date(), ledgerTransactionId: ledgerTxnId, failureReason: null },
+    data: { status: "paid", ledgerTransactionId: ledgerTxnId, failureReason: null },
   });
 
   if (updated.count === 0) {
@@ -394,6 +439,18 @@ async function activateSubscriptionAndPostLedger(input: {
     }
     logger.warn("saas.invoice_unexpected_state", { invoiceId: input.invoiceId, status: current?.status });
     return { activated: false };
+  }
+
+  // Phase 2B.3.14 P1-6: If paidAt was not provided by the caller (e.g. webhook
+  // path without provider paidAt), set it now as a fallback. This is a best-effort
+  // write — if paidAt is already set (from the guarded write above), this is a no-op.
+  if (!input.paidAt) {
+    await db.tenantInvoice.updateMany({
+      where: { id: input.invoiceId, paidAt: null },
+      data: { paidAt: new Date() },
+    }).catch((err) => {
+      logger.error("saas.paidAt_fallback_failed", { invoiceId: input.invoiceId, error: err instanceof Error ? err.message : String(err) });
+    });
   }
 
   // Step 3: Domain activation — for initial subscriptions only.
@@ -470,7 +527,7 @@ async function activateInitialSaasSubscription(input: {
       reason: string;
       periodStart?: Date;
       periodEnd?: Date;
-      periodSource?: "reused" | "paidAt";
+      periodSource?: "reused" | "paidAt" | "validated";
     };
     const result: ActivationResult = await db.$transaction(async (tx) => {
       // 1. Lock the invoice — Phase 2B.3.13: also load paidAt + existing periods
@@ -518,18 +575,77 @@ async function activateInitialSaasSubscription(input: {
         return { activated: true, reason: "already_active" };
       }
 
-      // 5. Phase 2B.3.13: Derive billing period DETERMINISTICALLY.
+      // 5. Phase 2B.3.13/2B.3.14: Derive billing period DETERMINISTICALLY.
       //    The billing clock starts when the customer pays — never when a
       //    recovery worker happens to repair the domain state.
       let periodStart: Date;
       let periodEnd: Date;
-      let periodSource: "reused" | "paidAt";
+      let periodSource: "reused" | "paidAt" | "validated";
       if (inv.periodStart && inv.periodEnd) {
-        // Durable recorded period from a prior (committed) attempt —
-        // retry MUST NOT drift the period. Reuse the recorded dates verbatim.
-        periodStart = inv.periodStart;
-        periodEnd = inv.periodEnd;
-        periodSource = "reused";
+        // Phase 2B.3.14 P1-9: VALIDATE the existing period before reusing it.
+        // Blind reuse preserves corrupt values — we must verify consistency.
+        const ps = inv.periodStart;
+        const pe = inv.periodEnd;
+
+        // 5a. Temporal sanity: periodEnd must be after periodStart.
+        if (pe.getTime() <= ps.getTime()) {
+          logger.error("saas.existing_period_invalid_duration", {
+            invoiceId: input.invoiceId, periodStart: ps, periodEnd: pe,
+          });
+          return { activated: false, reason: "Existing invoice period is invalid (periodEnd <= periodStart)" };
+        }
+
+        // 5b. Duration must match the billing cycle (within tolerance).
+        // Monthly: 28-31 days. Yearly: 365-366 days.
+        const durationDays = (pe.getTime() - ps.getTime()) / 86400000;
+        if (input.billingCycle === "yearly") {
+          if (durationDays < 360 || durationDays > 367) {
+            logger.error("saas.existing_period_duration_mismatch", {
+              invoiceId: input.invoiceId, billingCycle: input.billingCycle, durationDays,
+            });
+            return { activated: false, reason: `Existing period duration (${durationDays.toFixed(1)} days) doesn't match yearly billing cycle` };
+          }
+        } else {
+          if (durationDays < 27 || durationDays > 32) {
+            logger.error("saas.existing_period_duration_mismatch", {
+              invoiceId: input.invoiceId, billingCycle: input.billingCycle, durationDays,
+            });
+            return { activated: false, reason: `Existing period duration (${durationDays.toFixed(1)} days) doesn't match monthly billing cycle` };
+          }
+        }
+
+        // 5c. If paidAt is available, verify periodStart is consistent with it.
+        // For initial subscriptions, periodStart should equal paidAt (the financial event).
+        // If they differ significantly, the recorded period may be corrupt.
+        if (inv.paidAt) {
+          const diffMs = Math.abs(ps.getTime() - inv.paidAt.getTime());
+          const diffDays = diffMs / 86400000;
+          if (diffDays > 1) {
+            // periodStart doesn't match paidAt — fall through to paidAt derivation
+            // rather than reusing the inconsistent period. This is a repair, not a refusal.
+            logger.warn("saas.existing_period_inconsistent_with_paidAt", {
+              invoiceId: input.invoiceId, periodStart: ps, paidAt: inv.paidAt, diffDays: diffDays.toFixed(1),
+              message: "Existing periodStart doesn't match paidAt — re-deriving from paidAt.",
+            });
+            periodStart = inv.paidAt;
+            periodEnd = new Date(periodStart.getTime());
+            if (input.billingCycle === "yearly") {
+              periodEnd.setFullYear(periodEnd.getFullYear() + 1);
+            } else {
+              periodEnd.setMonth(periodEnd.getMonth() + 1);
+            }
+            periodSource = "validated";
+          } else {
+            periodStart = ps;
+            periodEnd = pe;
+            periodSource = "reused";
+          }
+        } else {
+          // No paidAt to compare against — reuse the recorded period (duration was validated).
+          periodStart = ps;
+          periodEnd = pe;
+          periodSource = "reused";
+        }
       } else if (inv.paidAt) {
         // First activation — anchor to the financial event that created the subscription.
         periodStart = inv.paidAt;
@@ -717,6 +833,20 @@ async function completeSaasRenewalCycle(input: {
         return { completed: false, reason: `Invoice not ready (status: ${invoice?.status})` };
       }
 
+      // Phase 2B.3.14 P1-7: Verify the referenced LedgerTransaction ACTUALLY EXISTS
+      // inside the helper's own transaction — symmetric with activateInitialSaasSubscription.
+      // The authoritative completion function must NOT trust a non-null ledgerTransactionId
+      // without proving the row exists.
+      const ledgerCheck: Array<{ id: string }> = await tx.$queryRaw`
+        SELECT id FROM "LedgerTransaction" WHERE id = ${invoice.ledgerTransactionId}
+      `;
+      if (ledgerCheck.length === 0) {
+        logger.error("saas.cycle_completion_dangling_ledger", {
+          cycleId: c.id, invoiceId: c.invoiceId, ledgerTxnId: invoice.ledgerTransactionId,
+        });
+        return { completed: false, reason: "Ledger transaction referenced by invoice does not exist (dangling reference)" };
+      }
+
       // 5. Update the subscription period FIRST (before marking cycle COMPLETED)
       await tx.tenantSubscription.update({
         where: { id: c.subscriptionId },
@@ -779,14 +909,32 @@ export async function cancelSubscription(input: {
     throw new AppError("not_found", "No subscription found", 404, "This tenant has no subscription.");
   }
 
-  await db.tenantSubscription.update({
-    where: { id: subscription.id },
+  // Phase 2B.3.14 P2-10: Guard cancellation against financial recovery states.
+  // A subscription in reconciliation_required has a paid invoice + posted ledger
+  // that is awaiting domain activation. Cancelling it would orphan the financial
+  // state with no recovery path.
+  if (subscription.status === "reconciliation_required") {
+    throw new AppError(
+      "conflict",
+      "Cannot cancel subscription in recovery state",
+      409,
+      "This subscription has a pending financial reconciliation. Wait for the reconciliation worker to complete before cancelling, or contact support.",
+    );
+  }
+
+  // Phase 2B.3.14 P2-10: Guarded transition — only cancel if not already cancelled.
+  const result = await db.tenantSubscription.updateMany({
+    where: { id: subscription.id, status: { not: "cancelled" } },
     data: {
       status: "cancelled",
       cancelledAt: new Date(),
       cancelReason: input.reason ?? null,
     },
   });
+  if (result.count === 0) {
+    // Already cancelled — idempotent
+    return { status: "cancelled", currentPeriodEnd: subscription.currentPeriodEnd };
+  }
 
   await audit({
     tenantId: input.tenantId,
@@ -822,6 +970,26 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
   // Don't renew cancelled subscriptions
   if (subscription.status === "cancelled") {
     return { success: false, status: "cancelled", reason: "Subscription is cancelled" };
+  }
+
+  // Phase 2B.3.14 P2-13: Don't renew free plans through the paid SaaS machinery.
+  // Free plans have monthlyPriceMinor = 0 — the ledger rejects zero-amount
+  // transactions, and there's no payment to process. Free-plan subscriptions
+  // should be handled by a separate product-level flow, not the payment pipeline.
+  if (subscription.saaasPlan && subscription.saaasPlan.monthlyPriceMinor <= 0) {
+    logger.info("saas.free_plan_renewal_skipped", { tenantId, planName: subscription.saaasPlan.name });
+    // Extend the period without payment/ledger — free plan.
+    const newPeriodEnd = new Date(subscription.currentPeriodEnd.getTime());
+    if (subscription.billingCycle === "yearly") {
+      newPeriodEnd.setFullYear(newPeriodEnd.getFullYear() + 1);
+    } else {
+      newPeriodEnd.setMonth(newPeriodEnd.getMonth() + 1);
+    }
+    await db.tenantSubscription.updateMany({
+      where: { id: subscription.id, status: { in: ["active", "past_due"] } },
+      data: { status: "active", currentPeriodEnd: newPeriodEnd },
+    });
+    return { success: true, status: "active" };
   }
 
   // Don't renew if the current period hasn't ended yet
@@ -941,8 +1109,9 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     // Phase 2B.3.8: Use the single authoritative completion function.
     // NO direct cycle/subscription mutation outside completeSaasRenewalCycle().
     if (!cycle.invoiceId) {
-      await db.saasRenewalCycle.update({
-        where: { id: cycle.id },
+      // Phase 2B.3.14 P2-12: Guarded — only update invoiceId if not already set.
+      await db.saasRenewalCycle.updateMany({
+        where: { id: cycle.id, invoiceId: null },
         data: { invoiceId: existingInvoice.id },
       });
     }
@@ -977,9 +1146,10 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     update: {},
   });
 
-  // Link the invoice to the cycle + transition to PAYMENT_PENDING
-  await db.saasRenewalCycle.update({
-    where: { id: cycle.id },
+  // Link the invoice to the cycle + transition to PAYMENT_PENDING.
+  // Phase 2B.3.14 P2-12: Guarded — don't overwrite COMPLETED or RECONCILIATION_REQUIRED.
+  await db.saasRenewalCycle.updateMany({
+    where: { id: cycle.id, state: { notIn: ["COMPLETED", "RECONCILIATION_REQUIRED", "PAYMENT_PENDING"] } },
     data: { state: "PAYMENT_PENDING", invoiceId: invoice.id },
   });
 
@@ -999,7 +1169,10 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
 
   // If the invoice is reconciliation_required, attempt to finalize
   if (invoice.status === "reconciliation_required") {
-    await db.saasRenewalCycle.update({ where: { id: cycle.id }, data: { state: "FINANCIAL_POSTED" } });
+    await db.saasRenewalCycle.updateMany({
+      where: { id: cycle.id, state: { notIn: ["COMPLETED", "RECONCILIATION_REQUIRED"] } },
+      data: { state: "FINANCIAL_POSTED" },
+    });
     const result = await activateSubscriptionAndPostLedger({
       subscriptionId: subscription.id,
       invoiceId: invoice.id,
@@ -1020,7 +1193,10 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
         return { success: false, status: "financial_pending", reason: "Period extension failed" };
       }
     } else {
-      await db.saasRenewalCycle.update({ where: { id: cycle.id }, data: { state: "RECONCILIATION_REQUIRED" } });
+      await db.saasRenewalCycle.updateMany({
+        where: { id: cycle.id, state: { not: "COMPLETED" } },
+        data: { state: "RECONCILIATION_REQUIRED" },
+      });
       return { success: false, status: "financial_pending", reason: "Ledger posting still failing during renewal retry" };
     }
   }
@@ -1035,10 +1211,31 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     metadata: { tenantId, planName: plan.name, type: "saas_renewal" },
   });
 
-  await db.tenantInvoice.update({
-    where: { id: invoice.id },
-    data: { providerReference: intent.providerReference, paymentProvider: provider.id },
-  }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+  // Phase 2B.3.14 P1-8: Remove swallowed providerReference persistence failure.
+  // The providerReference MUST be persisted before proceeding to payment verification.
+  // If persistence fails, the cycle enters a durable recovery state — not a
+  // swallowed error that orphans the provider operation.
+  try {
+    await db.tenantInvoice.update({
+      where: { id: invoice.id },
+      data: { providerReference: intent.providerReference, paymentProvider: provider.id },
+    });
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    logger.error("saas.providerReference_persist_failed", {
+      invoiceId: invoice.id, cycleId: cycle.id, providerReference: intent.providerReference, error: errorMsg,
+      message: "CRITICAL: Failed to persist providerReference. Cycle marked RECONCILIATION_REQUIRED. The provider operation exists but cannot be correlated until the reference is persisted.",
+    });
+    // Mark the cycle for recovery — the reconciliation worker will retry.
+    // The invoice retains its idempotencyKey so the cycle can be found.
+    await db.saasRenewalCycle.updateMany({
+      where: { id: cycle.id, state: { not: "COMPLETED" } },
+      data: { state: "RECONCILIATION_REQUIRED", failureReason: `ProviderReference persistence failed: ${errorMsg}` },
+    }).catch((updateErr) => {
+      logger.error("saas.state_update_failed", { error: updateErr instanceof Error ? updateErr.message : String(updateErr) });
+    });
+    return { success: false, status: "financial_pending", reason: "ProviderReference persistence failed — cycle marked for recovery" };
+  }
 
   // For the mock provider, auto-confirm
   if (provider.isMock) {
@@ -1053,48 +1250,68 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
   });
 
   if (verification.status === "failed") {
-    await db.tenantInvoice.update({
-      where: { id: invoice.id },
+    // Phase 2B.3.14 P0-3: GUARDED transitions — never overwrite a concurrently-finalized state.
+    // A webhook may have arrived during verifyPayment() and finalized the invoice/cycle.
+    // Each mutation is PostgreSQL-atomic with a state guard.
+    const invoiceGuarded = await db.tenantInvoice.updateMany({
+      where: { id: invoice.id, status: "pending" },
       data: { status: "failed", failureReason: "Renewal payment failed" },
     });
-    await db.tenantSubscription.update({
-      where: { id: subscription.id },
+    if (invoiceGuarded.count === 0) {
+      // The invoice was no longer pending — a concurrent worker advanced it.
+      logger.info("saas.renewal_failed_invoice_already_advanced", { invoiceId: invoice.id, cycleId: cycle.id });
+      // Do NOT overwrite the subscription or cycle — they may have been finalized.
+      // Re-read and reconcile.
+      const currentCycle = await db.saasRenewalCycle.findUnique({ where: { id: cycle.id }, select: { state: true } });
+      if (currentCycle?.state === "COMPLETED") {
+        return { success: true, status: "active" };
+      }
+      return { success: false, status: "financial_pending", reason: "Invoice was concurrently advanced — skipping destructive overwrite" };
+    }
+    // Invoice was actually transitioned to failed — now guard the subscription + cycle.
+    await db.tenantSubscription.updateMany({
+      where: { id: subscription.id, status: { in: ["active", "trialing", "pending_payment"] } },
       data: { status: "past_due" },
     });
-    await db.saasRenewalCycle.update({
-      where: { id: cycle.id },
+    await db.saasRenewalCycle.updateMany({
+      where: { id: cycle.id, state: { notIn: ["COMPLETED", "PAST_DUE"] } },
       data: { state: "PAST_DUE", failureReason: "Payment failed" },
     });
     return { success: false, status: "past_due", reason: "Renewal payment failed" };
   }
 
   if (verification.status === "pending") {
-    await db.tenantSubscription.update({
-      where: { id: subscription.id },
+    // Phase 2B.3.14 P2-11: Guarded transition — don't overwrite a concurrently-active subscription.
+    await db.tenantSubscription.updateMany({
+      where: { id: subscription.id, status: { in: ["active", "trialing", "pending_payment"] } },
       data: { status: "past_due" },
     });
     // Cycle stays in PAYMENT_PENDING
     return { success: false, status: "past_due", reason: "Payment pending" };
   }
 
-  // Payment succeeded — transition cycle to PAYMENT_CONFIRMED
-  await db.saasRenewalCycle.update({
-    where: { id: cycle.id },
+  // Payment succeeded — transition cycle to PAYMENT_CONFIRMED.
+  // Phase 2B.3.14 P2-12: Guarded — don't overwrite COMPLETED/RECONCILIATION_REQUIRED.
+  await db.saasRenewalCycle.updateMany({
+    where: { id: cycle.id, state: { notIn: ["COMPLETED", "RECONCILIATION_REQUIRED"] } },
     data: { state: "PAYMENT_CONFIRMED" },
   });
 
-  // Attempt financial finalization
+  // Attempt financial finalization.
+  // Phase 2B.3.14 P1-6: Thread provider paidAt through.
   const result = await activateSubscriptionAndPostLedger({
     subscriptionId: subscription.id,
     invoiceId: invoice.id,
     tenantId,
     userId: "renewal-worker",
+    paidAt: verification.paidAt,
   });
 
   if (!result.activated) {
-    // Ledger failed — cycle → RECONCILIATION_REQUIRED, period NOT extended
-    await db.saasRenewalCycle.update({
-      where: { id: cycle.id },
+    // Ledger failed — cycle → RECONCILIATION_REQUIRED, period NOT extended.
+    // Phase 2B.3.14 P2-12: Guarded — don't overwrite COMPLETED.
+    await db.saasRenewalCycle.updateMany({
+      where: { id: cycle.id, state: { not: "COMPLETED" } },
       data: { state: "RECONCILIATION_REQUIRED", failureReason: "Ledger posting failed" },
     });
     return { success: false, status: "financial_pending", reason: "Ledger posting failed during renewal — invoice is reconciliation_required" };
@@ -1107,8 +1324,9 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     logger.info("saas.subscription_renewed", { tenantId, subscriptionId: subscription.id, cycleId: cycle.id, newPeriodEnd });
     return { success: true, status: "active" };
   } else {
-    // Period extension failed — mark cycle for retry
-    await db.saasRenewalCycle.update({
+    // Period extension failed — mark cycle for retry.
+    // Phase 2B.3.14 P2-12: Guarded (already had state guard, but use updateMany for consistency).
+    await db.saasRenewalCycle.updateMany({
       where: { id: cycle.id, state: { not: "COMPLETED" } },
       data: { state: "RECONCILIATION_REQUIRED", failureReason: "Period extension failed" },
     });
@@ -1170,6 +1388,8 @@ export async function handleSaasPaymentWebhook(input: {
   providerKey: string;
   providerReference: string;
   status: "succeeded" | "failed" | "pending";
+  /** Phase 2B.3.14 P1-6: Provider's authoritative payment timestamp from the webhook event. */
+  paidAt?: Date;
 }): Promise<{ handled: boolean }> {
   const invoice = await db.tenantInvoice.findFirst({
     where: {
@@ -1204,6 +1424,7 @@ export async function handleSaasPaymentWebhook(input: {
       invoiceId: invoice.id,
       tenantId: invoice.tenantId,
       userId: "webhook",
+      paidAt: input.paidAt,
     });
 
     // Phase 2B.3.10: If financial finalization succeeded, complete the renewal cycle.
@@ -1232,6 +1453,8 @@ export async function handleSaasPaymentWebhook(input: {
 
   if (input.status === "failed") {
     // Status-guarded: only pending → failed (don't overwrite paid/reconciliation_required)
+    // Phase 2B.3.14 P0: This was already guarded for the invoice, but the subscription
+    // update is now also guarded to prevent overwriting an active subscription.
     await db.tenantInvoice.updateMany({
       where: { id: invoice.id, status: "pending" },
       data: { status: "failed", failureReason: "Webhook reported payment failed" },
@@ -1303,6 +1526,7 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
       // prove the payment succeeded. Only reconciliation_required invoices
       // have already been verified (the payment was confirmed by the caller
       // before the ledger attempt failed).
+      let stalePendingPaidAt: Date | undefined;
       if (invoice.status === "pending") {
         if (!invoice.providerReference || !invoice.paymentProvider) {
           // No provider reference — can't verify, skip
@@ -1318,13 +1542,24 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
         });
 
         if (verification.status === "failed") {
-          // Payment failed — mark the invoice as failed, do NOT post revenue
-          await db.tenantInvoice.update({
-            where: { id: invoice.id },
+          // Phase 2B.3.14 P0-2: GUARDED transition — never overwrite a concurrently-paid invoice.
+          // The invoice was selected as "pending" but may have been finalized by a webhook
+          // while verifyPayment() was in flight. The mutation must be PostgreSQL-atomic.
+          const guarded = await db.tenantInvoice.updateMany({
+            where: { id: invoice.id, status: "pending" },
             data: { status: "failed", failureReason: "Payment verification failed during reconciliation" },
           });
-          await db.tenantSubscription.update({
-            where: { id: invoice.subscriptionId },
+          if (guarded.count === 0) {
+            // The invoice was no longer pending — a concurrent worker advanced it.
+            logger.info("saas.reconciliation_failed_invoice_already_advanced", {
+              invoiceId: invoice.id,
+            });
+            // Do NOT overwrite the subscription — it may have been activated.
+            continue;
+          }
+          // Invoice was actually transitioned to failed — guard the subscription too.
+          await db.tenantSubscription.updateMany({
+            where: { id: invoice.subscriptionId, status: { in: ["pending_payment", "active", "trialing"] } },
             data: { status: "past_due" },
           });
           logger.info("saas.reconciliation_payment_failed", { invoiceId: invoice.id });
@@ -1337,16 +1572,22 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
           continue;
         }
 
-        // verification.status === "succeeded" — proceed to financial finalization
+        // verification.status === "succeeded" — proceed to financial finalization.
+        // Phase 2B.3.14 P1-6: Capture the provider's authoritative paidAt.
+        // This is the critical fix: the stale-pending path now uses the provider's
+        // payment timestamp, not the reconciliation execution time.
+        stalePendingPaidAt = verification.paidAt;
       }
 
       // For reconciliation_required invoices, the payment was already verified
       // by the original caller. The ledger just needs to be retried.
+      // For stale-pending invoices that just verified as succeeded, use the provider paidAt.
       const activated = await activateSubscriptionAndPostLedger({
         subscriptionId: invoice.subscriptionId,
         invoiceId: invoice.id,
         tenantId: invoice.tenantId,
         userId: "reconciliation-worker",
+        paidAt: stalePendingPaidAt,
       });
       if (activated.activated) {
         result.repaired++;

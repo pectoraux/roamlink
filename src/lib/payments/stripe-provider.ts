@@ -103,7 +103,15 @@ export class StripeProvider implements PaymentProvider {
     // status: requires_payment_method | requires_confirmation | requires_action | processing | succeeded | canceled
     const status: PaymentVerification["status"] =
       data.status === "succeeded" ? "succeeded" : data.status === "processing" ? "pending" : data.status === "canceled" ? "failed" : "pending";
-    return { status, providerReference: input.providerReference, raw: data };
+    // Phase 2B.3.14 P1-5: Stripe provides the settlement timestamp.
+    return {
+      status,
+      providerReference: input.providerReference,
+      paidAt: data.status === "succeeded" && data.charges?.data?.[0]?.created
+        ? new Date(data.charges.data[0].created * 1000)
+        : undefined,
+      raw: data,
+    };
   }
 
   async verifyWebhook(input: {
@@ -132,6 +140,8 @@ export class StripeProvider implements PaymentProvider {
           providerReference: pi?.id,
           status,
           amountMinor: pi?.amount_received != null ? Number(pi.amount_received) : pi?.amount != null ? Number(pi.amount) : undefined,
+          // Phase 2B.3.14 P1-5: Stripe webhook provides created timestamp
+          paidAt: pi?.status === "succeeded" && pi?.created ? new Date(pi.created * 1000) : undefined,
         },
         raw: parsed,
       };

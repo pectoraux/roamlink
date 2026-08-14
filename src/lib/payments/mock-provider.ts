@@ -25,6 +25,9 @@ type MockIntent = {
   status: "pending" | "succeeded" | "failed";
   // Test hook: intents created with metadata.forceFail will fail verification.
   forceFail: boolean;
+  // Phase 2B.3.14 P1-5: The timestamp when the mock intent was confirmed.
+  // This simulates the provider's authoritative payment timestamp.
+  confirmedAt?: Date;
 };
 
 const intents = new Map<string, MockIntent>();
@@ -88,6 +91,10 @@ export class MockPaymentProvider implements PaymentProvider {
     return {
       status: intent.status === "pending" ? "pending" : intent.status,
       providerReference: intent.providerReference,
+      // Phase 2B.3.14 P1-5: Return the authoritative payment timestamp.
+      // This is set when confirmIntent() is called — simulating the provider's
+      // settlement time, which may differ from when we call verifyPayment().
+      paidAt: intent.status === "succeeded" && intent.confirmedAt ? intent.confirmedAt : undefined,
       raw: { amountMinor: intent.amountMinor, currency: intent.currency },
     };
   }
@@ -101,7 +108,9 @@ export class MockPaymentProvider implements PaymentProvider {
       return false;
     }
     intent.status = "succeeded";
-    logger.info("mock.payment_confirmed", { providerReference });
+    // Phase 2B.3.14 P1-5: Record the authoritative confirmation timestamp.
+    intent.confirmedAt = new Date();
+    logger.info("mock.payment_confirmed", { providerReference, paidAt: intent.confirmedAt });
     return true;
   }
 
@@ -122,6 +131,8 @@ export class MockPaymentProvider implements PaymentProvider {
           providerReference: parsed.providerReference ?? parsed.reference,
           status: parsed.status,
           amountMinor: parsed.amountMinor != null ? Number(parsed.amountMinor) : undefined,
+          // Phase 2B.3.14 P1-5: pass through provider paidAt if provided
+          paidAt: parsed.paidAt ? new Date(parsed.paidAt) : undefined,
         },
         raw: parsed,
       };

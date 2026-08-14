@@ -104,9 +104,12 @@ export class FlutterwaveProvider implements PaymentProvider {
     }
     const tx = data.data[0];
     const status = tx.status === "successful" ? "succeeded" : tx.status === "pending" ? "pending" : "failed";
+    // Phase 2B.3.14 P1-5: Flutterwave provides created_at (ISO string).
+    const paidAtStr = tx.created_at || tx.createdAt;
     return {
       status,
       providerReference: input.providerReference,
+      paidAt: status === "succeeded" && paidAtStr ? new Date(paidAtStr) : undefined,
       raw: tx,
     };
   }
@@ -124,6 +127,7 @@ export class FlutterwaveProvider implements PaymentProvider {
       const evt = parsed.event; // charge.completed, etc.
       const ref = parsed.data?.tx_ref;
       const status = parsed.data?.status === "successful" ? "succeeded" : parsed.data?.status === "pending" ? "pending" : "failed";
+      const paidAtStr = parsed.data?.created_at || parsed.data?.createdAt;
       return {
         externalId: `${ref}-${evt}`,
         eventType: evt,
@@ -131,6 +135,8 @@ export class FlutterwaveProvider implements PaymentProvider {
           providerReference: ref,
           status,
           amountMinor: parsed.data?.amount != null ? Math.round(Number(parsed.data.amount) * 100) : undefined,
+          // Phase 2B.3.14 P1-5: Flutterwave webhook provides created_at
+          paidAt: status === "succeeded" && paidAtStr ? new Date(paidAtStr) : undefined,
         },
         raw: parsed,
       };
