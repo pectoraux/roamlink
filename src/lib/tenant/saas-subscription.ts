@@ -49,6 +49,59 @@ import { getPaymentProvider, getPaymentProviderByKey } from "@/lib/payments";
 import type { Currency } from "@/lib/money";
 
 /**
+ * Phase 2B.3.15 P1-3: Canonical billing-interval derivation.
+ *
+ * "monthly" and "yearly" are CALENDAR intervals, not fixed day counts.
+ * Jan 31 + 1 month = Feb 28 (or 29 in a leap year), NOT Jan 31 + 30 days
+ * and NOT Mar 3 (which is what JavaScript's naive setMonth produces due to
+ * day overflow).
+ *
+ * This helper uses calendar arithmetic WITH end-of-month clamping:
+ *   - If the target month doesn't have the original day (e.g. Feb 31),
+ *     clamp to the last day of the target month (Feb 28/29).
+ *   - This matches the billing-period semantics used by Stripe and other
+ *     billing systems: "charge on the same day each month, or the last day
+ *     if that day doesn't exist."
+ *
+ * The billing period for a subscription is defined as:
+ *   periodStart = paidAt (the financial event)
+ *   periodEnd   = addBillingInterval(periodStart, billingCycle)
+ *
+ * Validation of an existing period MUST re-derive the expected periodEnd
+ * from the recorded periodStart using this same function, then compare
+ * for exact equality — NOT use a duration tolerance window.
+ */
+function addBillingInterval(start: Date, billingCycle: string): Date {
+  const end = new Date(start.getTime());
+  if (billingCycle === "yearly") {
+    end.setFullYear(end.getFullYear() + 1);
+  } else {
+    // monthly (default) — with end-of-month clamping.
+    // JavaScript's Date.setMonth overflows: Jan 31 + setMonth(1) → Mar 3,
+    // because it tries to create "February 31" which doesn't exist.
+    // We detect the overflow and clamp to the last day of the target month.
+    const originalDay = end.getDate();
+    end.setMonth(end.getMonth() + 1);
+    if (end.getDate() < originalDay) {
+      // Day overflowed (e.g., Feb 31 → Mar 3). Clamp to the last day
+      // of the target month by setting day = 0 (last day of previous month).
+      end.setDate(0);
+    }
+  }
+  return end;
+}
+
+/**
+ * Phase 2B.3.15 P1-3: Validate that (periodStart, periodEnd) is the canonical
+ * billing interval for the given cycle. Returns true if periodEnd ===
+ * addBillingInterval(periodStart, billingCycle).
+ */
+function isCanonicalBillingInterval(periodStart: Date, periodEnd: Date, billingCycle: string): boolean {
+  const expected = addBillingInterval(periodStart, billingCycle);
+  return periodEnd.getTime() === expected.getTime();
+}
+
+/**
  * Create a subscription intent for a tenant choosing a SaaS plan.
  * Creates a payment provider intent. The subscription is NOT activated until
  * the payment is verified.
@@ -575,15 +628,17 @@ async function activateInitialSaasSubscription(input: {
         return { activated: true, reason: "already_active" };
       }
 
-      // 5. Phase 2B.3.13/2B.3.14: Derive billing period DETERMINISTICALLY.
+      // 5. Phase 2B.3.13/2B.3.14/2B.3.15: Derive billing period DETERMINISTICALLY.
       //    The billing clock starts when the customer pays — never when a
       //    recovery worker happens to repair the domain state.
       let periodStart: Date;
       let periodEnd: Date;
       let periodSource: "reused" | "paidAt" | "validated";
       if (inv.periodStart && inv.periodEnd) {
-        // Phase 2B.3.14 P1-9: VALIDATE the existing period before reusing it.
-        // Blind reuse preserves corrupt values — we must verify consistency.
+        // Phase 2B.3.15 P1-3: VALIDATE the existing period using CANONICAL CALENDAR
+        // intervals — NOT duration tolerances. "monthly" is a calendar month
+        // (Jan 31 → Feb 28), not 30 days. We re-derive the expected periodEnd
+        // from periodStart using addBillingInterval(), then compare exactly.
         const ps = inv.periodStart;
         const pe = inv.periodEnd;
 
@@ -595,23 +650,17 @@ async function activateInitialSaasSubscription(input: {
           return { activated: false, reason: "Existing invoice period is invalid (periodEnd <= periodStart)" };
         }
 
-        // 5b. Duration must match the billing cycle (within tolerance).
-        // Monthly: 28-31 days. Yearly: 365-366 days.
-        const durationDays = (pe.getTime() - ps.getTime()) / 86400000;
-        if (input.billingCycle === "yearly") {
-          if (durationDays < 360 || durationDays > 367) {
-            logger.error("saas.existing_period_duration_mismatch", {
-              invoiceId: input.invoiceId, billingCycle: input.billingCycle, durationDays,
-            });
-            return { activated: false, reason: `Existing period duration (${durationDays.toFixed(1)} days) doesn't match yearly billing cycle` };
-          }
-        } else {
-          if (durationDays < 27 || durationDays > 32) {
-            logger.error("saas.existing_period_duration_mismatch", {
-              invoiceId: input.invoiceId, billingCycle: input.billingCycle, durationDays,
-            });
-            return { activated: false, reason: `Existing period duration (${durationDays.toFixed(1)} days) doesn't match monthly billing cycle` };
-          }
+        // 5b. Phase 2B.3.15 P1-3: Canonical calendar validation.
+        // Re-derive expected periodEnd from periodStart using the same calendar
+        // arithmetic used to create it. If they don't match exactly, the recorded
+        // period is corrupt.
+        if (!isCanonicalBillingInterval(ps, pe, input.billingCycle)) {
+          logger.error("saas.existing_period_not_canonical", {
+            invoiceId: input.invoiceId, billingCycle: input.billingCycle,
+            periodStart: ps, periodEnd: pe,
+            expected: addBillingInterval(ps, input.billingCycle),
+          });
+          return { activated: false, reason: `Existing period is not the canonical ${input.billingCycle} billing interval for the recorded periodStart` };
         }
 
         // 5c. If paidAt is available, verify periodStart is consistent with it.
@@ -628,12 +677,7 @@ async function activateInitialSaasSubscription(input: {
               message: "Existing periodStart doesn't match paidAt — re-deriving from paidAt.",
             });
             periodStart = inv.paidAt;
-            periodEnd = new Date(periodStart.getTime());
-            if (input.billingCycle === "yearly") {
-              periodEnd.setFullYear(periodEnd.getFullYear() + 1);
-            } else {
-              periodEnd.setMonth(periodEnd.getMonth() + 1);
-            }
+            periodEnd = addBillingInterval(periodStart, input.billingCycle);
             periodSource = "validated";
           } else {
             periodStart = ps;
@@ -641,20 +685,16 @@ async function activateInitialSaasSubscription(input: {
             periodSource = "reused";
           }
         } else {
-          // No paidAt to compare against — reuse the recorded period (duration was validated).
+          // No paidAt to compare against — reuse the recorded period (calendar shape was validated).
           periodStart = ps;
           periodEnd = pe;
           periodSource = "reused";
         }
       } else if (inv.paidAt) {
         // First activation — anchor to the financial event that created the subscription.
+        // Phase 2B.3.15 P1-3: Use addBillingInterval for canonical calendar derivation.
         periodStart = inv.paidAt;
-        periodEnd = new Date(periodStart.getTime());
-        if (input.billingCycle === "yearly") {
-          periodEnd.setFullYear(periodEnd.getFullYear() + 1);
-        } else {
-          periodEnd.setMonth(periodEnd.getMonth() + 1);
-        }
+        periodEnd = addBillingInterval(periodStart, input.billingCycle);
         periodSource = "paidAt";
       } else {
         // Defensive — a paid invoice MUST have paidAt. If missing, the schema is corrupt;
@@ -979,12 +1019,8 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
   if (subscription.saaasPlan && subscription.saaasPlan.monthlyPriceMinor <= 0) {
     logger.info("saas.free_plan_renewal_skipped", { tenantId, planName: subscription.saaasPlan.name });
     // Extend the period without payment/ledger — free plan.
-    const newPeriodEnd = new Date(subscription.currentPeriodEnd.getTime());
-    if (subscription.billingCycle === "yearly") {
-      newPeriodEnd.setFullYear(newPeriodEnd.getFullYear() + 1);
-    } else {
-      newPeriodEnd.setMonth(newPeriodEnd.getMonth() + 1);
-    }
+    // Phase 2B.3.15 P1-3: Use addBillingInterval for canonical calendar derivation.
+    const newPeriodEnd = addBillingInterval(subscription.currentPeriodEnd, subscription.billingCycle);
     await db.tenantSubscription.updateMany({
       where: { id: subscription.id, status: { in: ["active", "past_due"] } },
       data: { status: "active", currentPeriodEnd: newPeriodEnd },
@@ -1003,13 +1039,9 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
   // Phase 2B.3.5: Derive the durable cycle identity from immutable periodStart.
   // The cycleKey is subscriptionId + immutable periodStart (the expired period's end).
   // This is the SAME key regardless of how many workers run concurrently.
+  // Phase 2B.3.15 P1-3: Use addBillingInterval for canonical calendar derivation.
   const newPeriodStart = subscription.currentPeriodEnd;
-  const newPeriodEnd = new Date(newPeriodStart);
-  if (subscription.billingCycle === "yearly") {
-    newPeriodEnd.setFullYear(newPeriodEnd.getFullYear() + 1);
-  } else {
-    newPeriodEnd.setMonth(newPeriodEnd.getMonth() + 1);
-  }
+  const newPeriodEnd = addBillingInterval(newPeriodStart, subscription.billingCycle);
 
   const cycleKey = `saas_renewal_${subscription.id}_${newPeriodStart.getTime()}`;
 
@@ -1201,51 +1233,75 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     }
   }
 
-  // Phase 2B.3.3: Use the subscription's stored payment provider
+  // Phase 2B.3.3: Use the subscription's stored payment provider.
+  // Phase 2B.3.15 P1-2: ONE INVOICE → ONE PROVIDER PAYMENT OPERATION invariant.
+  // If the invoice already has a providerReference (from a prior attempt that
+  // crashed after persisting the reference but before completing verification),
+  // we MUST reuse it — never create a second payment operation at the provider.
   const provider = getPaymentProviderByKey(subscription.paymentProvider || "mock");
-  const intent = await provider.createPaymentIntent({
-    amountMinor,
-    currency: plan.currency as Currency,
-    description: `SaaS renewal: ${plan.displayName} (${subscription.billingCycle})`,
-    idempotencyKey: renewalKey,
-    metadata: { tenantId, planName: plan.name, type: "saas_renewal" },
+  let providerReference: string;
+
+  // Re-read the invoice to get the current providerReference (it may have been
+  // set by a prior attempt that crashed before verification completed).
+  const currentInvoice = await db.tenantInvoice.findUnique({
+    where: { id: invoice.id },
+    select: { providerReference: true, paymentProvider: true },
   });
 
-  // Phase 2B.3.14 P1-8: Remove swallowed providerReference persistence failure.
-  // The providerReference MUST be persisted before proceeding to payment verification.
-  // If persistence fails, the cycle enters a durable recovery state — not a
-  // swallowed error that orphans the provider operation.
-  try {
-    await db.tenantInvoice.update({
-      where: { id: invoice.id },
-      data: { providerReference: intent.providerReference, paymentProvider: provider.id },
+  if (currentInvoice?.providerReference) {
+    // Reuse the existing provider operation — never create a second one.
+    providerReference = currentInvoice.providerReference;
+    logger.info("saas.renewal_reusing_provider_reference", {
+      invoiceId: invoice.id, cycleId: cycle.id, providerReference,
     });
-  } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    logger.error("saas.providerReference_persist_failed", {
-      invoiceId: invoice.id, cycleId: cycle.id, providerReference: intent.providerReference, error: errorMsg,
-      message: "CRITICAL: Failed to persist providerReference. Cycle marked RECONCILIATION_REQUIRED. The provider operation exists but cannot be correlated until the reference is persisted.",
+  } else {
+    // No existing providerReference — this is the first attempt. Create the payment intent.
+    const intent = await provider.createPaymentIntent({
+      amountMinor,
+      currency: plan.currency as Currency,
+      description: `SaaS renewal: ${plan.displayName} (${subscription.billingCycle})`,
+      idempotencyKey: renewalKey,
+      metadata: { tenantId, planName: plan.name, type: "saas_renewal" },
     });
-    // Mark the cycle for recovery — the reconciliation worker will retry.
-    // The invoice retains its idempotencyKey so the cycle can be found.
-    await db.saasRenewalCycle.updateMany({
-      where: { id: cycle.id, state: { not: "COMPLETED" } },
-      data: { state: "RECONCILIATION_REQUIRED", failureReason: `ProviderReference persistence failed: ${errorMsg}` },
-    }).catch((updateErr) => {
-      logger.error("saas.state_update_failed", { error: updateErr instanceof Error ? updateErr.message : String(updateErr) });
-    });
-    return { success: false, status: "financial_pending", reason: "ProviderReference persistence failed — cycle marked for recovery" };
+    providerReference = intent.providerReference;
+
+    // Phase 2B.3.14 P1-8: Persist the providerReference BEFORE any other work.
+    // If persistence fails, the cycle enters a durable recovery state.
+    // On recovery, the code above will find no providerReference and create
+    // a new intent — BUT the provider's idempotencyKey (renewalKey) ensures
+    // the provider returns the SAME intent (mock, Stripe via Idempotency-Key
+    // header, Paystack/Flutterwave via reference = idempotencyKey).
+    // So even across a crash, ONE invoice → ONE provider payment operation.
+    try {
+      await db.tenantInvoice.update({
+        where: { id: invoice.id },
+        data: { providerReference, paymentProvider: provider.id },
+      });
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error("saas.providerReference_persist_failed", {
+        invoiceId: invoice.id, cycleId: cycle.id, providerReference, error: errorMsg,
+        message: "CRITICAL: Failed to persist providerReference. Cycle marked RECONCILIATION_REQUIRED. The provider operation exists but cannot be correlated until the reference is persisted.",
+      });
+      await db.saasRenewalCycle.updateMany({
+        where: { id: cycle.id, state: { not: "COMPLETED" } },
+        data: { state: "RECONCILIATION_REQUIRED", failureReason: `ProviderReference persistence failed: ${errorMsg}` },
+      }).catch((updateErr) => {
+        logger.error("saas.state_update_failed", { error: updateErr instanceof Error ? updateErr.message : String(updateErr) });
+      });
+      return { success: false, status: "financial_pending", reason: "ProviderReference persistence failed — cycle marked for recovery" };
+    }
   }
 
   // For the mock provider, auto-confirm
   if (provider.isMock) {
     const { mockPaymentProvider } = await import("@/lib/payments");
-    mockPaymentProvider.confirmIntent(intent.providerReference);
+    mockPaymentProvider.confirmIntent(providerReference);
   }
 
   // Verify the payment
   const verification = await provider.verifyPayment({
-    providerReference: intent.providerReference,
+    providerReference,
     idempotencyKey: renewalKey,
   });
 

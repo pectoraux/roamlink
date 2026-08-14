@@ -541,8 +541,9 @@ describe("Phase 2B.3.14 — Adversarial Financial Concurrency Hardening", () => 
   it("Static: period validation in activateInitialSaasSubscription", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync("src/lib/tenant/saas-subscription.ts", "utf-8");
+    // Phase 2B.3.15: duration-tolerance checks replaced with canonical calendar validation.
     expect(source).toContain("saas.existing_period_invalid_duration");
-    expect(source).toContain("saas.existing_period_duration_mismatch");
+    expect(source).toContain("saas.existing_period_not_canonical");
     expect(source).toContain("saas.existing_period_inconsistent_with_paidAt");
     expect(source).toContain("periodSource = \"validated\"");
   }, 10000);
