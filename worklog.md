@@ -1777,3 +1777,23 @@ Stage Summary:
 - Lint: clean. TypeScript: clean.
 - SaaS billing kernel: FROZEN (no changes)
 - Phase 2C.3 (MikroTik Adapter): next target — reference implementation of the contract
+
+---
+Task ID: 2C.2.2
+Agent: Lead engineer (main) — Reconciliation Atomicity + State-Transition Safety
+Task: Harden reconcileBindingWithProvider() — make the observe→validate→transition→commit flow atomic, stale-observation-safe, with kernel-owned legal transition matrix and MANUAL_INTERVENTION_REQUIRED for permanent failures.
+
+Work Log:
+- Rewrote reconcileBindingWithProvider() to use a single $transaction with FOR UPDATE on the binding row. The transition + metadata update are now ONE atomic commit — no separate writes.
+- Added stale observation prevention: the binding's status is captured before the adapter call. After the adapter returns, the transaction verifies the status hasn't changed. If it has, the reconciliation is a no-op (stale_observation).
+- Added MANUAL_INTERVENTION_REQUIRED for failed_permanent — distinct from RECONCILIATION_REQUIRED. Permanent failures are NOT picked up by the automatic retry loop.
+- Added kernel-owned legal transition matrix (RECONCILIATION_LEGAL_TRANSITIONS). The adapter's recommendedBindingState is a signal, not authority. Illegal recommendations are refused → MANUAL_INTERVENTION_REQUIRED.
+- Added mapReconciliationResult() — the kernel mapping from observation to decision, with validation.
+
+Stage Summary:
+- HEAD: 6a5c44832402e5dbf10e7bd9a620c95961be93dc
+- origin/main: 6a5c44832402e5dbf10e7bd9a620c95961be93dc (pushed)
+- Tests: 13 — all EXECUTED + PASSED (8 runtime + 5 static)
+- Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN (no changes)
+- Phase 2C.3 (MikroTik Adapter): next target — reference implementation of the contract
