@@ -1757,3 +1757,23 @@ Stage Summary:
 - Lint: clean. TypeScript: clean.
 - SaaS billing kernel: FROZEN (no changes)
 - Phase 2C.3 (MikroTik Adapter): next target — will be a replaceable plugin using this registry
+
+---
+Task ID: 2C.2.1
+Agent: Lead engineer (main) — Registry Safety + Durable Binding Resolution
+Task: Harden the provider adapter registry before real provider integration. Safe registration semantics, durable binding resolution, reconciliation boundary.
+
+Work Log:
+- Safe registration: registerConnectivityProvider now throws when a different adapter is already registered for the same providerType. Same adapter re-registration is idempotent. replaceConnectivityProvider is test/development-only.
+- normalizeProviderType: trim, lowercase, reject empty. Used for all registry operations and binding resolution.
+- resolveBindingAdapter(bindingId): loads ProviderResourceBinding from PostgreSQL, reads providerType, resolves through the registry. Never uses a global/default provider.
+- reconcileBindingWithProvider(bindingId): the adapter returns observations only (ReconciliationResult). The kernel owns all state transitions. Mapping: in_sync→no-op, drift_detected→transition per recommendation, resource_missing→FAILED, failed_retryable→preserve+retry, failed_permanent→FAILED+manual.
+- Serverless safety: documented that registry state may disappear on cold start, application startup must register adapters, customer binding state survives in PostgreSQL.
+
+Stage Summary:
+- HEAD: e9e908c803c6520d40938b23e9328a8dcd1a9c13
+- origin/main: e9e908c803c6520d40938b23e9328a8dcd1a9c13 (pushed)
+- Tests: 16 — all EXECUTED + PASSED (11 runtime + 5 static)
+- Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN (no changes)
+- Phase 2C.3 (MikroTik Adapter): next target — reference implementation of the contract
