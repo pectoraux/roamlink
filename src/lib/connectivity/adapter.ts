@@ -71,6 +71,35 @@ export type UsageMetrics = {
 };
 
 // ---------------------------------------------------------------------------
+// Reconciliation Result
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of a reconcile() call.
+ *
+ * The adapter compares the provider's observed state with the binding's
+ * recorded state and reports whether they match or what action is needed.
+ *
+ * - in_sync: the provider's state matches the binding — no action needed
+ * - drift_detected: the provider's state differs — the kernel should
+ *   transition the binding (e.g., BOUND → DEGRADED if the resource is
+ *   inactive at the provider)
+ * - resource_missing: the provider no longer has the resource — the
+ *   kernel should transition to FAILED and potentially re-provision
+ * - failed_retryable: transient error checking the provider — retry later
+ * - failed_permanent: permanent error — manual intervention required
+ */
+export type ReconciliationResult = {
+  status: "in_sync" | "drift_detected" | "resource_missing" | "failed_retryable" | "failed_permanent";
+  /** The provider's observed state for the resource (if available). */
+  observedState?: "active" | "suspended" | "inactive" | "not_found";
+  /** Recommended binding state transition (if drift detected). */
+  recommendedBindingState?: string;
+  /** Details about the drift or error. */
+  details?: string;
+};
+
+// ---------------------------------------------------------------------------
 // Provider Adapter Interface
 // ---------------------------------------------------------------------------
 
@@ -102,4 +131,21 @@ export interface ConnectivityProviderAdapter {
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<UsageMetrics | undefined>;
+
+  /**
+   * Reconcile the binding's recorded state with the provider's observed state.
+   *
+   * Called by the reconciliation worker to detect drift. The adapter checks
+   * the provider's API and reports whether the resource still exists, is
+   * active, or has been modified.
+   *
+   * This is the connectivity equivalent of the SaaS reconciliation principle:
+   * "Every external side effect needs a durable state machine and reconciliation path."
+   *
+   * Idempotent: calling reconcile() multiple times is safe.
+   */
+  reconcile(input: {
+    entitlement: ConnectivityEntitlementInput;
+    binding: ProviderResourceBindingInput;
+  }): Promise<ReconciliationResult>;
 }

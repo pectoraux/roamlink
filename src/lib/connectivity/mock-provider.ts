@@ -10,6 +10,7 @@ import type {
   ProvisionResult,
   ActionResult,
   UsageMetrics,
+  ReconciliationResult,
   ConnectivityEntitlementInput,
   ProviderResourceBindingInput,
 } from "./adapter";
@@ -99,6 +100,72 @@ export class MockConnectivityProvider implements ConnectivityProviderAdapter {
       sessionDurationSeconds: Math.floor((Date.now() - resource.createdAt.getTime()) / 1000),
       isActive: resource.active,
       measuredAt: new Date(),
+    };
+  }
+
+  async reconcile(input: {
+    entitlement: ConnectivityEntitlementInput;
+    binding: ProviderResourceBindingInput;
+  }): Promise<ReconciliationResult> {
+    const bindingId = input.binding.id;
+    const providerResourceId = input.binding.providerResourceId;
+
+    if (!providerResourceId) {
+      // No provider resource — binding hasn't been provisioned yet
+      logger.info("mock.connectivity.reconcile_no_resource", { bindingId });
+      return {
+        status: "in_sync",
+        observedState: "not_found",
+        details: "No providerResourceId on binding — not yet provisioned",
+      };
+    }
+
+    const resource = mockResources.get(providerResourceId);
+    if (!resource) {
+      // Resource was deleted at the provider (e.g., manual cleanup)
+      logger.warn("mock.connectivity.reconcile_missing", { bindingId, providerResourceId });
+      return {
+        status: "resource_missing",
+        observedState: "not_found",
+        recommendedBindingState: "FAILED",
+        details: "Provider resource no longer exists — binding should transition to FAILED",
+      };
+    }
+
+    // Check if the resource state matches the binding state
+    const bindingStatus = input.binding.status;
+    if (resource.active && (bindingStatus === "BOUND" || bindingStatus === "PROVISIONING")) {
+      return {
+        status: "in_sync",
+        observedState: "active",
+        details: "Provider resource is active and matches binding state",
+      };
+    }
+
+    if (!resource.active && bindingStatus === "BOUND") {
+      // Resource is inactive but binding thinks it's BOUND — drift
+      logger.warn("mock.connectivity.reconcile_drift", { bindingId, providerResourceId, bindingStatus, resourceActive: resource.active });
+      return {
+        status: "drift_detected",
+        observedState: "inactive",
+        recommendedBindingState: "DEGRADED",
+        details: "Provider resource is inactive but binding is BOUND — recommend DEGRADED",
+      };
+    }
+
+    if (!resource.active && bindingStatus === "DEGRADED") {
+      return {
+        status: "in_sync",
+        observedState: "inactive",
+        details: "Provider resource is inactive and binding is DEGRADED — states match",
+      };
+    }
+
+    // Default: in sync
+    return {
+      status: "in_sync",
+      observedState: resource.active ? "active" : "inactive",
+      details: "Provider resource state matches binding state",
     };
   }
 }
