@@ -573,3 +573,170 @@ export async function reconcileConnectivityEntitlements(): Promise<{
   logger.info("connectivity.reconciliation_completed", result);
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2C.2.1: Reconciliation Boundary — Adapter Reports, Kernel Decides
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 2C.2.1: Reconcile a single binding with its provider.
+ *
+ * RECONCILIATION BOUNDARY:
+ *   The adapter returns observations only. It MUST NOT directly mutate
+ *   ProviderResourceBinding state. The kernel owns all state transitions.
+ *
+ * Mapping from ReconciliationResult to binding state transitions:
+ *
+ *   in_sync            → no transition (binding stays as-is)
+ *   drift_detected     → transition per recommendedBindingState (e.g., DEGRADED)
+ *   resource_missing   → transition to FAILED
+ *   failed_retryable   → keep current durable state + mark RECONCILIATION_REQUIRED
+ *   failed_permanent   → transition to FAILED + mark for manual intervention
+ *
+ * This function is idempotent — safe to call multiple times.
+ */
+export async function reconcileBindingWithProvider(bindingId: string): Promise<{
+  status: "in_sync" | "transitioned" | "no_action" | "error";
+  observedState?: string;
+  transition?: { from: string; to: string };
+  error?: string;
+}> {
+  // Resolve the adapter from the persisted binding's providerType
+  const { resolveBindingAdapter } = await import("./registry");
+  const { adapter, binding } = await resolveBindingAdapter(bindingId);
+
+  // Load the full entitlement for the adapter call
+  const fullBinding = await db.providerResourceBinding.findUnique({
+    where: { id: bindingId },
+    select: { id: true, entitlementId: true, providerType: true, providerResourceId: true, providerMetadata: true, status: true, provisioningState: true },
+  });
+  if (!fullBinding) {
+    return { status: "error", error: "Binding not found" };
+  }
+
+  const entitlement = await db.connectivityEntitlement.findUnique({
+    where: { id: fullBinding.entitlementId },
+    include: { capability: true },
+  });
+  if (!entitlement) {
+    return { status: "error", error: "Entitlement not found" };
+  }
+
+  // Call the adapter's reconcile() — this is an OBSERVATION, not a mutation
+  const result = await adapter.reconcile({
+    entitlement: {
+      id: entitlement.id,
+      tenantId: entitlement.tenantId,
+      subscriptionId: entitlement.subscriptionId,
+      status: entitlement.status,
+      capabilityType: entitlement.capability.type,
+      capabilitySet: JSON.parse(entitlement.capabilitySet),
+      policy: entitlement.policy ? JSON.parse(entitlement.policy) : null,
+      validFrom: entitlement.validFrom,
+      validUntil: entitlement.validUntil,
+    },
+    binding: {
+      id: fullBinding.id,
+      entitlementId: fullBinding.entitlementId,
+      providerType: fullBinding.providerType,
+      providerResourceId: fullBinding.providerResourceId,
+      providerMetadata: fullBinding.providerMetadata ? JSON.parse(fullBinding.providerMetadata) : null,
+      status: fullBinding.status,
+      provisioningState: fullBinding.provisioningState,
+    },
+  });
+
+  // KERNEL OWNS THE STATE TRANSITION — based on the adapter's observation
+  switch (result.status) {
+    case "in_sync": {
+      // No drift — mark reconciled
+      await db.providerResourceBinding.updateMany({
+        where: { id: bindingId },
+        data: { reconciliationState: "RECONCILED", lastReconciledAt: new Date() },
+      });
+      return { status: "in_sync", observedState: result.observedState };
+    }
+
+    case "drift_detected": {
+      // Transition per the adapter's recommendation
+      const targetState = result.recommendedBindingState as BindingState | undefined;
+      if (targetState) {
+        const transitionResult = await transitionBinding({
+          bindingId,
+          toState: targetState,
+          reason: result.details ?? "Provider drift detected",
+        });
+        await db.providerResourceBinding.updateMany({
+          where: { id: bindingId },
+          data: { reconciliationState: "RECONCILED", lastReconciledAt: new Date() },
+        });
+        return {
+          status: transitionResult.transitioned ? "transitioned" : "no_action",
+          observedState: result.observedState,
+          transition: transitionResult.transitioned
+            ? { from: binding.status, to: targetState }
+            : undefined,
+        };
+      }
+      // No recommended state — just mark for reconciliation
+      await db.providerResourceBinding.updateMany({
+        where: { id: bindingId },
+        data: { reconciliationState: "RECONCILIATION_REQUIRED" },
+      });
+      return { status: "no_action", observedState: result.observedState };
+    }
+
+    case "resource_missing": {
+      // Provider no longer has the resource → transition to FAILED
+      const transitionResult = await transitionBinding({
+        bindingId,
+        toState: BINDING_STATES.FAILED,
+        reason: "Provider resource missing — reconcile() reported resource_missing",
+      });
+      await db.providerResourceBinding.updateMany({
+        where: { id: bindingId },
+        data: { reconciliationState: "RECONCILED", lastReconciledAt: new Date() },
+      });
+      return {
+        status: transitionResult.transitioned ? "transitioned" : "no_action",
+        observedState: result.observedState,
+        transition: transitionResult.transitioned
+          ? { from: binding.status, to: BINDING_STATES.FAILED }
+          : undefined,
+      };
+    }
+
+    case "failed_retryable": {
+      // Keep current durable state — retry later
+      await db.providerResourceBinding.updateMany({
+        where: { id: bindingId },
+        data: { reconciliationState: "RECONCILIATION_REQUIRED", failureReason: result.details },
+      });
+      return { status: "no_action", error: result.details };
+    }
+
+    case "failed_permanent": {
+      // Transition to FAILED — manual intervention required
+      const transitionResult = await transitionBinding({
+        bindingId,
+        toState: BINDING_STATES.FAILED,
+        reason: `Permanent reconciliation failure: ${result.details ?? "unknown"}`,
+      });
+      await db.providerResourceBinding.updateMany({
+        where: { id: bindingId },
+        data: { reconciliationState: "RECONCILIATION_REQUIRED", failureReason: result.details },
+      });
+      return {
+        status: transitionResult.transitioned ? "transitioned" : "no_action",
+        observedState: result.observedState,
+        transition: transitionResult.transitioned
+          ? { from: binding.status, to: BINDING_STATES.FAILED }
+          : undefined,
+        error: result.details,
+      };
+    }
+
+    default:
+      return { status: "error", error: `Unknown reconciliation status: ${result.status}` };
+  }
+}

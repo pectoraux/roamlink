@@ -15,6 +15,7 @@ export {
   transitionBinding,
   listResourceBindings,
   reconcileConnectivityEntitlements,
+  reconcileBindingWithProvider,
   CAPABILITY_TYPES,
   ENTITLEMENT_STATES,
   BINDING_STATES,
@@ -39,10 +40,14 @@ export type {
 // Provider registry
 export {
   registerConnectivityProvider,
+  replaceConnectivityProvider,
+  unregisterConnectivityProvider,
   getConnectivityProvider,
   requireConnectivityProvider,
   listRegisteredProviderTypes,
   isProviderRegistered,
+  normalizeProviderType,
+  resolveBindingAdapter,
 } from "./registry";
 
 // Mock provider (for development/testing)
