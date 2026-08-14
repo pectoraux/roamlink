@@ -1282,3 +1282,24 @@ Stage Summary:
   - G: COMPLETED-but-stale repair ✅
   - 5 static tests ✅
 - The invariant: IF cycle = COMPLETED THEN invoice = PAID AND ledgerTransactionId != null AND subscription.currentPeriodEnd = cycle.periodEnd. No partial completion is possible — both updates are in ONE transaction.
+
+---
+Task ID: 2B.3.8
+Agent: Lead engineer (main) — Eliminate All SaaS Renewal Completion Bypasses
+Task: Fix P0: two paid-invoice paths in renewSubscription bypass completeSaasRenewalCycle
+
+Work Log:
+- P0: Two alternate paid-invoice paths in renewSubscription directly set cycle.state = COMPLETED and subscription.currentPeriodEnd without going through the atomic completeSaasRenewalCycle function.
+- Bypass #1 (existingInvoice paid): Replaced inline saasRenewalCycle.update + tenantSubscription.update with completeSaasRenewalCycle().
+- Bypass #2 (invoice upsert paid): Replaced inline saasRenewalCycle.update with completeSaasRenewalCycle().
+- After this fix, completeSaasRenewalCycle() is the SINGLE authoritative function for renewal completion. No other code path directly sets state = "COMPLETED" or currentPeriodEnd for renewals.
+- Repository-wide audit confirms: exactly 1 occurrence of `data: { state: "COMPLETED"` in production code, and it's inside completeSaasRenewalCycle(). Zero direct currentPeriodEnd mutations for renewal outside the completion function.
+
+Stage Summary:
+- Files changed: src/lib/tenant/saas-subscription.ts, tests/phase2b38-eliminate-bypasses.test.ts
+- No schema migration needed
+- Tests: 6 tests — all EXECUTED + PASSED
+  - B: already-paid invoice recovery → uses completeSaasRenewalCycle ✅
+  - C: concurrent already-paid recovery → one cycle, one extension ✅
+  - 4 static tests (audit: zero COMPLETED writes, zero currentPeriodEnd mutations, all paid paths use completion function, no direct COMPLETED in saasRenewalCycle.update) ✅
+- The invariant: there is exactly ONE function that completes a SaaS renewal — completeSaasRenewalCycle(). No bypasses exist.

@@ -700,16 +700,20 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     : await db.tenantInvoice.findUnique({ where: { idempotencyKey: renewalKey } });
 
   if (existingInvoice && existingInvoice.status === "paid") {
-    // Already paid — complete the cycle + activate
-    await db.saasRenewalCycle.update({
-      where: { id: cycle.id },
-      data: { state: "COMPLETED", invoiceId: existingInvoice.id },
-    });
-    await db.tenantSubscription.update({
-      where: { id: subscription.id },
-      data: { status: "active", renewalIdempotencyKey: renewalKey },
-    });
-    return { success: true, status: "active" };
+    // Phase 2B.3.8: Use the single authoritative completion function.
+    // NO direct cycle/subscription mutation outside completeSaasRenewalCycle().
+    if (!cycle.invoiceId) {
+      await db.saasRenewalCycle.update({
+        where: { id: cycle.id },
+        data: { invoiceId: existingInvoice.id },
+      });
+    }
+    const completion = await completeSaasRenewalCycle({ invoiceId: existingInvoice.id, tenantId });
+    if (completion.completed) {
+      return { success: true, status: "active" };
+    } else {
+      return { success: false, status: "financial_pending", reason: "Completion failed for already-paid invoice" };
+    }
   }
 
   // Create or reuse the invoice
@@ -737,8 +741,13 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
   });
 
   if (invoice.status === "paid") {
-    await db.saasRenewalCycle.update({ where: { id: cycle.id }, data: { state: "COMPLETED" } });
-    return { success: true, status: "active" };
+    // Phase 2B.3.8: Use the single authoritative completion function.
+    const completion = await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId });
+    if (completion.completed) {
+      return { success: true, status: "active" };
+    } else {
+      return { success: false, status: "financial_pending", reason: "Completion failed for paid invoice" };
+    }
   }
 
   // If the invoice is reconciliation_required, attempt to finalize
