@@ -1696,3 +1696,22 @@ Stage Summary:
 - SaaS financial kernel: FROZEN — no changes during Phase 2C
 - Phase 2C.1 (Connectivity Entitlement Model) is the next implementation target
 - The billing kernel should become a stable foundation that consumes entitlements, not something that changes while connectivity integrations are added.
+
+---
+Task ID: 2C.DESIGN.LOCK
+Agent: Lead engineer (main) — Phase 2C Design Lock (Entitlement Lifecycle)
+Task: Record the final Phase 2C design refinements — entitlement lifecycle states, provider resource binding lifecycle states, and the carryover of the SaaS reconciliation principle.
+
+Work Log:
+- Confirmed the design lock: Phase 2C boundary is explicit. Commercial Product → SaaS Subscription (FROZEN) → Connectivity Entitlement (Capability Layer) → Provider Resource Binding → Provider Adapters.
+- Recorded the entitlement lifecycle state machine: PENDING → ACTIVE → (SUSPENDED | EXPIRED | REVOKED). This is the Phase 2C equivalent of the SaaS payment state machine.
+- Recorded the provider resource binding lifecycle: UNBOUND → PROVISIONING → BOUND → (DEGRADED | FAILED | RELEASED). The separation matters: an ACTIVE entitlement can coexist with a temporarily unhealthy provider binding (e.g., MikroTik router offline). Billing must not interpret infrastructure unhealthiness as a payment problem.
+- Carried over the strongest SaaS lesson: "Every external side effect needs a durable state machine and reconciliation path." Phase 2C must NOT do "subscription activated → create MikroTik user → done." It must do "subscription activated → create entitlement → provisioning job → provider adapter → resource binding → reconciliation monitors drift."
+- Confirmed the implementation order: 2C.1 Entitlement Kernel (state machines + reconciliation framework, NO MikroTik code), 2C.2 Provider Adapter Contract (interface freeze with idempotency/retry/error-classification/reconciliation hooks), 2C.3+ Provider Implementations (MikroTik, WiFi ISP, eSIM as replaceable plugins).
+- Strategic milestone after 2C.1: RoamLink knows "what connectivity capability does this customer own?" It does NOT yet care "which network vendor provides it?" That is the correct abstraction boundary.
+
+Stage Summary:
+- HEAD: 4936ad8123707d9a5731eb2436614848db5c17bf (origin/main, unchanged — this is a design lock, not code)
+- SaaS financial kernel: FROZEN — will not be reopened during Phase 2C
+- Phase 2C.1 implementation: ready to begin when requested
+- The entitlement lifecycle + provider resource binding lifecycle are the two new state machines that Phase 2C.1 must build.
