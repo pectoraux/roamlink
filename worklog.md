@@ -1384,3 +1384,39 @@ Stage Summary:
   - A: initial subscription success → atomic activation ✅
   - 4 static tests ✅
 - The invariant: initial activation is atomic — invoice period + subscription state commit or roll back together. No partial activation state.
+
+---
+Task ID: 2B.3.13
+Agent: Lead engineer (main) — Deterministic Initial Billing Period
+Task: Fix P1: activateInitialSaasSubscription() uses new Date() for periodStart on every retry, so a delayed reconciliation worker shifts the customer's billing period to the retry date instead of the original payment date.
+
+Work Log:
+- Phase 2B.3.12 atomic activation fix is preserved (verified by re-running 2B.3.12 test file — 5/5 pass).
+- P1 (billing-period drift on retry): The locked-invoice SELECT inside activateInitialSaasSubscription() now also loads `paidAt`, `periodStart`, and `periodEnd`. The billing period is derived deterministically:
+  - If the invoice already has a recorded (periodStart, periodEnd): reuse them verbatim. Retry never drifts the period.
+  - Else if invoice.paidAt is non-null: periodStart = paidAt; periodEnd = paidAt + billingCycle.
+  - Else: refuse to activate (a paid invoice MUST have paidAt — refusing is safer than fabricating a period).
+  - The function no longer contains `periodStart = new Date()` anywhere.
+- P1 (helper enforces ledger invariant): The helper now verifies `LedgerTransaction` exists for invoice.ledgerTransactionId inside its own transaction. The authoritative activation function cannot ever be called with a dangling ledger reference, even if a caller forgets to check.
+- Audit log enriched: every successful activation now records `periodSource` ("paidAt" | "reused"), `periodStart`, and `periodEnd` in the audit detail so future auditors can prove the period was derived from the financial event, not the retry execution time. The structured log line `saas.subscription_activated` also carries `periodSource`.
+- Audit of src/ for stray `new Date()` initial-activation recovery paths: clean. The only remaining `new Date()` near periodStart is `new Date(periodStart.getTime())` for cloning paidAt into periodEnd — that is correct. Other matches (lines 860, 972) are renewal-period calculations inside `renewSubscription`, which legitimately anchor to `sub.currentPeriodEnd` (not initial activation).
+
+Stage Summary:
+- No schema migration needed (paidAt + periodStart + periodEnd already nullable on TenantInvoice).
+- Files changed: src/lib/tenant/saas-subscription.ts (+85/-15), tests/phase2b313-deterministic-period.test.ts (new, 15 tests).
+- HEAD: 37eaa52043b03a1aa65e54462e143fda0c357412
+- origin/main: 37eaa52043b03a1aa65e54462e143fda0c357412 (pushed)
+- Tests: 15 in phase2b313-deterministic-period.test.ts — all EXECUTED + PASSED against PostgreSQL:
+  - A: initial payment → activation (paidAt == periodStart, 10 expects) ✅
+  - B: activation failure → reconciliation → worker recovers (7 expects) ✅
+  - C: delayed reconciliation preserves periodStart == T1 (paidAt, 10 days ago) ✅
+  - D: delayed reconciliation preserves periodEnd == T1 + cycle (NOT now + cycle, 12-day drift) ✅
+  - E: second reconciliation is idempotent — same periodStart/periodEnd/currentPeriodEnd ✅
+  - F: existing invoice period is reused verbatim (paidAt ≠ recorded periodStart; helper keeps recorded values) ✅
+  - G: missing ledger reference (null ledgerTransactionId) does not activate ✅
+  - H: dangling ledger reference (nonexistent ledger id) does not activate ✅
+  - I: renewal flow remains passing (renewal_cycle_completed observed, currentPeriodEnd pushed into future) ✅
+  - 6 static tests: contract enforcement for "no new Date() for periodStart", "reuses existing period", "ledger existence checked inside helper", "locked SELECT includes paidAt + periods", "audit records periodSource", "doc comment forbids new Date()" ✅
+- The audit log line observed at runtime: `{"message":"saas.subscription_activated", ...,"source":"step3","periodSource":"paidAt"}` and `...,"source":"fast_path","periodSource":"paidAt"}` — confirms both fast-path and step-3 paths anchor the period to paidAt.
+- Pre-existing failures noted (NOT caused by this phase): tests/phase2b311-initial-activation-integrity.test.ts has 4 failing tests at HEAD `4c2e899` (before this work) because Phase 2B.3.12 restructured the activation code in ways that broke 2B.3.11's static test contracts (e.g. it looks for "Verify the ledger transaction actually exists" and "Domain activation failed", which were renamed in 2B.3.12). These were pre-existing and outside the scope of 2B.3.13.
+- The invariant: Payment time → billing period. Never recovery time → billing period. The initial subscription billing period is now determined by the financial event that created the subscription (invoice.paidAt), not by when a recovery worker happens to repair the domain state. Retries days apart produce the same periodStart/periodEnd.
