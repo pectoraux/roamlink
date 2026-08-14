@@ -1031,6 +1031,8 @@ model Tenant {
   depositPayments TenantDepositPayment[]
   // Phase 2B.3: SaaS invoices
   invoices        TenantInvoice[]
+  // Phase 2C.1: connectivity entitlements
+  entitlements    ConnectivityEntitlement[]
 
   @@index([status])
 }
@@ -1403,4 +1405,119 @@ model SaasRenewalCycle {
   @@index([subscriptionId])
   @@index([tenantId])
   @@index([state])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2C.1 — Connectivity Entitlement Kernel
+// -----------------------------------------------------------------------------
+// The connectivity entitlement layer sits between the SaaS billing kernel
+// (frozen) and provider-specific adapters (MikroTik, WiFi ISP, eSIM).
+//
+// Three layers of truth:
+//   Commercial Truth: TenantSubscription (billing kernel — FROZEN)
+//   Entitlement Truth: ConnectivityEntitlement (this layer)
+//   Infrastructure Truth: ProviderResourceBinding (this layer)
+//
+// The entitlement kernel does NOT know about MikroTik, RADIUS, eSIM suppliers,
+// or ISP APIs. It only expresses what connectivity capability a customer owns.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ConnectivityCapability — the vocabulary of grantable connectivity types.
+// Provider-neutral. A capability is "what can be granted," not "how it's delivered."
+// ---------------------------------------------------------------------------
+
+model ConnectivityCapability {
+  id          String   @id @default(cuid())
+  type        String   @unique // INTERNET | LOCAL_NETWORK | CACHE_ACCESS | MESH_RELAY | VPN_ACCESS | ROAMING
+  displayName String   // human-readable label
+  description String?
+  // JSON string of capability-specific attributes schema, e.g.:
+  // {"downloadMbps": "number", "uploadMbps": "number", "monthlyQuotaBytes": "number"}
+  attributes  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  entitlements ConnectivityEntitlement[]
+}
+
+// ---------------------------------------------------------------------------
+// ConnectivityEntitlement — the customer's RIGHT to consume connectivity.
+//
+// Lifecycle: PENDING → ACTIVE → (SUSPENDED | EXPIRED | REVOKED)
+//
+// An entitlement is created when a subscription grants connectivity capability.
+// It is separate from the subscription because:
+//   - A subscription can have multiple entitlements (e.g., internet + eSIM)
+//   - An entitlement can outlive a billing period (grace period)
+//   - An entitlement can be suspended without cancelling the subscription
+//   - Infrastructure unhealthiness does NOT affect entitlement status
+// ---------------------------------------------------------------------------
+
+model ConnectivityEntitlement {
+  id              String   @id @default(cuid())
+  tenantId        String
+  subscriptionId  String // originating TenantSubscription
+  capabilityId    String
+  status          String   @default("PENDING") // PENDING | ACTIVE | SUSPENDED | EXPIRED | REVOKED
+  // JSON string of the capability set granted to this entitlement, e.g.:
+  // {"downloadMbps": 50, "uploadMbps": 10, "monthlyQuotaBytes": 500000000000}
+  capabilitySet   String
+  // JSON string of policy reference (rate limits, fair-use, priority, etc.)
+  policy          String?
+  validFrom       DateTime
+  validUntil      DateTime?
+  // Reconciliation: tracks drift between desired and observed state
+  reconciliationState String? // null | RECONCILIATION_REQUIRED | RECONCILED
+  failureReason   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  capability      ConnectivityCapability @relation(fields: [capabilityId], references: [id])
+  resourceBindings ProviderResourceBinding[]
+
+  @@index([tenantId])
+  @@index([subscriptionId])
+  @@index([status])
+  @@index([capabilityId])
+}
+
+// ---------------------------------------------------------------------------
+// ProviderResourceBinding — the actual external resource that delivers a capability.
+//
+// Lifecycle: UNBOUND → PROVISIONING → BOUND → (DEGRADED | FAILED | RELEASED)
+//
+// A binding is separate from the entitlement because:
+//   - An ACTIVE entitlement can coexist with a FAILED binding (router offline)
+//   - A binding can be rebound to a different provider without changing the entitlement
+//   - The billing system does not interpret binding health as a payment problem
+// ---------------------------------------------------------------------------
+
+model ProviderResourceBinding {
+  id              String   @id @default(cuid())
+  entitlementId   String
+  // Provider-neutral identifier: "mock" | "mikrotik" | "wifi-isp" | "esim" | future
+  providerType    String
+  // Provider-specific resource reference (e.g., MikroTik user profile ID, eSIM ICCID)
+  // Stored as a string — the provider adapter owns the interpretation.
+  providerResourceId String?
+  // JSON string of provider-specific binding metadata (routerId, radiusUsername, etc.)
+  // The entitlement kernel does NOT interpret these fields — they are opaque to it.
+  providerMetadata String?
+  status          String   @default("UNBOUND") // UNBOUND | PROVISIONING | BOUND | DEGRADED | FAILED | RELEASED
+  // Provisioning is asynchronous — tracks the durable provisioning job state
+  provisioningState String? // null | PENDING | IN_PROGRESS | COMPLETED | FAILED
+  // Reconciliation: tracks drift between desired and observed binding state
+  reconciliationState String? // null | RECONCILIATION_REQUIRED | RECONCILED
+  failureReason   String?
+  lastReconciledAt DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  entitlement     ConnectivityEntitlement @relation(fields: [entitlementId], references: [id], onDelete: Cascade)
+
+  @@index([entitlementId])
+  @@index([providerType])
+  @@index([status])
 }
