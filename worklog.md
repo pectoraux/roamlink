@@ -1570,3 +1570,30 @@ Stage Summary:
 - Lint: clean. TypeScript: clean. No schema migration needed.
 - The application-level invariant is now: ONE TenantInvoice → at most ONE createPaymentIntent call, enforced by PostgreSQL-atomic PAYMENT_CREATING claim.
 - Remaining assumption (explicitly documented): the ambiguous-success crash case requires manual provider audit — auto-retry would risk a double charge.
+
+---
+Task ID: 2B.3.17
+Agent: Lead engineer (main) — Ambiguous Payment State Safety / Reconciliation Boundary
+Task: Fix P0: AMBIGUOUS_PAYMENT state was not isolated from the normal financial-finalization path. An ambiguous external payment could become recognized revenue without proof of payment verification.
+
+Work Log:
+- P0 audit confirmed: the 2B.3.16 ambiguous case (PAYMENT_CREATING + no providerReference) transitioned to RECONCILIATION_REQUIRED. The renewSubscription RECONCILIATION_REQUIRED branch then called activateSubscriptionAndPostLedger(), which posted the ledger for a "pending" invoice without payment verification. Revenue was recognized for an unverified payment.
+- P0-1/P0-3: Added AMBIGUOUS_PAYMENT state — distinct from RECONCILIATION_REQUIRED. Used exclusively for the ambiguous case. renewSubscription refuses to process AMBIGUOUS_PAYMENT cycles — returns an error requiring manual/provider audit.
+- P0-2: Added resolveAmbiguousPayment() — the ONLY safe exit from AMBIGUOUS_PAYMENT. Requires a providerReference recovered via manual provider audit. Verifies the payment with the provider: succeeded → persist ref + post ledger + complete renewal; failed → safe to retry (PENDING); pending → leave in AMBIGUOUS_PAYMENT.
+- P0-4: Guarded activateSubscriptionAndPostLedger() with paymentVerified parameter. Refuses to post the ledger for a "pending" invoice without paymentVerified=true. Updated all 7 callers to pass the correct value.
+- Removed all 4 silent .catch(() => {}) calls from the payment-acquisition state machine. Each replaced with an explicit count check + CRITICAL log containing tenantId, subscriptionId, cycleId, invoiceId, previousState, intendedState, and error.
+
+Stage Summary:
+- HEAD: 9897cb89f188371684d6b659a074daffbca427f5
+- origin/main: 9897cb89f188371684d6b659a074daffbca427f5 (pushed)
+- Files changed: 2 (saas-subscription.ts +262/-16, +1 new test file with 11 tests)
+- Tests: 11 — all EXECUTED + PASSED:
+  - B: AMBIGUOUS_PAYMENT has NO ledger and NO paid invoice ✅
+  - C: renewSubscription on AMBIGUOUS_PAYMENT refuses, NO revenue ✅
+  - D: reconciliation worker does NOT auto-retry AMBIGUOUS_PAYMENT ✅
+  - E: resolveAmbiguousPayment with succeeded payment → recovery completes ✅
+  - F: resolveAmbiguousPayment with failed payment → safe retry ✅
+  - H: second reconciliation produces no financial duplicates ✅
+  - 5 static tests ✅
+- Lint: clean. TypeScript: clean. No schema migration needed.
+- The invariant: UNKNOWN PAYMENT → NO REVENUE. AMBIGUOUS PAYMENT → MANUAL RECONCILIATION. Only VERIFIED PAYMENT → REVENUE.
