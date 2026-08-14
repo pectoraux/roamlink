@@ -1499,6 +1499,9 @@ model ProviderResourceBinding {
   entitlementId   String
   // Provider-neutral identifier: "mock" | "mikrotik" | "wifi-isp" | "esim" | future
   providerType    String
+  // Phase 2C.3: Resource type within the provider (e.g., "hotspot_user", "radius_subscriber", "pppoe_session", "esim_profile")
+  // Allows a single providerType to manage different kinds of resources.
+  resourceType    String?
   // Provider-specific resource reference (e.g., MikroTik user profile ID, eSIM ICCID)
   // Stored as a string — the provider adapter owns the interpretation.
   providerResourceId String?
@@ -1509,7 +1512,7 @@ model ProviderResourceBinding {
   // Provisioning is asynchronous — tracks the durable provisioning job state
   provisioningState String? // null | PENDING | IN_PROGRESS | COMPLETED | FAILED
   // Reconciliation: tracks drift between desired and observed binding state
-  reconciliationState String? // null | RECONCILIATION_REQUIRED | RECONCILED
+  reconciliationState String? // null | RECONCILIATION_REQUIRED | RECONCILED | MANUAL_INTERVENTION_REQUIRED
   failureReason   String?
   lastReconciledAt DateTime?
   createdAt       DateTime @default(now())

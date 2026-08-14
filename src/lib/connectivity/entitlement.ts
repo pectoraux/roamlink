@@ -353,6 +353,8 @@ export async function getEntitlement(entitlementId: string, tenantId: string) {
 export async function createResourceBinding(input: {
   entitlementId: string;
   providerType: string;
+  /** Phase 2C.3: Resource type within the provider (e.g., "hotspot_user", "radius_subscriber") */
+  resourceType?: string;
   providerMetadata?: Record<string, unknown>;
   userId?: string;
 }): Promise<{ id: string; status: string }> {
@@ -360,6 +362,7 @@ export async function createResourceBinding(input: {
     data: {
       entitlementId: input.entitlementId,
       providerType: input.providerType,
+      resourceType: input.resourceType ?? null,
       providerMetadata: input.providerMetadata ? JSON.stringify(input.providerMetadata) : null,
       status: BINDING_STATES.UNBOUND,
     },
