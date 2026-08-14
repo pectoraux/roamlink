@@ -1797,3 +1797,24 @@ Stage Summary:
 - Lint: clean. TypeScript: clean.
 - SaaS billing kernel: FROZEN (no changes)
 - Phase 2C.3 (MikroTik Adapter): next target — reference implementation of the contract
+
+---
+Task ID: 2C.3
+Agent: Lead engineer (main) — MikroTik Reference Provider
+Task: Prove that a radically different connectivity provider can implement the frozen ConnectivityProviderAdapter contract without modifying the entitlement kernel.
+
+Work Log:
+- Added resourceType field to ProviderResourceBinding schema (e.g., "hotspot_user", "radius_subscriber"). Allows one providerType to manage different kinds of resources.
+- Created MikroTikProviderClient interface (createResource, getResource, suspendResource, resumeResource, deleteResource, getResourceUsage) with typed error classification (RETRYABLE, PERMANENT, AUTHENTICATION, NOT_FOUND, CONFLICT, TIMEOUT).
+- Created MockMikroTikProviderClient — deterministic test implementation with failure simulation.
+- Created MikroTikConnectivityAdapter implementing ConnectivityProviderAdapter. Translates generic contract to MikroTik operations via the provider client. Owns capability mapping (INTERNET → bandwidth limits). Classifies errors into retryable/permanent.
+- Registered MikroTik adapter in the provider registry.
+- Verified: entitlement kernel has ZERO MikroTik/RouterOS/RADIUS imports (static test).
+
+Stage Summary:
+- HEAD: 515f6753d9140bf0b8e9c116070c48942a633999
+- origin/main: 515f6753d9140bf0b8e9c116070c48942a633999 (pushed)
+- Tests: 19 — all EXECUTED + PASSED (13 runtime + 6 static)
+- Lint: clean. TypeScript: clean. Schema pushed via prisma db push.
+- SaaS billing kernel: FROZEN (no changes)
+- MikroTik is the first real reference implementation of the provider-independent connectivity architecture.
