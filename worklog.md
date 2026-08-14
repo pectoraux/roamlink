@@ -1715,3 +1715,26 @@ Stage Summary:
 - SaaS financial kernel: FROZEN — will not be reopened during Phase 2C
 - Phase 2C.1 implementation: ready to begin when requested
 - The entitlement lifecycle + provider resource binding lifecycle are the two new state machines that Phase 2C.1 must build.
+
+---
+Task ID: 2C.1.ADAPTER
+Agent: Lead engineer (main) — Connectivity Provider Adapter Contract
+Task: Complete the Phase 2C.1 Definition of Done by adding the ConnectivityProviderAdapter interface.
+
+Work Log:
+- Created ConnectivityProviderAdapter interface with 5 methods: provision, suspend, resume, release, getUsage. All operations must be idempotent.
+- Defined result types: ProvisionResult (success/pending/failed_retryable/failed_permanent), ActionResult, UsageMetrics.
+- Created MockConnectivityProvider — a no-op adapter for development/testing that proves the interface is usable.
+- The adapter does NOT own financial state. It only manages infrastructure resources.
+
+Stage Summary:
+- HEAD: fd5f06f (origin/main, pushed)
+- Tests: 9 — all EXECUTED + PASSED (5 runtime + 4 static)
+- Phase 2C.1 DoD: COMPLETE
+  ✅ ConnectivityCapability model exists
+  ✅ ConnectivityEntitlement lifecycle exists
+  ✅ ProviderResourceBinding abstraction exists
+  ✅ Async provisioning workflow exists
+  ✅ Provider adapter interface exists
+  ✅ Reconciliation model exists
+  ✅ No billing code changes required
