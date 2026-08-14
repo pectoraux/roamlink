@@ -1544,3 +1544,29 @@ Stage Summary:
   - 5 static tests (3 new + 2 updated from 2B.3.14)
 - Lint: clean. TypeScript: clean. No schema migration needed.
 - The SaaS billing subsystem is ready to freeze.
+
+---
+Task ID: 2B.3.16
+Agent: Lead engineer (main) — Payment Operation Acquisition Concurrency
+Task: Read-only audit of the external payment-operation acquisition boundary. Prove or disprove ONE TenantInvoice → ONE external provider payment operation under concurrency, crash, and ambiguous-success scenarios. Fix the race condition with an application-level atomic claim.
+
+Work Log:
+- Audit finding: the 2B.3.15 code had a read-check-call race. Two concurrent workers could both observe providerReference = null, both call createPaymentIntent(), and both try to persist. The invariant relied entirely on provider-level idempotency, not on an application-level guarantee.
+- Fix: introduced a durable payment-operation state machine using the SaasRenewalCycle's state field. Added PAYMENT_CREATING state. The transition PAYMENT_PENDING → PAYMENT_CREATING is a PostgreSQL-atomic conditional mutation (updateMany WHERE state = 'PAYMENT_PENDING'). Only one worker wins. The winner calls createPaymentIntent and persists the reference. Losers poll for the reference (up to 10 seconds) and reuse it — they never call createPaymentIntent.
+- Crash recovery: reconciliation worker scans for cycles stuck in PAYMENT_CREATING for > 5 minutes. WITH providerReference → safe recovery to PAYMENT_PENDING. WITHOUT providerReference → RECONCILIATION_REQUIRED (no auto-retry, because the provider may have created the operation but the response was lost — auto-retry would risk a double charge).
+- Timezone fix: addBillingInterval switched from local-time (setMonth/setFullYear) to UTC operations (setUTCMonth/setUTCFullYear/getUTCDate/setUTCDate). Billing periods are now timezone-independent.
+- Test instrumentation: MockPaymentProvider now counts createPaymentIntent calls. Exported getCreatePaymentIntentCallCount() and resetCreatePaymentIntentCallCount() for concurrency tests.
+
+Stage Summary:
+- HEAD: ce597607ab29c16e7b8cceed2bbf8ab2eede8b79
+- origin/main: ce597607ab29c16e7b8cceed2bbf8ab2eede8b79 (pushed)
+- Files changed: 5 (saas-subscription.ts +252/-52, mock-provider.ts +19, payments/index.ts +2, 2B.3.15 test contract updated, +1 new test file with 8 tests)
+- Tests: 8 in phase2b316-payment-acquisition.test.ts — all EXECUTED + PASSED:
+  - Test 1: two concurrent renewSubscription → createPaymentIntent called exactly ONCE ✅
+  - Test 4: stuck PAYMENT_CREATING + reference → safe recovery ✅
+  - Test 5: stuck PAYMENT_CREATING + no reference → RECONCILIATION_REQUIRED (no auto-retry) ✅
+  - Test 6: UTC billing period (timezone-independent) ✅
+  - 4 static tests ✅
+- Lint: clean. TypeScript: clean. No schema migration needed.
+- The application-level invariant is now: ONE TenantInvoice → at most ONE createPaymentIntent call, enforced by PostgreSQL-atomic PAYMENT_CREATING claim.
+- Remaining assumption (explicitly documented): the ambiguous-success crash case requires manual provider audit — auto-retry would risk a double charge.
