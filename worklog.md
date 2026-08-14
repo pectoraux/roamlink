@@ -1597,3 +1597,31 @@ Stage Summary:
   - 5 static tests ✅
 - Lint: clean. TypeScript: clean. No schema migration needed.
 - The invariant: UNKNOWN PAYMENT → NO REVENUE. AMBIGUOUS PAYMENT → MANUAL RECONCILIATION. Only VERIFIED PAYMENT → REVENUE.
+
+---
+Task ID: 2B.3.18
+Agent: Lead engineer (main) — Ambiguous Payment Resolution Integrity
+Task: Fix P0: resolveAmbiguousPayment() trusted a manually supplied provider reference too much — verified "a payment succeeded" but not "the correct payment for this exact invoice succeeded". Also fix P1: paidAt persistence failure was logged-and-ignored, allowing finalization without the authoritative payment timestamp.
+
+Work Log:
+- P0: Extended PaymentVerification type with amountMinor?: number and currency?: string. All 4 provider adapters (mock, stripe, paystack, flutterwave) now normalize the paid amount and currency. resolveAmbiguousPayment() verifies that verification.amountMinor === invoice.amountMinor AND verification.currency === invoice.currency (case-insensitive). If either check fails, resolution is refused and the cycle remains AMBIGUOUS_PAYMENT. If the provider doesn't return amount/currency, resolution is also refused (fail-closed).
+- P1: paidAt persistence now BLOCKS finalization. The paidAt write is performed BEFORE the atomic state claim, so a failure leaves the cycle in AMBIGUOUS_PAYMENT (unchanged). If the write throws, the function returns resolved=false with a CRITICAL log containing tenantId, subscriptionId, cycleId, invoiceId, providerReference, paidAt, and error.
+- P1: Added atomic claim to resolveAmbiguousPayment. The transition AMBIGUOUS_PAYMENT → PAYMENT_PENDING is a PostgreSQL-atomic conditional mutation (updateMany WHERE state = 'AMBIGUOUS_PAYMENT'). Only the winner (count=1) proceeds. Concurrent calls produce exactly one financial effect.
+
+Stage Summary:
+- HEAD: 8a64b1b4ee5c2af0746d0b9360c49fe85d26cceb
+- origin/main: 8a64b1b4ee5c2af0746d0b9360c49fe85d26cceb (pushed)
+- Files changed: 7 (provider.ts +15, mock-provider.ts +5, stripe-provider.ts +3, paystack-provider.ts +3, flutterwave-provider.ts +4, saas-subscription.ts +204/-57, +1 new test file with 13 tests)
+- Tests: 13 — all EXECUTED + PASSED:
+  - A: correct recovered payment → 1 ledger, paid, completed ✅
+  - B: wrong reference (wrong amount) → rejected, no ledger ✅
+  - C: correct reference, wrong amount → rejected ✅
+  - D: correct reference, wrong currency → rejected ✅
+  - E: provider pending → remains AMBIGUOUS_PAYMENT ✅
+  - F: provider failed → safe retry ✅
+  - H: duplicate → exactly 1 financial effect ✅
+  - I: concurrent → exactly 1 financial effect ✅
+  - J: regression — normal initial subscription works ✅
+  - 4 static tests ✅
+- Lint: clean. TypeScript: clean. No schema migration needed.
+- The invariant: PAYMENT REFERENCE RECOVERED → PROVIDER VERIFICATION → EXACT INVOICE MATCH (amount + currency + provider) → PAYMENT VERIFIED → LEDGER → DOMAIN COMPLETION. Anything less remains AMBIGUOUS_PAYMENT.
