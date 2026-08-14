@@ -1303,3 +1303,26 @@ Stage Summary:
   - C: concurrent already-paid recovery → one cycle, one extension ✅
   - 4 static tests (audit: zero COMPLETED writes, zero currentPeriodEnd mutations, all paid paths use completion function, no direct COMPLETED in saasRenewalCycle.update) ✅
 - The invariant: there is exactly ONE function that completes a SaaS renewal — completeSaasRenewalCycle(). No bypasses exist.
+
+---
+Task ID: 2B.3.9
+Agent: Lead engineer (main) — Enforce SaaS Renewal Invariant on Completed Cycles
+Task: Fix P0: renewSubscription blindly returns success on COMPLETED cycle without verifying invariant
+
+Work Log:
+- P0: renewSubscription contained `if (cycle.state === "COMPLETED") { return { success: true } }` — a blind early return that bypassed completeSaasRenewalCycle(). This meant a stale legacy state (cycle=COMPLETED, subscription.currentPeriodEnd != cycle.periodEnd) would never be repaired.
+- Fix: Replaced the blind early return with a call to completeSaasRenewalCycle(). If the cycle has no invoiceId, it fails closed (returns error). If it has an invoiceId, completeSaasRenewalCycle() verifies the invariant and repairs if stale.
+- Tests use REAL ledger transactions (via ledgerSaasSubscriptionPayment) instead of fake IDs. Added assertCompletedSaasRenewalInvariant() helper that verifies: cycle=COMPLETED, invoice=paid, ledgerTransactionId exists AND the referenced LedgerTransaction actually exists, subscription.currentPeriodEnd == cycle.periodEnd.
+- Replaced silent .catch(() => {}) in test cleanup with logged catches.
+- Test B: completed + correct period → renewSubscription returns "not ended" (correct behavior, no mutation needed).
+- Test C: completed + stale period → completeSaasRenewalCycle detects and repairs the stale period. Verified with real ledger transaction.
+- Test D: completed cycle without invoice → fails closed.
+
+Stage Summary:
+- Files changed: src/lib/tenant/saas-subscription.ts, tests/phase2b39-invariant-enforcement.test.ts
+- Tests: 5 tests — all EXECUTED + PASSED (33 expect calls)
+  - B: completed + correct period → no mutations ✅
+  - C: completed + stale period → repaired via completeSaasRenewalCycle ✅ (with real ledger)
+  - D: completed without invoice → fails closed ✅
+  - 2 static tests ✅
+- The invariant: cycle=COMPLETED ⇒ invoice=PAID AND ledgerTransactionId exists AND real LedgerTransaction exists AND subscription.currentPeriodEnd = cycle.periodEnd. Every caller enforces it.

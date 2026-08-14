@@ -655,9 +655,21 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
     return { success: false, status: "error", reason: "Failed to create/find renewal cycle" };
   }
 
-  // If the cycle is already COMPLETED, the renewal was already done.
+  // Phase 2B.3.9: If the cycle is already COMPLETED, do NOT blindly return success.
+  // Route through completeSaasRenewalCycle() which verifies the invariant
+  // (subscription.currentPeriodEnd == cycle.periodEnd) and repairs if stale.
   if (cycle.state === "COMPLETED") {
-    return { success: true, status: "active" };
+    if (!cycle.invoiceId) {
+      // COMPLETED cycle with no invoice — fail closed, don't silently succeed
+      logger.error("saas.completed_cycle_no_invoice", { cycleId: cycle.id });
+      return { success: false, status: "error", reason: "Completed cycle has no invoice — manual reconciliation required" };
+    }
+    const completion = await completeSaasRenewalCycle({ invoiceId: cycle.invoiceId, tenantId });
+    if (completion.completed) {
+      return { success: true, status: "active" };
+    } else {
+      return { success: false, status: "error", reason: "Completed cycle invariant verification failed" };
+    }
   }
 
   // If the cycle is RECONCILIATION_REQUIRED, attempt to finalize the existing invoice.
