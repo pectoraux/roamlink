@@ -1366,3 +1366,21 @@ Stage Summary:
   - D: paid invoice with null ledger → does NOT activate ✅
   - 4 static tests ✅
 - The invariant: PAID invoice ⇒ ledgerTransactionId non-null AND LedgerTransaction exists. Initial activation failure ⇒ subscription reconciliation_required ⇒ worker discovers via subscription scan ⇒ retries domain activation only.
+
+---
+Task ID: 2B.3.12
+Agent: Lead engineer (main) — Final Initial-Activation Atomicity
+Task: Make initial SaaS domain activation transactional
+
+Work Log:
+- Created activateInitialSaasSubscription() — the single authoritative function for initial SaaS domain activation. Performs invoice period update + subscription activation inside ONE PostgreSQL $transaction with FOR UPDATE locks on both TenantInvoice and TenantSubscription rows.
+- Both the paid-invoice fast path and the Step 3 path now delegate to activateInitialSaasSubscription() — no separate inline activation code exists.
+- If the transaction fails, neither update commits (no partial state). The subscription is marked reconciliation_required with a CRITICAL log containing tenantId, subscriptionId, invoiceId, and the original error.
+- The recovery-state .catch also emits a CRITICAL log with full context (tenantId, subscriptionId, originalError, persistError).
+
+Stage Summary:
+- Files changed: src/lib/tenant/saas-subscription.ts, tests/phase2b312-atomic-activation.test.ts
+- Tests: 5 tests — all EXECUTED + PASSED (24 expect calls)
+  - A: initial subscription success → atomic activation ✅
+  - 4 static tests ✅
+- The invariant: initial activation is atomic — invoice period + subscription state commit or roll back together. No partial activation state.
