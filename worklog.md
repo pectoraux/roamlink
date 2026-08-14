@@ -1677,3 +1677,22 @@ Stage Summary:
 - Phase 2B.3.20 (boundary audit): NOT started — deferred until real provider integrations are ready
 - Phase 2C (local connectivity supply): CLEARED TO BEGIN
 - The billing kernel is now a stable foundation. It should not change while connectivity integrations are added.
+
+---
+Task ID: 2C.DESIGN
+Agent: Lead engineer (main) — Phase 2C Architecture Agreement
+Task: Record the agreed Phase 2C design direction. The SaaS financial kernel is frozen. Phase 2C begins with the Connectivity Entitlement Kernel, not with provider-specific integrations.
+
+Work Log:
+- Confirmed the three-state milestone: SaaS financial kernel FROZEN ✅, real-money operational readiness NOT YET CERTIFIED ⚠️, connectivity supply integration READY TO BEGIN ✅.
+- Agreed on the architecture boundary: SaaS Billing Kernel (FROZEN) → Connectivity Entitlement Layer → Provider Adapters (MikroTik / WiFi ISP / eSIM). The billing kernel becomes a consumer of connectivity entitlements, not a controller of network infrastructure.
+- Agreed on the canonical model: CommercialProduct → Subscription → Entitlement → ProviderResourceBinding. No per-provider subscription types (no "MikroTik Subscription" or "eSIM Subscription" — those are provider resources, not commercial entities).
+- Agreed on the Phase 2C sub-phase order: 2C.1 Connectivity Entitlement Model, 2C.2 Provider Adapter Interface, 2C.3 MikroTik Adapter, 2C.4 WiFi ISP Adapter, 2C.5 eSIM Adapter. Each provider becomes a plugin.
+- Agreed on the ConnectivityProviderAdapter interface shape: provision(), suspend(), resume(), getUsage().
+- Agreed on the "Connectivity Capability" naming (not "Internet Access") to future-proof for: INTERNET, LOCAL_NETWORK, CACHE_ACCESS, MESH_RELAY. The entitlement expresses capability, not transport.
+
+Stage Summary:
+- HEAD: 4936ad8123707d9a5731eb2436614848db5c17bf (origin/main, unchanged)
+- SaaS financial kernel: FROZEN — no changes during Phase 2C
+- Phase 2C.1 (Connectivity Entitlement Model) is the next implementation target
+- The billing kernel should become a stable foundation that consumes entitlements, not something that changes while connectivity integrations are added.
