@@ -1521,3 +1521,26 @@ Canonical rule adopted:
   WHERE clause that includes the expected predecessor state, and the code
   inspects the affected-row count. If 0 rows were affected, the state has
   already advanced — the code re-reads and reconciles rather than overwriting.
+
+---
+Task ID: 2B.3.15
+Agent: Lead engineer (main) — Production Boundary Audit + Calendar Billing
+Task: Read-only audit of provider paidAt extraction, providerReference recovery, billing-period derivation, and state-transition completeness. Then fix findings and add integration tests.
+
+Work Log:
+- Area 1 (provider paidAt): Audited all 4 provider adapters. The paidAt extraction code is present and uses the correct documented fields (Stripe: charges.data[0].created, Paystack: paid_at, Flutterwave: created_at). Created 8 fixture tests using provider-native response shapes from API docs — all pass.
+- Area 2 (providerReference recovery): Found a gap — renewSubscription called createPaymentIntent BEFORE checking if the invoice already had a providerReference. On recovery after a crash, this could create a second payment operation. Fixed: renewSubscription now re-reads the invoice and reuses an existing providerReference. The ONE INVOICE → ONE PROVIDER PAYMENT OPERATION invariant is now enforced at the application level, with provider-level idempotency as a backstop.
+- Area 3 (billing-period derivation): Found a real bug — the code used duration tolerances (27-32 days for monthly) instead of canonical calendar intervals. Worse, JavaScript's Date.setMonth overflows on end-of-month dates (Jan 31 + setMonth(1) → Mar 3, not Feb 28). Fixed: created addBillingInterval() with end-of-month clamping. Validation now re-derives expected periodEnd from periodStart using the same function, then compares for exact equality.
+- Area 4 (state-transition enumeration): Enumerated all writes to the 7 critical fields. All use updateMany with state guards. Zero unguarded db.*.update calls remaining (grep-verified).
+- Area 5 (state-transition graph): Produced complete graph (see report).
+
+Stage Summary:
+- HEAD: abec66512ff09aab9d4d81461d3a5deea1a70503
+- origin/main: abec66512ff09aab9d4d81461d3a5deea1a70503 (pushed)
+- Files changed: 4 (saas-subscription.ts +134/-77, 2B.3.14 test contract updated, +2 new test files with 19 tests)
+- Tests: 19 total — all EXECUTED + PASSED:
+  - 8 provider fixture tests (Stripe, Paystack, Flutterwave, Mock — using documented payload shapes)
+  - 6 integration tests (process crash recovery, webhook race, duplicate webhook, Jan→Feb month-end, leap year, full lifecycle ONE→ONE→ONE→ONE)
+  - 5 static tests (3 new + 2 updated from 2B.3.14)
+- Lint: clean. TypeScript: clean. No schema migration needed.
+- The SaaS billing subsystem is ready to freeze.
