@@ -1346,3 +1346,23 @@ Stage Summary:
   - G+H+I: idempotency — second run produces nothing ✅ (3 expects)
   - 4 static tests ✅
 - The invariant: PAID + LEDGER + CYCLE != COMPLETED → cycle = RECONCILIATION_REQUIRED → worker discovers → retries domain completion only → COMPLETED. No second payment, no second ledger.
+
+---
+Task ID: 2B.3.11
+Agent: Lead engineer (main) — Unify Initial SaaS Activation Financial Integrity
+Task: Fix P0-1: paid initial invoice can be left unactivated. Fix P0-2: paid-invoice fast path trusts status without verifying ledger.
+
+Work Log:
+- P0-2 (paid-invoice fast path trusts status): Fixed the idempotent fast path in activateSubscriptionAndPostLedger to verify: (1) invoice.ledgerTransactionId is non-null, (2) the referenced LedgerTransaction actually exists in the database. If either check fails, marks subscription reconciliation_required and returns activated=false.
+- P0-1 (paid initial invoice left unactivated): The paid-invoice fast path now also checks if the subscription needs domain activation (status = pending_payment or reconciliation_required). If so, it performs the full domain activation: sets invoice periodStart/periodEnd, sets subscription status=active + currentPeriodEnd. If domain activation fails, marks subscription reconciliation_required.
+- P1 (invoice period update .catch): The invoice period update + subscription activation are now inside a try/catch that marks the subscription reconciliation_required on failure. No silent .catch.
+- Extended the reconciliation worker to scan subscriptions in reconciliation_required with a paid invoice + ledger. For these, retries ONLY the domain activation (no payment, no ledger reposting).
+
+Stage Summary:
+- Files changed: src/lib/tenant/saas-subscription.ts, tests/phase2b311-initial-activation-integrity.test.ts
+- Tests: 7 tests — all EXECUTED + PASSED
+  - A: initial subscription success → ACTIVE with real period ✅ (6 expects)
+  - C+E: initial activation failure → reconciliation_required → worker recovers ✅ (7 expects, real ledger)
+  - D: paid invoice with null ledger → does NOT activate ✅
+  - 4 static tests ✅
+- The invariant: PAID invoice ⇒ ledgerTransactionId non-null AND LedgerTransaction exists. Initial activation failure ⇒ subscription reconciliation_required ⇒ worker discovers via subscription scan ⇒ retries domain activation only.

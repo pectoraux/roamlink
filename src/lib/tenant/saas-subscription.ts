@@ -292,8 +292,77 @@ async function activateSubscriptionAndPostLedger(input: {
     throw new AppError("not_found", "Invoice not found", 404, "Invoice not found during activation.");
   }
 
-  // Idempotent: if already paid, return early
+  // Phase 2B.3.11 P0-2: Idempotent fast path must verify ledger existence.
+  // A paid invoice with no ledgerTransactionId is a corrupted state —
+  // do NOT return activated=true.
   if (invoice.status === "paid") {
+    if (!invoice.ledgerTransactionId) {
+      logger.error("saas.paid_invoice_missing_ledger", { invoiceId: input.invoiceId });
+      await db.tenantSubscription.updateMany({
+        where: { id: input.subscriptionId, status: { not: "active" } },
+        data: { status: "reconciliation_required" },
+      }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+      return { activated: false };
+    }
+    const ledgerExists = await db.ledgerTransaction.findUnique({
+      where: { id: invoice.ledgerTransactionId },
+      select: { id: true },
+    });
+    if (!ledgerExists) {
+      logger.error("saas.paid_invoice_ledger_not_found", { invoiceId: input.invoiceId, ledgerTxnId: invoice.ledgerTransactionId });
+      await db.tenantSubscription.updateMany({
+        where: { id: input.subscriptionId, status: { not: "active" } },
+        data: { status: "reconciliation_required" },
+      }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+      return { activated: false };
+    }
+
+    // Phase 2B.3.11: Check if the subscription needs domain activation.
+    // If it's not active yet (pending_payment or reconciliation_required),
+    // perform the domain activation now.
+    const currentSub = await db.tenantSubscription.findUnique({
+      where: { id: input.subscriptionId },
+      select: { status: true },
+    });
+
+    if (currentSub?.status === "pending_payment" || currentSub?.status === "reconciliation_required") {
+      // Perform domain activation (same as Step 3 below)
+      const periodStart = new Date();
+      const periodEnd = new Date(periodStart);
+      if (invoice.billingCycle === "yearly") {
+        periodEnd.setFullYear(periodEnd.getFullYear() + 1);
+      } else {
+        periodEnd.setMonth(periodEnd.getMonth() + 1);
+      }
+
+      try {
+        await db.tenantInvoice.update({
+          where: { id: input.invoiceId },
+          data: { periodStart, periodEnd },
+        });
+        await db.tenantSubscription.update({
+          where: { id: input.subscriptionId },
+          data: { status: "active", currentPeriodEnd: periodEnd },
+        });
+        logger.info("saas.subscription_activated_via_fast_path", { subscriptionId: input.subscriptionId, invoiceId: input.invoiceId });
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        logger.error("saas.initial_activation_failed", {
+          subscriptionId: input.subscriptionId,
+          invoiceId: input.invoiceId,
+          error: errorMsg,
+          message: "CRITICAL: Financial finalization succeeded but domain activation failed (fast path).",
+        });
+        await db.tenantSubscription.updateMany({
+          where: { id: input.subscriptionId, status: { not: "active" } },
+          data: { status: "reconciliation_required" },
+        }).catch((updateErr) => {
+          logger.error("saas.state_update_failed", { error: updateErr instanceof Error ? updateErr.message : String(updateErr) });
+        });
+        return { activated: false };
+      }
+    }
+
     logger.info("saas.invoice_already_paid", { invoiceId: input.invoiceId });
     return { activated: true };
   }
@@ -316,8 +385,6 @@ async function activateSubscriptionAndPostLedger(input: {
       idempotencyKey: `${invoice.idempotencyKey}:ledger`,
     });
   } catch (err) {
-    // Phase 2B.3.1: Ledger failed — mark as reconciliation_required.
-    // Do NOT mark as paid. Do NOT activate the subscription.
     const errorMsg = err instanceof Error ? err.message : String(err);
     logger.error("saas.ledger_posting_failed", { invoiceId: input.invoiceId, error: errorMsg });
     await db.tenantInvoice.updateMany({
@@ -329,7 +396,7 @@ async function activateSubscriptionAndPostLedger(input: {
         invoiceId: input.invoiceId,
         ledgerError: errorMsg,
         updateError: updateMsg,
-        message: "CRITICAL: Ledger failed AND status update to reconciliation_required failed. The worker will recover it via the stale-status scan.",
+        message: "CRITICAL: Ledger failed AND status update to reconciliation_required failed.",
       });
     });
     return { activated: false };
@@ -342,20 +409,17 @@ async function activateSubscriptionAndPostLedger(input: {
   });
 
   if (updated.count === 0) {
-    // Another concurrent call paid it — check if it's already paid
     const current = await db.tenantInvoice.findUnique({ where: { id: input.invoiceId } });
-    if (current?.status === "paid") {
+    if (current?.status === "paid" && current.ledgerTransactionId) {
       logger.info("saas.invoice_concurrently_paid", { invoiceId: input.invoiceId });
       return { activated: true };
     }
-    // It's in some other state — don't activate
     logger.warn("saas.invoice_unexpected_state", { invoiceId: input.invoiceId, status: current?.status });
     return { activated: false };
   }
 
-  // Step 3: Activate the subscription (only after ledger is confirmed + invoice is paid)
-  // Phase 2B.3.3 P0-1: Set the billing period based on payment confirmation time,
-  // not intent creation time. The billing clock starts when the customer pays.
+  // Step 3: Domain activation — for initial subscriptions only.
+  // For renewals, completeSaasRenewalCycle() handles period extension.
   const periodStart = new Date();
   const periodEnd = new Date(periodStart);
   if (invoice.billingCycle === "yearly") {
@@ -364,40 +428,64 @@ async function activateSubscriptionAndPostLedger(input: {
     periodEnd.setMonth(periodEnd.getMonth() + 1);
   }
 
-  // Get the current subscription to check if this is the first activation
   const currentSub = await db.tenantSubscription.findUnique({
     where: { id: input.subscriptionId },
     select: { status: true, currentPeriodEnd: true },
   });
 
-  // If the subscription was pending_payment (first activation), set the real period.
-  // If it was already active/reconciliation_required (renewal), the caller (renewSubscription)
-  // handles the period extension.
-  const updateData: any = { status: "active" };
-  if (currentSub?.status === "pending_payment") {
-    updateData.currentPeriodEnd = periodEnd;
-    // Also update the invoice's period to match the real billing period
-    await db.tenantInvoice.update({
-      where: { id: input.invoiceId },
-      data: { periodStart, periodEnd },
-    }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+  // Phase 2B.3.11 P0-1: Only perform domain activation for initial subscriptions.
+  // For renewals, the caller (renewSubscription) handles period extension
+  // via completeSaasRenewalCycle().
+  if (currentSub?.status === "pending_payment" || currentSub?.status === "reconciliation_required") {
+    // Phase 2B.3.11 P1: Invoice period update + subscription activation must
+    // both succeed. If either fails, mark subscription reconciliation_required
+    // so the worker can retry. No silent .catch().
+    try {
+      // Update invoice period
+      await db.tenantInvoice.update({
+        where: { id: input.invoiceId },
+        data: { periodStart, periodEnd },
+      });
+
+      // Activate the subscription
+      await db.tenantSubscription.update({
+        where: { id: input.subscriptionId },
+        data: { status: "active", currentPeriodEnd: periodEnd },
+      });
+
+      await audit({
+        tenantId: input.tenantId,
+        userId: (input.userId === "renewal-worker" || input.userId === "webhook" || input.userId === "reconciliation-worker") ? undefined : input.userId,
+        action: "saas.subscription_activated",
+        entity: "tenant_subscription",
+        entityId: input.subscriptionId,
+        detail: { invoiceId: input.invoiceId, ledgerTxnId, amount: invoice.amountMinor },
+      });
+
+      logger.info("saas.subscription_activated", { tenantId: input.tenantId, subscriptionId: input.subscriptionId, ledgerTxnId, invoiceId: input.invoiceId });
+      return { activated: true };
+    } catch (err) {
+      // Phase 2B.3.11 P0-1: Domain activation failed. Financial state is complete
+      // (invoice paid + ledger posted). Mark subscription for recovery.
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error("saas.initial_activation_failed", {
+        subscriptionId: input.subscriptionId,
+        invoiceId: input.invoiceId,
+        error: errorMsg,
+        message: "CRITICAL: Financial finalization succeeded but domain activation failed. Subscription marked reconciliation_required.",
+      });
+      await db.tenantSubscription.updateMany({
+        where: { id: input.subscriptionId, status: { not: "active" } },
+        data: { status: "reconciliation_required" },
+      }).catch((updateErr) => {
+        logger.error("saas.state_update_failed", { error: updateErr instanceof Error ? updateErr.message : String(updateErr) });
+      });
+      return { activated: false };
+    }
   }
 
-  await db.tenantSubscription.update({
-    where: { id: input.subscriptionId },
-    data: updateData,
-  });
-
-  await audit({
-    tenantId: input.tenantId,
-    userId: (input.userId === "renewal-worker" || input.userId === "webhook" || input.userId === "reconciliation-worker") ? undefined : input.userId,
-    action: "saas.subscription_activated",
-    entity: "tenant_subscription",
-    entityId: input.subscriptionId,
-    detail: { invoiceId: input.invoiceId, ledgerTxnId, amount: invoice.amountMinor },
-  });
-
-  logger.info("saas.subscription_activated", { tenantId: input.tenantId, subscriptionId: input.subscriptionId, ledgerTxnId, invoiceId: input.invoiceId });
+  // For renewals (status was already active/past_due), the caller handles
+  // domain completion via completeSaasRenewalCycle().
   return { activated: true };
 }
 
@@ -1199,6 +1287,58 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
       result.stillFailing++;
       logger.error("saas.cycle_reconciliation_failed", {
         cycleId: cycle.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Phase 2B.3.11 P0-1: Initial subscription recovery scan.
+  // Find subscriptions in reconciliation_required with a paid invoice + ledger.
+  // These represent initial activations where financial finalization succeeded
+  // but domain activation failed. Retry ONLY the domain activation.
+  const stuckSubs = await db.tenantSubscription.findMany({
+    where: { status: "reconciliation_required" },
+    select: { id: true, tenantId: true, saaasPlanId: true, billingCycle: true },
+  });
+
+  for (const sub of stuckSubs) {
+    const paidInvoice = await db.tenantInvoice.findFirst({
+      where: { subscriptionId: sub.id, status: "paid", ledgerTransactionId: { not: null } },
+      orderBy: { createdAt: "desc" },
+    });
+
+    if (!paidInvoice || !paidInvoice.ledgerTransactionId) {
+      continue;
+    }
+
+    const ledgerExists = await db.ledgerTransaction.findUnique({
+      where: { id: paidInvoice.ledgerTransactionId },
+      select: { id: true },
+    });
+    if (!ledgerExists) {
+      logger.error("saas.initial_recovery_ledger_missing", { subscriptionId: sub.id, invoiceId: paidInvoice.id });
+      continue;
+    }
+
+    // Retry ONLY the domain activation (no payment, no ledger)
+    result.retried++;
+    try {
+      const activated = await activateSubscriptionAndPostLedger({
+        subscriptionId: sub.id,
+        invoiceId: paidInvoice.id,
+        tenantId: sub.tenantId,
+        userId: "reconciliation-worker",
+      });
+      if (activated.activated) {
+        result.repaired++;
+        logger.info("saas.initial_activation_reconciled", { subscriptionId: sub.id, invoiceId: paidInvoice.id });
+      } else {
+        result.stillFailing++;
+      }
+    } catch (err) {
+      result.stillFailing++;
+      logger.error("saas.initial_activation_recovery_failed", {
+        subscriptionId: sub.id,
         error: err instanceof Error ? err.message : String(err),
       });
     }
