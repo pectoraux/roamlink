@@ -355,14 +355,63 @@ export async function createResourceBinding(input: {
   providerType: string;
   /** Phase 2C.3: Resource type within the provider (e.g., "hotspot_user", "radius_subscriber") */
   resourceType?: string;
+  /** Phase 2C.3.1: Provider instance — the specific infrastructure endpoint */
+  providerInstanceId?: string;
   providerMetadata?: Record<string, unknown>;
   userId?: string;
 }): Promise<{ id: string; status: string }> {
+  // Phase 2C.3.1: If a providerInstanceId is supplied, verify it belongs to
+  // the same tenant as the entitlement and matches the providerType.
+  if (input.providerInstanceId) {
+    const entitlement = await db.connectivityEntitlement.findUnique({
+      where: { id: input.entitlementId },
+      select: { tenantId: true },
+    });
+    if (!entitlement) {
+      throw new AppError("not_found", "Entitlement not found", 404, "Cannot create binding — entitlement not found.");
+    }
+    const instance = await db.connectivityProviderInstance.findUnique({
+      where: { id: input.providerInstanceId },
+      select: { tenantId: true, providerType: true, status: true },
+    });
+    if (!instance) {
+      throw new AppError("not_found", "Provider instance not found", 404, "Provider instance does not exist.");
+    }
+    // Tenant isolation: the instance must belong to the same tenant
+    if (instance.tenantId !== entitlement.tenantId) {
+      throw new AppError(
+        "authorization",
+        "Cross-tenant provider instance access denied",
+        403,
+        "The provider instance belongs to a different tenant.",
+      );
+    }
+    // Type match: the instance's providerType must match the binding's providerType
+    if (instance.providerType !== input.providerType) {
+      throw new AppError(
+        "validation",
+        "Provider type mismatch",
+        400,
+        `Instance providerType is "${instance.providerType}" but binding providerType is "${input.providerType}".`,
+      );
+    }
+    // Instance must be active
+    if (instance.status !== "active") {
+      throw new AppError(
+        "conflict",
+        "Provider instance not active",
+        409,
+        `Provider instance status is "${instance.status}". Only "active" instances can be used.`,
+      );
+    }
+  }
+
   const binding = await db.providerResourceBinding.create({
     data: {
       entitlementId: input.entitlementId,
       providerType: input.providerType,
       resourceType: input.resourceType ?? null,
+      providerInstanceId: input.providerInstanceId ?? null,
       providerMetadata: input.providerMetadata ? JSON.stringify(input.providerMetadata) : null,
       status: BINDING_STATES.UNBOUND,
     },
@@ -874,4 +923,115 @@ export async function reconcileBindingWithProvider(bindingId: string): Promise<{
     logger.error("connectivity.reconcile_binding_failed", { bindingId, error: errorMsg });
     return { status: "error", error: errorMsg };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2C.3.1: Provider Instance Management
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 2C.3.1: Create a connectivity provider instance.
+ *
+ * A provider instance represents a specific infrastructure endpoint
+ * (e.g., "Accra Router 01", "Kumasi Router 02").
+ *
+ * Secrets/credentials MUST NOT be stored in the database. Use configurationKey
+ * to reference a secrets manager key. The configuration field is for non-secret
+ * configuration only (endpoint URL, API version, region, etc.).
+ */
+export async function createProviderInstance(input: {
+  tenantId: string;
+  providerType: string;
+  name: string;
+  configuration?: Record<string, unknown>;
+  configurationKey?: string;
+  userId?: string;
+}): Promise<{ id: string; status: string }> {
+  const instance = await db.connectivityProviderInstance.create({
+    data: {
+      tenantId: input.tenantId,
+      providerType: input.providerType,
+      name: input.name,
+      status: "active",
+      configuration: input.configuration ? JSON.stringify(input.configuration) : null,
+      configurationKey: input.configurationKey ?? null,
+    },
+  });
+
+  await audit({
+    tenantId: input.tenantId,
+    userId: input.userId,
+    action: "connectivity.provider_instance_created",
+    entity: "connectivity_provider_instance",
+    entityId: instance.id,
+    detail: { providerType: input.providerType, name: input.name },
+  });
+
+  logger.info("connectivity.provider_instance_created", {
+    instanceId: instance.id, tenantId: input.tenantId,
+    providerType: input.providerType, name: input.name,
+  });
+
+  return { id: instance.id, status: instance.status };
+}
+
+/**
+ * Phase 2C.3.1: List provider instances for a tenant.
+ */
+export async function listProviderInstances(tenantId: string, providerType?: string) {
+  return db.connectivityProviderInstance.findMany({
+    where: {
+      tenantId,
+      ...(providerType ? { providerType } : {}),
+    },
+    orderBy: { createdAt: "desc" },
+  });
+}
+
+/**
+ * Phase 2C.3.1: Get a provider instance by ID, with tenant authorization.
+ */
+export async function getProviderInstance(instanceId: string, tenantId: string) {
+  const instance = await db.connectivityProviderInstance.findUnique({
+    where: { id: instanceId },
+  });
+  if (!instance || instance.tenantId !== tenantId) {
+    throw new AppError("not_found", "Provider instance not found", 404, "Provider instance not found or access denied.");
+  }
+  return instance;
+}
+
+/**
+ * Phase 2C.3.1: Resolve the provider instance for a binding.
+ *
+ * Returns the provider instance (if set) along with the adapter.
+ * This is the full resolution path:
+ *   ProviderResourceBinding.providerInstanceId → ConnectivityProviderInstance
+ *   ProviderResourceBinding.providerType → ConnectivityProviderAdapter (via registry)
+ */
+export async function resolveBindingWithInstance(bindingId: string): Promise<{
+  adapter: import("./adapter").ConnectivityProviderAdapter;
+  binding: { id: string; providerType: string; providerInstanceId: string | null; status: string; providerResourceId: string | null };
+  providerInstance: { id: string; tenantId: string; providerType: string; name: string; status: string } | null;
+}> {
+  const { db } = await import("@/lib/db");
+  const { resolveBindingAdapter } = await import("./registry");
+
+  const { adapter, binding } = await resolveBindingAdapter(bindingId);
+
+  let providerInstance = null;
+  if (binding.providerInstanceId) {
+    // Load the instance — note: we don't check tenant here because the binding
+    // was already authorized at creation time. The binding's entitlement has
+    // the tenantId, and the instance was verified to belong to that tenant.
+    const instance = await db.connectivityProviderInstance.findUnique({
+      where: { id: binding.providerInstanceId },
+      select: { id: true, tenantId: true, providerType: true, name: true, status: true },
+    });
+    if (instance) {
+      providerInstance = instance;
+    }
+  }
+
+  return { adapter, binding, providerInstance };
 }

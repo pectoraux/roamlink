@@ -1033,6 +1033,8 @@ model Tenant {
   invoices        TenantInvoice[]
   // Phase 2C.1: connectivity entitlements
   entitlements    ConnectivityEntitlement[]
+  // Phase 2C.3.1: connectivity provider instances
+  providerInstances ConnectivityProviderInstance[]
 
   @@index([status])
 }
@@ -1515,12 +1517,59 @@ model ProviderResourceBinding {
   reconciliationState String? // null | RECONCILIATION_REQUIRED | RECONCILED | MANUAL_INTERVENTION_REQUIRED
   failureReason   String?
   lastReconciledAt DateTime?
+  // Phase 2C.3.1: Provider instance — selects the specific infrastructure endpoint
+  // (e.g., "accra-router-01" vs "kumasi-router-02"). providerType selects the adapter
+  // CLASS; providerInstanceId selects the specific infrastructure INSTANCE.
+  // Immutable after provisioning begins (PROVISIONING or later states).
+  providerInstanceId String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
   entitlement     ConnectivityEntitlement @relation(fields: [entitlementId], references: [id], onDelete: Cascade)
+  providerInstance ConnectivityProviderInstance? @relation(fields: [providerInstanceId], references: [id])
 
   @@index([entitlementId])
+  @@index([providerType])
+  @@index([status])
+  @@index([providerInstanceId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2C.3.1 — Connectivity Provider Instance
+// -----------------------------------------------------------------------------
+// Represents a specific infrastructure instance (e.g., a specific MikroTik router,
+// a specific eSIM supplier endpoint, a specific WiFi ISP platform).
+//
+// providerType selects the adapter CLASS (e.g., "mikrotik").
+// providerInstance selects the specific infrastructure INSTANCE (e.g., "accra-router-01").
+//
+// Secrets/credentials MUST NOT be stored in plaintext. Use environment variables
+// or a secrets manager referenced by configurationKey.
+//
+// Tenant isolation: a provider instance belongs to a tenant. Other tenants
+// cannot use it.
+// -----------------------------------------------------------------------------
+
+model ConnectivityProviderInstance {
+  id              String   @id @default(cuid())
+  tenantId        String
+  // Provider type: "mikrotik" | "wifi-isp" | "esim" | future
+  providerType    String
+  // Human-readable name: "Accra Router 01" | "Kumasi Router 02"
+  name            String
+  status          String   @default("active") // active | inactive | maintenance
+  // Configuration reference — NOT secrets. E.g., endpoint URL, API version, region.
+  // Secrets are resolved via environment variables or secrets manager using
+  // the configurationKey as a lookup.
+  configuration   String?  // JSON string of non-secret configuration
+  configurationKey String? // reference to secrets manager key (e.g., "mikrotik-accra-01-creds")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  resourceBindings ProviderResourceBinding[]
+
+  @@index([tenantId])
   @@index([providerType])
   @@index([status])
 }

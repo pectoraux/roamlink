@@ -16,6 +16,10 @@ export {
   listResourceBindings,
   reconcileConnectivityEntitlements,
   reconcileBindingWithProvider,
+  createProviderInstance,
+  listProviderInstances,
+  getProviderInstance,
+  resolveBindingWithInstance,
   CAPABILITY_TYPES,
   ENTITLEMENT_STATES,
   BINDING_STATES,
@@ -54,7 +58,7 @@ export {
 export { mockConnectivityProvider, MockConnectivityProvider } from "./mock-provider";
 
 // Phase 2C.3: MikroTik provider (reference implementation)
-export { MikroTikConnectivityAdapter, mikrotikConnectivityAdapter } from "./providers/mikrotik/adapter";
+export { MikroTikConnectivityAdapter } from "./providers/mikrotik/adapter";
 export type { MikroTikProviderClient, MikroTikResource, MikroTikResourceConfig, MikroTikErrorType } from "./providers/mikrotik/client";
 export { MikroTikProviderError } from "./providers/mikrotik/client";
 export { MockMikroTikProviderClient, mockMikroTikProviderClient, setMockFailureSimulation, clearMockFailureSimulation, clearMockMikroTikResources } from "./providers/mikrotik/mock-client";

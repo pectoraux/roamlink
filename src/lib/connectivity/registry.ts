@@ -204,7 +204,7 @@ export function isProviderRegistered(providerType: string): boolean {
  */
 export async function resolveBindingAdapter(bindingId: string): Promise<{
   adapter: ConnectivityProviderAdapter;
-  binding: { id: string; providerType: string; status: string; providerResourceId: string | null };
+  binding: { id: string; providerType: string; status: string; providerResourceId: string | null; providerInstanceId: string | null };
 }> {
   // Import db lazily to avoid circular dependency at module load time
   const { db } = await import("@/lib/db");
@@ -216,6 +216,7 @@ export async function resolveBindingAdapter(bindingId: string): Promise<{
       providerType: true,
       status: true,
       providerResourceId: true,
+      providerInstanceId: true,
       entitlementId: true,
     },
   });
@@ -233,6 +234,7 @@ export async function resolveBindingAdapter(bindingId: string): Promise<{
       providerType: binding.providerType,
       status: binding.status,
       providerResourceId: binding.providerResourceId,
+      providerInstanceId: binding.providerInstanceId,
     },
   };
 }

@@ -37,7 +37,6 @@ import type {
 } from "../../adapter";
 import type { MikroTikProviderClient, MikroTikResourceConfig } from "./client";
 import { MikroTikProviderError } from "./client";
-import { mockMikroTikProviderClient } from "./mock-client";
 import { logger } from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
@@ -110,7 +109,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
   readonly providerType = "mikrotik";
   readonly label = "MikroTik Connectivity Provider";
 
-  constructor(private readonly client: MikroTikProviderClient = mockMikroTikProviderClient) {}
+  constructor(private readonly client: MikroTikProviderClient) {}
 
   async provision(input: {
     entitlement: ConnectivityEntitlementInput;
@@ -323,5 +322,3 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     }
   }
 }
-
-export const mikrotikConnectivityAdapter = new MikroTikConnectivityAdapter();
