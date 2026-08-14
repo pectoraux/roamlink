@@ -64,3 +64,5 @@ export { MockPaymentProvider, mockPaymentProvider } from "./mock-provider";
 export { PayStackProvider } from "./paystack-provider";
 export { FlutterwaveProvider } from "./flutterwave-provider";
 export { StripeProvider } from "./stripe-provider";
+// Phase 2B.3.16: Test instrumentation for concurrency tests.
+export { getCreatePaymentIntentCallCount, resetCreatePaymentIntentCallCount } from "./mock-provider";

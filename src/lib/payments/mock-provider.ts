@@ -33,6 +33,23 @@ type MockIntent = {
 const intents = new Map<string, MockIntent>();
 const intentByIdem = new Map<string, string>();
 
+/**
+ * Phase 2B.3.16: Test instrumentation — counts createPaymentIntent calls.
+ * Used by concurrency tests to prove that only ONE worker calls createPaymentIntent
+ * even when multiple workers race from providerReference = NULL.
+ */
+let createPaymentIntentCallCount = 0;
+
+/** Get the total number of createPaymentIntent calls (test instrumentation). */
+export function getCreatePaymentIntentCallCount(): number {
+  return createPaymentIntentCallCount;
+}
+
+/** Reset the call counter (test instrumentation). */
+export function resetCreatePaymentIntentCallCount(): void {
+  createPaymentIntentCallCount = 0;
+}
+
 export class MockPaymentProvider implements PaymentProvider {
   readonly id = "mock";
   readonly label = "Mock Payment Provider (Development)";
@@ -45,6 +62,8 @@ export class MockPaymentProvider implements PaymentProvider {
     idempotencyKey: string;
     metadata?: Record<string, string>;
   }): Promise<PaymentIntentResult> {
+    // Phase 2B.3.16: Increment the call counter for test instrumentation.
+    createPaymentIntentCallCount++;
     // Idempotent: same key returns same intent.
     let providerReference = intentByIdem.get(input.idempotencyKey);
     if (!providerReference) {

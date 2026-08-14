@@ -423,8 +423,9 @@ describe("Phase 2B.3.15 — Integration Tests: Boundary Conditions & Calendar Bi
     const source = fs.readFileSync("src/lib/tenant/saas-subscription.ts", "utf-8");
     expect(source).toContain("function addBillingInterval");
     expect(source).toContain("function isCanonicalBillingInterval");
-    expect(source).toContain("end.setFullYear(end.getFullYear() + 1)");
-    expect(source).toContain("end.setMonth(end.getMonth() + 1)");
+    // Phase 2B.3.16: switched from local-time to UTC operations.
+    expect(source).toContain("end.setUTCFullYear(end.getUTCFullYear() + 1)");
+    expect(source).toContain("end.setUTCMonth(end.getUTCMonth() + 1)");
   }, 10000);
 
   it("Static: canonical calendar validation replaces duration tolerances", async () => {

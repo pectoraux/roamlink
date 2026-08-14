@@ -49,14 +49,22 @@ import { getPaymentProvider, getPaymentProviderByKey } from "@/lib/payments";
 import type { Currency } from "@/lib/money";
 
 /**
- * Phase 2B.3.15 P1-3: Canonical billing-interval derivation.
+ * Phase 2B.3.15 P1-3 / Phase 2B.3.16: Canonical billing-interval derivation.
  *
  * "monthly" and "yearly" are CALENDAR intervals, not fixed day counts.
  * Jan 31 + 1 month = Feb 28 (or 29 in a leap year), NOT Jan 31 + 30 days
  * and NOT Mar 3 (which is what JavaScript's naive setMonth produces due to
  * day overflow).
  *
- * This helper uses calendar arithmetic WITH end-of-month clamping:
+ * Phase 2B.3.16: Billing periods are defined in UTC, not local server time.
+ * All Date arithmetic uses getUTCDate/getUTCMonth/setUTCMonth/setUTCFullYear
+ * to ensure the billing period is independent of the server's timezone
+ * configuration. This is critical because:
+ *   - paidAt is stored as a UTC timestamp in PostgreSQL
+ *   - periodStart/periodEnd are stored as UTC timestamps
+ *   - DST transitions in the server timezone must not shift the billing period
+ *
+ * This helper uses UTC calendar arithmetic WITH end-of-month clamping:
  *   - If the target month doesn't have the original day (e.g. Feb 31),
  *     clamp to the last day of the target month (Feb 28/29).
  *   - This matches the billing-period semantics used by Stripe and other
@@ -64,7 +72,7 @@ import type { Currency } from "@/lib/money";
  *     if that day doesn't exist."
  *
  * The billing period for a subscription is defined as:
- *   periodStart = paidAt (the financial event)
+ *   periodStart = paidAt (the financial event, UTC)
  *   periodEnd   = addBillingInterval(periodStart, billingCycle)
  *
  * Validation of an existing period MUST re-derive the expected periodEnd
@@ -74,18 +82,18 @@ import type { Currency } from "@/lib/money";
 function addBillingInterval(start: Date, billingCycle: string): Date {
   const end = new Date(start.getTime());
   if (billingCycle === "yearly") {
-    end.setFullYear(end.getFullYear() + 1);
+    end.setUTCFullYear(end.getUTCFullYear() + 1);
   } else {
-    // monthly (default) — with end-of-month clamping.
-    // JavaScript's Date.setMonth overflows: Jan 31 + setMonth(1) → Mar 3,
+    // monthly (default) — with end-of-month clamping in UTC.
+    // JavaScript's Date.setUTCMonth overflows: Jan 31 + setUTCMonth(1) → Mar 3,
     // because it tries to create "February 31" which doesn't exist.
     // We detect the overflow and clamp to the last day of the target month.
-    const originalDay = end.getDate();
-    end.setMonth(end.getMonth() + 1);
-    if (end.getDate() < originalDay) {
+    const originalDay = end.getUTCDate();
+    end.setUTCMonth(end.getUTCMonth() + 1);
+    if (end.getUTCDate() < originalDay) {
       // Day overflowed (e.g., Feb 31 → Mar 3). Clamp to the last day
       // of the target month by setting day = 0 (last day of previous month).
-      end.setDate(0);
+      end.setUTCDate(0);
     }
   }
   return end;
@@ -1234,15 +1242,36 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
   }
 
   // Phase 2B.3.3: Use the subscription's stored payment provider.
-  // Phase 2B.3.15 P1-2: ONE INVOICE → ONE PROVIDER PAYMENT OPERATION invariant.
-  // If the invoice already has a providerReference (from a prior attempt that
-  // crashed after persisting the reference but before completing verification),
-  // we MUST reuse it — never create a second payment operation at the provider.
+  // Phase 2B.3.16: ATOMIC PAYMENT-OPERATION ACQUISITION.
+  //
+  // The previous code (2B.3.15) had a race: two concurrent workers could both
+  // read providerReference = null, both call createPaymentIntent(), and both
+  // try to persist. The invariant "ONE INVOICE → ONE PROVIDER PAYMENT OPERATION"
+  // relied entirely on provider-level idempotency.
+  //
+  // This fix introduces a durable payment-operation state machine at the
+  // APPLICATION level, using the SaasRenewalCycle's state field:
+  //
+  //   PAYMENT_PENDING → PAYMENT_CREATING → PAYMENT_CONFIRMED
+  //
+  // The transition PAYMENT_PENDING → PAYMENT_CREATING is a PostgreSQL-atomic
+  // conditional mutation (updateMany WHERE state = 'PAYMENT_PENDING'). Only
+  // ONE worker can win this claim. The winner calls createPaymentIntent and
+  // persists the providerReference. Losers re-read and reuse the reference.
+  //
+  // Crash recovery: if the winner crashes after claiming PAYMENT_CREATING but
+  // before persisting the providerReference, the cycle is stuck in
+  // PAYMENT_CREATING. The reconciliation worker scans for cycles stuck in
+  // PAYMENT_CREATING for > 5 minutes and re-claims them (see
+  // processDueSaasFinancialReconciliation).
+  //
+  // This does NOT eliminate provider-level idempotency as a defense — it
+  // adds an APPLICATION-LEVEL guarantee that only one worker calls
+  // createPaymentIntent, without relying on the provider to deduplicate.
   const provider = getPaymentProviderByKey(subscription.paymentProvider || "mock");
   let providerReference: string;
 
-  // Re-read the invoice to get the current providerReference (it may have been
-  // set by a prior attempt that crashed before verification completed).
+  // Re-read the invoice to get the current providerReference.
   const currentInvoice = await db.tenantInvoice.findUnique({
     where: { id: invoice.id },
     select: { providerReference: true, paymentProvider: true },
@@ -1255,41 +1284,102 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
       invoiceId: invoice.id, cycleId: cycle.id, providerReference,
     });
   } else {
-    // No existing providerReference — this is the first attempt. Create the payment intent.
-    const intent = await provider.createPaymentIntent({
-      amountMinor,
-      currency: plan.currency as Currency,
-      description: `SaaS renewal: ${plan.displayName} (${subscription.billingCycle})`,
-      idempotencyKey: renewalKey,
-      metadata: { tenantId, planName: plan.name, type: "saas_renewal" },
+    // Phase 2B.3.16: ATOMIC CLAIM — transition cycle to PAYMENT_CREATING.
+    // Only the worker that successfully transitions PAYMENT_PENDING →
+    // PAYMENT_CREATING may call createPaymentIntent. This is a
+    // PostgreSQL-atomic conditional mutation.
+    const claim = await db.saasRenewalCycle.updateMany({
+      where: { id: cycle.id, state: "PAYMENT_PENDING" },
+      data: { state: "PAYMENT_CREATING" },
     });
-    providerReference = intent.providerReference;
 
-    // Phase 2B.3.14 P1-8: Persist the providerReference BEFORE any other work.
-    // If persistence fails, the cycle enters a durable recovery state.
-    // On recovery, the code above will find no providerReference and create
-    // a new intent — BUT the provider's idempotencyKey (renewalKey) ensures
-    // the provider returns the SAME intent (mock, Stripe via Idempotency-Key
-    // header, Paystack/Flutterwave via reference = idempotencyKey).
-    // So even across a crash, ONE invoice → ONE provider payment operation.
-    try {
-      await db.tenantInvoice.update({
-        where: { id: invoice.id },
-        data: { providerReference, paymentProvider: provider.id },
+    if (claim.count === 0) {
+      // Another worker is already creating the payment operation (cycle is in
+      // PAYMENT_CREATING) or has already moved past it. We must NOT call
+      // createPaymentIntent. Wait briefly for the winner to persist the
+      // providerReference, then re-read and reuse it.
+      logger.info("saas.payment_creation_claim_lost", {
+        cycleId: cycle.id, invoiceId: invoice.id,
       });
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      logger.error("saas.providerReference_persist_failed", {
-        invoiceId: invoice.id, cycleId: cycle.id, providerReference, error: errorMsg,
-        message: "CRITICAL: Failed to persist providerReference. Cycle marked RECONCILIATION_REQUIRED. The provider operation exists but cannot be correlated until the reference is persisted.",
+
+      // Wait up to 10 seconds (polling every 500ms) for the providerReference
+      // to appear. If it doesn't appear, return financial_pending — the
+      // reconciliation worker will recover the stuck cycle.
+      let waited = 0;
+      let ref: string | null = null;
+      while (waited < 10000) {
+        await new Promise((r) => setTimeout(r, 500));
+        waited += 500;
+        const reRead = await db.tenantInvoice.findUnique({
+          where: { id: invoice.id },
+          select: { providerReference: true },
+        });
+        if (reRead?.providerReference) {
+          ref = reRead.providerReference;
+          break;
+        }
+      }
+
+      if (ref) {
+        providerReference = ref;
+        logger.info("saas.payment_creation_reuse_after_wait", {
+          cycleId: cycle.id, invoiceId: invoice.id, providerReference, waitedMs: waited,
+        });
+      } else {
+        // The winner didn't persist the reference within 10 seconds.
+        // This could be a crash or a slow provider. Return financial_pending —
+        // the reconciliation worker will re-claim the cycle after 5 minutes.
+        logger.warn("saas.payment_creation_timeout", {
+          cycleId: cycle.id, invoiceId: invoice.id, waitedMs: waited,
+        });
+        return {
+          success: false,
+          status: "financial_pending",
+          reason: "Payment operation creation in progress by another worker — cycle will be recovered if stuck",
+        };
+      }
+    } else {
+      // We won the claim — we are the ONLY worker allowed to call createPaymentIntent.
+      logger.info("saas.payment_creation_claimed", {
+        cycleId: cycle.id, invoiceId: invoice.id,
       });
-      await db.saasRenewalCycle.updateMany({
-        where: { id: cycle.id, state: { not: "COMPLETED" } },
-        data: { state: "RECONCILIATION_REQUIRED", failureReason: `ProviderReference persistence failed: ${errorMsg}` },
-      }).catch((updateErr) => {
-        logger.error("saas.state_update_failed", { error: updateErr instanceof Error ? updateErr.message : String(updateErr) });
+
+      // Create the payment intent at the provider.
+      const intent = await provider.createPaymentIntent({
+        amountMinor,
+        currency: plan.currency as Currency,
+        description: `SaaS renewal: ${plan.displayName} (${subscription.billingCycle})`,
+        idempotencyKey: renewalKey,
+        metadata: { tenantId, planName: plan.name, type: "saas_renewal" },
       });
-      return { success: false, status: "financial_pending", reason: "ProviderReference persistence failed — cycle marked for recovery" };
+      providerReference = intent.providerReference;
+
+      // Persist the providerReference BEFORE any other work.
+      // If persistence fails, the cycle stays in PAYMENT_CREATING — the
+      // reconciliation worker will re-claim it after 5 minutes and retry.
+      try {
+        await db.tenantInvoice.update({
+          where: { id: invoice.id },
+          data: { providerReference, paymentProvider: provider.id },
+        });
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        logger.error("saas.providerReference_persist_failed", {
+          invoiceId: invoice.id, cycleId: cycle.id, providerReference, error: errorMsg,
+          message: "CRITICAL: Failed to persist providerReference after claiming PAYMENT_CREATING. Cycle will be recovered by the reconciliation worker after 5 minutes.",
+        });
+        // Leave the cycle in PAYMENT_CREATING — the reconciliation worker
+        // will re-claim it and retry. Do NOT transition to RECONCILIATION_REQUIRED
+        // because that would allow another worker to immediately re-attempt
+        // createPaymentIntent, which could create a second provider operation
+        // if the first one actually succeeded at the provider but we didn't
+        // receive the response.
+        return {
+          success: false,
+          status: "financial_pending",
+          reason: "ProviderReference persistence failed — cycle will be recovered after 5-minute timeout",
+        };
+      }
     }
   }
 
@@ -1342,14 +1432,22 @@ export async function renewSubscription(tenantId: string): Promise<{ success: bo
       where: { id: subscription.id, status: { in: ["active", "trialing", "pending_payment"] } },
       data: { status: "past_due" },
     });
-    // Cycle stays in PAYMENT_PENDING
+    // Phase 2B.3.16: Cycle stays in PAYMENT_CREATING (or transitions back to
+    // PAYMENT_PENDING if it was in PAYMENT_CREATING — the payment intent exists
+    // at the provider, we just don't have confirmation yet). The reconciliation
+    // worker will pick it up and re-verify.
+    await db.saasRenewalCycle.updateMany({
+      where: { id: cycle.id, state: "PAYMENT_CREATING" },
+      data: { state: "PAYMENT_PENDING" },
+    }).catch(() => {}); // If not in PAYMENT_CREATING, no-op
     return { success: false, status: "past_due", reason: "Payment pending" };
   }
 
   // Payment succeeded — transition cycle to PAYMENT_CONFIRMED.
-  // Phase 2B.3.14 P2-12: Guarded — don't overwrite COMPLETED/RECONCILIATION_REQUIRED.
+  // Phase 2B.3.16: Guarded — only transition from PAYMENT_CREATING or PAYMENT_PENDING.
+  // Don't overwrite COMPLETED/RECONCILIATION_REQUIRED.
   await db.saasRenewalCycle.updateMany({
-    where: { id: cycle.id, state: { notIn: ["COMPLETED", "RECONCILIATION_REQUIRED"] } },
+    where: { id: cycle.id, state: { in: ["PAYMENT_CREATING", "PAYMENT_PENDING"] } },
     data: { state: "PAYMENT_CONFIRMED" },
   });
 
@@ -1671,6 +1769,86 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
         invoiceId: invoice.id,
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+  }
+
+  // Phase 2B.3.16: Stuck PAYMENT_CREATING scan.
+  // Find cycles stuck in PAYMENT_CREATING for > 5 minutes. These represent
+  // crashed payment-operation acquisitions — the worker claimed the right to
+  // call createPaymentIntent but never completed (crash, timeout, or DB failure).
+  //
+  // Recovery: re-claim the cycle by transitioning it back to PAYMENT_PENDING,
+  // but ONLY if the invoice doesn't already have a providerReference. If it
+  // does have a reference, the payment operation was created at the provider —
+  // we must NOT create another one. Instead, transition to PAYMENT_CONFIRMED
+  // and let the normal verification path proceed.
+  //
+  // The 5-minute timeout is chosen to be longer than any reasonable provider
+  // API call (Stripe/Paystack/Flutterwave typically respond in < 30 seconds).
+  // This prevents premature re-claims while ensuring crashed workers don't
+  // permanently block renewal.
+  const stuckPaymentCreatingCutoff = new Date(Date.now() - 5 * 60 * 1000);
+  const stuckCreatingCycles = await db.saasRenewalCycle.findMany({
+    where: {
+      state: "PAYMENT_CREATING",
+      updatedAt: { lt: stuckPaymentCreatingCutoff },
+    },
+    select: { id: true, invoiceId: true, tenantId: true, subscriptionId: true },
+  });
+
+  for (const cycle of stuckCreatingCycles) {
+    if (!cycle.invoiceId) {
+      // No invoice — reset to PENDING so renewSubscription can retry from scratch.
+      await db.saasRenewalCycle.updateMany({
+        where: { id: cycle.id, state: "PAYMENT_CREATING" },
+        data: { state: "PENDING", failureReason: "Payment creation timed out — no invoice linked" },
+      }).catch(() => {});
+      continue;
+    }
+
+    // Check if the providerReference was persisted despite the crash.
+    const inv = await db.tenantInvoice.findUnique({
+      where: { id: cycle.invoiceId },
+      select: { providerReference: true, status: true },
+    });
+
+    if (inv?.providerReference) {
+      // The payment operation WAS created at the provider — the worker crashed
+      // after persisting the reference but before transitioning the cycle.
+      // Transition to PAYMENT_PENDING so the normal verification path can
+      // proceed. We must NOT create another payment operation.
+      logger.info("saas.stuck_creating_has_reference", {
+        cycleId: cycle.id, invoiceId: cycle.invoiceId, providerReference: inv.providerReference,
+      });
+      await db.saasRenewalCycle.updateMany({
+        where: { id: cycle.id, state: "PAYMENT_CREATING" },
+        data: { state: "PAYMENT_PENDING", failureReason: null },
+      }).catch(() => {});
+      result.retried++;
+    } else {
+      // The payment operation was NOT created (or we can't prove it was).
+      // The ambiguous case: the worker may have called createPaymentIntent at
+      // the provider but crashed before receiving the response or persisting
+      // the reference. In this case, we CANNOT safely call createPaymentIntent
+      // again without risking a second payment operation.
+      //
+      // Recovery strategy: transition to RECONCILIATION_REQUIRED with a
+      // specific failure reason. This requires manual intervention or a
+      // provider-level audit to determine whether the payment operation was
+      // created. The system does NOT automatically retry — that would risk
+      // a double charge.
+      logger.error("saas.stuck_creating_ambiguous", {
+        cycleId: cycle.id, invoiceId: cycle.invoiceId,
+        message: "CRITICAL: Payment creation timed out with no providerReference. Cannot safely retry — may require manual provider audit to determine if a payment operation was created.",
+      });
+      await db.saasRenewalCycle.updateMany({
+        where: { id: cycle.id, state: "PAYMENT_CREATING" },
+        data: {
+          state: "RECONCILIATION_REQUIRED",
+          failureReason: "Payment creation timed out with no providerReference — ambiguous state, may require manual provider audit",
+        },
+      }).catch(() => {});
+      result.stillFailing++;
     }
   }
 
