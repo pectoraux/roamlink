@@ -1420,3 +1420,20 @@ Stage Summary:
 - The audit log line observed at runtime: `{"message":"saas.subscription_activated", ...,"source":"step3","periodSource":"paidAt"}` and `...,"source":"fast_path","periodSource":"paidAt"}` — confirms both fast-path and step-3 paths anchor the period to paidAt.
 - Pre-existing failures noted (NOT caused by this phase): tests/phase2b311-initial-activation-integrity.test.ts has 4 failing tests at HEAD `4c2e899` (before this work) because Phase 2B.3.12 restructured the activation code in ways that broke 2B.3.11's static test contracts (e.g. it looks for "Verify the ledger transaction actually exists" and "Domain activation failed", which were renamed in 2B.3.12). These were pre-existing and outside the scope of 2B.3.13.
 - The invariant: Payment time → billing period. Never recovery time → billing period. The initial subscription billing period is now determined by the financial event that created the subscription (invoice.paidAt), not by when a recovery worker happens to repair the domain state. Retries days apart produce the same periodStart/periodEnd.
+
+---
+Task ID: 2B.AUDIT
+Agent: Lead engineer (main) — Adversarial SaaS Billing Subsystem Audit (read-only, first pass)
+Task: Repository-wide adversarial audit of the entire SaaS billing subsystem after Phase 2B.3.13. No code modifications. Verify every invariant from 2B.3.1 through 2B.3.13 against the actual production call graph and PostgreSQL schema. Produce classified findings.
+
+Work Log:
+- Audited HEAD 37eaa52 (origin/main) — confirmed audit-critical files (saas-subscription.ts, balance.ts, double-entry-ledger.ts, webhook routes, reconcile route, schema.prisma) are byte-identical between local HEAD and origin/main.
+- Read the full saas-subscription.ts (1482 lines), the webhook routes, the reconcile cron route, the payments module (provider.ts, index.ts, mock-provider.ts), the ledger function (ledgerSaasSubscriptionPayment), and the Prisma schema for TenantSubscription, TenantInvoice, SaasRenewalCycle, SaaasPlan, LedgerTransaction.
+- Enumerated every write to subscription.status, invoice.status, cycle.state, and currentPeriodEnd via grep.
+- Traced every payment-provider lookup in the SaaS subsystem.
+- Cross-referenced findings against existing tests (25 test files in tests/phase2b3*) to identify missing test coverage.
+
+Stage Summary:
+- See the full classified audit report delivered to the user below.
+- No code was modified during this audit pass.
+- 3 P0 findings, 4 P1 findings, 5 P2 findings, 3 informational notes, 21 verified invariants, 3 unverified assumptions, 8 missing tests identified.
