@@ -1738,3 +1738,22 @@ Stage Summary:
   ✅ Provider adapter interface exists
   ✅ Reconciliation model exists
   ✅ No billing code changes required
+
+---
+Task ID: 2C.2
+Agent: Lead engineer (main) — Provider Adapter Registry
+Task: Build the Phase 2C.2 Provider Adapter Registry. Add reconcile() to the adapter contract. The registry resolves adapters by providerType and is generic enough for eSIM, MikroTik, and WiFi/ISP providers.
+
+Work Log:
+- Added reconcile() method to ConnectivityProviderAdapter interface. Returns ReconciliationResult with 5 status values: in_sync, drift_detected, resource_missing, failed_retryable, failed_permanent. Includes observedState and recommendedBindingState.
+- Built the registry: registerConnectivityProvider (idempotent), getConnectivityProvider (case-insensitive), requireConnectivityProvider (throws), listRegisteredProviderTypes, isProviderRegistered.
+- Updated mock provider to implement reconcile() — detects drift (inactive resource + BOUND binding), resource_missing (released resource), and in_sync states.
+- Created barrel export index.ts for the connectivity module.
+
+Stage Summary:
+- HEAD: bf16b32c67f1eecf598ecd5ca72840743b0838d6
+- origin/main: bf16b32c67f1eecf598ecd5ca72840743b0838d6 (pushed)
+- Tests: 15 — all EXECUTED + PASSED (10 runtime + 5 static)
+- Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN (no changes)
+- Phase 2C.3 (MikroTik Adapter): next target — will be a replaceable plugin using this registry
