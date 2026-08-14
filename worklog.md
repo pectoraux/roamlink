@@ -1659,3 +1659,21 @@ Invariant Classification:
   10. Recovery is observationally idempotent: PROVEN (Tests F, G — duplicate/concurrent → exactly 1 ledger)
 
 All 10 invariants are PROVEN. No PARTIALLY PROVEN or UNPROVEN.
+
+---
+Task ID: 2B.FREEZE
+Agent: Lead engineer (main) — SaaS Financial Kernel Freeze Declaration
+Task: Record the architectural milestone. The SaaS financial kernel (Phases 2B.3.1 through 2B.3.19) is certified and frozen. Document the boundary between "financial kernel frozen" and "real-money production readiness."
+
+Work Log:
+- Reviewed the full hardening progression: 2B.3.7 (atomic completion) → 2B.3.8 (single authority) → 2B.3.9 (stale repair) → 2B.3.10 (recovery visibility) → 2B.3.11 (initial activation recovery) → 2B.3.12 (atomic activation) → 2B.3.13 (deterministic periods) → 2B.3.14 (concurrency hardening) → 2B.3.15 (calendar billing + boundary audit) → 2B.3.16 (payment acquisition concurrency) → 2B.3.17 (ambiguous payment state safety) → 2B.3.18 (resolution integrity) → 2B.3.19 (state-machine certification).
+- The SaaS financial kernel now has: domain-state convergence, single-writer model, first-class recovery, 10 proven invariants with real PostgreSQL concurrency tests, no new Date() fallback, COMPLETED path ledger verification, ambiguous payment isolation.
+- Declared two milestones: (1) SaaS financial kernel frozen — internal accounting/state machine certified. (2) Real-money production readiness — deferred to Phase 2B.3.20 (provider boundary certification, refund/reversal handling, entitlement separation audit).
+- Documented Phase 2C architecture implication: the billing kernel stays unchanged. Phase 2C adds a Connectivity Entitlement Layer between billing and connectivity providers (MikroTik, WiFi ISP, eSIM). The architecture is: SaaS Billing Kernel → Connectivity Entitlement Layer → Provider Adapters.
+
+Stage Summary:
+- HEAD: 4936ad8123707d9a5731eb2436614848db5c17bf (origin/main, pushed)
+- SaaS financial kernel: FROZEN
+- Phase 2B.3.20 (boundary audit): NOT started — deferred until real provider integrations are ready
+- Phase 2C (local connectivity supply): CLEARED TO BEGIN
+- The billing kernel is now a stable foundation. It should not change while connectivity integrations are added.
