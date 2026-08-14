@@ -114,6 +114,11 @@ export class MockPaymentProvider implements PaymentProvider {
       // This is set when confirmIntent() is called — simulating the provider's
       // settlement time, which may differ from when we call verifyPayment().
       paidAt: intent.status === "succeeded" && intent.confirmedAt ? intent.confirmedAt : undefined,
+      // Phase 2B.3.18 P0: Return the amount and currency for invoice correlation.
+      // These allow resolveAmbiguousPayment() to verify that a manually-recovered
+      // payment reference actually corresponds to THIS invoice.
+      amountMinor: intent.amountMinor,
+      currency: intent.currency,
       raw: { amountMinor: intent.amountMinor, currency: intent.currency },
     };
   }

@@ -37,6 +37,21 @@ export type PaymentVerification = {
    * caller falls back to new Date() (with a warning log).
    */
   paidAt?: Date;
+  /**
+   * Phase 2B.3.18 P0: The amount paid, in minor units, as reported by the provider.
+   * Used by resolveAmbiguousPayment() to verify that a manually-recovered provider
+   * payment actually corresponds to THIS invoice — not a different invoice's payment.
+   *
+   * Providers should normalize the paid amount into this field. If the provider
+   * doesn't expose the amount, undefined is returned (and ambiguous resolution
+   * cannot verify amount correlation — it must fail closed).
+   */
+  amountMinor?: number;
+  /**
+   * Phase 2B.3.18 P0: The currency of the payment, as reported by the provider.
+   * Used together with amountMinor for invoice correlation verification.
+   */
+  currency?: string;
   /** Raw provider response — server-side only. */
   raw?: unknown;
 };

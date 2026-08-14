@@ -111,6 +111,9 @@ export class PayStackProvider implements PaymentProvider {
       status: mapped,
       providerReference: input.providerReference,
       paidAt: mapped === "succeeded" && paidAtStr ? new Date(paidAtStr) : undefined,
+      // Phase 2B.3.18 P0: PayStack provides amount and currency.
+      amountMinor: data.data.amount != null ? Number(data.data.amount) : undefined,
+      currency: data.data.currency ? String(data.data.currency).toUpperCase() : undefined,
       raw: data.data,
     };
   }

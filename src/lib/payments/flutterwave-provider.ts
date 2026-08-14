@@ -110,6 +110,10 @@ export class FlutterwaveProvider implements PaymentProvider {
       status,
       providerReference: input.providerReference,
       paidAt: status === "succeeded" && paidAtStr ? new Date(paidAtStr) : undefined,
+      // Phase 2B.3.18 P0: Flutterwave provides amount (major units) and currency.
+      // Convert major → minor units (multiply by 100).
+      amountMinor: tx.amount != null ? Math.round(Number(tx.amount) * 100) : undefined,
+      currency: tx.currency ? String(tx.currency).toUpperCase() : undefined,
       raw: tx,
     };
   }

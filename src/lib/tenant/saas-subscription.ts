@@ -2072,19 +2072,27 @@ export async function processDueSaasFinancialReconciliation(): Promise<{
 }
 
 /**
- * Phase 2B.3.17 P0-2: Resolve an AMBIGUOUS_PAYMENT cycle.
+ * Phase 2B.3.17 P0-2 / Phase 2B.3.18: Resolve an AMBIGUOUS_PAYMENT cycle.
  *
  * This is the ONLY safe way out of the AMBIGUOUS_PAYMENT state. It requires
  * a providerReference that was recovered via a manual provider audit.
  *
- * The function:
- *   1. Verifies the payment with the provider using the recovered reference.
- *   2. If verification succeeds: persists the providerReference on the invoice,
- *      transitions the cycle to PAYMENT_PENDING, and lets the normal flow proceed.
- *   3. If verification fails: transitions the cycle to PENDING so a new payment
- *      operation can be safely created (the provider confirmed no payment exists).
- *   4. If verification is pending: leaves the cycle in AMBIGUOUS_PAYMENT —
- *      the caller should retry later.
+ * Phase 2B.3.18 P0: The function now verifies that the recovered provider
+ * payment EXACTLY matches the invoice — not just that "a payment succeeded".
+ * It checks:
+ *   - provider identity matches invoice.paymentProvider
+ *   - providerReference belongs to a real provider payment
+ *   - amount == invoice.amountMinor
+ *   - currency == invoice.currency
+ *   - payment status == succeeded
+ *
+ * If ANY of these checks fail, resolution fails closed and the cycle remains
+ * AMBIGUOUS_PAYMENT. This prevents an operator from accidentally associating
+ * the wrong successful payment with an invoice.
+ *
+ * Phase 2B.3.18 P1: paidAt persistence failure now BLOCKS financial
+ * finalization. If the provider returns a paidAt but it cannot be persisted,
+ * the cycle is NOT finalized — it remains in a retryable recovery state.
  *
  * This function is intentionally NOT called automatically by the reconciliation
  * worker. It requires a human to recover the providerReference from the
@@ -2117,10 +2125,10 @@ export async function resolveAmbiguousPayment(input: {
     return { resolved: false, status: "error", reason: "No invoice linked to cycle" };
   }
 
-  // Resolve the provider from the invoice's paymentProvider field.
+  // Load the FULL invoice — we need amountMinor and currency for correlation.
   const invoice = await db.tenantInvoice.findUnique({
     where: { id: cycle.invoiceId },
-    select: { paymentProvider: true, idempotencyKey: true },
+    select: { paymentProvider: true, idempotencyKey: true, amountMinor: true, currency: true },
   });
   if (!invoice) {
     return { resolved: false, status: "error", reason: "Invoice not found" };
@@ -2134,51 +2142,12 @@ export async function resolveAmbiguousPayment(input: {
     idempotencyKey: invoice.idempotencyKey,
   });
 
-  if (verification.status === "succeeded") {
-    // The provider confirms the payment exists and succeeded.
-    // Persist the providerReference + paidAt, transition to PAYMENT_PENDING,
-    // then directly trigger financial finalization (we already verified the payment).
-    logger.info("saas.ambiguous_resolved_succeeded", {
+  if (verification.status === "pending") {
+    // Provider verification returned pending — leave in AMBIGUOUS_PAYMENT.
+    logger.info("saas.ambiguous_resolved_pending", {
       cycleId: cycle.id, invoiceId: cycle.invoiceId, providerReference: input.providerReference,
     });
-    await db.tenantInvoice.update({
-      where: { id: cycle.invoiceId },
-      data: { providerReference: input.providerReference },
-    });
-    if (verification.paidAt) {
-      await db.tenantInvoice.updateMany({
-        where: { id: cycle.invoiceId, paidAt: null },
-        data: { paidAt: verification.paidAt },
-      }).catch((err) => {
-        logger.error("saas.ambiguous_paidAt_failed", {
-          invoiceId: cycle.invoiceId, error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    }
-    await db.saasRenewalCycle.updateMany({
-      where: { id: cycle.id, state: "AMBIGUOUS_PAYMENT" },
-      data: { state: "PAYMENT_PENDING", failureReason: null },
-    });
-    // Phase 2B.3.17 P0-2: We already verified the payment — proceed directly
-    // to financial finalization. Don't wait for the reconciliation worker.
-    const activated = await activateSubscriptionAndPostLedger({
-      subscriptionId: cycle.subscriptionId,
-      invoiceId: cycle.invoiceId,
-      tenantId: cycle.tenantId,
-      userId: "ambiguous-resolver",
-      paidAt: verification.paidAt,
-      paymentVerified: true,
-    });
-    if (activated.activated) {
-      // Complete the renewal cycle.
-      const completion = await completeSaasRenewalCycle({ invoiceId: cycle.invoiceId, tenantId: cycle.tenantId });
-      if (completion.completed) {
-        return { resolved: true, status: "resolved_succeeded" };
-      }
-    }
-    // If finalization didn't complete, the cycle is in PAYMENT_PENDING — the
-    // reconciliation worker will pick it up on the next run.
-    return { resolved: true, status: "resolved_succeeded_pending_finalization" };
+    return { resolved: false, status: "pending", reason: "Provider verification returned pending — retry later" };
   }
 
   if (verification.status === "failed") {
@@ -2194,9 +2163,130 @@ export async function resolveAmbiguousPayment(input: {
     return { resolved: true, status: "resolved_failed" };
   }
 
-  // verification.status === "pending" — leave in AMBIGUOUS_PAYMENT
-  logger.info("saas.ambiguous_resolved_pending", {
+  // verification.status === "succeeded"
+  // Phase 2B.3.18 P0: EXACT INVOICE CORRELATION — verify that this provider
+  // payment actually belongs to THIS invoice, not a different one.
+  // The provider must return amount and currency; we compare them to the invoice.
+  if (verification.amountMinor === undefined || verification.currency === undefined) {
+    // The provider didn't return amount/currency — we CANNOT verify correlation.
+    // Fail closed: remain AMBIGUOUS_PAYMENT. Do NOT proceed to finalization.
+    logger.error("saas.ambiguous_resolution_missing_amount_currency", {
+      cycleId: cycle.id, invoiceId: cycle.invoiceId, providerReference: input.providerReference,
+      message: "CRITICAL: Provider verification succeeded but did not return amount/currency. Cannot verify invoice correlation. Resolution refused — cycle remains AMBIGUOUS_PAYMENT.",
+    });
+    return {
+      resolved: false,
+      status: "error",
+      reason: "Provider verification did not return amount/currency — cannot verify invoice correlation",
+    };
+  }
+
+  // Verify amount matches.
+  if (verification.amountMinor !== invoice.amountMinor) {
+    logger.error("saas.ambiguous_resolution_amount_mismatch", {
+      cycleId: cycle.id, invoiceId: cycle.invoiceId, providerReference: input.providerReference,
+      expectedAmount: invoice.amountMinor, providerAmount: verification.amountMinor,
+      message: "CRITICAL: Recovered payment amount does not match invoice amount. This may be the wrong payment. Resolution refused — cycle remains AMBIGUOUS_PAYMENT.",
+    });
+    return {
+      resolved: false,
+      status: "error",
+      reason: `Amount mismatch: invoice=${invoice.amountMinor}, provider=${verification.amountMinor}`,
+    };
+  }
+
+  // Verify currency matches (case-insensitive — providers may return lowercase).
+  if (verification.currency.toUpperCase() !== invoice.currency.toUpperCase()) {
+    logger.error("saas.ambiguous_resolution_currency_mismatch", {
+      cycleId: cycle.id, invoiceId: cycle.invoiceId, providerReference: input.providerReference,
+      expectedCurrency: invoice.currency, providerCurrency: verification.currency,
+      message: "CRITICAL: Recovered payment currency does not match invoice currency. Resolution refused — cycle remains AMBIGUOUS_PAYMENT.",
+    });
+    return {
+      resolved: false,
+      status: "error",
+      reason: `Currency mismatch: invoice=${invoice.currency}, provider=${verification.currency}`,
+    };
+  }
+
+  // Phase 2B.3.18 P0: All correlation checks passed. The recovered payment
+  // is verified to belong to THIS invoice. Proceed to finalization.
+  logger.info("saas.ambiguous_resolved_succeeded", {
     cycleId: cycle.id, invoiceId: cycle.invoiceId, providerReference: input.providerReference,
+    amountMinor: verification.amountMinor, currency: verification.currency,
   });
-  return { resolved: false, status: "pending", reason: "Provider verification returned pending — retry later" };
+
+  // Phase 2B.3.18 P1: paidAt persistence — BLOCKS finalization on failure.
+  // Do this BEFORE the atomic claim, so if it fails, the cycle remains
+  // AMBIGUOUS_PAYMENT (unchanged) and the operator can retry.
+  if (verification.paidAt) {
+    try {
+      const paidAtResult = await db.tenantInvoice.updateMany({
+        where: { id: cycle.invoiceId, paidAt: null },
+        data: { paidAt: verification.paidAt },
+      });
+      logger.info("saas.ambiguous_paidAt_persisted", {
+        invoiceId: cycle.invoiceId, paidAt: verification.paidAt, updated: paidAtResult.count,
+      });
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      logger.error("saas.ambiguous_paidAt_persist_failed_blocking", {
+        cycleId: cycle.id, tenantId: cycle.tenantId, subscriptionId: cycle.subscriptionId,
+        invoiceId: cycle.invoiceId, providerReference: input.providerReference,
+        paidAt: verification.paidAt, error: errorMsg,
+        message: "CRITICAL: paidAt persistence failed. Financial finalization BLOCKED. Cycle remains AMBIGUOUS_PAYMENT for retry.",
+      });
+      return {
+        resolved: false,
+        status: "error",
+        reason: `paidAt persistence failed: ${errorMsg} — cycle remains AMBIGUOUS_PAYMENT`,
+      };
+    }
+  }
+
+  // Phase 2B.3.18 P1: ATOMIC CLAIM — transition AMBIGUOUS_PAYMENT → PAYMENT_PENDING.
+  // This prevents concurrent resolveAmbiguousPayment calls from both proceeding
+  // to finalization. Only the winner (count=1) continues. The loser gets count=0
+  // and returns without posting a duplicate ledger.
+  const claim = await db.saasRenewalCycle.updateMany({
+    where: { id: cycle.id, state: "AMBIGUOUS_PAYMENT" },
+    data: { state: "PAYMENT_PENDING", failureReason: null },
+  });
+  if (claim.count === 0) {
+    logger.info("saas.ambiguous_resolution_claim_lost", {
+      cycleId: cycle.id, tenantId: cycle.tenantId,
+    });
+    return {
+      resolved: false,
+      status: "error",
+      reason: "Cycle was concurrently resolved by another worker",
+    };
+  }
+
+  // Persist the providerReference (only the winner reaches this point).
+  await db.tenantInvoice.update({
+    where: { id: cycle.invoiceId },
+    data: { providerReference: input.providerReference },
+  });
+
+  // Phase 2B.3.17 P0-2: We already verified the payment — proceed directly
+  // to financial finalization. Don't wait for the reconciliation worker.
+  const activated = await activateSubscriptionAndPostLedger({
+    subscriptionId: cycle.subscriptionId,
+    invoiceId: cycle.invoiceId,
+    tenantId: cycle.tenantId,
+    userId: "ambiguous-resolver",
+    paidAt: verification.paidAt,
+    paymentVerified: true,
+  });
+  if (activated.activated) {
+    // Complete the renewal cycle.
+    const completion = await completeSaasRenewalCycle({ invoiceId: cycle.invoiceId, tenantId: cycle.tenantId });
+    if (completion.completed) {
+      return { resolved: true, status: "resolved_succeeded" };
+    }
+  }
+  // If finalization didn't complete, the cycle is in PAYMENT_PENDING — the
+  // reconciliation worker will pick it up on the next run.
+  return { resolved: true, status: "resolved_succeeded_pending_finalization" };
 }

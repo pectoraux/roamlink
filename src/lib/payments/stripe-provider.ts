@@ -104,12 +104,15 @@ export class StripeProvider implements PaymentProvider {
     const status: PaymentVerification["status"] =
       data.status === "succeeded" ? "succeeded" : data.status === "processing" ? "pending" : data.status === "canceled" ? "failed" : "pending";
     // Phase 2B.3.14 P1-5: Stripe provides the settlement timestamp.
+    // Phase 2B.3.18 P0: Stripe provides amount_received and currency.
     return {
       status,
       providerReference: input.providerReference,
       paidAt: data.status === "succeeded" && data.charges?.data?.[0]?.created
         ? new Date(data.charges.data[0].created * 1000)
         : undefined,
+      amountMinor: data.amount_received != null ? Number(data.amount_received) : (data.amount != null ? Number(data.amount) : undefined),
+      currency: data.currency ? String(data.currency).toUpperCase() : undefined,
       raw: data,
     };
   }
