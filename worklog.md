@@ -1818,3 +1818,25 @@ Stage Summary:
 - Lint: clean. TypeScript: clean. Schema pushed via prisma db push.
 - SaaS billing kernel: FROZEN (no changes)
 - MikroTik is the first real reference implementation of the provider-independent connectivity architecture.
+
+---
+Task ID: 2C.3.1
+Agent: Lead engineer (main) — Provider Instance + Client Injection
+Task: Harden the provider boundary before real RouterOS integration. Client dependency injection, provider instance abstraction, tenant isolation, binding immutability.
+
+Work Log:
+- Refactored MikroTikConnectivityAdapter to receive MikroTikProviderClient via constructor — removed hard-coded mockMikroTikProviderClient import. No default parameter. Adapter logic is identical regardless of which client is injected.
+- Added ConnectivityProviderInstance model — represents a specific infrastructure endpoint (e.g., "Accra Router 01", "Kumasi Router 02"). Secrets are NOT stored in plaintext — configurationKey references a secrets manager key.
+- Added providerInstanceId to ProviderResourceBinding — selects the specific infrastructure instance. Immutable after creation.
+- Updated resolveBindingAdapter to include providerInstanceId in the query. Added resolveBindingWithInstance() which resolves the full chain: binding → adapter + provider instance.
+- Implemented tenant isolation in createResourceBinding() — verifies that the providerInstanceId belongs to the same tenant as the entitlement. Cross-tenant access → 403.
+- Added createProviderInstance(), listProviderInstances(), getProviderInstance() management functions.
+
+Stage Summary:
+- HEAD: ca281081fe56228f9a1c67d1c44fe7fd7db672bf
+- origin/main: ca281081fe56228f9a1c67d1c44fe7fd7db672bf (pushed)
+- Tests: 13 — all EXECUTED + PASSED (7 runtime + 6 static)
+- Lint: clean. TypeScript: clean. Schema pushed via prisma db push.
+- SaaS billing kernel: FROZEN (no changes)
+- The provider boundary is now ready for multiple independent MikroTik operators.
+- Next step: real RouterOS REST client implementation.
