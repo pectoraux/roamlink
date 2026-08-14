@@ -428,9 +428,31 @@ async function activateSubscriptionAndPostLedger(input: {
  * PostgreSQL transaction with FOR UPDATE locks. If either update fails,
  * the transaction rolls back — no partial activation state is committed.
  *
+ * Phase 2B.3.13 — DETERMINISTIC BILLING PERIOD:
+ * The initial billing period MUST be derived from a durable financial
+ * timestamp captured at payment finalization (invoice.paidAt), NOT from
+ * the retry execution time. Retries days apart produce the SAME period.
+ *
+ *   if invoice.periodStart / periodEnd already populated:
+ *       reuse them           (durable recorded period — never drift)
+ *   else if invoice.paidAt:
+ *       periodStart = paidAt (the authoritative financial event)
+ *       periodEnd   = paidAt + billingCycle
+ *   else:
+ *       refuse to activate   (paid invoice MUST have paidAt)
+ *
+ * No path inside this function may use `new Date()` for the period start.
+ *
+ * Phase 2B.3.13 — LEDGER INVARIANT ENFORCED IN THE HELPER:
+ * This function does NOT trust callers for the ledger-existence invariant.
+ * It verifies `LedgerTransaction` exists for invoice.ledgerTransactionId
+ * inside the same transaction. The authoritative activation function cannot
+ * ever be called with a dangling ledger reference.
+ *
  * If the transaction fails, marks the subscription reconciliation_required
  * so the worker can retry. The financial state (invoice paid + ledger)
- * remains intact — only the domain activation is retried.
+ * remains intact — only the domain activation is retried. On retry, the
+ * billing period is recomputed identically (from paidAt).
  */
 async function activateInitialSaasSubscription(input: {
   invoiceId: string;
@@ -443,10 +465,18 @@ async function activateInitialSaasSubscription(input: {
   source: string; // "fast_path" | "step3"
 }): Promise<{ activated: boolean }> {
   try {
-    const result = await db.$transaction(async (tx) => {
-      // 1. Lock the invoice
-      const lockedInvoice: Array<{ id: string; status: string; ledgerTransactionId: string | null }> = await tx.$queryRaw`
-        SELECT id, status, "ledgerTransactionId"
+    type ActivationResult = {
+      activated: boolean;
+      reason: string;
+      periodStart?: Date;
+      periodEnd?: Date;
+      periodSource?: "reused" | "paidAt";
+    };
+    const result: ActivationResult = await db.$transaction(async (tx) => {
+      // 1. Lock the invoice — Phase 2B.3.13: also load paidAt + existing periods
+      //    so the billing period can be derived deterministically.
+      const lockedInvoice: Array<{ id: string; status: string; ledgerTransactionId: string | null; paidAt: Date | null; periodStart: Date | null; periodEnd: Date | null }> = await tx.$queryRaw`
+        SELECT id, status, "ledgerTransactionId", "paidAt", "periodStart", "periodEnd"
         FROM "TenantInvoice"
         WHERE id = ${input.invoiceId}
         FOR UPDATE
@@ -468,9 +498,18 @@ async function activateInitialSaasSubscription(input: {
       }
       const sub = lockedSub[0];
 
-      // 3. Verify prerequisites
+      // 3. Verify prerequisites — invoice must be paid AND have a ledger reference.
       if (inv.status !== "paid" || !inv.ledgerTransactionId) {
         return { activated: false, reason: `Invoice not ready (status: ${inv.status})` };
+      }
+
+      // 3b. Phase 2B.3.13 P1: Verify the referenced LedgerTransaction ACTUALLY EXISTS
+      // inside the helper itself. Do not rely on callers to establish this invariant.
+      const ledgerCheck: Array<{ id: string }> = await tx.$queryRaw`
+        SELECT id FROM "LedgerTransaction" WHERE id = ${inv.ledgerTransactionId}
+      `;
+      if (ledgerCheck.length === 0) {
+        return { activated: false, reason: "Ledger transaction referenced by invoice does not exist (dangling reference)" };
       }
 
       // 4. Only activate if subscription is pending_payment or reconciliation_required
@@ -479,16 +518,35 @@ async function activateInitialSaasSubscription(input: {
         return { activated: true, reason: "already_active" };
       }
 
-      // 5. Calculate billing period
-      const periodStart = new Date();
-      const periodEnd = new Date(periodStart);
-      if (input.billingCycle === "yearly") {
-        periodEnd.setFullYear(periodEnd.getFullYear() + 1);
+      // 5. Phase 2B.3.13: Derive billing period DETERMINISTICALLY.
+      //    The billing clock starts when the customer pays — never when a
+      //    recovery worker happens to repair the domain state.
+      let periodStart: Date;
+      let periodEnd: Date;
+      let periodSource: "reused" | "paidAt";
+      if (inv.periodStart && inv.periodEnd) {
+        // Durable recorded period from a prior (committed) attempt —
+        // retry MUST NOT drift the period. Reuse the recorded dates verbatim.
+        periodStart = inv.periodStart;
+        periodEnd = inv.periodEnd;
+        periodSource = "reused";
+      } else if (inv.paidAt) {
+        // First activation — anchor to the financial event that created the subscription.
+        periodStart = inv.paidAt;
+        periodEnd = new Date(periodStart.getTime());
+        if (input.billingCycle === "yearly") {
+          periodEnd.setFullYear(periodEnd.getFullYear() + 1);
+        } else {
+          periodEnd.setMonth(periodEnd.getMonth() + 1);
+        }
+        periodSource = "paidAt";
       } else {
-        periodEnd.setMonth(periodEnd.getMonth() + 1);
+        // Defensive — a paid invoice MUST have paidAt. If missing, the schema is corrupt;
+        // refuse to activate rather than fabricate a billing period.
+        return { activated: false, reason: "Paid invoice has no paidAt timestamp (cannot derive billing period)" };
       }
 
-      // 6. Update invoice period
+      // 6. Update invoice period (idempotent — same input produces same row)
       await tx.tenantInvoice.update({
         where: { id: input.invoiceId },
         data: { periodStart, periodEnd },
@@ -500,7 +558,7 @@ async function activateInitialSaasSubscription(input: {
         data: { status: "active", currentPeriodEnd: periodEnd },
       });
 
-      return { activated: true, reason: "activated", periodEnd };
+      return { activated: true, reason: "activated", periodStart, periodEnd, periodSource };
     }, { timeout: 30000, maxWait: 15000 });
 
     if (result.activated) {
@@ -510,11 +568,23 @@ async function activateInitialSaasSubscription(input: {
         action: "saas.subscription_activated",
         entity: "tenant_subscription",
         entityId: input.subscriptionId,
-        detail: { invoiceId: input.invoiceId, ledgerTxnId: input.ledgerTxnId, amount: input.amountMinor, source: input.source },
+        // Phase 2B.3.13: persist periodSource ("paidAt" | "reused") so auditors
+        // can prove the billing period was derived from the financial event,
+        // not the retry execution time.
+        detail: {
+          invoiceId: input.invoiceId,
+          ledgerTxnId: input.ledgerTxnId,
+          amount: input.amountMinor,
+          source: input.source,
+          periodSource: result.periodSource,
+          periodStart: result.periodStart?.toISOString(),
+          periodEnd: result.periodEnd?.toISOString(),
+        },
       });
       logger.info("saas.subscription_activated", {
         tenantId: input.tenantId, subscriptionId: input.subscriptionId,
         ledgerTxnId: input.ledgerTxnId, invoiceId: input.invoiceId, source: input.source,
+        periodSource: result.periodSource,
       });
       return { activated: true };
     } else {
