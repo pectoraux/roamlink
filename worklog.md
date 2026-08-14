@@ -1437,3 +1437,87 @@ Stage Summary:
 - See the full classified audit report delivered to the user below.
 - No code was modified during this audit pass.
 - 3 P0 findings, 4 P1 findings, 5 P2 findings, 3 informational notes, 21 verified invariants, 3 unverified assumptions, 8 missing tests identified.
+
+---
+Task ID: 2B.3.14
+Agent: Lead engineer (main) — Adversarial Financial Concurrency Hardening
+Task: Fix all P0/P1/P2 findings from the Phase 2B.3.13 adversarial audit. Establish canonical guarded-transition pattern. Prove invariants with real PostgreSQL tests. Build state-transition matrix.
+
+Work Log:
+- P0-1: confirmSubscriptionPayment failed path now uses `updateMany` with `status: "pending"` guard. If 0 rows affected (invoice was concurrently paid), re-reads and returns the current state without overwriting.
+- P0-2: stale-pending reconciliation failed path uses the same guard.
+- P0-3: renewSubscription failed path guards all three: invoice (status="pending"), subscription (status in active/trialing/pending_payment), cycle (state not in COMPLETED/PAST_DUE). If invoice guard returns 0 rows, does NOT touch subscription or cycle.
+- P1-4,5: Extended `PaymentVerification` and `PaymentWebhookEvent.data` with optional `paidAt?: Date`. All 4 provider adapters (mock, stripe, paystack, flutterwave) now normalize the provider's authoritative payment timestamp.
+- P1-6: `activateSubscriptionAndPostLedger` now accepts `paidAt?: Date` and sets it BEFORE attempting the ledger posting (guarded: only sets if `paidAt: null`). This ensures stale-pending reconciliation uses the provider's paidAt, not the execution time. The "mark paid" step no longer sets `paidAt` (it's already set). Fallback: if no `paidAt` provided (webhook without provider timestamp), sets it as a best-effort after marking paid.
+- P1-7: `completeSaasRenewalCycle` now verifies `LedgerTransaction` exists inside its own transaction — symmetric with `activateInitialSaasSubscription`.
+- P1-8: `providerReference` persistence failure is no longer swallowed with `.catch()`. It's wrapped in try/catch that marks the cycle `RECONCILIATION_REQUIRED` with full context for recovery.
+- P1-9: `activateInitialSaasSubscription` validates existing period values: periodEnd > periodStart, duration matches billing cycle (27-32 days monthly, 360-367 yearly), periodStart consistent with paidAt (within 1 day). Inconsistent periods are re-derived from paidAt (repair, not refusal). Corrupt durations are rejected.
+- P2-10: `cancelSubscription` refuses `reconciliation_required` state (409 conflict). Guarded transition (not "cancelled" → "cancelled").
+- P2-11: All `past_due` transitions in renewSubscription are now guarded with `updateMany`.
+- P2-12: ALL `saasRenewalCycle.update` calls converted to `updateMany` with state guards. Zero remaining unguarded calls (verified by grep).
+- P2-13: Free plans (`monthlyPriceMinor <= 0`) excluded from paid renewal machinery. Period extended directly without invoice/payment/ledger.
+- P2-14: `monthlyPriceMinor <= 0` rejected at `createSubscriptionIntent` (changed from `=== 0` to `<= 0`).
+
+Stage Summary:
+- HEAD: 393aa21b6695da105c644922bfe0b30022d838e2
+- origin/main: 393aa21b6695da105c644922bfe0b30022d838e2 (pushed)
+- Files changed: 9 (345 insertions in saas-subscription.ts, 13 in provider.ts, 13 in mock-provider.ts, 12 in stripe-provider.ts, 6 in paystack-provider.ts, 6 in flutterwave-provider.ts, 2 in webhook route, 4 in 2B.3.13 test, +941 new test file)
+- Tests: 19 in phase2b314-concurrency-hardening.test.ts — all EXECUTED + PASSED:
+  - 9 runtime tests (P0-1, P0-2, P0-3, P1-6, P1-7, P1-9, P2-10, P2-13, P2-14) ✅
+  - 10 static tests ✅
+- Prior phase tests verified: 2B.3.13 static tests (6/6 pass), 2B.3.12 (5/5 pass at HEAD).
+- Lint: clean. TypeScript: clean for all changed files.
+- No schema migration needed.
+
+State-Transition Matrix (all 7 critical fields):
+=== TenantInvoice.status ===
+  pending → paid: guarded (status in [pending, reconciliation_required]) — activateSubscriptionAndPostLedger line 429
+  pending → failed: guarded (status = pending) — confirmSubscriptionPayment line 235, renewSubscription line 1256, reconciliation line 1548
+  pending → reconciliation_required: guarded (status in [pending, reconciliation_required]) — activateSubscriptionAndPostLedger line 410
+  paid → (any): NEVER (monotonic — webhook handler line 1411 returns early if already paid)
+  FAILED → (any): NEVER (monotonic)
+=== TenantInvoice.paidAt ===
+  null → Date: guarded (paidAt = null, status in [pending, reconciliation_required]) — activateSubscriptionAndPostLedger line 327
+  Date → Date: NEVER (immutable after first set — the guard ensures only the first write succeeds)
+  Date → null: NEVER
+=== TenantInvoice.ledgerTransactionId ===
+  null → string: set atomically with status → paid (line 429)
+  string → (any): NEVER (immutable after set — no code path overwrites it)
+=== TenantSubscription.status ===
+  pending_payment → active: inside $transaction with FOR UPDATE — activateInitialSaasSubscription line 725
+  pending_payment → past_due: guarded (status in [pending_payment, active, trialing]) — confirmSubscriptionPayment line 254
+  reconciliation_required → active: inside $transaction with FOR UPDATE — activateInitialSaasSubscription line 725
+  reconciliation_required → cancelled: REFUSED (409) — cancelSubscription line 916
+  active → past_due: guarded (status in [active, trialing, pending_payment]) — renewSubscription lines 1272, 1285
+  active → cancelled: guarded (status != cancelled) — cancelSubscription line 926
+  cancelled → (any): NEVER (idempotent return)
+=== TenantSubscription.currentPeriodEnd ===
+  Set to periodEnd: inside $transaction (FOR UPDATE) — activateInitialSaasSubscription line 725, completeSaasRenewalCycle lines 855/871
+  Free-plan extension: guarded (status in [active, past_due]) — renewSubscription line 988
+  NO unguarded writes outside $transaction
+=== SaasRenewalCycle.state ===
+  ALL transitions use updateMany with state guards:
+  → PENDING: create (initial)
+  → PAYMENT_PENDING: guarded (state not in [COMPLETED, RECONCILIATION_REQUIRED, PAYMENT_PENDING]) — line 1151
+  → PAYMENT_CONFIRMED: guarded (state not in [COMPLETED, RECONCILIATION_REQUIRED]) — line 1295
+  → FINANCIAL_POSTED: guarded (state not in [COMPLETED, RECONCILIATION_REQUIRED]) — line 1172
+  → COMPLETED: guarded (state != COMPLETED) — completeSaasRenewalCycle line 872
+  → RECONCILIATION_REQUIRED: guarded (state != COMPLETED) — multiple lines
+  → PAST_DUE: guarded (state not in [COMPLETED, PAST_DUE]) — line 1276
+  COMPLETED → (any): NEVER (monotonic — completeSaasRenewalCycle verifies invariant on re-entry)
+=== SaasRenewalCycle.invoiceId ===
+  null → string: guarded (invoiceId = null) — line 1113
+  string → string: guarded (invoiceId = null) — only sets if null
+  string → null: NEVER
+
+Remaining assumptions:
+1. The mock provider's `confirmedAt` accurately simulates a real provider's payment timestamp. Real providers (Stripe, Paystack, Flutterwave) have type-level support for `paidAt` but their adapter implementations extract it from `raw` response fields that haven't been tested against live provider APIs.
+2. The period-duration tolerance (27-32 days for monthly, 360-367 for yearly) covers all calendar variations. Edge case: a monthly period starting Jan 31 → Feb 28 is 28 days (within tolerance); Feb 28 → Mar 28 is also 28 days. Yearly periods crossing a leap year are 366 days (within tolerance).
+3. The providerReference persistence failure (P1-8) enters RECONCILIATION_REQUIRED, but the recovery path for a cycle with a missing providerReference has not been explicitly tested — the reconciliation worker would need to re-create the payment intent, which is idempotent via `idempotencyKey`.
+
+Canonical rule adopted:
+  No external observation may directly mutate financial state without a guarded
+  PostgreSQL transition. Every destructive transition uses updateMany with a
+  WHERE clause that includes the expected predecessor state, and the code
+  inspects the affected-row count. If 0 rows were affected, the state has
+  already advanced — the code re-reads and reconciles rather than overwriting.
