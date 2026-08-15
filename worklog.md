@@ -1882,3 +1882,23 @@ Stage Summary:
 - SaaS billing kernel: FROZEN (no changes)
 - The three-level separation is now proven at runtime: providerType → adapter, providerInstanceId → client, providerResourceId → resource
 - Next step: real RouterOS REST client implementation.
+
+---
+Task ID: 2C.3.4
+Agent: Lead engineer (main) — Fail-Closed Provider Client Resolution
+Task: Eliminate the unsafe default fallback in the MikroTik client resolver. Unknown/unconfigured provider instances must FAIL CLOSED, not fall back to a default mock client.
+
+Work Log:
+- Rewrote the production MikroTik client resolver to be fail-closed. When a providerInstanceId has no registered client, the resolver throws MikroTikProviderError(PERMANENT) with a message explaining that each infrastructure instance must be explicitly configured and there is no fallback.
+- Removed the import of mockMikroTikProviderClient from the production resolver path (index.ts). The test-only mock registry (registerMockClientForInstance) remains available for tests, but the production path has ZERO default fallback.
+- Fixed the adapter's legacy comment: removed "return a default client for backward compat" — there is NO default infrastructure instance.
+- Test J specifically proves: register client → provisioning succeeds → clear registration → provisioning FAILS (not fallback) → original client received NO new operations.
+
+Stage Summary:
+- HEAD: 1da1c8d51c6a5851d143be8b29ad203380e65e75
+- origin/main: 1da1c8d51c6a5851d143be8b29ad203380e65e75 (pushed)
+- Tests: 10 — all EXECUTED + PASSED (6 runtime + 4 static)
+- Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN (no changes)
+- The invariant: providerInstanceId = X ⇒ ONLY a client bound to X may execute. If client X cannot be resolved ⇒ FAIL CLOSED. No default.
+- Next step: real RouterOS REST client (Phase 2C.4).
