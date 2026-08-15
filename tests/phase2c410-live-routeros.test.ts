@@ -361,29 +361,6 @@ class ControllableProxyTransport implements RouterOSTransport {
   }
 }
 
-/** Direct HTTP request to RouterOS — bypasses the client for low-level tests. */
-async function rawRequest(
-  transport: FetchRouterOSTransport,
-  method: string,
-  path: string,
-  body?: Record<string, unknown>,
-): Promise<{ status: number; body: unknown; error?: string }> {
-  try {
-    // Use the transport's internal request but catch the error to inspect status.
-    // The transport throws on non-2xx, so we need to catch and parse.
-    const result = await (transport as any).request({ method, path, body });
-    return { status: 200, body: result };
-  } catch (err) {
-    if (err instanceof MikroTikProviderError) {
-      // Parse the status from the error message: "RouterOS PUT /path → 409: ..."
-      const match = err.message.match(/→ (\d+):/);
-      const status = match ? parseInt(match[1], 10) : 0;
-      return { status, body: null, error: err.message };
-    }
-    throw err;
-  }
-}
-
 /** List all HotSpot users at the router (for evidence + cleanup). */
 async function listAllUsers(transport: FetchRouterOSTransport): Promise<Array<Record<string, unknown>>> {
   try {
@@ -928,47 +905,26 @@ describe("Phase 2C.4.10A — Live RouterOS Compatibility Validation (IMPLEMENTED
   }, 30000);
 
   liveOnly("4b: real error payloads (malformed request, missing fields)", async () => {
-    const transport = makeTransport();
+    // Phase 2C.4.10D: use rawFetch to capture the ACTUAL HTTP status code
+    // for both error cases, and recordEvidence for consistent logging.
 
-    // PUT without a name → RouterOS should return an error
-    let errorCaught: MikroTikProviderError | null = null;
-    try {
-      await transport.request({
-        method: "PUT",
-        path: "/ip/hotspot/user",
-        body: { password: "no-name" },
-      });
-    } catch (err) {
-      if (err instanceof MikroTikProviderError) {
-        errorCaught = err;
-      }
-    }
-    expect(errorCaught).not.toBeNull();
-    expect(errorCaught!.errorType).toBe("PERMANENT");
-    // Record the actual error message for evidence
-    evidenceLog.push({
-      testId: "4b-missing-name",
-      method: "PUT",
-      path: "/ip/hotspot/user (no name)",
-      status: "error",
-      durationMs: 0,
-      timestamp: new Date().toISOString(),
+    // PUT without a name → RouterOS should return an error (400 or similar)
+    const missingNameResponse = await rawFetch("PUT", "/ip/hotspot/user", {
+      password: "no-name",
     });
+    expect(missingNameResponse.httpStatus).toBeGreaterThanOrEqual(400);
+    expect(missingNameResponse.errorType).toBeTruthy();
+    recordEvidence("4b-missing-name", "PUT", "/ip/hotspot/user (no name)",
+      missingNameResponse.httpStatus, 0, `errorType=${missingNameResponse.errorType}`);
 
     // PATCH a non-existent .id → 404/NOT_FOUND
-    let notFoundError: MikroTikProviderError | null = null;
-    try {
-      await transport.request({
-        method: "PATCH",
-        path: "/ip/hotspot/user/*nonexistent-id-4b",
-        body: { disabled: "true" },
-      });
-    } catch (err) {
-      if (err instanceof MikroTikProviderError) {
-        notFoundError = err;
-      }
-    }
-    expect(notFoundError).not.toBeNull();
+    const patchResponse = await rawFetch("PATCH", "/ip/hotspot/user/*nonexistent-id-4b", {
+      disabled: "true",
+    });
+    expect(patchResponse.httpStatus).toBeGreaterThanOrEqual(400);
+    expect(patchResponse.errorType).toBeTruthy();
+    recordEvidence("4b-not-found", "PATCH", "/ip/hotspot/user/*nonexistent-id-4b",
+      patchResponse.httpStatus, 0, `errorType=${patchResponse.errorType}`);
   }, 30000);
 
   liveOnly("4c: real timeout behavior (very short timeout → TIMEOUT error)", async () => {

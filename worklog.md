@@ -2469,3 +2469,22 @@ Stage Summary:
 - The ControllableProxyTransport gate bug is fixed. Both GETs now genuinely block before release.
 - No production code changed — this is purely test-harness correctness.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
+
+---
+Task ID: 2C.4.10D
+Agent: Lead engineer (main) — Evidence model consistency cleanup
+Task: The auditor accepted 2C.4.10C but found two cleanup issues: (1) test 4b still used the old `status: "error"` field instead of `httpStatus: number`, (2) the unused `rawRequest()` helper returned a hardcoded `status: 200` instead of the actual HTTP status.
+
+Work Log:
+- Fixed test 4b: replaced the old `evidenceLog.push({ status: "error", ... })` with `rawFetch()` + `recordEvidence()`. Both error cases (PUT without name, PATCH non-existent .id) now capture the ACTUAL HTTP status code and errorType via rawFetch, and log them consistently via recordEvidence. This makes the evidence model fully consistent — every evidence record uses `httpStatus: number`.
+- Removed the unused `rawRequest()` helper. It was superseded by `rawFetch()` in 2C.4.10B but was left behind. It returned a hardcoded `status: 200` for any successful request, which was misleading. All tests now use either `rawFetch()` (for low-level HTTP status capture) or `makeClient()` (which wraps rawFetch internally for evidence recording).
+
+Test Results:
+- Without LIVE_ROUTEROS_ENDPOINT: 1 pass (META), 21 skip, 0 fail.
+- Lint: clean. TypeScript: clean (only pre-existing mobile app error).
+
+Stage Summary:
+- HEAD: (to be committed)
+- The evidence model is now fully consistent: every HttpOp record uses `httpStatus: number` (the actual HTTP status code), never a generic "success"/"error" string.
+- No production code changed — this is purely test-harness cleanup.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
