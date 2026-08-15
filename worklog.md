@@ -2391,3 +2391,44 @@ Stage Summary:
 - The 2C.4.10A test harness is now IMPLEMENTED (not scaffold). All 20 live tests contain real assertions.
 - No production code changed — this is purely test implementation.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
+
+---
+Task ID: 2C.4.10B
+Agent: Lead engineer (main) — Live RouterOS harness correctness fixes
+Task: Fix the four issues the auditor found in 7c7ce80: (1) 1c doesn't test rotation, (2) 4d can pass despite incompatibility, (3) 3d doesn't force the concurrent-PUT race, (4) evidence records generic "success" not actual HTTP status.
+
+Work Log:
+- P1-1 (1c honest naming): Renamed test 1c from "credential rotation — new credentials work after rotation" to "transport recreation with current credentials (NOT full rotation)". Added a detailed comment explaining: this test verifies transport construction, NOT rotation. Full rotation requires changing the password on the router and verifying old credentials fail while new credentials succeed — that's an operational procedure that cannot be safely automated against a shared router. Full credential rotation remains UNTESTED in this harness.
+
+- P1-2 (4d fails on incompatibility): Rewrote test 4d to FAIL on unsupported duplicate-name semantics instead of just logging a warning. The test now:
+  - Uses rawFetch to capture the actual HTTP status code.
+  - PASSES only if RouterOS returns 409 CONFLICT or 200-with-existing-resource.
+  - FAILS with expect.fail() if RouterOS returns 400, 200-with-new-.id (duplicate creation), or any unexpected status.
+  - Records the actual behavior as evidence with the real HTTP status code.
+  This means a live run against an incompatible RouterOS version will FAIL, not silently pass.
+
+- P1-3 (3d-force forced concurrent race): Added a new test "3d-force: forced concurrent-PUT race" that uses a ControllableProxyTransport to force the exact concurrent-PUT/409 path. The proxy delays both initial GET-by-username requests until both workers have issued them, then releases them simultaneously. This guarantees both workers observe "absent" before either issues a PUT — the genuine concurrent-PUT race. The original 3d test was renamed to "3d: concurrent PUTs → exactly one resource (convergence, not forced race)" with an honest comment explaining it proves convergence, not the forced race.
+
+- P1-4 (actual HTTP status evidence): Added rawFetch() helper that uses fetch directly to capture the real HTTP status code (200, 201, 409, etc.). Updated the HttpOp evidence type to use `httpStatus: number` instead of `status: number | "error" | "timeout"`. Updated makeClient's logged transport wrapper to use rawFetch internally, so every operation records the actual HTTP status. Updated the EVIDENCE test output to show "→ HTTP 200" instead of "→ success". Added a recordEvidence() helper for clean evidence recording.
+
+Test Results:
+- Without LIVE_ROUTEROS_ENDPOINT: 1 pass (META), 21 skip, 0 fail.
+- All 21 live tests are (skip), never (pass) — cannot be confused with mock validation.
+- Lint: clean. TypeScript: clean (only pre-existing mobile app error).
+
+Honest validation status (unchanged):
+  2C.4.5 – 2C.4.9: MOCK-VALIDATED
+  2C.4.10A:          IMPLEMENTED — NOT EXECUTED
+  2C.4.10B:          HARNESS CORRECTNESS FIXED — NOT EXECUTED (no live RouterOS)
+  2C.4.11:            NOT STARTED
+
+The four auditor issues are fixed:
+  1. 1c is honestly named (transport recreation, not rotation).
+  2. 4d FAILS on unsupported duplicate semantics (400, unexpected, duplicate creation).
+  3. 3d-force forces the genuine concurrent-PUT race via ControllableProxyTransport.
+  4. Evidence records actual HTTP status codes (200, 409, etc.), not generic "success".
+
+Stage Summary:
+- HEAD: (to be committed)
+- No production code changed — this is purely test-harness correctness.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.

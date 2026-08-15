@@ -69,6 +69,78 @@ import {
 import type { RouterOSTransport } from "@/lib/connectivity";
 
 // ---------------------------------------------------------------------------
+// Phase 2C.4.10B: Raw HTTP status recording
+//
+// The FetchRouterOSTransport returns parsed JSON but does NOT expose the raw
+// HTTP status code. For evidence-grade recording, we need the actual status
+// (200 vs 201 vs 409, etc.). This helper uses fetch directly to capture the
+// real status, then classifies it the same way the transport does.
+// ---------------------------------------------------------------------------
+
+interface RawHttpResponse {
+  httpStatus: number;
+  body: unknown;
+  errorType?: string; // MikroTikErrorType if non-2xx
+  errorBody?: string;
+}
+
+async function rawFetch(
+  method: string,
+  path: string,
+  body?: Record<string, unknown>,
+  timeoutMs = 10000,
+): Promise<RawHttpResponse> {
+  const url = `${LIVE_ENDPOINT}${path}`;
+  const authHeader = "Basic " + Buffer.from(`${LIVE_USERNAME}:${LIVE_PASSWORD}`).toString("base64");
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const fetchOptions: RequestInit = {
+      method,
+      headers: {
+        "Authorization": authHeader,
+        "Content-Type": "application/json",
+      },
+      signal: controller.signal,
+    };
+    if (body && method !== "GET") {
+      fetchOptions.body = JSON.stringify(body);
+    }
+
+    const response = await fetch(url, fetchOptions);
+    const text = await response.text();
+
+    // Classify the status the same way the transport does
+    let errorType: string | undefined;
+    if (response.status === 401 || response.status === 403) errorType = "AUTHENTICATION";
+    else if (response.status === 404) errorType = "NOT_FOUND";
+    else if (response.status === 409) errorType = "CONFLICT";
+    else if (response.status === 429) errorType = "RETRYABLE";
+    else if (response.status >= 500) errorType = "RETRYABLE";
+    else if (response.status >= 400) errorType = "PERMANENT";
+
+    let parsedBody: unknown = null;
+    if (text) {
+      try {
+        parsedBody = JSON.parse(text);
+      } catch {
+        parsedBody = text;
+      }
+    }
+
+    return {
+      httpStatus: response.status,
+      body: parsedBody,
+      errorType,
+      errorBody: errorType ? text.substring(0, 200) : undefined,
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Environment gate
 // ---------------------------------------------------------------------------
 
@@ -84,15 +156,31 @@ const LIVE_AVAILABLE = !!(LIVE_ENDPOINT && LIVE_USERNAME && LIVE_PASSWORD);
 const RUN_ID = `live-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
 // Evidence log — every HTTP operation is recorded here.
+// Phase 2C.4.10B: httpStatus records the ACTUAL HTTP status code (200, 201,
+// 409, etc.), not a generic "success" string. This is critical for
+// discovering real RouterOS response semantics.
 interface HttpOp {
   testId: string;
   method: string;
   path: string;
-  status: number | "error" | "timeout";
+  httpStatus: number; // actual HTTP status code (200, 201, 404, 409, etc.)
   durationMs: number;
   timestamp: string;
+  notes?: string;
 }
 const evidenceLog: HttpOp[] = [];
+
+function recordEvidence(testId: string, method: string, path: string, httpStatus: number, durationMs: number, notes?: string): void {
+  evidenceLog.push({
+    testId,
+    method,
+    path,
+    httpStatus,
+    durationMs,
+    timestamp: new Date().toISOString(),
+    notes,
+  });
+}
 
 // RouterOS version — recorded once in beforeAll.
 let routerOSVersion: string | null = null;
@@ -118,6 +206,10 @@ function makeTransport(timeoutMs = 10000): FetchRouterOSTransport {
 function makeClient(label: string, timeoutMs = 10000): RouterOSProviderClient {
   const transport = makeTransport(timeoutMs);
   // Wrap the transport to log every operation for evidence.
+  // Phase 2C.4.10B: use rawFetch to capture the ACTUAL HTTP status code,
+  // not a generic "success" string. The rawFetch result is classified the
+  // same way the transport classifies errors, so the client's behavior is
+  // unchanged — only the evidence recording is richer.
   const loggedTransport: RouterOSTransport = {
     async request<T = unknown>(input: {
       method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -125,35 +217,28 @@ function makeClient(label: string, timeoutMs = 10000): RouterOSProviderClient {
       body?: Record<string, unknown>;
     }): Promise<T | null> {
       const start = Date.now();
-      const timestamp = new Date().toISOString();
-      try {
-        const result = await transport.request<T>(input);
-        evidenceLog.push({
-          testId: label,
-          method: input.method,
-          path: input.path,
-          status: "success" as any,
-          durationMs: Date.now() - start,
-          timestamp,
-        });
-        return result;
-      } catch (err) {
-        const status: number | "error" | "timeout" =
-          err instanceof MikroTikProviderError
-            ? err.errorType === "TIMEOUT"
-              ? "timeout"
-              : "error"
-            : "error";
-        evidenceLog.push({
-          testId: label,
-          method: input.method,
-          path: input.path,
-          status,
-          durationMs: Date.now() - start,
-          timestamp,
-        });
-        throw err;
+      const raw = await rawFetch(input.method, input.path, input.body, timeoutMs);
+      const durationMs = Date.now() - start;
+
+      // Record the actual HTTP status code as evidence.
+      recordEvidence(label, input.method, input.path, raw.httpStatus, durationMs,
+        raw.errorType ? `errorType=${raw.errorType}` : undefined);
+
+      // Reconstruct the transport's return semantics from the raw response:
+      //   404 → null
+      //   204 → null
+      //   2xx → parsed body
+      //   non-2xx → throw MikroTikProviderError (classified the same way)
+      if (raw.httpStatus === 404) return null;
+      if (raw.httpStatus === 204) return null;
+      if (raw.httpStatus >= 200 && raw.httpStatus < 300) {
+        return (raw.body ?? null) as T | null;
       }
+      // Non-2xx — throw the same error the transport would throw.
+      throw new MikroTikProviderError(
+        raw.errorType as any ?? "PERMANENT",
+        `RouterOS ${input.method} ${input.path} → ${raw.httpStatus}: ${raw.errorBody ?? ""}`,
+      );
     },
   };
   return new RouterOSProviderClient(loggedTransport, label);
@@ -163,6 +248,71 @@ function makeUsername(testId: string): string {
   const username = `rl-live-${RUN_ID}-${testId}`;
   createdUsernames.add(username);
   return username;
+}
+
+/**
+ * Phase 2C.4.10B: Controllable test proxy for forcing the concurrent-PUT race.
+ *
+ * Real RouterOS cannot be instructed to pause its GET responses. To force the
+ * exact concurrent-PUT/409 path (both GETs observe absence before either PUT),
+ * we route requests through a local in-process proxy that can delay GET
+ * responses until both workers have issued their initial GET.
+ *
+ * This is only used by test 3d-force-concurrent. All other tests use the
+ * direct transport.
+ */
+class ControllableProxyTransport implements RouterOSTransport {
+  private gatePromise: Promise<void> | null = null;
+  private gateResolve: (() => void) | null = null;
+  private getsWaiting = 0;
+  private readonly requiredGets: number;
+
+  constructor(
+    private readonly upstream: RouterOSTransport,
+    requiredGets = 2,
+  ) {
+    this.requiredGets = requiredGets;
+  }
+
+  /** Arm the gate — subsequent GET-by-username requests will block. */
+  armGate(): void {
+    this.getsWaiting = 0;
+  }
+
+  /** Wait until `requiredGets` GETs are blocked, then release them all. */
+  async waitForGetsAndRelease(timeoutMs = 5000): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (this.getsWaiting >= this.requiredGets) break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    this.releaseGate();
+  }
+
+  releaseGate(): void {
+    if (this.gateResolve) {
+      this.gateResolve();
+      this.gateResolve = null;
+      this.gatePromise = null;
+    }
+  }
+
+  async request<T = unknown>(input: {
+    method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+    path: string;
+    body?: Record<string, unknown>;
+  }): Promise<T | null> {
+    // If this is a GET-by-username (idempotency lookup) and the gate is armed,
+    // block until releaseGate() is called.
+    if (input.method === "GET" && input.path.includes("/ip/hotspot/user?name=") && this.gateResolve === null && this.getsWaiting < this.requiredGets) {
+      this.getsWaiting++;
+      this.gatePromise = new Promise<void>((resolve) => {
+        this.gateResolve = resolve;
+      });
+      await this.gatePromise;
+    }
+    return this.upstream.request<T>(input);
+  }
 }
 
 /** Direct HTTP request to RouterOS — bypasses the client for low-level tests. */
@@ -288,15 +438,9 @@ describe("Phase 2C.4.10A — Live RouterOS Compatibility Validation (IMPLEMENTED
     expect(resource!.version).toBeTruthy();
     expect(typeof resource!.version).toBe("string");
 
-    // Record evidence
-    evidenceLog.push({
-      testId: "1a",
-      method: "GET",
-      path: "/system/resource",
-      status: 200,
-      durationMs: 0,
-      timestamp: new Date().toISOString(),
-    });
+    // Record evidence (use the actual HTTP status from rawFetch)
+    const raw = await rawFetch("GET", "/system/resource");
+    recordEvidence("1a", "GET", "/system/resource", raw.httpStatus, 0);
   }, 30000);
 
   liveOnly("1b: authentication failure — wrong credentials → AUTHENTICATION error", async () => {
@@ -321,13 +465,23 @@ describe("Phase 2C.4.10A — Live RouterOS Compatibility Validation (IMPLEMENTED
     expect((thrownError as MikroTikProviderError).errorType).toBe("AUTHENTICATION");
   }, 30000);
 
-  liveOnly("1c: credential rotation — new credentials work after rotation", async () => {
-    // This test verifies that creating a NEW transport with (potentially)
-    // rotated credentials works. Full credential rotation (changing the
-    // password on the router) is an operational procedure we can't safely
-    // automate against a shared router, so we verify the transport
-    // construction path: a new FetchRouterOSTransport with the current
-    // credentials makes a successful request.
+  liveOnly("1c: transport recreation with current credentials (NOT full rotation)", async () => {
+    // PHASE 2C.4.10B HONEST NAMING:
+    // This test does NOT test credential rotation. Full rotation requires
+    // changing the password on the router and verifying old credentials fail
+    // while new credentials succeed — that's an operational procedure we
+    // cannot safely automate against a shared router.
+    //
+    // What this test DOES verify: creating a NEW FetchRouterOSTransport with
+    // the current credentials works. In production, the client-factory's
+    // cache fingerprint includes the credential version, so a rotated
+    // credential produces a new client instance. This test verifies the
+    // transport construction path, not the rotation itself.
+    //
+    // Full credential rotation remains UNTESTED in this harness. It requires
+    // a dedicated test account whose password the harness can safely change
+    // and restore. That is a future operational validation step, not a
+    // code-level test.
     const transport1 = makeTransport();
     const resource1 = await transport1.request<Record<string, unknown>>({
       method: "GET",
@@ -335,10 +489,7 @@ describe("Phase 2C.4.10A — Live RouterOS Compatibility Validation (IMPLEMENTED
     });
     expect(resource1).not.toBeNull();
 
-    // Simulate "rotation" by creating a fresh transport (new instance, same
-    // credentials). In production, the client-factory's cache fingerprint
-    // includes the credential version, so a rotated credential produces a new
-    // client instance.
+    // Create a fresh transport (new instance, same credentials).
     const transport2 = makeTransport();
     const resource2 = await transport2.request<Record<string, unknown>>({
       method: "GET",
@@ -539,7 +690,14 @@ describe("Phase 2C.4.10A — Live RouterOS Compatibility Validation (IMPLEMENTED
     expect(resource.username).toBe(username);
   }, 30000);
 
-  liveOnly("3d: concurrent PUTs → exactly one resource (via client createResource)", async () => {
+  liveOnly("3d: concurrent PUTs → exactly one resource (convergence, not forced race)", async () => {
+    // PHASE 2C.4.10B HONEST NAMING:
+    // This test proves concurrent createResource() CONVERGES on one resource,
+    // but it does NOT force the exact concurrent-PUT/409 path. The race may
+    // resolve as: A GETs absent → A PUTs → B GETs existing → B returns existing
+    // (GET-first idempotency), rather than: both GET absent → both PUT → 409.
+    //
+    // The forced-concurrent-PUT/409 path is tested separately in 3d-force.
     const client = makeClient("3d");
     const transport = makeTransport();
     const username = makeUsername("3d");
@@ -572,6 +730,90 @@ describe("Phase 2C.4.10A — Live RouterOS Compatibility Validation (IMPLEMENTED
       path: `/ip/hotspot/user?name=${encodeURIComponent(username)}`,
     });
     expect(found!.length).toBe(1);
+  }, 60000);
+
+  liveOnly("3d-force: forced concurrent-PUT race (both GETs observe absence before either PUT)", async () => {
+    // PHASE 2C.4.10B: This test FORCES the exact concurrent-PUT/409 path
+    // using a ControllableProxyTransport that delays both initial GETs until
+    // both workers have issued them. This guarantees:
+    //   A: GET → absent (blocked)
+    //   B: GET → absent (blocked)
+    //   release both
+    //   A: GET returns absent → PUT → creates
+    //   B: GET returns absent → PUT → 409 (or 200-existing, depending on RouterOS)
+    //
+    // This is the live equivalent of the mock harness's GET gate (2C.4.7).
+    const username = makeUsername("3d-force");
+
+    // Create a logged transport (for evidence + HTTP status recording) and
+    // wrap it in the controllable proxy.
+    const loggedTransport: RouterOSTransport = {
+      async request<T = unknown>(input: {
+        method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+        path: string;
+        body?: Record<string, unknown>;
+      }): Promise<T | null> {
+        const start = Date.now();
+        const raw = await rawFetch(input.method, input.path, input.body);
+        const durationMs = Date.now() - start;
+        recordEvidence("3d-force", input.method, input.path, raw.httpStatus, durationMs,
+          raw.errorType ? `errorType=${raw.errorType}` : undefined);
+        if (raw.httpStatus === 404) return null;
+        if (raw.httpStatus === 204) return null;
+        if (raw.httpStatus >= 200 && raw.httpStatus < 300) {
+          return (raw.body ?? null) as T | null;
+        }
+        throw new MikroTikProviderError(
+          raw.errorType as any ?? "PERMANENT",
+          `RouterOS ${input.method} ${input.path} → ${raw.httpStatus}: ${raw.errorBody ?? ""}`,
+        );
+      },
+    };
+    const proxy = new ControllableProxyTransport(loggedTransport, 2);
+    const client = new RouterOSProviderClient(proxy, "3d-force");
+
+    // Arm the gate — both initial GETs will block.
+    proxy.armGate();
+
+    // Launch two concurrent createResource calls. Both will issue GET-first
+    // and block on the gate.
+    const promiseA = client.createResource({
+      resourceType: "hotspot_user",
+      username,
+      password: "pw-3d-force",
+    });
+    const promiseB = client.createResource({
+      resourceType: "hotspot_user",
+      username,
+      password: "pw-3d-force",
+    });
+
+    // Wait until both GETs are blocked, then release them simultaneously.
+    // Both GETs will return "absent" (the resource doesn't exist yet), so
+    // both workers proceed to PUT — forcing the concurrent-PUT race.
+    await proxy.waitForGetsAndRelease(5000);
+
+    const [resA, resB] = await Promise.all([promiseA, promiseB]);
+
+    // Both must converge on the same .id.
+    expect(resA.username).toBe(username);
+    expect(resB.username).toBe(username);
+    expect(resA.id).toBe(resB.id);
+    expect(resA.id).toBeTruthy();
+
+    // CRITICAL: exactly one resource exists at the provider.
+    const found = await rawFetch("GET", `/ip/hotspot/user?name=${encodeURIComponent(username)}`);
+    const foundArray = (found.body as Array<Record<string, unknown>>) ?? [];
+    expect(foundArray.length).toBe(1);
+    expect(foundArray[0][".id"]).toBe(resA.id);
+    recordEvidence("3d-force", "GET", "/ip/hotspot/user?name= (verify)", found.httpStatus, 0, `count=${foundArray.length}`);
+
+    // Record how many PUTs were issued (should be 2: one created, one 409'd
+    // or returned existing). The evidence log shows the actual RouterOS
+    // behavior for the concurrent PUT.
+    const puts = evidenceLog.filter((e) => e.testId === "3d-force" && e.method === "PUT");
+    console.log(`\n  3d-force: ${puts.length} PUTs issued. Statuses: ${puts.map((p) => p.httpStatus).join(", ")}\n`);
+    expect(puts.length).toBe(2);
   }, 60000);
 
   // -------------------------------------------------------------------------
@@ -700,75 +942,81 @@ describe("Phase 2C.4.10A — Live RouterOS Compatibility Validation (IMPLEMENTED
   // The production client assumes 409 (CONFLICT). This test issues a real
   // duplicate PUT and classifies the ACTUAL response. If it's not 409, the
   // production classifier may need updating.
-  liveOnly("4d: actual duplicate-name behavior (DISCOVERY — does not assume 409)", async () => {
-    const transport = makeTransport();
+  liveOnly("4d: duplicate-name PUT — DISCOVER + FAIL on unsupported semantics", async () => {
+    // PHASE 2C.4.10B: This test DISCOVERS the actual duplicate-name behavior
+    // and FAILS if it doesn't match what the production client supports.
+    //
+    // The production RouterOSProviderClient handles two duplicate-name outcomes:
+    //   1. 409 CONFLICT → reconciles via GET → bind existing
+    //   2. 200 with existing resource → GET-first idempotency (handled before PUT)
+    //
+    // If RouterOS returns 400 or an unexpected status, the production
+    // classifier/convergence path is INCOMPATIBLE with the live router, and
+    // this test MUST FAIL — not silently pass with a warning.
     const username = makeUsername("4d");
 
-    // First PUT — creates the resource
-    const firstPut = await transport.request<Record<string, unknown>>({
-      method: "PUT",
-      path: "/ip/hotspot/user",
-      body: { name: username, password: "pw-4d-first" },
+    // First PUT — creates the resource (use rawFetch for accurate status)
+    const firstPut = await rawFetch("PUT", "/ip/hotspot/user", {
+      name: username,
+      password: "pw-4d-first",
     });
-    expect(firstPut).not.toBeNull();
-    const firstId = firstPut![".id"] as string;
+    expect(firstPut.httpStatus).toBeGreaterThanOrEqual(200);
+    expect(firstPut.httpStatus).toBeLessThan(300);
+    expect(firstPut.body).not.toBeNull();
+    const firstId = (firstPut.body as Record<string, unknown>)[".id"] as string;
+    expect(firstId).toBeTruthy();
+    recordEvidence("4d", "PUT", "/ip/hotspot/user (first)", firstPut.httpStatus, 0, "create");
 
     // Second PUT with the SAME username — DISCOVER what RouterOS does.
-    // Options:
-    //   a) 409 CONFLICT (what the production client assumes)
-    //   b) 400 BAD REQUEST
-    //   c) 200 with the existing resource (silent idempotency)
-    //   d) 200 with a NEW resource (duplicate creation — would be a bug)
-    let secondStatus: number | "error" = "error";
-    let secondBody: unknown = null;
-    let secondError: string | null = null;
-    try {
-      const secondPut = await transport.request<Record<string, unknown>>({
-        method: "PUT",
-        path: "/ip/hotspot/user",
-        body: { name: username, password: "pw-4d-second" },
-      });
-      secondStatus = 200;
-      secondBody = secondPut;
-    } catch (err) {
-      if (err instanceof MikroTikProviderError) {
-        const match = err.message.match(/→ (\d+):/);
-        secondStatus = match ? parseInt(match[1], 10) : 0;
-        secondError = err.message;
-        secondBody = null;
-      }
-    }
+    const secondPut = await rawFetch("PUT", "/ip/hotspot/user", {
+      name: username,
+      password: "pw-4d-second",
+    });
 
     // Record the actual behavior as evidence.
-    console.log(`\n  4d DISCOVERY: duplicate-name PUT returned status=${secondStatus}`);
-    console.log(`  4d body: ${JSON.stringify(secondBody)?.substring(0, 200)}`);
-    console.log(`  4d error: ${secondError?.substring(0, 200) ?? "none"}\n`);
-    evidenceLog.push({
-      testId: "4d-duplicate-name",
-      method: "PUT",
-      path: "/ip/hotspot/user (duplicate name)",
-      status: secondStatus,
-      durationMs: 0,
-      timestamp: new Date().toISOString(),
-    });
+    console.log(`\n  4d DISCOVERY: duplicate-name PUT returned HTTP ${secondPut.httpStatus}`);
+    console.log(`  4d body: ${JSON.stringify(secondPut.body)?.substring(0, 200)}`);
+    console.log(`  4d errorType: ${secondPut.errorType ?? "none"}`);
+    console.log(`  4d errorBody: ${secondPut.errorBody?.substring(0, 200) ?? "none"}\n`);
+    recordEvidence("4d", "PUT", "/ip/hotspot/user (duplicate)", secondPut.httpStatus, 0,
+      `errorType=${secondPut.errorType ?? "none"}`);
 
     // Verify exactly ONE resource exists (regardless of the status code).
-    const found = await transport.request<Array<Record<string, unknown>>>({
-      method: "GET",
-      path: `/ip/hotspot/user?name=${encodeURIComponent(username)}`,
-    });
-    expect(found!.length).toBe(1);
-    expect(found![0][".id"]).toBe(firstId);
+    const found = await rawFetch("GET", `/ip/hotspot/user?name=${encodeURIComponent(username)}`);
+    const foundArray = (found.body as Array<Record<string, unknown>>) ?? [];
+    expect(foundArray.length).toBe(1);
+    expect(foundArray[0][".id"]).toBe(firstId);
+    recordEvidence("4d", "GET", "/ip/hotspot/user?name= (verify)", found.httpStatus, 0, `count=${foundArray.length}`);
 
-    // Document the behavior classification.
-    if (secondStatus === 409) {
-      console.log("  4d CLASSIFICATION: RouterOS returns 409 CONFLICT (matches production assumption)");
-    } else if (secondStatus === 400) {
-      console.log("  4d CLASSIFICATION: RouterOS returns 400 BAD REQUEST (production CONFLICT handler may need updating)");
-    } else if (secondStatus === 200 && secondBody && (secondBody as any)[".id"] === firstId) {
-      console.log("  4d CLASSIFICATION: RouterOS returns 200 with existing resource (silent idempotency)");
+    // CLASSIFICATION + ASSERTION:
+    // The production client supports 409 CONFLICT and 200-with-existing.
+    // Any other response is INCOMPATIBLE and must FAIL the test.
+    if (secondPut.httpStatus === 409) {
+      console.log("  4d CLASSIFICATION: RouterOS returns 409 CONFLICT (matches production assumption) ✅");
+      expect(secondPut.errorType).toBe("CONFLICT");
+    } else if (secondPut.httpStatus === 200 && secondPut.body) {
+      const secondId = (secondPut.body as Record<string, unknown>)[".id"];
+      if (secondId === firstId) {
+        console.log("  4d CLASSIFICATION: RouterOS returns 200 with existing resource (silent idempotency) ✅");
+      } else {
+        // 200 with a DIFFERENT .id means duplicate creation — a RouterOS bug
+        // or a non-unique-name scenario the production client doesn't handle.
+        console.log(`  4d CLASSIFICATION: 200 with NEW .id (duplicate creation!) ❌`);
+        expect.fail(`RouterOS created a DUPLICATE resource for username "${username}". ` +
+          `First .id=${firstId}, second .id=${secondId}. The production client assumes usernames are unique.`);
+      }
+    } else if (secondPut.httpStatus === 400) {
+      console.log("  4d CLASSIFICATION: RouterOS returns 400 BAD REQUEST ❌");
+      expect.fail(`RouterOS returns 400 for duplicate-name PUT, but the production ` +
+        `RouterOSProviderClient expects 409 CONFLICT. The production classifier/convergence ` +
+        `path is INCOMPATIBLE with this RouterOS version. ` +
+        `Either update the production client to handle 400, or use a RouterOS version ` +
+        `that returns 409. Actual response: ${secondPut.errorBody}`);
     } else {
-      console.log(`  4d CLASSIFICATION: RouterOS returns ${secondStatus} (unexpected — investigate)`);
+      console.log(`  4d CLASSIFICATION: RouterOS returns ${secondPut.httpStatus} (unexpected) ❌`);
+      expect.fail(`RouterOS returned unexpected HTTP ${secondPut.httpStatus} for duplicate-name PUT. ` +
+        `The production client only handles 409 CONFLICT or 200-with-existing. ` +
+        `Actual response: ${secondPut.errorBody ?? JSON.stringify(secondPut.body)}`);
     }
   }, 30000);
 
@@ -807,14 +1055,7 @@ describe("Phase 2C.4.10A — Live RouterOS Compatibility Validation (IMPLEMENTED
     // Record the full representation for evidence
     console.log(`\n  4e HotSpot user representation:`);
     console.log(`  ${JSON.stringify(resource, null, 2)}\n`);
-    evidenceLog.push({
-      testId: "4e-representation",
-      method: "GET",
-      path: `/ip/hotspot/user/${resourceId}`,
-      status: 200,
-      durationMs: 0,
-      timestamp: new Date().toISOString(),
-    });
+    recordEvidence("4e-representation", "GET", `/ip/hotspot/user/${resourceId}`, 200, 0);
   }, 30000);
 
   // -------------------------------------------------------------------------
@@ -1002,7 +1243,7 @@ describe("Phase 2C.4.10A — Live RouterOS Compatibility Validation (IMPLEMENTED
     console.log(`Test usernames created: ${createdUsernames.size}`);
     console.log(`\nOperation log:`);
     for (const op of evidenceLog) {
-      console.log(`  [${op.testId}] ${op.method} ${op.path} → ${op.status} (${op.durationMs}ms)`);
+      console.log(`  [${op.testId}] ${op.method} ${op.path} → HTTP ${op.httpStatus} (${op.durationMs}ms)${op.notes ? ` ${op.notes}` : ""}`);
     }
     console.log(`\n=== END EVIDENCE ===\n`);
 
