@@ -1987,3 +1987,25 @@ Stage Summary:
 - SaaS billing kernel: FROZEN
 - Entitlement kernel: FROZEN
 - Adapter contract: FROZEN
+
+---
+Task ID: 2C.4.3
+Agent: Lead engineer (main) — RouterOS Create Fail-Closed
+Task: Fix P0: initial create lookup failed open (proceeded to PUT on timeout/5xx). Must fail closed — unknown external state ≠ resource absent.
+
+Work Log:
+- Removed the "proceed to create" catch block from createResource(). All lookup failures (timeout, retryable, auth, permanent) now FAIL CLOSED — the client does NOT proceed to PUT when it cannot confirm the resource is absent.
+- Only confirmed absence (GET returns empty result) permits creation.
+- The PUT-timeout reconcile-before-retry logic remains: after PUT timeout, GET by username → if found, return existing; if absent, one controlled PUT retry.
+- Added CRITICAL log: "refusing to create with unknown external state" on lookup failure.
+
+Stage Summary:
+- HEAD: d64564ee24e159631a4f68bf2ddeda84e3a88bcc
+- origin/main: d64564ee24e159631a4f68bf2ddeda84e3a88bcc (pushed)
+- Tests: 11 — all EXECUTED + PASSED (8 runtime + 3 static)
+- Lint: clean. TypeScript: clean.
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED
+- SaaS billing kernel: FROZEN
+- Entitlement kernel: FROZEN
+- Adapter contract: FROZEN
+- The invariant: UNKNOWN EXTERNAL STATE ≠ RESOURCE ABSENT. Only confirmed absence permits creation.
