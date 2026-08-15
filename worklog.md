@@ -1840,3 +1840,24 @@ Stage Summary:
 - SaaS billing kernel: FROZEN (no changes)
 - The provider boundary is now ready for multiple independent MikroTik operators.
 - Next step: real RouterOS REST client implementation.
+
+---
+Task ID: 2C.3.2
+Agent: Lead engineer (main) — Provider Instance Runtime Resolution
+Task: Make providerInstanceId part of the actual runtime execution path, not just database metadata. The provider instance must participate in adapter resolution.
+
+Work Log:
+- Added providerInstanceId and providerInstanceConfiguration to ProviderResourceBindingInput in the adapter contract. All provider adapters now receive the instance identity through the generic contract.
+- Created resolveBindingRuntime() — the canonical runtime resolver. Validates tenant isolation, type match, and instance status at RUNTIME (not just creation time). Returns the full runtime context: adapter, binding input (with providerInstanceId), entitlement input, and provider instance.
+- Updated reconcileBindingWithProvider() to use resolveBindingRuntime() instead of the old resolveBindingAdapter() + manual loading. The adapter now receives providerInstanceId and providerInstanceConfiguration in its input.
+- Runtime tenant isolation: if the instance's ownership changes after binding creation, the runtime resolver detects it and fails closed.
+- Instance status validation: only 'active' instances can be used. 'inactive' and 'maintenance' are rejected at runtime.
+
+Stage Summary:
+- HEAD: a88f9c888c21f17a2941933382c6c0e0092bf07e
+- origin/main: a88f9c888c21f17a2941933382c6c0e0092bf07e (pushed)
+- Tests: 12 — all EXECUTED + PASSED (8 runtime + 4 static)
+- Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN (no changes)
+- The three-level separation is now complete: providerType (adapter class) → providerInstanceId (infrastructure instance) → providerResourceId (specific resource)
+- Next step: real RouterOS REST client implementation.
