@@ -37,10 +37,16 @@ export class MikroTikProviderError extends Error {
 
 /**
  * A MikroTik resource (hotspot user, RADIUS subscriber, PPPoE session).
+ *
+ * Phase 2C.4.2: Resource identity is now properly separated:
+ *   id       = RouterOS .id (internal record ID, used for GET/PATCH/DELETE addressing)
+ *   username = HotSpot username (name field, used for active-session correlation)
  */
 export type MikroTikResource = {
-  /** The resource identifier (e.g., username, RADIUS username) */
+  /** RouterOS .id — the internal record ID used for addressing */
   id: string;
+  /** HotSpot username (name field) — used for active-session correlation */
+  username: string;
   /** Resource type: "hotspot_user" | "radius_subscriber" | "pppoe_session" */
   resourceType: string;
   /** Whether the resource is currently active/enabled */

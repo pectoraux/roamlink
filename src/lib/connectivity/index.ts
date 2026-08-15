@@ -63,7 +63,7 @@ export { MikroTikConnectivityAdapter } from "./providers/mikrotik/adapter";
 export type { MikroTikProviderClient, MikroTikResource, MikroTikResourceConfig, MikroTikErrorType, MikroTikClientResolver } from "./providers/mikrotik/client";
 export { MikroTikProviderError } from "./providers/mikrotik/client";
 export { MockMikroTikProviderClient, mockMikroTikProviderClient, setMockFailureSimulation, clearMockFailureSimulation, clearMockMikroTikResources } from "./providers/mikrotik/mock-client";
-export { registerMockClientForInstance, clearMockClientRegistry, clearClientCache, createRouterOSClientForInstance, productionAsyncResolver } from "./providers/mikrotik/client-factory";
+export { registerMockClientForInstance, clearMockClientRegistry, clearClientCache, invalidateRouterOSClient, createRouterOSClientForInstance, productionAsyncResolver } from "./providers/mikrotik/client-factory";
 export type { AsyncMikroTikClientResolver } from "./providers/mikrotik/client-factory";
 export { RouterOSProviderClient } from "./providers/mikrotik/routeros-client";
 export { FetchRouterOSTransport, MockRouterOSTransport } from "./providers/mikrotik/transport";

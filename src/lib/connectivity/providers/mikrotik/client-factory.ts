@@ -39,6 +39,27 @@ export function clearClientCache(): void {
   logger.info("routeros.client_cache_cleared", {});
 }
 
+/**
+ * Phase 2C.4.2: Invalidate cached clients for a specific provider instance.
+ *
+ * This is used when credential rotation occurs without a PostgreSQL row update
+ * (e.g., secrets manager rotates the password but the configurationKey stays
+ * the same and the secret resolver doesn't provide a version).
+ *
+ * After calling this, the next operation for this instance will construct a
+ * fresh client with the current credentials.
+ */
+export function invalidateRouterOSClient(providerInstanceId: string): void {
+  let evicted = 0;
+  for (const key of clientCache.keys()) {
+    if (key.startsWith(`${providerInstanceId}:`)) {
+      clientCache.delete(key);
+      evicted++;
+    }
+  }
+  logger.info("routeros.client_invalidated", { providerInstanceId, evictedEntries: evicted });
+}
+
 // ---------------------------------------------------------------------------
 // Client Factory
 // ---------------------------------------------------------------------------
@@ -99,22 +120,30 @@ export async function createRouterOSClientForInstance(
     );
   }
 
-  // Step 4: Check cache — but include a configuration fingerprint to detect changes
-  // The fingerprint includes configurationKey + updatedAt, so if either changes,
-  // the cache is invalidated.
-  const fingerprint = `${instance.configurationKey ?? ""}:${instance.updatedAt.toISOString()}`;
+  // Step 4: Resolve secrets via configurationKey (BEFORE cache check — need version for fingerprint)
+  const configuration = instance.configuration ? JSON.parse(instance.configuration) : null;
+  const credentials = await secretResolver.resolve({
+    configurationKey: instance.configurationKey,
+    configuration,
+  });
+
+  // Step 5: Check cache — include a configuration fingerprint that detects:
+  //   - configurationKey changes (via instance.updatedAt)
+  //   - credential rotation (via credentials.version)
+  const fingerprint = `${instance.configurationKey ?? ""}:${instance.updatedAt.toISOString()}:${credentials.version ?? "no-version"}`;
   const cacheKey = `${providerInstanceId}:${fingerprint}`;
   const cached = clientCache.get(cacheKey);
   if (cached) {
     return cached;
   }
 
-  // Step 5: Resolve secrets via configurationKey
-  const configuration = instance.configuration ? JSON.parse(instance.configuration) : null;
-  const credentials = await secretResolver.resolve({
-    configurationKey: instance.configurationKey,
-    configuration,
-  });
+  // Step 5b: Evict old cache entries for this providerInstanceId (bounded cache)
+  // When a new fingerprint is created, old entries for the same instance are removed.
+  for (const key of clientCache.keys()) {
+    if (key.startsWith(`${providerInstanceId}:`)) {
+      clientCache.delete(key);
+    }
+  }
 
   // Step 6: Construct the transport + client
   const transport = new FetchRouterOSTransport({

@@ -126,7 +126,19 @@ export class FetchRouterOSTransport implements RouterOSTransport {
     const authHeader = "Basic " + Buffer.from(`${this.config.username}:${this.config.password}`).toString("base64");
 
     let lastError: MikroTikProviderError | null = null;
-    const maxAttempts = 1 + this.config.maxRetries;
+
+    // Phase 2C.4.2: Method-specific retry policy.
+    // PUT create is NOT automatically retried — the client owns create retry semantics
+    // (reconcile via GET before retry). Blind transport retries for PUT could duplicate
+    // external resources if the first request reached the server but the response was lost.
+    //
+    // GET: retryable (safe, idempotent)
+    // PATCH: retryable (idempotent for our use case — disabled=true/false)
+    // DELETE: retryable (idempotent — RouterOS returns 204 even if already deleted)
+    // PUT: NOT retryable (create — client reconciles before retry)
+    // POST: NOT retryable (command execution — may have side effects)
+    const isMethodRetryable = input.method === "GET" || input.method === "PATCH" || input.method === "DELETE";
+    const maxAttempts = isMethodRetryable ? (1 + this.config.maxRetries) : 1;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const controller = new AbortController();

@@ -37,7 +37,22 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
 
   async createResource(config: MikroTikResourceConfig): Promise<MikroTikResource> {
     // Step 1: Check if resource already exists (idempotent)
-    const existing = await this.getResourceByUsername(config.username);
+    // If the GET lookup fails with a retryable error, proceed to create —
+    // the lookup is an optimization, not a requirement.
+    let existing: MikroTikResource | null = null;
+    try {
+      existing = await this.getResourceByUsername(config.username);
+    } catch (err) {
+      if (err instanceof MikroTikProviderError && (err.errorType === "RETRYABLE" || err.errorType === "TIMEOUT")) {
+        logger.warn("routeros.create_lookup_failed", {
+          username: config.username, instance: this.instanceLabel,
+          error: err.message,
+          message: "Idempotency lookup failed — proceeding to create.",
+        });
+      } else {
+        throw err;
+      }
+    }
     if (existing) {
       logger.info("routeros.create_idempotent", { username: config.username, instance: this.instanceLabel });
       return existing;
@@ -181,9 +196,9 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
       path: "/ip/hotspot/active",
     });
 
-    // Find the session for this user (by username, not .id)
-    const username = resource.id; // We store username as id for now; see parseResource
-    const session = (activeSessions ?? []).find((s) => s.user === username);
+    // Phase 2C.4.2: Use resource.username (NOT resource.id) for active-session correlation.
+    // Active sessions are keyed by HotSpot username (the `user` field), not by RouterOS .id.
+    const session = (activeSessions ?? []).find((s) => s.user === resource.username);
 
     return {
       downloadBytes: this.parseIntSafe(session?.["bytes-in"] as string | undefined),
@@ -200,18 +215,14 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
   /**
    * Parse a RouterOS resource response into MikroTikResource.
    *
-   * Phase 2C.4.1: Resource identity:
-   *   - id = RouterOS .id (the internal record ID, used for addressing)
-   *   - username = the HotSpot user name (used for lookup/correlation)
-   *
-   * The RoamLink providerResourceId stores the RouterOS .id.
+   * Phase 2C.4.2: Resource identity is properly separated:
+   *   id       = RouterOS .id (internal record ID, used for addressing)
+   *   username = HotSpot username (name field, used for active-session correlation)
    */
   private parseResource(data: Record<string, unknown>): MikroTikResource {
-    const routerOSId = data[".id"] as string | undefined;
-    const username = data.name as string | undefined;
-
     return {
-      id: routerOSId ?? username ?? "", // Use .id as primary; fall back to username
+      id: (data[".id"] as string) ?? "",
+      username: (data.name as string) ?? "",
       resourceType: "hotspot_user",
       isActive: data.disabled !== "true",
       downloadRateLimitBps: this.parseRateLimit(data["rate-limit"] as string | undefined, "down"),

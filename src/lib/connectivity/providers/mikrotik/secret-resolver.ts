@@ -31,6 +31,16 @@ export type ResolvedProviderCredentials = {
   allowInsecureTls?: boolean;
   /** Request timeout in ms */
   timeoutMs?: number;
+  /**
+   * Phase 2C.4.2: Credential version — a stable string that changes when
+   * the credential value changes. Used in the client cache key to detect
+   * credential rotation without a PostgreSQL row update.
+   *
+   * If the secret resolver cannot provide a version, it should return undefined.
+   * In that case, credential rotation requires explicit cache invalidation
+   * via invalidateRouterOSClient().
+   */
+  version?: string;
 };
 
 // ---------------------------------------------------------------------------
