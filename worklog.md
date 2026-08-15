@@ -2592,3 +2592,62 @@ Stage Summary:
 - The kernel is FROZEN and correct. The commercial layer builds on top, not inside.
 - The fastest path to revenue is B2B reseller SaaS: 3 Ghanaian WiFi ISPs at $49/mo in 90 days.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
+
+---
+Task ID: 3.0
+Agent: Lead engineer (main) — Phase 3 Commercial Layer (catalog + orders + portal + checkout)
+Task: Build the thin commercial layer connecting the frozen entitlement kernel to a reseller portal and customer checkout flow. Per the architecture: only 2 new entities (ResellerProduct + CustomerOrder), no new abstractions, no kernel changes.
+
+Work Log:
+- Added 2 new Prisma models (renamed from ConnectivityProduct to ResellerProduct to avoid collision with an existing model from the old B2C era):
+  - ResellerProduct: tenant-scoped catalog entry (name, capabilityType, providerType, priceMinor, capabilitySet JSON)
+  - CustomerOrder: purchase record (customerId, productId, status, entitlementId, credentials JSON)
+  - Added back-relations on Tenant and User.
+  - Ran prisma db push — database is in sync.
+
+- Created the fulfillment service (src/lib/commerce/fulfillment.ts):
+  - fulfillOrder(orderId) — the thin layer connecting CustomerOrder to the FROZEN kernel.
+  - Calls createEntitlement() → transitionEntitlement() → createResourceBinding() → provisionBinding() — all UNCHANGED from 2C.4.9.
+  - Extracts credentials (WiFi hotspot username / eSIM ICCID) from the provisioned binding.
+  - Marks the order fulfilled or failed.
+  - On failure, the entitlement remains in a recoverable state (reconcileProvisioning can retry).
+
+- Created API routes under /api/commerce/:
+  - GET/POST /api/commerce/products — list/create products
+  - GET/PATCH/DELETE /api/commerce/products/[productId] — product CRUD
+  - GET/POST /api/commerce/orders — list/create orders
+  - POST /api/commerce/orders/[orderId]/fulfill — mark paid + fulfillOrder()
+  - POST /api/commerce/customer — find-or-create a customer user
+
+- Built the reseller portal UI (/):
+  - Replaced the old B2C eSIM marketplace landing page with the B2B reseller dashboard.
+  - Server component: checks auth, shows sign-in prompt if not logged in, shows "no tenant" if no tenant membership.
+  - Dashboard: active entitlements count, products count, recent orders count.
+  - Product catalog table (name, type, provider, price, status).
+  - Recent orders table (customer, product, status, date).
+
+- Built the new product page (/portal/products/new):
+  - Client component form for creating WiFi (INTERNET + MikroTik) or eSIM (ROAMING + eSIM) products.
+  - Capability-specific fields (download/upload Mbps for WiFi, countries for eSIM).
+  - Price, currency, billing cycle selectors.
+  - Posts to /api/commerce/products.
+
+- Built the customer checkout flow (/checkout/[productId]):
+  - Server component fetches the product by ID.
+  - Displays product details (speeds for WiFi, data/countries for eSIM, price).
+  - Client checkout form: customer enters name + email → creates order → fulfills → displays credentials.
+  - Credentials display: WiFi hotspot username or eSIM ICCID + instructions.
+  - Payment is simulated for MVP (in production, Stripe/Paystack webhook → fulfillOrder).
+
+Test Results:
+- TypeScript: clean (no errors in commerce/fulfillment/portal/checkout).
+- Lint: clean.
+- No kernel changes (entitlement.ts unchanged from 2C.4.9 — verified by the static test in phase2c5-esim-integration.test.ts).
+
+Stage Summary:
+- HEAD: (to be committed)
+- New models: ResellerProduct, CustomerOrder (2 new entities only — no kernel changes)
+- New service: fulfillOrder() — thin layer calling the frozen kernel
+- New API: /api/commerce/* (products, orders, customer, fulfill)
+- New UI: reseller portal (/) + new product (/portal/products/new) + checkout (/checkout/[productId])
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.

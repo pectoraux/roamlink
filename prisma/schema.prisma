@@ -36,6 +36,8 @@ model User {
   esims                 Esim[]
   payments              Payment[]
   topUps                TopUp[]
+  // Phase 3: connectivity customer orders
+  customerOrders        CustomerOrder[]
   auditLogs             AuditLog[]
   passwordResetTokens   PasswordResetToken[]
   emailVerificationTokens EmailVerificationToken[]
@@ -1035,6 +1037,9 @@ model Tenant {
   entitlements    ConnectivityEntitlement[]
   // Phase 2C.3.1: connectivity provider instances
   providerInstances ConnectivityProviderInstance[]
+  // Phase 3: commercial catalog + orders
+  resellerProducts ResellerProduct[]
+  customerOrders  CustomerOrder[]
 
   @@index([status])
 }
@@ -1579,5 +1584,84 @@ model ConnectivityProviderInstance {
 
   @@index([tenantId])
   @@index([providerType])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — Commercial Layer: Catalog + Orders
+//
+// These are the ONLY new commercial entities. They are thin layers connecting
+// the reseller's catalog to the frozen entitlement kernel:
+//
+//   ConnectivityProduct (catalog entry)
+//     → CustomerOrder (purchase)
+//       → createEntitlement() [FROZEN kernel]
+//         → provisionBinding() [FROZEN kernel]
+//           → adapter.provision() [FROZEN contract]
+//
+// The product is provider-neutral in its capability description but may
+// specify a providerType to route provisioning. The order is the commercial
+// record; the entitlement is the provisioning record.
+// ---------------------------------------------------------------------------
+
+model ResellerProduct {
+  id              String   @id @default(cuid())
+  tenantId        String
+  // Display name: "Accra WiFi 50Mbps Monthly" | "eSIM 5GB Roaming 30 Days"
+  name            String
+  description     String?
+  // INTERNET | ROAMING | LOCAL_NETWORK | CACHE_ACCESS | MESH_RELAY | VPN_ACCESS
+  capabilityType  String
+  // mikrotik | esim | null (null = reseller chooses at provisioning time)
+  providerType    String?
+  // FLAT | USAGE_BASED | TIERED
+  pricingModel    String   @default("FLAT")
+  // Price in currency minor units (e.g., cents). 0 = free.
+  priceMinor      Int      @default(0)
+  currency        String   @default("USD")
+  // monthly | one_time | prepaid
+  billingCycle    String   @default("one_time")
+  // JSON: { downloadMbps, uploadMbps, dataLimitBytes, allowedCountries, ... }
+  // This is passed to createEntitlement() as the capabilitySet.
+  capabilitySet   String
+  status          String   @default("active") // active | archived
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  orders          CustomerOrder[]
+
+  @@index([tenantId])
+  @@index([capabilityType])
+  @@index([providerType])
+  @@index([status])
+}
+
+model CustomerOrder {
+  id              String   @id @default(cuid())
+  tenantId        String
+  // The reseller's end customer (a User with role "customer")
+  customerId      String
+  productId       String
+  // Created on fulfillment (after payment confirmation)
+  entitlementId   String?
+  status          String   @default("pending") // pending | paid | fulfilled | failed | refunded
+  paidAmountMinor Int      @default(0)
+  currency        String   @default("USD")
+  // Payment provider reference (Stripe payment intent, Paystack reference, etc.)
+  paymentRef      String?
+  // JSON: { hotspotPassword, esimQrCode, activationLink, ... }
+  // Populated on fulfillment with the credentials the customer needs.
+  credentials     String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer        User     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  product         ResellerProduct @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([customerId])
+  @@index([productId])
   @@index([status])
 }
