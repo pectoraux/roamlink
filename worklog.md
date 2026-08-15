@@ -1945,3 +1945,24 @@ Stage Summary:
 - Entitlement kernel: FROZEN (no changes)
 - Adapter contract: FROZEN (no changes)
 - The real RouterOS client is now implemented behind the proven provider boundary.
+
+---
+Task ID: 2C.4.1
+Agent: Lead engineer (main) — RouterOS Protocol Correctness + Client Cache Safety
+Task: Fix three protocol-level issues: wrong create method (POST→PUT), unsafe create retries, RouterOS .id addressing, and client cache invalidation.
+
+Work Log:
+- P0: Changed create from POST to PUT (RouterOS REST CRUD: PUT=create). Updated mock transport to handle PUT.
+- P0/P1: Implemented reconcile-before-retry for create. After timeout/5xx, the client performs a GET by username (?name= query) to check if the resource was created despite the lost response. Only if absent does it retry PUT. Prevents duplicate external resources.
+- P1: RouterOS .id (returned from PUT) is now the primary resource identifier. GET/PATCH/DELETE use .id for addressing. Username used for lookup via ?name= query. Three distinct identities: RoamLink providerResourceId ↔ RouterOS .id ↔ HotSpot username.
+- P1: Client cache now loads ConnectivityProviderInstance from PostgreSQL BEFORE checking cache. Cache key includes fingerprint (configurationKey + updatedAt). Status changes, config changes, and credential rotations all invalidate the cache.
+
+Stage Summary:
+- HEAD: 7b7de2206fbd0c1557823dbfe2e3cd584b864e92
+- origin/main: 7b7de2206fbd0c1557823dbfe2e3cd584b864e92 (pushed)
+- Tests: 12 — all EXECUTED + PASSED (7 runtime + 5 static)
+- Lint: clean. TypeScript: clean.
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED
+- SaaS billing kernel: FROZEN
+- Entitlement kernel: FROZEN
+- Adapter contract: FROZEN
