@@ -664,25 +664,6 @@ export async function confirmAndProvision(input: {
   }
 }
 
-type OrderSnapshotParsed = {
-  canonicalProductId?: string;
-  canonicalSpecification?: string | null;
-  identityHash?: string | null;
-  productType?: string;
-  distributionOfferId?: string;
-  retailPriceMinor?: number;
-  tenantId?: string | null;
-};
-
-function parseOrderSnapshot(raw: string | null): OrderSnapshotParsed {
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw) as OrderSnapshotParsed;
-  } catch {
-    return {};
-  }
-}
-
 /**
  * Fulfill an order via the orchestration engine + fulfillment adapter +
  * persistence handler + double-entry ledger.
