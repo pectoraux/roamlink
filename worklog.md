@@ -2554,3 +2554,41 @@ Stage Summary:
 - Lint: clean. TypeScript: clean.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN (unchanged). Entitlement kernel: FROZEN (unchanged).
 - REAL ESIM SUPPLIER ENDPOINT TEST: NOT EXECUTED (no real eSIM API key available — same as RouterOS)
+
+---
+Task ID: ARCHITECTURE
+Agent: Chief Architect (main) — Connectivity Operating System Design
+Task: Review the current repository and frozen kernel. Design the smallest commercially viable platform that unifies WiFi resellers, ISP resellers, eSIM suppliers, and future providers behind one entitlement model. Challenge business assumptions. Identify the fastest path to revenue. Preserve the existing kernel where correct.
+
+Work Log:
+- Reviewed the actual repository at e6fb09f: the frozen kernel (entitlement.ts, 2114 lines), the SaaS billing kernel (2B.3.x, FROZEN), the provider registry, the MikroTik adapter (2C.3–2C.4), and the new eSIM adapter (2C.5).
+- Challenged five business assumptions:
+  1. "We are building an eSIM marketplace" → Wrong. We're a connectivity OS, not a B2C marketplace.
+  2. "We need a consumer app" → Not first. B2B reseller SaaS is faster to revenue.
+  3. "We need to build all providers" → No. Build 2 adapters, publish the contract, partners build the rest.
+  4. "We need to handle payments" → We do, but only reseller→RoamLink. End-customer→reseller is theirs.
+  5. "The reseller model is complex" → It's half-built. The gap is the thin commercial layer.
+- Produced the architecture document (docs/ARCHITECTURE.md) covering:
+  - The core insight: one entitlement, many providers
+  - Domain model: existing entities (preserved) + 2 new thin entities (ConnectivityProduct, CustomerOrder)
+  - Provider model: adapter contract (FROZEN), tiered providers, future SDK
+  - SaaS strategy: $49/mo + $0.10/entitlement, no revenue cut, white-label
+  - Marketplace strategy: it's a platform, not a marketplace
+  - System architecture with layer table (what's frozen vs new)
+  - Implementation roadmap: Phase 3 (commercial layer, 4-6 weeks), Phase 4 (operations), Phase 5 (expansion)
+  - The fastest path to revenue: 3 Ghanaian WiFi ISPs in 90 days at $49/mo each
+
+Key architectural decisions:
+  1. PRESERVE the frozen kernel (entitlement, billing, adapter contract, lease, convergence) — do not modify.
+  2. ADD only 2 new entities (ConnectivityProduct, CustomerOrder) — thin layers connecting the catalog to the existing createEntitlement() + provisionBinding().
+  3. DO NOT add new abstractions — the existing ConnectivityProviderAdapter contract handles all provider types.
+  4. DO NOT build a consumer app first — B2B reseller SaaS is the path to revenue.
+  5. DO NOT build a marketplace UI — it's a platform, not a marketplace.
+  6. DEFER live provider validation (2C.4.10/2C.4.11) — it doesn't block the commercial layer.
+
+Stage Summary:
+- HEAD: e6fb09f (no code changes — design document only)
+- New artifact: docs/ARCHITECTURE.md
+- The kernel is FROZEN and correct. The commercial layer builds on top, not inside.
+- The fastest path to revenue is B2B reseller SaaS: 3 Ghanaian WiFi ISPs at $49/mo in 90 days.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
