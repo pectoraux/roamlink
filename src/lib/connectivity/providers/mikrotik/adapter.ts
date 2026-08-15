@@ -37,6 +37,7 @@ import type {
 } from "../../adapter";
 import type { MikroTikProviderClient, MikroTikResourceConfig, MikroTikClientResolver } from "./client";
 import { MikroTikProviderError } from "./client";
+import type { AsyncMikroTikClientResolver } from "./client-factory";
 import { logger } from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
@@ -110,7 +111,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
   readonly label = "MikroTik Connectivity Provider";
 
   /**
-   * Phase 2C.3.3 / 2C.3.4: The adapter receives a client RESOLVER, not a fixed client.
+   * Phase 2C.3.3 / 2C.3.4 / 2C.4: The adapter receives a client RESOLVER, not a fixed client.
    *
    * The resolver maps providerInstanceId → MikroTikProviderClient.
    * This allows the SAME adapter class to operate against different MikroTik
@@ -119,22 +120,30 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
    * Phase 2C.3.4: There is NO default client. If providerInstanceId is null
    * or the resolver cannot find a client for the instance, the operation
    * FAILS CLOSED. No backward-compat fallback to a default infrastructure.
+   *
+   * Phase 2C.4: The resolver may be sync (for mock tests) or async (for
+   * the real RouterOS client factory). The adapter handles both.
    */
-  constructor(private readonly clientResolver: MikroTikClientResolver) {}
+  constructor(
+    private readonly clientResolver: MikroTikClientResolver | AsyncMikroTikClientResolver,
+  ) {}
 
   /**
-   * Phase 2C.3.3: Resolve the correct provider client for this binding.
+   * Phase 2C.3.3 / 2C.4: Resolve the correct provider client for this binding.
    * Uses the binding's providerInstanceId to select the infrastructure instance.
+   * Supports both sync and async resolvers.
    */
-  private resolveClient(binding: ProviderResourceBindingInput): MikroTikProviderClient {
+  private async resolveClient(binding: ProviderResourceBindingInput): Promise<MikroTikProviderClient> {
     const instanceId = binding.providerInstanceId;
     if (!instanceId) {
       throw new MikroTikProviderError("PERMANENT", "No providerInstanceId on binding — cannot resolve MikroTik client");
     }
-    return this.clientResolver({
+    const result = this.clientResolver({
       providerInstanceId: instanceId,
       providerInstanceConfiguration: binding.providerInstanceConfiguration,
     });
+    // Handle both sync and async resolvers
+    return result instanceof Promise ? result : Promise.resolve(result);
   }
 
   async provision(input: {
@@ -142,7 +151,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     binding: ProviderResourceBindingInput;
   }): Promise<ProvisionResult> {
     try {
-      const client = this.resolveClient(input.binding);
+      const client = await this.resolveClient(input.binding);
       // If the binding already has a providerResourceId, it's idempotent — return it.
       if (input.binding.providerResourceId) {
         const existing = await client.getResource(input.binding.providerResourceId);
@@ -208,7 +217,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     }
 
     try {
-      const client = this.resolveClient(input.binding);
+      const client = await this.resolveClient(input.binding);
       await client.suspendResource(input.binding.providerResourceId);
       return { status: "success" };
     } catch (err) {
@@ -226,7 +235,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     }
 
     try {
-      const client = this.resolveClient(input.binding);
+      const client = await this.resolveClient(input.binding);
       await client.resumeResource(input.binding.providerResourceId);
       return { status: "success" };
     } catch (err) {
@@ -245,7 +254,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     }
 
     try {
-      const client = this.resolveClient(input.binding);
+      const client = await this.resolveClient(input.binding);
       await client.deleteResource(input.binding.providerResourceId);
       return { status: "success" };
     } catch (err) {
@@ -261,7 +270,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     if (!input.binding.providerResourceId) return undefined;
 
     try {
-      const client = this.resolveClient(input.binding);
+      const client = await this.resolveClient(input.binding);
       const usage = await client.getResourceUsage(input.binding.providerResourceId);
       if (!usage) return undefined;
 
@@ -297,7 +306,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     }
 
     try {
-      const client = this.resolveClient(input.binding);
+      const client = await this.resolveClient(input.binding);
       const resource = await client.getResource(input.binding.providerResourceId);
 
       if (!resource) {

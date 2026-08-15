@@ -63,7 +63,13 @@ export { MikroTikConnectivityAdapter } from "./providers/mikrotik/adapter";
 export type { MikroTikProviderClient, MikroTikResource, MikroTikResourceConfig, MikroTikErrorType, MikroTikClientResolver } from "./providers/mikrotik/client";
 export { MikroTikProviderError } from "./providers/mikrotik/client";
 export { MockMikroTikProviderClient, mockMikroTikProviderClient, setMockFailureSimulation, clearMockFailureSimulation, clearMockMikroTikResources } from "./providers/mikrotik/mock-client";
-export { registerMockClientForInstance, clearMockClientRegistry } from "./providers/mikrotik";
+export { registerMockClientForInstance, clearMockClientRegistry, clearClientCache, createRouterOSClientForInstance, productionAsyncResolver } from "./providers/mikrotik/client-factory";
+export type { AsyncMikroTikClientResolver } from "./providers/mikrotik/client-factory";
+export { RouterOSProviderClient } from "./providers/mikrotik/routeros-client";
+export { FetchRouterOSTransport, MockRouterOSTransport } from "./providers/mikrotik/transport";
+export type { RouterOSTransport, RouterOSTransportConfig } from "./providers/mikrotik/transport";
+export { EnvProviderInstanceSecretResolver, TestSecretResolver } from "./providers/mikrotik/secret-resolver";
+export type { ProviderInstanceSecretResolver, ResolvedProviderCredentials } from "./providers/mikrotik/secret-resolver";
 
 // Register the MikroTik provider at module load time
 import "./providers/mikrotik";
