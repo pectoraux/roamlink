@@ -2009,3 +2009,26 @@ Stage Summary:
 - Entitlement kernel: FROZEN
 - Adapter contract: FROZEN
 - The invariant: UNKNOWN EXTERNAL STATE ≠ RESOURCE ABSENT. Only confirmed absence permits creation.
+
+---
+Task ID: 2C.4.4
+Agent: Lead engineer (main) — Durable Provisioning Claim
+Task: Prevent concurrent create races by moving the idempotency claim into the durable RoamLink binding state machine.
+
+Work Log:
+- Created claimProvisioning() — atomic UNBOUND → PROVISIONING transition using PostgreSQL conditional mutation (updateMany WHERE status=UNBOUND). Only ONE worker wins.
+- Created provisionBinding() — kernel-level provisioning orchestration: resolve runtime → check BOUND → check PROVISIONING → atomic claim → adapter.provision() → transition to BOUND or FAILED.
+- The loser (claim_lost) does NOT issue PUT — it reconciles (GET) instead.
+- Retry from FAILED: transition FAILED → PROVISIONING, then provisionBinding sees PROVISIONING without providerResourceId and retries.
+- The adapter contract is unchanged — the claim is a kernel-level concern.
+
+Stage Summary:
+- HEAD: 68c090143b7c1b11d5ebec23730dc066a52a6e71
+- origin/main: 68c090143b7c1b11d5ebec23730dc066a52a6e71 (pushed)
+- Tests: 10 — all EXECUTED + PASSED (7 runtime + 3 static)
+- Lint: clean. TypeScript: clean.
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED
+- SaaS billing kernel: FROZEN
+- Entitlement kernel: FROZEN
+- Adapter contract: FROZEN
+- The invariant: only ONE worker may issue PUT create for a binding. The durable claim (UNBOUND → PROVISIONING) is the boundary.
