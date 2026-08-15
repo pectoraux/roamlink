@@ -1147,13 +1147,53 @@ export async function resolveBindingRuntime(bindingId: string): Promise<{
 
 // ---------------------------------------------------------------------------
 // Phase 2C.4.5: Durable Provisioning Claim with Lease + Attempt Identity
+// Phase 2C.4.6: Lease Ownership Enforcement During External Operations
 // ---------------------------------------------------------------------------
 
 /**
  * Phase 2C.4.5: Lease duration for provisioning claims (5 minutes).
  * After this time, another worker may take over the claim.
+ *
+ * Phase 2C.4.6: This duration MUST exceed providerOperationTimeoutMs so
+ * that a single, non-crashed worker can always complete a bounded provider
+ * operation before its lease naturally expires. The heartbeat
+ * (provisioningHeartbeatIntervalMs) extends the lease well before it
+ * expires, so an actively-running worker is never subject to takeover.
+ *
+ * Mutable for testing via _setLeaseDurationForTesting() — production code
+ * must not change this value.
  */
-const PROVISIONING_LEASE_MS = 5 * 60 * 1000;
+let provisioningLeaseMs = 5 * 60 * 1000;
+
+/**
+ * Phase 2C.4.6: How often the provisioning worker extends its lease while a
+ * provider operation is in flight. The interval (60s) is far shorter than the
+ * lease (5 min), so even a couple of missed heartbeats cannot let the lease
+ * expire while the worker is genuinely alive.
+ *
+ * Mutable for testing via _setHeartbeatIntervalForTesting() — production code
+ * must not change this value.
+ */
+let provisioningHeartbeatIntervalMs = 60 * 1000;
+
+/**
+ * Phase 2C.4.6: Bounded maximum duration for a single provider operation.
+ *
+ * This is a hard ceiling on how long provisionBinding() will wait for
+ * adapter.provision() to resolve. It MUST be strictly less than
+ * PROVISIONING_LEASE_MS so that a non-crashed worker always completes (or
+ * times out) before its initial lease could possibly expire, making
+ * mid-operation takeover impossible without a crash.
+ *
+ * If a provider operation exceeds this bound, it is treated as a failure and
+ * finalized via the claim-guarded FAILED transition. The underlying provider
+ * call (if still running) cannot be cancelled, but its eventual result is
+ * discarded — the claim-guarded finalization refuses to apply a stale result.
+ *
+ * Mutable for testing via _setOperationTimeoutForTesting() — production code
+ * must not change this value.
+ */
+let providerOperationTimeoutMs = 4 * 60 * 1000;
 
 /**
  * Phase 2C.4.5: Atomic provisioning claim with attempt identity + lease.
@@ -1180,7 +1220,7 @@ export async function claimProvisioning(bindingId: string): Promise<{
 }> {
   const now = new Date();
   const attemptId = `attempt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const claimExpiresAt = new Date(now.getTime() + PROVISIONING_LEASE_MS);
+  const claimExpiresAt = new Date(now.getTime() + provisioningLeaseMs);
 
   // Path 1: UNBOUND → PROVISIONING (initial claim)
   const initialClaim = await db.providerResourceBinding.updateMany({
@@ -1220,7 +1260,16 @@ export async function claimProvisioning(bindingId: string): Promise<{
     return { claimed: false, currentStatus: current.status };
   }
 
-  // Lease has expired — take over atomically
+  // Lease has expired — take over atomically.
+  //
+  // Phase 2C.4.6: A takeover is a durable signal that the previous attempt's
+  // outcome is UNKNOWN — the previous worker may have created a resource at
+  // the provider, or it may have failed, or it may have crashed before any
+  // side effect. We mark the binding RECONCILIATION_REQUIRED so that:
+  //   - the new owner's adapter.provision() (which does GET-before-PUT) is
+  //     treated as the reconciliation, and
+  //   - any reconciler observing the binding knows the previous attempt was
+  //     superseded and its outcome was never durably finalized.
   const takeoverClaim = await db.providerResourceBinding.updateMany({
     where: {
       id: bindingId,
@@ -1234,13 +1283,16 @@ export async function claimProvisioning(bindingId: string): Promise<{
     data: {
       provisioningAttemptId: attemptId,
       claimExpiresAt,
+      // Phase 2C.4.6: Durable signal — previous attempt outcome is unknown.
+      reconciliationState: "RECONCILIATION_REQUIRED",
     },
   });
 
   if (takeoverClaim.count > 0) {
-    logger.info("connectivity.provisioning_claimed", {
+    logger.warn("connectivity.provisioning_claimed_takeover", {
       bindingId, attemptId, claimType: "takeover",
       previousAttemptId: current.provisioningAttemptId,
+      message: "Lease takeover — previous attempt outcome is unknown. Binding marked RECONCILIATION_REQUIRED.",
     });
     return { claimed: true, attemptId };
   }
@@ -1259,7 +1311,12 @@ export async function claimProvisioning(bindingId: string): Promise<{
  *
  * WHERE id = bindingId
  *   AND provisioningAttemptId = attemptId
- *   AND status = expectedStatus
+ *   AND status = PROVISIONING
+ *
+ * Phase 2C.4.6: A successful (count=1) finalization is a CLEAN outcome —
+ * the binding has reached BOUND or FAILED through the legitimate claim
+ * holder. Any prior RECONCILIATION_REQUIRED marker (e.g. from a takeover)
+ * is cleared, because the outcome is now durably known.
  */
 async function claimGuardedTransition(input: {
   bindingId: string;
@@ -1275,6 +1332,8 @@ async function claimGuardedTransition(input: {
     failureReason: input.reason ?? null,
     provisioningAttemptId: null, // Clear the claim after finalization
     claimExpiresAt: null,
+    // Phase 2C.4.6: Clean finalization clears any prior reconciliation flag.
+    reconciliationState: null,
   };
   if (input.providerResourceId !== undefined) {
     updateData.providerResourceId = input.providerResourceId;
@@ -1308,19 +1367,284 @@ async function claimGuardedTransition(input: {
   return { transitioned: true };
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2C.4.6: Lease Ownership Enforcement During External Operations
+// ---------------------------------------------------------------------------
+
 /**
- * Phase 2C.4.5: Kernel-level provisioning orchestration with lease.
+ * Phase 2C.4.6: Verify that the caller still holds the active provisioning
+ * claim IMMEDIATELY before invoking the provider adapter.
  *
- * This is the canonical way to provision a binding. It:
- *   1. Atomically claims the provisioning (UNBOUND → PROVISIONING)
- *      with a unique attemptId + lease expiry
- *   2. Only the winner calls the adapter's provision()
- *   3. The loser gets claim_lost and reconciles instead
- *   4. On success: claim-guarded transition to BOUND
- *   5. On failure: claim-guarded transition to FAILED
- *   6. If the winner crashes, the lease expires and another worker takes over
+ * This is the "pre-provider ownership check". It closes the race where a
+ * worker's lease expired (or was taken over) between claimProvisioning() and
+ * adapter.provision(). Without this check, a stale worker could begin a
+ * provider side effect after another worker had already taken over.
  *
- * A stale worker (whose attemptId no longer matches) cannot finalize the binding.
+ * Invariant enforced:
+ *   ACTIVE CLAIM (attemptId matches + status=PROVISIONING + lease not expired)
+ *     → provider operation MAY begin
+ *   CLAIM NO LONGER ACTIVE
+ *     → provider operation MUST NOT begin (returns owns: false)
+ *
+ * This is a READ (findUnique) — it does not mutate the binding. The
+ * authoritative ownership gate is the conditional UPDATE in
+ * claimGuardedTransition / extendProvisioningLease; this read is the
+ * fast-path guard that prevents issuing a provider call when ownership has
+ * already visibly been lost.
+ */
+export async function verifyProvisioningOwnership(
+  bindingId: string,
+  attemptId: string,
+): Promise<{
+  owns: boolean;
+  status?: string;
+  claimExpiresAt?: Date | null;
+  reason?: string;
+}> {
+  const binding = await db.providerResourceBinding.findUnique({
+    where: { id: bindingId },
+    select: {
+      status: true,
+      provisioningAttemptId: true,
+      claimExpiresAt: true,
+    },
+  });
+
+  if (!binding) {
+    return { owns: false, status: "not_found", reason: "Binding not found" };
+  }
+
+  if (binding.status !== BINDING_STATES.PROVISIONING) {
+    return {
+      owns: false,
+      status: binding.status,
+      reason: `Binding is no longer PROVISIONING (status: ${binding.status})`,
+    };
+  }
+
+  if (binding.provisioningAttemptId !== attemptId) {
+    return {
+      owns: false,
+      status: binding.status,
+      reason: "Claim was taken over by another worker (attemptId mismatch)",
+    };
+  }
+
+  const now = new Date();
+  if (binding.claimExpiresAt && binding.claimExpiresAt < now) {
+    return {
+      owns: false,
+      status: binding.status,
+      claimExpiresAt: binding.claimExpiresAt,
+      reason: "Lease has expired",
+    };
+  }
+
+  return { owns: true, claimExpiresAt: binding.claimExpiresAt };
+}
+
+/**
+ * Phase 2C.4.6: Extend (heartbeat) the provisioning lease while a provider
+ * operation is in flight.
+ *
+ * This is a conditional UPDATE guarded by the caller's attemptId. It is the
+ * authoritative ownership gate during a long-running operation:
+ *   - If the caller still holds the attempt AND the binding is still
+ *     PROVISIONING, the lease is extended and no takeover is possible.
+ *   - If another worker has taken over (attemptId changed) or the binding
+ *     moved out of PROVISIONING, the update matches zero rows and the caller
+ *     learns it has lost ownership.
+ *
+ * Combined with the bounded PROVIDER_OPERATION_TIMEOUT_MS, this guarantees
+ * that a non-crashed worker never loses its lease while legitimately
+ * executing a provider operation, and a crashed worker's lease expires
+ * naturally so another worker can take over.
+ */
+export async function extendProvisioningLease(
+  bindingId: string,
+  attemptId: string,
+): Promise<{ extended: boolean; reason?: string; newExpiresAt?: Date }> {
+  const newExpiresAt = new Date(Date.now() + provisioningLeaseMs);
+
+  const result = await db.providerResourceBinding.updateMany({
+    where: {
+      id: bindingId,
+      provisioningAttemptId: attemptId,
+      status: BINDING_STATES.PROVISIONING,
+    },
+    data: {
+      claimExpiresAt: newExpiresAt,
+    },
+  });
+
+  if (result.count === 0) {
+    return {
+      extended: false,
+      reason: "Claim was taken over by another worker or binding is no longer PROVISIONING",
+    };
+  }
+
+  return { extended: true, newExpiresAt };
+}
+
+/**
+ * Phase 2C.4.6: Test-only override of the heartbeat interval.
+ *
+ * Production code MUST NOT call this. Returns a restore function so tests can
+ * reset the value after they finish. This keeps the production 60s heartbeat
+ * untouched while allowing tests to exercise the lease-loss-during-operation
+ * race in milliseconds rather than minutes.
+ */
+export function _setHeartbeatIntervalForTesting(ms: number): () => void {
+  const previous = provisioningHeartbeatIntervalMs;
+  provisioningHeartbeatIntervalMs = ms;
+  return () => {
+    provisioningHeartbeatIntervalMs = previous;
+  };
+}
+
+/**
+ * Phase 2C.4.6: Test-only override of the lease duration.
+ *
+ * Production code MUST NOT call this. Returns a restore function so tests can
+ * exercise the "heartbeat keeps the lease alive past its natural expiry"
+ * guarantee in seconds rather than minutes.
+ */
+export function _setLeaseDurationForTesting(ms: number): () => void {
+  const previous = provisioningLeaseMs;
+  provisioningLeaseMs = ms;
+  return () => {
+    provisioningLeaseMs = previous;
+  };
+}
+
+/**
+ * Phase 2C.4.6: Test-only override of the provider operation timeout.
+ *
+ * Production code MUST NOT call this. Returns a restore function so tests can
+ * exercise the bounded-operation guarantee in milliseconds rather than minutes.
+ */
+export function _setOperationTimeoutForTesting(ms: number): () => void {
+  const previous = providerOperationTimeoutMs;
+  providerOperationTimeoutMs = ms;
+  return () => {
+    providerOperationTimeoutMs = previous;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2C.4.6 — Architectural Distinction: Lease Fencing vs. Provider-Side
+// Convergence
+// ---------------------------------------------------------------------------
+//
+// Provisioning safety is provided by TWO INDEPENDENT layers. Neither layer
+// alone is sufficient; together they establish the full invariant.
+//
+// LAYER 1 — LEASE FENCING (local coordination, this kernel):
+//
+//   The PostgreSQL provisioning lease (provisioningAttemptId + claimExpiresAt)
+//   guarantees that, under NORMAL operation, only ONE worker begins a
+//   provisioning attempt. It also guarantees that a STALE worker (whose lease
+//   expired or was taken over) cannot FINALIZE the binding — the
+//   claim-guarded transition refuses to apply a stale attemptId.
+//
+//   What it CANNOT guarantee:
+//     "A worker whose lease later expires cannot continue an already-started
+//      external operation."
+//
+//   If worker A sends a PUT to RouterOS and then loses its DB lease (network
+//   partition, crash, GC pause), worker B may take over and also send a PUT.
+//   The DB lease cannot make either in-flight HTTP request disappear. The
+//   network, not the application timeout, determines when the external system
+//   stops receiving a request.
+//
+//   So the lease provides:
+//     ✅ only one worker normally starts provisioning
+//     ✅ stale workers cannot write local state (claim-guarded finalization)
+//     ❌ stale workers cannot mutate the external provider
+//
+// LAYER 2 — PROVIDER-SIDE CONVERGENCE (external safety, the adapter + client):
+//
+//   Because a DB lease cannot fence an already-started external operation,
+//   provider-side safety must be INDEPENDENT of the lease. The create
+//   operation must be CONVERGENT: replay, concurrent, or uncertain attempts
+//   must all resolve to exactly ONE external resource, bound by the stable
+//   binding identity (the HotSpot username).
+//
+//   The RouterOSProviderClient.createResource() implements three convergence
+//   paths, all keyed on the stable username:
+//
+//     1. GET by username → if exists, return it (idempotent — no PUT needed).
+//        This handles: replay, retry, takeover-after-crash, and the common
+//        case where worker B's GET finds the resource worker A created.
+//
+//     2. PUT → CONFLICT (409): another worker created the resource between
+//        our GET and PUT. Reconcile: GET by username → return the existing
+//        resource. This is the core concurrent-PUT race the lease cannot
+//        prevent — both workers did GET (absent), both issued PUT, the second
+//        conflicts. The resource exists; we converge on it.
+//
+//     3. PUT → TIMEOUT/RETRYABLE: uncertain outcome (the request may or may
+//        not have reached the router). Reconcile: GET by username → if found,
+//        return it; if absent, one controlled PUT retry.
+//
+//   In all three paths, two concurrent workers converge on the SAME external
+//   resource. No duplicate RouterOS user is ever created. The binding's
+//   providerResourceId is set to the RouterOS .id of that single resource.
+//
+// THE COMBINED INVARIANT:
+//
+//   Normal operation:  the lease ensures only one worker starts → one PUT →
+//   one resource. The convergence layer is a no-op (GET finds absence, PUT
+//   succeeds).
+//
+//   Failure/recovery:  the lease may let two workers believe they own
+//   provisioning (A's lease expired while A was in-flight, B took over). Both
+//   may issue provider operations. The convergence layer guarantees they
+//   resolve to ONE external resource. The claim-guarded finalization
+//   guarantees only ONE worker finalizes the binding to that resource. The
+//   other worker's result is discarded (claim_lost) — but the external state
+//   is consistent because the convergence layer already bound both to the
+//   same resource.
+//
+//   This is why provider-side convergence is an INDEPENDENT layer: even if the
+//   lease layer fails to prevent concurrent provider operations, the
+//   provider layer guarantees no duplicate external resource is created.
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 2C.4.5 + 2C.4.6: Kernel-level provisioning orchestration with lease.
+ *
+ * This is the canonical way to provision a binding. The full sequence:
+ *
+ *   1. Resolve runtime context (adapter, binding, entitlement).
+ *   2. If already BOUND → already_provisioned (idempotent).
+ *   3. Atomic claim (UNBOUND → PROVISIONING, or lease takeover) with a unique
+ *      attemptId + lease expiry. Only ONE worker wins.
+ *   4. [2C.4.6] Pre-provider ownership verification — verify the claim is
+ *      still active IMMEDIATELY before invoking the adapter. A stale worker
+ *      that lost ownership MUST NOT begin a provider side effect.
+ *   5. [2C.4.6] Start a heartbeat that extends the lease while the provider
+ *      operation runs, so a non-crashed worker is never subject to takeover.
+ *   6. [2C.4.6] Bounded provider operation — adapter.provision() is raced
+ *      against PROVIDER_OPERATION_TIMEOUT_MS (< lease duration).
+ *   7. [2C.4.6] If the heartbeat detected ownership loss during the operation,
+ *      refuse to finalize — discard the provider result.
+ *   8. Claim-guarded finalization (success → BOUND, failure → FAILED).
+ *   9. [2C.4.6] NO silent failure swallowing — if the failure transition
+ *      itself fails (claim taken over), emit a CRITICAL log and return
+ *      claim_lost. The takeover has already marked the binding
+ *      RECONCILIATION_REQUIRED as the durable signal.
+ *
+ * Invariants enforced:
+ *   - Only the worker holding provisioningAttemptId may BEGIN a provider op
+ *     (pre-provider ownership check) or FINALIZE one (claim-guarded write).
+ *   - A non-crashed worker never loses its lease mid-operation (heartbeat +
+ *     bounded timeout < lease duration).
+ *   - A crashed worker's lease expires naturally, enabling takeover. The
+ *     takeover marks the binding RECONCILIATION_REQUIRED because the previous
+ *     attempt's outcome is unknown.
+ *   - No failure path is silently swallowed.
  */
 export async function provisionBinding(bindingId: string): Promise<{
   status: "success" | "failed_retryable" | "failed_permanent" | "already_provisioned" | "claim_lost";
@@ -1343,18 +1667,99 @@ export async function provisionBinding(bindingId: string): Promise<{
 
   const attemptId = claim.attemptId!;
 
-  // Step 4: Winner — call the adapter's provision()
+  // Step 4 (Phase 2C.4.6): Pre-provider ownership verification.
+  // Verify the claim is still active IMMEDIATELY before invoking the adapter.
+  // This closes the race where the lease expired (or was taken over) between
+  // claimProvisioning() and adapter.provision(). A stale worker that has lost
+  // ownership MUST NOT begin a provider side effect.
+  const ownership = await verifyProvisioningOwnership(bindingId, attemptId);
+  if (!ownership.owns) {
+    logger.warn("connectivity.provisioning_ownership_lost_pre_provider", {
+      bindingId, attemptId, reason: ownership.reason, status: ownership.status,
+    });
+    return {
+      status: "claim_lost",
+      error: `Lost provisioning ownership before provider call: ${ownership.reason}`,
+    };
+  }
+
+  // Step 5 (Phase 2C.4.6): Heartbeat — keep the lease alive while the provider
+  // operation runs. If the heartbeat detects that ownership was lost (another
+  // worker took over), we mark the attempt as superseded and refuse to
+  // finalize any result the provider returns.
+  //
+  // The heartbeat is guarded by an inFlight flag: if a previous heartbeat's
+  // lease-extension query is still in flight (e.g., under high DB latency),
+  // subsequent ticks are SKIPPED rather than stacked. This prevents connection-
+  // pool exhaustion when the heartbeat interval is shorter than the query
+  // latency, while still extending the lease as often as the DB allows.
+  let heartbeatLost = false;
+  let heartbeatLostReason: string | null = null;
+  let heartbeatInFlight = false;
+  const heartbeatTimer = setInterval(async () => {
+    if (heartbeatInFlight) return; // don't stack overlapping extension queries
+    heartbeatInFlight = true;
+    try {
+      const ext = await extendProvisioningLease(bindingId, attemptId);
+      if (!ext.extended) {
+        heartbeatLost = true;
+        heartbeatLostReason = ext.reason ?? "unknown";
+        logger.error("connectivity.provisioning_lease_lost_during_operation", {
+          bindingId, attemptId, reason: ext.reason,
+          message: "CRITICAL: Lease lost during provider operation — result will be discarded.",
+        });
+      }
+    } catch (e) {
+      // A transient heartbeat error must not kill the in-flight operation;
+      // the claim-guarded finalization will catch a genuine ownership loss.
+      logger.warn("connectivity.provisioning_heartbeat_error", {
+        bindingId, attemptId, error: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      heartbeatInFlight = false;
+    }
+  }, provisioningHeartbeatIntervalMs);
+  // Don't let the heartbeat timer keep the process alive on its own.
+  if (typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
+
+  // Declared outside try so the catch block can read it for diagnostics.
+  let timeoutFired = false;
+
   try {
     // Re-resolve the binding (it's now PROVISIONING with our attemptId)
     const { binding: updatedBinding, entitlement: updatedEntitlement } = await resolveBindingRuntime(bindingId);
 
-    const result = await adapter.provision({
-      entitlement: updatedEntitlement,
-      binding: updatedBinding,
-    });
+    // Step 6 (Phase 2C.4.6): Bounded provider operation.
+    // The operation is raced against providerOperationTimeoutMs (4 min),
+    // which is strictly less than the lease (5 min). A non-crashed worker
+    // therefore always completes (or times out) before its lease can expire,
+    // making mid-operation takeover impossible without a crash.
+    const result = await Promise.race([
+      adapter.provision({ entitlement: updatedEntitlement, binding: updatedBinding }),
+      new Promise<never>((_, reject) => {
+        const t = setTimeout(() => {
+          timeoutFired = true;
+          reject(new Error(`Provider operation timed out after ${providerOperationTimeoutMs}ms`));
+        }, providerOperationTimeoutMs);
+        if (typeof t.unref === "function") t.unref();
+      }),
+    ]);
+
+    // Step 7 (Phase 2C.4.6): If the heartbeat detected ownership loss during
+    // the operation, refuse to finalize — another worker now owns the binding.
+    if (heartbeatLost) {
+      logger.error("connectivity.provisioning_result_discarded_lease_lost", {
+        bindingId, attemptId, reason: heartbeatLostReason,
+        message: "Provider operation completed but lease was lost during operation — result discarded.",
+      });
+      return {
+        status: "claim_lost",
+        error: `Lease was lost during provider operation: ${heartbeatLostReason}`,
+      };
+    }
 
     if (result.status === "success") {
-      // Step 5: Claim-guarded transition to BOUND
+      // Step 8: Claim-guarded transition to BOUND
       const transitioned = await claimGuardedTransition({
         bindingId,
         attemptId,
@@ -1400,18 +1805,43 @@ export async function provisionBinding(bindingId: string): Promise<{
       return { status: result.status, error: result.error };
     }
   } catch (err) {
-    // Unexpected error — claim-guarded transition to FAILED
     const errorMsg = err instanceof Error ? err.message : String(err);
-    await claimGuardedTransition({
+
+    // Step 9 (Phase 2C.4.6): NO silent failure swallowing.
+    // Attempt the claim-guarded FAILED transition. If it fails (count=0), the
+    // claim was taken over by another worker — we could NOT durably record
+    // this failure. This is a CRITICAL condition, not an ignored exception.
+    // The binding remains PROVISIONING under a NEW attemptId, and the
+    // takeover path in claimProvisioning() has already marked it
+    // RECONCILIATION_REQUIRED as the durable signal.
+    const failureTransition = await claimGuardedTransition({
       bindingId,
       attemptId,
       toState: BINDING_STATES.FAILED,
       provisioningState: "FAILED",
       reason: errorMsg,
-    }).catch(() => {});
+    });
 
-    logger.error("connectivity.provisioning_error", { bindingId, attemptId, error: errorMsg });
+    if (failureTransition.transitioned) {
+      // Failure was durably recorded.
+      logger.warn("connectivity.provisioning_error", {
+        bindingId, attemptId, error: errorMsg, timeoutFired,
+      });
+      return { status: "failed_permanent", error: errorMsg };
+    }
 
-    return { status: "failed_permanent", error: errorMsg };
+    // CRITICAL: The failure could not be durably finalized — the claim was
+    // taken over. The new owner will reconcile. We return claim_lost so the
+    // caller knows this worker's outcome was NOT durably recorded.
+    logger.error("connectivity.provisioning_failure_unfinalized", {
+      bindingId, attemptId, error: errorMsg, timeoutFired,
+      message: "CRITICAL: Provider operation failed but failure could not be durably recorded — claim was taken over. Binding marked RECONCILIATION_REQUIRED by takeover.",
+    });
+    return {
+      status: "claim_lost",
+      error: `Provider failed (${errorMsg}) but claim was taken over before failure finalization; marked RECONCILIATION_REQUIRED.`,
+    };
+  } finally {
+    clearInterval(heartbeatTimer);
   }
 }

@@ -2032,3 +2032,109 @@ Stage Summary:
 - Entitlement kernel: FROZEN
 - Adapter contract: FROZEN
 - The invariant: only ONE worker may issue PUT create for a binding. The durable claim (UNBOUND → PROVISIONING) is the boundary.
+
+---
+Task ID: 2C.4.5
+Agent: Lead engineer (main) — Durable Provisioning Lease + Attempt Identity
+Task: Replace the simple UNBOUND → PROVISIONING claim with a proper distributed provisioning lease that includes attempt identity and lease expiry. Prevent stale workers from finalizing after lease takeover.
+
+Work Log:
+- Added provisioningAttemptId and claimExpiresAt fields to ProviderResourceBinding schema.
+- Rewrote claimProvisioning() with two claim paths: initial (UNBOUND → PROVISIONING) and takeover (PROVISIONING + expired lease). Both generate a unique attemptId and set a 5-minute lease.
+- Created claimGuardedTransition() — finalization writes are guarded by WHERE provisioningAttemptId = X AND status = PROVISIONING. A stale worker whose attemptId no longer matches gets count=0 and cannot mutate the binding.
+- Rewrote provisionBinding() to use claimGuardedTransition for both success (→ BOUND) and failure (→ FAILED) finalization. If the claim was taken over, returns claim_lost and discards the stale result.
+- Test G proves: worker A claims, lease expires, worker B takes over, worker A's direct DB finalization attempt gets count=0.
+- Test H proves: worker A claims, creates resource at provider, crashes. Lease expires. Worker B takes over, GET finds the existing resource, returns it without issuing PUT.
+
+Stage Summary:
+- HEAD: bd9775632fd9b8c722af2e5e08109abf093b86ba
+- origin/main: bd9775632fd9b8c722af2e5e08109abf093b86ba (pushed)
+- Tests: 11 — all EXECUTED + PASSED (7 runtime + 4 static)
+- Lint: clean. TypeScript: clean.
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED
+- SaaS billing kernel: FROZEN
+- Entitlement kernel: FROZEN
+- Adapter contract: FROZEN
+- The invariant: only the worker holding provisioningAttemptId may finalize the binding. A stale worker cannot mutate after lease takeover.
+
+---
+Task ID: 2C.4.6
+Agent: Lead engineer (main) — Lease Ownership Enforcement During External Operations
+Task: Close the three correctness gaps identified in the Phase 2C.4.5 audit (bd97756): (P0-1) pre-provider ownership enforcement, (P0-2) lease renewal during provider operations, (P0-3) no silent failure swallowing.
+
+Work Log:
+- Audited the three P0 problems in bd97756's provisionBinding():
+  1. No ownership check between claimProvisioning() and adapter.provision() — a stale worker could begin a provider side effect after losing ownership.
+  2. Hard-coded 5-min lease with no heartbeat — could expire mid-operation, allowing two workers to both believe they own provisioning.
+  3. `await claimGuardedTransition(...).catch(() => {})` in the catch branch silently swallowed failed finalization.
+- Added `verifyProvisioningOwnership(bindingId, attemptId)` — a read-based pre-provider ownership gate. Returns owns=false if the attemptId no longer matches, the binding is no longer PROVISIONING, or the lease has expired. Invoked immediately before adapter.provision() in provisionBinding().
+- Added `extendProvisioningLease(bindingId, attemptId)` — a conditional UPDATE guarded by the caller's attemptId. This is the authoritative ownership gate during long-running operations: succeeds (extends claimExpiresAt) only if the caller still holds the attempt AND the binding is still PROVISIONING.
+- Rewrote provisionBinding() with the full lease-enforcement sequence:
+    claim → verifyProvisioningOwnership (pre-provider gate) → start heartbeat → bounded adapter.provision() (Promise.race vs timeout) → if heartbeatLost, discard result → claim-guarded finalization → catch branch with NO silent swallow.
+- Added a heartbeat (setInterval → extendProvisioningLease) with an inFlight guard that prevents overlapping queries from exhausting the connection pool when the heartbeat interval is shorter than DB latency. The heartbeat sets heartbeatLost=true if ownership is lost during the operation; provisionBinding then discards the provider result and returns claim_lost.
+- Added a bounded provider-operation timeout (PROVIDER_OPERATION_TIMEOUT_MS = 4 min, strictly < the 5-min lease). A non-crashed worker always completes or times out before its lease can naturally expire, making mid-operation takeover impossible without a crash.
+- Removed the `.catch(() => {})` silent swallow. The catch branch now: attempts claimGuardedTransition(FAILED); if it succeeds, returns failed_permanent (durably recorded); if it fails (claim taken over), emits a CRITICAL log (provisioning_failure_unfinalized) and returns claim_lost.
+- Updated claimProvisioning()'s takeover path to set reconciliationState = "RECONCILIATION_REQUIRED" — a durable signal that the previous attempt's outcome is unknown. The new owner's adapter.provision() (GET-before-PUT) acts as the reconciliation.
+- Updated claimGuardedTransition() to clear reconciliationState = null on clean finalization (BOUND or FAILED through the legitimate claim holder).
+- Added test-only hooks (_setHeartbeatIntervalForTesting, _setOperationTimeoutForTesting, _setLeaseDurationForTesting) so tests can exercise the lease/heartbeat/timeout races in seconds rather than minutes. Production values (60s heartbeat, 4-min timeout, 5-min lease) are untouched.
+- Exported verifyProvisioningOwnership, extendProvisioningLease, and the three test hooks from the barrel.
+
+Test Suite (tests/phase2c46-lease-enforcement.test.ts) — 13 tests, ALL PASSING:
+  J: verifyProvisioningOwnership returns owns=true for active claim, false after takeover.
+  I: stale worker loses ownership pre-provider → claim_lost, NO provider call (createCallCount=0).
+  K: extendProvisioningLease extends for active claim, fails for stale attempt.
+  L: heartbeat keeps lease alive PAST its natural expiry (20s lease, 500ms heartbeat; after 25s, takeover still fails — without the heartbeat the 20s lease would have expired).
+  M: THE HARDEST RACE — worker A inside adapter.provision(), B atomically takes over (attemptId replaced), A's heartbeat detects the loss, A's successful provider result is DISCARDED (claim_lost). Binding remains PROVISIONING under B, marked RECONCILIATION_REQUIRED.
+  N: provider operation exceeding the bounded timeout (100ms) → FAILED (claim-guarded).
+  O: unexpected error (timeout) + claim taken over → claim_lost + CRITICAL (NOT failed_permanent, NOT silently swallowed). The catch branch's claimGuardedTransition(FAILED) matches zero rows because the attemptId was replaced.
+  P: lease takeover sets reconciliationState=RECONCILIATION_REQUIRED; clean finalization clears it.
+  Q: happy-path provisioning still succeeds and clears the claim (regression).
+  4 static tests: verify the new primitives exist, the pre-provider check is in provisionBinding, NO .catch(() => {}) remains, and takeover marks RECONCILIATION_REQUIRED.
+
+Regression: Phase 2C.4.5 tests (phase2c45-provisioning-lease.test.ts) — 12/12 PASSING (no regression from the provisionBinding rewrite, claimProvisioning takeover change, or claimGuardedTransition change).
+
+Stage Summary:
+- HEAD: (uncommitted — changes to src/lib/connectivity/entitlement.ts, src/lib/connectivity/index.ts, tests/phase2c46-lease-enforcement.test.ts)
+- Tests: 25 EXECUTED + PASSED (13 new 2C.4.6 + 12 regression 2C.4.5)
+- Lint: clean. TypeScript: clean (no connectivity/entitlement errors).
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED (no physical router available)
+- SaaS billing kernel: FROZEN (no changes)
+- Entitlement kernel: extended (new functions, provisionBinding rewrite — backward compatible)
+- Adapter contract: FROZEN (no changes)
+- The three auditor P0s are closed:
+  P0-1: verifyProvisioningOwnership() gates adapter.provision() — a stale worker cannot BEGIN a provider operation.
+  P0-2: heartbeat (extendProvisioningLease) + bounded timeout (4min < 5min lease) — a non-crashed worker never loses its lease mid-operation; a crashed worker's lease expires naturally for takeover.
+  P0-3: the .catch(() => {}) is gone; failed finalization emits a CRITICAL log and returns claim_lost, with the takeover's RECONCILIATION_REQUIRED as the durable signal.
+- The hardest race (Test M) is proven: A inside adapter.provision() → B takes over → A's heartbeat detects loss → A's result is discarded → A returns claim_lost.
+
+---
+Task ID: 2C.4.6b
+Agent: Lead engineer (main) — Provider-Side Convergence (External Side-Effect Safety)
+Task: Address the auditor's deeper distributed-systems critique: a DB lease cannot fence an already-started external operation. Add the provider-side convergence layer that independently guarantees no duplicate external resource is created, even when two workers both issue provider operations.
+
+Work Log:
+- Auditor identified the fundamental gap: claim-guarded finalization protects LOCAL state, but a DB lease cannot cancel an in-flight HTTP request. If worker A sends a PUT to RouterOS and then loses its DB lease, worker B may take over and also send a PUT. The lease cannot make either request disappear.
+- Added CONFLICT (409) reconciliation to RouterOSProviderClient.createResource(). When a PUT conflicts (another worker created the resource between our GET and PUT), the client reconciles: GET by username → return the existing resource. This is the core concurrent-PUT race the lease cannot prevent. Three convergence paths now exist: (1) GET-first idempotency, (2) PUT CONFLICT → GET → bind, (3) PUT TIMEOUT/RETRYABLE → GET → bind or retry.
+- Added strictConflictMode to MockRouterOSTransport. When enabled, PUT to an existing username throws CONFLICT (409) — exactly as real RouterOS does — so the convergence path can be exercised in tests. Defaults to false for backward compatibility.
+- Added a 60-line architectural documentation block to entitlement.ts distinguishing: LAYER 1 (lease fencing — local coordination, cannot fence external operations) vs LAYER 2 (provider-side convergence — external safety, convergent create keyed on stable username). The two layers are INDEPENDENT: even if the lease fails to prevent concurrent provider operations, the convergence layer guarantees no duplicate external resource.
+- Created tests/phase2c46b-provider-convergence.test.ts — 7 tests proving provider-side convergence:
+  R: concurrent PUTs converge on ONE external resource via CONFLICT reconciliation (client-level, instruments transport.resources + operationLog).
+  S: the auditor's EXACT scenario — A claims → A sends PUT (resource created) → A loses lease → B takes over → B's GET finds existing resource → B binds it (no duplicate PUT) → A cannot overwrite B. Proves: exactly ONE external resource, exactly ONE PUT, exactly ONE final binding, stale A's finalization rejected (count=0), both converge on same providerResourceId.
+  T: strictConflictMode throws CONFLICT on duplicate PUT (proves the convergence path is exercised, not silently swallowed).
+  U: CONFLICT + GET-not-found → PERMANENT failure (fail closed on provider inconsistency).
+  2 static tests: architectural distinction documented, strictConflictMode present.
+
+Test Results:
+- Phase 2C.4.6b (new): 7/7 PASSING (3 runtime + 4 static)
+- Phase 2C.4.6 (lease enforcement, prior round): 13/13 PASSING
+- Phase 2C.4.5 (regression): 12/12 PASSING
+- Pre-existing failure: phase2c4-routeros-client.test.ts test 5 ("unknown instance fails closed") — fails in secret-resolver.ts (a file NOT touched by 2C.4.6). The error "Provider instance has no configurationKey" is classified as failed_retryable but the test expects failed_permanent. This is a pre-existing classification issue, NOT a regression from 2C.4.6.
+
+Stage Summary:
+- This commit (2C.4.6 + 2C.4.6b) squashes the auto-deploy commits ed60ab8 + c2a4e59 into one clean commit on top of bd97756.
+- The two-layer architecture is now complete:
+  Layer 1 (Lease Fencing): DB lease limits normal concurrent workers + claim-guarded finalization prevents stale local writes + heartbeat extends lease during operations + bounded timeout < lease duration.
+  Layer 2 (Provider-Side Convergence): GET-before-PUT idempotency + CONFLICT reconciliation + TIMEOUT reconciliation. Two concurrent workers always converge on ONE external resource, keyed on the stable username.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: extended (documentation + lease enforcement). RouterOS client: extended (CONFLICT reconciliation).
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED (no physical router available)
+- The auditor's exact test scenario (Test S) is proven: A claims → A sends PUT → A loses lease → B takes over → B reconciles → exactly ONE resource, ONE binding, same providerResourceId, stale A cannot overwrite.

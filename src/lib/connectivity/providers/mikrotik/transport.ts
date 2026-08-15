@@ -251,6 +251,26 @@ export class MockRouterOSTransport implements RouterOSTransport {
   private failureMode: { type: MikroTikErrorType; status?: number; paths?: string[] } | null = null;
 
   /**
+   * Phase 2C.4.6: Strict conflict mode — simulates REAL RouterOS behavior.
+   *
+   * When false (default, for backward compatibility with existing tests), a
+   * PUT to an existing username silently returns the existing resource.
+   *
+   * When true, a PUT to an existing username throws a CONFLICT (409) error,
+   * exactly as real RouterOS does. This lets convergence tests exercise the
+   * CONFLICT → GET → bind path in createResource().
+   */
+  private strictConflictMode = false;
+
+  /**
+   * Phase 2C.4.6: Enable strict conflict mode. When enabled, PUT to an
+   * existing username throws CONFLICT instead of returning the resource.
+   */
+  setStrictConflictMode(enabled: boolean): void {
+    this.strictConflictMode = enabled;
+  }
+
+  /**
    * Set a failure mode for the next requests.
    * @param type error type to simulate
    * @param status HTTP status code to return (optional)
@@ -322,8 +342,17 @@ export class MockRouterOSTransport implements RouterOSTransport {
     if (input.method === "PUT" && hotspotUserBase) {
       const username = input.body?.name as string;
       if (!username) throw new MikroTikProviderError("PERMANENT", "Missing 'name' in create body");
-      // Idempotent: if exists, return it
+      // Idempotent: if exists, return it (legacy/default behavior).
+      // Phase 2C.4.6: In strictConflictMode, PUT to an existing username
+      // throws CONFLICT (409) — exactly as real RouterOS does — so the
+      // convergence path (CONFLICT → GET → bind) is exercised.
       if (this.resources.has(username)) {
+        if (this.strictConflictMode) {
+          throw new MikroTikProviderError(
+            "CONFLICT",
+            `Simulated RouterOS 409: resource "${username}" already exists`,
+          );
+        }
         return this.resources.get(username) as T;
       }
       const resource = {

@@ -1,5 +1,5 @@
 /**
- * Phase 2C.4 / 2C.4.1 — Real RouterOS Provider Client
+ * Phase 2C.4 / 2C.4.1 / 2C.4.6 — Real RouterOS Provider Client
  *
  * Implements the MikroTikProviderClient interface using the RouterOS REST API.
  *
@@ -11,11 +11,35 @@
  *   - Create retries: after timeout/ambiguity, GET to reconcile before retry
  *   - No blind retry of non-idempotent create
  *
+ * Phase 2C.4.6 — PROVIDER-SIDE CONVERGENCE:
+ *   A database lease can fence LOCAL state (stale workers cannot finalize),
+ *   but it CANNOT fence an already-started EXTERNAL operation. If worker A
+ *   sends a PUT to RouterOS and then loses its DB lease, worker B may take
+ *   over and also send a PUT. The DB lease cannot make either in-flight HTTP
+ *   request disappear.
+ *
+ *   Provider-side safety is therefore an INDEPENDENT layer: the create
+ *   operation must be CONVERGENT — replay, concurrent, or uncertain attempts
+ *   must all resolve to exactly ONE external resource, bound by the stable
+ *   binding identity (username).
+ *
+ *   Convergence strategy (three reconciliation paths):
+ *     1. GET by username → if exists, return it (idempotent — no PUT needed)
+ *     2. PUT → CONFLICT (409): another worker created it between our GET and
+ *        PUT. Reconcile: GET by username → if found, return it (convergence).
+ *     3. PUT → TIMEOUT/RETRYABLE: uncertain outcome. Reconcile: GET by
+ *        username → if found, return it; if absent, one controlled retry.
+ *
+ *   In all three paths, two concurrent workers converge on the SAME external
+ *   resource, identified by the stable username. No duplicate RouterOS user
+ *   is ever created.
+ *
  * Idempotency strategy for create:
  *   1. GET by username → if exists, return it (idempotent)
  *   2. PUT create → if timeout/error, DON'T blindly retry
  *   3. After ambiguity: GET by username → if exists, return it (reconcile)
  *   4. Only retry PUT if GET confirms resource is absent
+ *   5. [2C.4.6] PUT → CONFLICT → GET by username → return existing (converge)
  *
  * Resource identity:
  *   - RoamLink providerResourceId = RouterOS .id (the internal record ID)
@@ -94,6 +118,46 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
       logger.info("routeros.created", { username: config.username, instance: this.instanceLabel });
       return this.parseResource(created ?? {});
     } catch (err) {
+      // Phase 2C.4.6: CONFLICT (409) reconciliation — provider-side convergence.
+      //
+      // A CONFLICT means another worker created the resource between our GET
+      // (which saw absence) and our PUT. This is the core concurrent-creation
+      // race that a DB lease CANNOT prevent: both workers did GET (absent),
+      // both issued PUT, and the second PUT conflicts.
+      //
+      // The resource now exists at the provider. We MUST converge: GET by
+      // username → return the existing resource. We must NOT treat this as a
+      // hard failure — the external state is consistent (exactly one
+      // resource), and the binding should bind to it.
+      if (err instanceof MikroTikProviderError && err.errorType === "CONFLICT") {
+        logger.warn("routeros.create_conflict_reconciling", {
+          username: config.username, instance: this.instanceLabel,
+          error: err.message,
+          message: "PUT conflicted (another worker created the resource) — reconciling via GET to converge on the existing resource.",
+        });
+
+        const reconciled = await this.getResourceByUsername(config.username);
+        if (reconciled) {
+          logger.info("routeros.create_conflict_reconciled", {
+            username: config.username, instance: this.instanceLabel,
+            resourceId: reconciled.id,
+            message: "CONFLICT reconciled — binding to the existing resource created by another worker.",
+          });
+          return reconciled;
+        }
+
+        // CONFLICT but the resource is not found by GET — this is a genuine
+        // provider inconsistency. Fail closed; do NOT retry PUT.
+        logger.error("routeros.create_conflict_inconsistent", {
+          username: config.username, instance: this.instanceLabel,
+          message: "CRITICAL: PUT returned CONFLICT but GET cannot find the resource — provider state is inconsistent. Failing closed.",
+        });
+        throw new MikroTikProviderError(
+          "PERMANENT",
+          `Provider inconsistency: PUT conflicted but GET cannot find resource "${config.username}"`,
+        );
+      }
+
       // Phase 2C.4.1: Don't blindly retry create on timeout/network error.
       // Instead, reconcile: check if the resource was actually created.
       if (err instanceof MikroTikProviderError && (err.errorType === "TIMEOUT" || err.errorType === "RETRYABLE")) {
