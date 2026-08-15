@@ -31,6 +31,11 @@ import {
   ENTITLEMENT_STATES,
 } from "@/lib/connectivity";
 import type { CapabilityType } from "@/lib/connectivity";
+import {
+  ledgerCustomerPayment,
+  ledgerResellerPurchase,
+  ledgerPaymentFee,
+} from "@/lib/finance/double-entry-ledger";
 
 export type FulfillmentResult = {
   status: "fulfilled" | "failed";
@@ -132,6 +137,23 @@ export async function fulfillOrder(orderId: string): Promise<FulfillmentResult> 
       },
     });
 
+    // Phase 5.1B: Post ledger entries for financial truth.
+    // Every fulfilled order records:
+    //   1. Customer payment (cash received, revenue recognized)
+    //   2. Payment processing fee (provider liability)
+    //   3. Reseller purchase (connectivity revenue net of platform fee)
+    // All ledger calls are idempotent via the orderId-based idempotency key.
+    await postFulfillmentLedger({
+      tenantId: order.tenantId,
+      orderId: order.id,
+      customerId: order.customerId,
+      customerPriceMinor: order.paidAmountMinor,
+      wholesalePriceMinor: product.priceMinor, // for own infra, wholesale = customer
+      currency: order.currency,
+      paymentProvider: order.paymentRef?.startsWith("sim-") ? "mock" : "paystack",
+      paymentRef: order.paymentRef ?? undefined,
+    });
+
     logger.info("fulfillment.completed", {
       orderId, entitlementId: entitlement.id, providerResourceId: provisionResult.providerResourceId,
     });
@@ -180,4 +202,112 @@ function extractCredentials(
   }
 
   return creds;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5.1B: Ledger Integration
+// ---------------------------------------------------------------------------
+
+/**
+ * Post ledger entries for a fulfilled order.
+ *
+ * This connects the commerce layer to the existing double-entry ledger
+ * (src/lib/finance/double-entry-ledger.ts). Every fulfilled order records:
+ *
+ *   1. Customer payment — the cash received from the customer
+ *   2. Payment processing fee — the fee charged by the payment provider
+ *   3. Reseller purchase — the connectivity revenue net of platform fee
+ *
+ * The contribution margin (customerPrice - wholesalePrice - paymentFee) is
+ * implicitly captured: customer payment credits revenue, payment fee debits
+ * fees, and the reseller purchase entry separates platform fee from
+ * connectivity revenue.
+ *
+ * All entries are idempotent via orderId-based idempotency keys. If
+ * fulfillOrder() is retried (e.g., after a crash), the ledger entries are
+ * not duplicated.
+ */
+async function postFulfillmentLedger(input: {
+  tenantId: string;
+  orderId: string;
+  customerId: string;
+  customerPriceMinor: number;
+  wholesalePriceMinor: number;
+  currency: string;
+  paymentProvider: string;
+  paymentRef?: string;
+}): Promise<void> {
+  // Estimate the payment processing fee (typically 1.5–3.5% depending on provider)
+  // Paystack: 1.5% (local), 3.8% (international)
+  // Stripe: 2.9% + 30¢
+  // Mock: 0%
+  const feePercent = input.paymentProvider === "mock" ? 0 : 0.015; // 1.5% default
+  const paymentFeeMinor = Math.round(input.customerPriceMinor * feePercent);
+
+  const idempotencyBase = `commerce-${input.orderId}`;
+
+  try {
+    // 1. Customer payment (cash received, revenue recognized)
+    await ledgerCustomerPayment({
+      userId: input.customerId,
+      orderId: input.orderId,
+      customerPriceMinor: input.customerPriceMinor,
+      paymentFeeMinor,
+      currency: input.currency,
+      provider: input.paymentProvider,
+      providerTxnId: input.paymentRef,
+      idempotencyKey: `${idempotencyBase}-customer-payment`,
+    });
+
+    // 2. Payment processing fee (separate entry for fee tracking)
+    if (paymentFeeMinor > 0) {
+      await ledgerPaymentFee({
+        userId: input.customerId,
+        orderId: input.orderId,
+        paymentFeeMinor,
+        currency: input.currency,
+        provider: input.paymentProvider,
+        idempotencyKey: `${idempotencyBase}-payment-fee`,
+      });
+    }
+
+    // 3. Reseller purchase (connectivity revenue net of platform fee)
+    // The platform fee is a percentage of the transaction (from SaaasPlan.platformFeePercent)
+    const subscription = await db.tenantSubscription.findFirst({
+      where: { tenantId: input.tenantId, status: "active" },
+      include: { saaasPlan: { select: { platformFeePercent: true } } },
+    });
+
+    const platformFeePercent = subscription?.saaasPlan.platformFeePercent ?? 0;
+    const platformFeeMinor = Math.round(input.customerPriceMinor * (platformFeePercent / 100));
+
+    await ledgerResellerPurchase({
+      tenantId: input.tenantId,
+      userId: input.customerId,
+      orderId: input.orderId,
+      retailPriceMinor: input.customerPriceMinor,
+      platformFeeMinor,
+      reason: `Connectivity purchase — order ${input.orderId}`,
+      currency: input.currency,
+      idempotencyKey: `${idempotencyBase}-reseller-purchase`,
+    });
+
+    logger.info("fulfillment.ledger_posted", {
+      orderId: input.orderId,
+      customerPriceMinor: input.customerPriceMinor,
+      paymentFeeMinor,
+      platformFeeMinor,
+      contributionMarginMinor: input.customerPriceMinor - input.wholesalePriceMinor - paymentFeeMinor,
+    });
+  } catch (err) {
+    // Ledger failures are logged but don't fail the fulfillment — the
+    // customer's resource is already provisioned. The ledger can be
+    // reconciled separately. This follows the same pattern as the SaaS
+    // billing kernel: provisioning success is not rolled back on ledger failure.
+    logger.error("fulfillment.ledger_failed", {
+      orderId: input.orderId,
+      error: err instanceof Error ? err.message : String(err),
+      message: "CRITICAL: Ledger posting failed. The order is fulfilled but financial truth is incomplete. Manual reconciliation required.",
+    });
+  }
 }

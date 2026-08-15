@@ -2796,3 +2796,84 @@ Stage Summary:
 - New artifact: docs/COMMERCIAL-AUDIT.md
 - The kernel is the crown jewel. The commerce layer is the revenue path. Close the 5 gaps and RoamLink OS is ready for its first paying reseller.
 - No code changes. SaaS kernel FROZEN. Adapter contract FROZEN. Entitlement kernel FROZEN.
+
+---
+Task ID: 5.1
+Agent: Principal Architect (main) — Commercial Foundation Phase 1
+Task: Implement the 5 blockers identified in the commercial audit: (A) payment integration, (B) ledger integration, (C) security fix, (D) reseller onboarding, (E) provider instance management. Preserve the frozen kernel.
+
+Work Log:
+
+AUDIT:
+- Audited exact files at 3fb56a9. Found:
+  - Payment provider interface + Paystack/Stripe/Mock adapters ALREADY EXIST (src/lib/payments/)
+  - Double-entry ledger functions ALREADY EXIST (src/lib/finance/double-entry-ledger.ts)
+  - WebhookEvent model ALREADY EXISTS
+  - seedSaaasPlans() ALREADY EXISTS
+  - createProviderInstance() ALREADY EXISTS in the frozen kernel
+- The gaps were WIRING (not building), plus auth fix + onboarding API + provider instance API.
+
+A. PAYMENT INTEGRATION:
+- Created POST /api/commerce/orders/[orderId]/payment-intent — creates a real payment intent via the configured payment provider (Paystack/Stripe/Mock). Returns the provider reference + redirect URL.
+- Creates a Payment record for audit trail (idempotent via orderId-based key).
+- Created POST /api/webhooks/commerce/[provider] — receives payment webhooks, verifies signature, deduplicates via WebhookEvent, marks order paid, calls fulfillOrder().
+- The webhook is idempotent: if (provider, externalId) already processed, it's skipped.
+
+B. LEDGER INTEGRATION:
+- Wired fulfillOrder() to the double-entry ledger via a new postFulfillmentLedger() function.
+- Every fulfilled order now posts 3 ledger entries (all idempotent via orderId-based keys):
+  1. ledgerCustomerPayment — cash received from customer, revenue recognized
+  2. ledgerPaymentFee — payment processing fee (1.5% default for Paystack, 0% for mock)
+  3. ledgerResellerPurchase — connectivity revenue net of platform fee (from SaaasPlan.platformFeePercent)
+- Contribution margin is implicitly captured: customerPrice - wholesalePrice - paymentFee.
+- Ledger failures are logged but don't roll back fulfillment (same pattern as the SaaS billing kernel). A CRITICAL log is emitted for manual reconciliation.
+
+C. SECURITY FIX:
+- Fixed the unauthenticated customer creation API (POST /api/commerce/customer).
+- BEFORE: accepted tenantId from the request body — anyone could create users in any tenant.
+- AFTER: derives tenantId from the productId (looks up the product's tenant). No tenantId in the request body.
+- Updated the checkout form to pass productId instead of tenantId.
+
+D. RESELLER ONBOARDING:
+- Created POST /api/onboarding/tenant — public signup route.
+- Creates: User (admin) → Tenant → TenantUser (owner) → TenantSubscription (14-day trial on starter plan) → TenantBalance (0 balance).
+- Validates email uniqueness + slug availability.
+- Signs the user in after signup (creates a session).
+- Created /onboarding UI page — reseller signup form (business name, slug, name, email, password).
+
+E. PROVIDER INSTANCE MANAGEMENT:
+- Created GET/POST /api/connectivity/instances — list/create provider instances.
+- Created GET/PATCH/DELETE /api/connectivity/instances/[instanceId] — detail/update/deactivate.
+- All routes are auth-guarded (getCurrentUser + requireTenantContext).
+- Validates providerType (mikrotik | esim only).
+- DELETE is a soft delete (marks status "inactive").
+- Uses the existing createProviderInstance() from the frozen kernel — no kernel changes.
+- Created /portal/infrastructure UI page — add/manage routers and eSIM suppliers.
+- Added "Infrastructure" button to the portal dashboard.
+
+TESTS (15/15 PASSING):
+  A1: payment intent API uses the payment provider ✅
+  A2: webhook handler uses WebhookEvent for idempotency ✅
+  B1: fulfillment imports and calls ledger functions ✅
+  B2: ledger entries are idempotent (orderId-based keys) ✅
+  B3: ledger failure doesn't roll back fulfillment ✅
+  C1: customer API derives tenantId from productId ✅
+  C2: customer API does NOT trust tenantId from request body ✅
+  D1: onboarding creates user + tenant + trial subscription ✅
+  D2: onboarding validates email uniqueness + slug availability ✅
+  D3: onboarding creates TenantBalance ✅
+  E1: provider instance API uses createProviderInstance from kernel ✅
+  E2: provider instance API is auth-guarded ✅
+  E3: provider instance API validates providerType ✅
+  E4: provider instance DELETE is soft delete ✅
+  KERNEL: entitlement.ts unchanged (no commerce/payment/onboarding code) ✅
+
+KERNEL PRESERVATION:
+  The frozen kernel (entitlement.ts) is UNCHANGED. Static test verifies it contains zero commerce/payment/onboarding code. All new code is in the commerce layer, API routes, and portal UI.
+
+Stage Summary:
+- HEAD: (to be committed)
+- 5 commercial foundation blockers closed: payment, ledger, security, onboarding, provider management.
+- No kernel changes (entitlement.ts, provisioning, adapter contract all FROZEN).
+- Tests: 15/15 PASSING. Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.

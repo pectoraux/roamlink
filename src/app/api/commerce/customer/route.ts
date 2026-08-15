@@ -1,29 +1,49 @@
 /**
- * Phase 3 — Customer find-or-create API
+ * Phase 5.1C — Customer find-or-create API (SECURITY FIXED)
  * POST /api/commerce/customer
  *
- * Finds an existing user by email, or creates a new one with role "customer".
- * This is used by the checkout flow — the customer doesn't need to sign up
- * separately; entering their email at checkout is enough.
+ * SECURITY FIX (Phase 5.1C):
+ * The previous version of this route had NO authentication and trusted the
+ * `tenantId` from the request body — allowing anyone to create users in
+ * any tenant. This was a P1 security vulnerability.
  *
- * The user is linked to the tenant via TenantUser so the reseller can see
- * their customers.
+ * The fix: the `tenantId` is NO LONGER trusted from the request body. It's
+ * derived from the `productId` — the customer is created in the tenant that
+ * owns the product. This means a customer can only be created in a tenant
+ * that has a product they're trying to buy.
+ *
+ * Additionally, the route verifies the product is active before creating
+ * the customer, preventing creation against archived/inactive products.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { hashPassword } from "@/lib/security";
+import { logger } from "@/lib/logger";
 
 export async function POST(req: NextRequest) {
   const body = await req.json();
-  const { email, name, tenantId } = body;
+  const { email, name, productId } = body;
 
-  if (!email || !tenantId) {
+  if (!email || !productId) {
     return NextResponse.json(
-      { error: "Missing required fields: email, tenantId" },
+      { error: "Missing required fields: email, productId" },
       { status: 400 },
     );
   }
+
+  // SECURITY: derive tenantId from the product, NOT from the request body.
+  // This prevents an attacker from creating users in arbitrary tenants.
+  const product = await db.resellerProduct.findFirst({
+    where: { id: productId, status: "active" },
+    select: { tenantId: true },
+  });
+
+  if (!product) {
+    return NextResponse.json({ error: "Product not found or inactive" }, { status: 404 });
+  }
+
+  const tenantId = product.tenantId;
 
   // Find or create the user
   let user = await db.user.findUnique({
@@ -57,6 +77,12 @@ export async function POST(req: NextRequest) {
       },
     });
   }
+
+  logger.info("commerce.customer_created", {
+    userId: user.id,
+    tenantId,
+    productId,
+  });
 
   return NextResponse.json({ customer: { id: user.id, email: user.email, name: user.name } });
 }

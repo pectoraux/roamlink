@@ -20,7 +20,10 @@ import { CheckCircle2, Loader2, Wifi, Smartphone } from "lucide-react";
 
 type FulfillmentState = "idle" | "creating_order" | "fulfilling" | "fulfilled" | "failed";
 
-export function CheckoutForm({ productId, tenantId }: { productId: string; tenantId: string }) {
+export function CheckoutForm({ productId, tenantId: _tenantId }: { productId: string; tenantId: string }) {
+  // tenantId is no longer sent to the API — the customer API derives it
+  // from the productId for security (Phase 5.1C). It's kept in the props
+  // for potential future UI use but prefixed with _ to indicate unused.
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
   const [state, setState] = useState<FulfillmentState>("idle");
@@ -32,13 +35,13 @@ export function CheckoutForm({ productId, tenantId }: { productId: string; tenan
     setState("creating_order");
 
     try {
-      // Step 1: Find or create a customer user with this email
-      // For the MVP, we use the first tenant user as the customer.
-      // In production, this would create a Customer entity linked to the tenant.
+      // Step 1: Find or create a customer user with this email.
+      // SECURITY (Phase 5.1C): the API derives tenantId from the productId,
+      // not from the request body. This prevents creating users in arbitrary tenants.
       const customerRes = await fetch("/api/commerce/customer", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, name, tenantId }),
+        body: JSON.stringify({ email, name, productId }),
       });
 
       if (!customerRes.ok) {
