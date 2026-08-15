@@ -1902,3 +1902,21 @@ Stage Summary:
 - SaaS billing kernel: FROZEN (no changes)
 - The invariant: providerInstanceId = X ⇒ ONLY a client bound to X may execute. If client X cannot be resolved ⇒ FAIL CLOSED. No default.
 - Next step: real RouterOS REST client (Phase 2C.4).
+
+---
+Task ID: 2C.3.4.ACCEPT
+Agent: Lead engineer (main) — Phase 2C.3.4 Acceptance + Phase 2C.4 Direction
+Task: Record the user's acceptance of Phase 2C.3.4 and the directive for Phase 2C.4.
+
+Work Log:
+- User accepted Phase 2C.3.4. The fail-closed behavior is proven: unknown/unconfigured instances throw, clearing registration causes failure not fallback, the production resolver no longer imports the default mock client.
+- User noted the nuance: the current "production resolver" is still mock-based (checks test registry, then fails closed). The actual PostgreSQL ConnectivityProviderInstance → credentials → RouterOSProviderClient factory is deferred to Phase 2C.4. This is the correct state for this milestone.
+- The safety property is now: providerInstanceId = X → client for X OR FAIL CLOSED. No default client.
+- User cleared Phase 2C.4 (real RouterOS client) with one strict requirement: the RouterOS implementation must preserve the exact same fail-closed boundary and must never become a hidden global/default client.
+
+Stage Summary:
+- HEAD: 1da1c8d51c6a5851d143be8b29ad203380e65e75 (origin/main, unchanged)
+- Phase 2C.3.4: ACCEPTED ✅
+- Phase 2C.4 (real RouterOS REST client): CLEARED TO BEGIN
+- Strict requirement: preserve fail-closed boundary, no hidden global/default client
+- The entitlement kernel, provider registry, adapter contract, and SaaS billing kernel must remain unchanged.
