@@ -1920,3 +1920,28 @@ Stage Summary:
 - Phase 2C.4 (real RouterOS REST client): CLEARED TO BEGIN
 - Strict requirement: preserve fail-closed boundary, no hidden global/default client
 - The entitlement kernel, provider registry, adapter contract, and SaaS billing kernel must remain unchanged.
+
+---
+Task ID: 2C.4
+Agent: Lead engineer (main) — Real RouterOS Client
+Task: Implement the real RouterOS REST API client behind the existing MikroTik provider boundary. No changes to the entitlement kernel, adapter contract, provider registry, or SaaS billing kernel.
+
+Work Log:
+- Created FetchRouterOSTransport — production HTTP transport with AbortController timeout, bounded retries (max 2) for retryable errors, no retry for auth/not_found/conflict, status-code classification into MikroTikErrorType.
+- Created MockRouterOSTransport — test double with failureMode simulation and operationLog for verification.
+- Created ProviderInstanceSecretResolver — injectable secret resolution. EnvProviderInstanceSecretResolver reads from env vars (MIKROTIK_{KEY}_ENDPOINT etc.). TestSecretResolver returns deterministic test credentials. NEVER stores credentials in PostgreSQL.
+- Created RouterOSProviderClient — implements MikroTikProviderClient using RouterOS REST API. Handles hotspot user CRUD, rate-limit formatting, duration parsing, usage collection via /ip/hotspot/active.
+- Created client-factory.ts — createRouterOSClientForInstance loads ConnectivityProviderInstance from PostgreSQL, verifies providerType/status, resolves secrets, constructs+ caches RouterOSProviderClient by providerInstanceId. FAIL-CLOSED: no fallback, no default client. productionAsyncResolver checks mock registry first, then real factory.
+- Updated adapter to support async resolvers (resolveClient now returns Promise).
+- Updated index.ts to use productionAsyncResolver instead of the old fail-closed mock-only resolver.
+
+Stage Summary:
+- HEAD: 097052c722303b0dce556c0b24d5ec73fd337760
+- origin/main: 097052c722303b0dce556c0b24d5ec73fd337760 (pushed)
+- Tests: 16 — all EXECUTED + PASSED (9 runtime + 7 static)
+- Lint: clean. TypeScript: clean.
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED (no physical router available)
+- SaaS billing kernel: FROZEN (no changes)
+- Entitlement kernel: FROZEN (no changes)
+- Adapter contract: FROZEN (no changes)
+- The real RouterOS client is now implemented behind the proven provider boundary.
