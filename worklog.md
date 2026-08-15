@@ -2239,3 +2239,49 @@ Stage Summary:
   Layer 4: Claim-guarded finalization (stale worker = 0 rows)
 - Two honest gaps remain for future work: live RouterOS validation and multi-node distributed deployment. Neither is an architecture blocker; both are validation scope expansions.
 - SaaS billing kernel: FROZEN throughout. Adapter contract: FROZEN throughout.
+
+---
+Task ID: 2C.4.9
+Agent: Lead engineer (main) — Canonical Provisioning Recovery & Reconciliation
+Task: Implement Phase 2C.4.9 per the auditor's directive: (1) fix the ownership-verification ordering so verifyProvisioningOwnership is the literal last DB operation before adapter.provision(), (2) create a canonical reconcileProvisioning() recovery worker, (3) prove the full recovery matrix.
+
+Work Log:
+- Fixed the provisionBinding ordering (P1): moved resolveBindingRuntime() BEFORE claimProvisioning() (previously it was called AFTER the ownership check, creating a window where the lease could expire during the DB reads). The adapter input is now constructed in-memory from the pre-claim resolution (only updating status→PROVISIONING and provisioningState→PENDING). verifyProvisioningOwnership() is now the literal last DB operation before adapter.provision() — there are zero DB reads between them.
+- Created reconcileProvisioning(bindingId) — the canonical recovery worker. It is idempotent and safe to call at any time:
+  - BOUND → already_healthy (no action)
+  - PROVISIONING + active lease → already_healthy (another worker is handling it)
+  - PROVISIONING + expired lease → takeover via provisionBinding → GET-first convergence
+  - FAILED → re-provision via provisionBinding
+  - All provisionBinding calls are wrapped in try/catch so throws (e.g., instance inactive, cross-tenant) return {status: "failed"} instead of propagating unhandled.
+- Exported reconcileProvisioning and ReconciliationResult from the barrel.
+- Created tests/phase2c49-recovery-matrix.test.ts — 15 tests covering the auditor's full recovery matrix:
+  A: crash before provider call → takeover creates exactly one resource
+  B: crash after provider create → takeover GETs existing, zero duplicate PUT
+  C: PUT timeout + process death → takeover reconciles via GET
+  D: 409 + GET exists → converge on existing resource
+  E: 409 + GET absent → PERMANENT failure (fail closed, structural proof)
+  F: active lease → reconciler does nothing (already_healthy)
+  G: expired lease → reconciler takes over and recovers
+  H: stale worker finalization → rejected (claim-guarded)
+  I: stale worker failure finalization → rejected (claim-guarded)
+  J: RECONCILIATION_REQUIRED + successful recovery → cleared
+  K: provider instance inactive during recovery → fail closed
+  L: provider instance reassigned to another tenant → fail closed
+  M: two concurrent reconcileProvisioning calls → exactly one takeover
+  2 static tests: ordering fix verified, reconcileProvisioning contract verified
+
+Bug found and fixed during testing:
+- Tests K and L initially failed because resolveBindingRuntime throws when the provider instance is inactive or cross-tenant, and that throw propagated unhandled through provisionBinding → reconcileProvisioning. Fixed by wrapping both provisionBinding calls in reconcileProvisioning with try/catch that returns {status: "failed"}.
+
+Test Results:
+- Phase 2C.4.9 (new): 15/15 PASSING (13 runtime + 2 static)
+- Lint: clean. TypeScript: clean.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The ordering fix closes the auditor's identified window: verifyProvisioningOwnership is now the literal last DB operation before adapter.provision(). No DB reads intervene.
+- reconcileProvisioning is the explicit, durable recovery contract — recovery is no longer implicit inside provisionBinding.
+- The full recovery matrix is proven: crash before PUT, crash after PUT, crash after uncertain PUT, provider inconsistency, active/expired lease, stale worker rejection, RECONCILIATION_REQUIRED clearing, instance inactive/cross-tenant fail-closed, concurrent recovery workers.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN.
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED (no physical router available)
+- The auditor's suggested validation track for 2C.4.10 (live RouterOS) and 2C.4.11 (multi-process distributed deployment) remain as explicit future validation milestones.

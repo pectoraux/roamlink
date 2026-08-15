@@ -18,6 +18,7 @@ export {
   reconcileBindingWithProvider,
   claimProvisioning,
   provisionBinding,
+  reconcileProvisioning,
   verifyProvisioningOwnership,
   extendProvisioningLease,
   _setHeartbeatIntervalForTesting,
@@ -36,6 +37,7 @@ export type {
   CapabilityType,
   EntitlementState,
   BindingState,
+  ReconciliationResult as ProvisioningReconciliationResult,
 } from "./entitlement";
 
 // Adapter contract
