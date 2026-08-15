@@ -1966,3 +1966,24 @@ Stage Summary:
 - SaaS billing kernel: FROZEN
 - Entitlement kernel: FROZEN
 - Adapter contract: FROZEN
+
+---
+Task ID: 2C.4.2
+Agent: Lead engineer (main) — Usage Identity + Retry + Credential Cache Correctness
+Task: Fix three concrete issues: usage uses wrong identifier, blind transport retries for PUT create, credential rotation not detected by cache.
+
+Work Log:
+- P0: Added `username` field to MikroTikResource (separate from `id` which is the RouterOS .id). getResourceUsage now uses resource.username for active-session correlation instead of resource.id.
+- P0/P1: Transport now has method-specific retry policy. PUT (create) and POST (command) are NOT retried by the transport. GET, PATCH, DELETE are retryable. The client owns create retry semantics (reconcile via GET before retry).
+- P1: Secret resolver now returns optional `version` field. Client cache key includes: providerInstanceId + configurationKey + updatedAt + credentials.version. If credentials rotate (version changes), cache is invalidated. Added invalidateRouterOSClient() for explicit eviction when secret resolver doesn't provide a version. Old cache entries for the same instance are evicted when a new fingerprint is installed.
+- Also fixed: createResource handles retryable GET lookup failures gracefully — proceeds to create if the idempotency lookup fails.
+
+Stage Summary:
+- HEAD: 18e72acb3b37633be2ebc76e966327ecf3f09258
+- origin/main: 18e72acb3b37633be2ebc76e966327ecf3f09258 (pushed)
+- Tests: 14 — all EXECUTED + PASSED (7 runtime + 7 static)
+- Lint: clean. TypeScript: clean.
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED
+- SaaS billing kernel: FROZEN
+- Entitlement kernel: FROZEN
+- Adapter contract: FROZEN
