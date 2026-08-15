@@ -2285,3 +2285,47 @@ Stage Summary:
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN.
 - REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED (no physical router available)
 - The auditor's suggested validation track for 2C.4.10 (live RouterOS) and 2C.4.11 (multi-process distributed deployment) remain as explicit future validation milestones.
+
+---
+Task ID: 2C.4.10.AUDIT
+Agent: Lead engineer (main) — Code Audit + 2C.4.10/2C.4.11 Preparation
+Task: Per the auditor's directive: audit the actual 9d203f5 GitHub code before writing the next implementation, then produce the 2C.4.10 implementation plan. Be honest about what can and cannot be executed in this environment.
+
+Work Log:
+- Audited the actual committed code at 9d203f5 (HEAD = origin/main = 9d203f5, working tree clean). All invariants confirmed present in the real source:
+  1. provisionBinding ordering fix: resolveBindingRuntime (line 1709) runs BEFORE claimProvisioning (line 1717). verifyProvisioningOwnership is the last DB operation before adapter.provision — zero resolveBindingRuntime calls between them (verified programmatically). ✅
+  2. reconcileProvisioning: exported at line 1974, with ReconciliationResult type at line 1928. Both provisionBinding calls wrapped in try/catch (lines 2021, 2069) with reconciliation_reprovisioning_failed / reconciliation_takeover_failed error logging. ✅
+  3. claimGuardedTransition .transitioned check: lines 1839 and 1863 both check !transitioned.transitioned (the 2C.4.7 P0 fix is intact). ✅
+  4. Heartbeat claimExpiresAt > now guard: line 1508 (the 2C.4.8 fix is intact). ✅
+  5. Takeover ABA fence: line 1287, provisioningAttemptId: current.provisioningAttemptId (the 2C.4.8 fix is intact). ✅
+  6. CONFLICT reconciliation in routeros-client: all three log points present (create_conflict_reconciling, create_conflict_reconciled, create_conflict_inconsistent). ✅
+  7. Barrel exports: reconcileProvisioning and ProvisioningReconciliationResult both exported from index.ts. ✅
+
+- Checked environment for live RouterOS capability: Docker is NOT available (docker: command not found). No physical MikroTik router is accessible. Therefore Phase 2C.4.10 (live RouterOS) and Phase 2C.4.11 (multi-process distributed) CANNOT be executed in this environment.
+
+- Created tests/phase2c410-live-routeros.test.ts — the live RouterOS test harness:
+  - 22 tests covering the auditor's full matrix (authentication, resource identity, create semantics, actual RouterOS response behavior, recovery, negative cases, evidence).
+  - Gated on LIVE_ROUTEROS_ENDPOINT environment variable — if not set, all tests are SKIPPED with an explicit warning.
+  - META test passes (not skips) to explicitly document the validation status: "MOCK-VALIDATED only. LIVE-PROVIDER-VALIDATED: NOT YET."
+  - When a live RouterOS IS available, setting the env vars and running the test executes the full live validation suite.
+  - This file is PREPARED but NOT EXECUTED. It cannot be confused with a passing mock test because all live tests are marked (skip), not (pass).
+
+- Created tests/phase2c410-411-validation-plan.md — the implementation plan for 2C.4.10 and 2C.4.11, documenting:
+  - The honest validation status labels (MOCK-VALIDATED, PREPARED-NOT-EXECUTED, NOT STARTED).
+  - The prerequisites for each phase (live RouterOS or CHR; multi-process infrastructure).
+  - The full test matrix for each phase.
+  - The critical unknown to resolve in 2C.4.10: actual RouterOS duplicate-name behavior (does PUT to an existing username return 409, 400, or silently return the resource?).
+  - Why these cannot be executed in the current environment (no Docker, no physical router, single process, no network control tools).
+
+Honest validation labels:
+  2C.4.5 – 2C.4.9: MOCK-VALIDATED (Neon PostgreSQL + MockRouterOSTransport)
+  2C.4.10:          PREPARED — NOT EXECUTED (test harness written, gated on live RouterOS)
+  2C.4.11:          NOT STARTED (requires multi-process infrastructure)
+
+Stage Summary:
+- HEAD: 9d203f5 (audited, no changes to production code in this step)
+- The 2C.4.10 test harness is ready for execution when a live RouterOS endpoint becomes available.
+- The 2C.4.11 plan is documented for when multi-process infrastructure becomes available.
+- No production code was changed — this step is purely audit + preparation.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN (no changes).
+- The auditor's explicit validation labels are adopted: MOCK-VALIDATED, LIVE-PROVIDER-VALIDATED, MULTI-PROCESS-VALIDATED. These are NOT collapsed into "tests pass."
