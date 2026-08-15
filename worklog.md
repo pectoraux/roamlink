@@ -2651,3 +2651,94 @@ Stage Summary:
 - New API: /api/commerce/* (products, orders, customer, fulfill)
 - New UI: reseller portal (/) + new product (/portal/products/new) + checkout (/checkout/[productId])
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
+
+---
+Task ID: 4.0
+Agent: Lead engineer (main) — Phase 4 Reseller Operating System
+Task: Build the Offer Ranking Engine + normalized offer model + supplier feed ingestion + reseller markup rules. The system must support three reseller types (WiFi operator, telco reseller, eSIM supplier) on a level playing field. Deterministic ranking only — no AI. The frozen kernel (entitlement, provisioning, adapter contract) remains unchanged.
+
+Work Log:
+
+DESIGN:
+- Audited the current models at 2c08f3f. Found existing legacy models (ConnectivityProduct, Supplier, ConnectivityOffer) from the B2C eSIM marketplace era. These are global, not reseller-scoped.
+- Designed 3 new models that normalize ALL connectivity offers into a single comparable shape:
+  1. ConnectivityOffer2 — the normalized offer (tenant-scoped, spec + coverage + pricing + reliability)
+  2. ResellerMarkup — markup rules (scoped: capability + provider + supplier, with resolution order)
+  3. ConnectivityIntent — a customer's request (desiredSpec + location + budget), stored with ranked results
+
+DATA MODEL:
+- Added ConnectivityOffer2, ResellerMarkup, ConnectivityIntent to the Prisma schema.
+- Pushed to the database (prisma db push — in sync).
+- Added back-relations on Tenant.
+- Named ConnectivityOffer2 to avoid collision with the legacy ConnectivityOffer model (future cleanup can merge them).
+
+OFFER RANKING ENGINE (src/lib/commerce/ranking-engine.ts):
+- rankOffers(intent, weights) — pure deterministic function.
+- 6 scoring dimensions, each 0.0–1.0, weighted, summed:
+  1. Intent match — does the offer's spec satisfy what the customer wants?
+  2. Location match — does the offer cover where the customer is? (country/region/city/geo-radius)
+  3. Availability — is the offer active and not expired?
+  4. Price — how competitive is the customer price? (normalized to the offer set)
+  5. Margin — how much margin does the reseller make?
+  6. Reliability — the offer's historical success rate (0.0–1.0)
+- Default weights: price 0.25, intentMatch 0.20, reliability 0.20, locationMatch 0.15, margin 0.10, availability 0.10.
+- Weights are configurable per tenant (resellers can prioritize margin vs. price vs. reliability).
+- The ranking is persisted (ConnectivityIntent.rankedResults) for analytics + debugging.
+- NO Math.random, NO Date.now in the scoring functions (verified by static test).
+
+SUPPLIER FEED INGESTION (src/lib/commerce/supplier-feed.ts):
+- ingestOffer() — the single entry point for all three ingestion paths.
+- Three convenience wrappers:
+  1. ingestOwnInfrastructure() — WiFi operator publishes their own hotspot plan (supplierId = null, no markup)
+  2. ingestSupplierFeed() — eSIM supplier's roaming product (supplierId = supplier, markup applied)
+  3. ingestTelcoProduct() — telco reseller imports a telecom product (supplierId = telco, markup applied)
+- Idempotent: if an offer with the same (tenantId, supplierId, spec, coverage) exists, it's updated.
+
+RESELLER MARKUP ENGINE (src/lib/commerce/markup-engine.ts):
+- calculateCustomerPrice() — resolves the most specific markup rule.
+- Resolution order (most specific to least specific):
+  1. capability+provider+supplier (triple-scoped)
+  2. capability+provider / capability+supplier / provider+supplier (double-scoped)
+  3. capability / provider / supplier (single-scoped)
+  4. global default (all nulls)
+  5. Tenant.defaultMarkupPercent (fallback)
+- Own infrastructure (supplierId = null) → no markup (wholesale = customer price).
+
+API ROUTES:
+- POST /api/commerce/rank — resolve an intent into ranked offers
+- GET/POST /api/commerce/markup — list/create markup rules
+
+TEST RESULTS (12/12 PASSING):
+  A: WiFi operator's own infrastructure ingested (no markup) ✅
+  B: eSIM supplier feed ingested (20% markup → customer price = 1200) ✅
+  C: Telco product ingested (15% markup → customer price = 2300) ✅
+  D: Markup engine resolves scoped rule over global default ✅
+  E: Ranking engine is deterministic (same inputs → same output) ✅
+  F: Ranking engine filters by capability type ✅
+  G: Ranking engine filters by budget ✅
+  H: Ranking engine scores location match (GH offers score higher for GH customer) ✅
+  I: Ranking engine incorporates reliability score ✅
+  J: All three reseller types ranked on the same playing field ✅
+  Static: ranking engine contains no Math.random or Date.now in scoring ✅
+  Static: kernel unchanged (entitlement.ts has no ranking/commerce code) ✅
+
+KEY PROOF — Test J:
+  All three reseller types (WiFi + eSIM + telco) are normalized into ConnectivityOffer2 rows and ranked together. The ranking engine doesn't know or care which path created the offer — it scores them identically on intent match, location match, availability, price, margin, and reliability.
+
+KERNEL PRESERVATION:
+  The frozen kernel (entitlement.ts, provisioning, adapter contract) is UNCHANGED.
+  Static test verifies entitlement.ts contains zero ranking/commerce code:
+    - no "rankOffers"
+    - no "ConnectivityOffer2"
+    - no "ResellerMarkup"
+    - no "calculateCustomerPrice"
+  The kernel still has all its frozen functions: provisionBinding, reconcileProvisioning, claimProvisioning, etc.
+
+Stage Summary:
+- HEAD: (to be committed)
+- New models: ConnectivityOffer2, ResellerMarkup, ConnectivityIntent (3 new entities)
+- New services: ranking-engine.ts, markup-engine.ts, supplier-feed.ts
+- New API: /api/commerce/rank, /api/commerce/markup
+- Tests: 12/12 PASSING (10 runtime + 2 static)
+- Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN (zero changes).

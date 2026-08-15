@@ -1040,6 +1040,10 @@ model Tenant {
   // Phase 3: commercial catalog + orders
   resellerProducts ResellerProduct[]
   customerOrders  CustomerOrder[]
+  // Phase 4: normalized offers + markup rules + customer intents
+  connectivityOffers ConnectivityOffer2[]
+  resellerMarkups  ResellerMarkup[]
+  connectivityIntents ConnectivityIntent[]
 
   @@index([status])
 }
@@ -1664,4 +1668,148 @@ model CustomerOrder {
   @@index([customerId])
   @@index([productId])
   @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — Reseller Operating System: Normalized Offers + Ranking Engine
+//
+// The core concept: every connectivity product — whether from a WiFi operator's
+// own infrastructure, a telco reseller's imported catalog, or an eSIM supplier's
+// roaming feed — is normalized into a ConnectivityOffer2 row that the ranking
+// engine can compare on a level playing field.
+//
+// (Named ConnectivityOffer2 to avoid collision with the legacy B2C-era
+// ConnectivityOffer model. A future cleanup can merge them.)
+//
+// A customer request (ConnectivityIntent) is resolved by the Offer Ranking
+// Engine into a ranked list of ConnectivityOffer2 rows, scored by:
+//   intent match + location match + availability + price + margin + reliability
+//
+// The reseller sets a markup (ResellerMarkup) on supplier offers to determine
+// the customer-facing price. The reseller's own infrastructure offers have
+// no markup (the reseller IS the supplier).
+//
+// This is the "Stripe + Shopify + AWS Marketplace for connectivity" layer:
+//   - Stripe: payment collection (existing)
+//   - Shopify: reseller catalog + storefront (Phase 3 + this)
+//   - AWS Marketplace: supplier feeds + normalized offers + ranking (this)
+// ---------------------------------------------------------------------------
+
+// A normalized connectivity offer. One row per sellable unit of connectivity.
+// Sources:
+//   1. Reseller's own infrastructure (WiFi hotspot plan) — supplierId = null
+//   2. Imported telecom product (telco reseller) — supplierId = Supplier
+//   3. eSIM roaming product (eSIM supplier feed) — supplierId = Supplier
+model ConnectivityOffer2 {
+  id              String   @id @default(cuid())
+  tenantId        String   // the reseller who owns/sells this offer
+
+  // What kind of connectivity
+  capabilityType  String   // INTERNET | ROAMING | LOCAL_NETWORK | VPN_ACCESS
+  providerType    String   // mikrotik | esim | wifi-isp | telco | future
+
+  // The normalized specification — what the customer gets
+  // JSON: { downloadMbps, uploadMbps, dataLimitBytes, validityDays,
+  //         allowedCountries[], allowedRegions[] }
+  spec            String
+
+  // Geographic coverage — for location-based ranking
+  // JSON: { countries: ["GH","NG"], regions: ["West Africa"], cities: ["Accra"],
+  //         lat, lng, radiusKm }
+  coverage        String
+
+  // Pricing (in currency minor units)
+  wholesalePriceMinor Int   @default(0) // what the reseller pays the supplier (0 for own infra)
+  customerPriceMinor  Int   @default(0) // what the customer pays (wholesale + markup)
+  currency        String   @default("USD")
+
+  // Source: who provides this connectivity
+  // null = the reseller's own infrastructure (they ARE the supplier)
+  // non-null = imported from a supplier feed
+  supplierId      String?
+
+  // Link to the reseller's product (if they've created a storefront product
+  // from this offer). null = not yet listed in the storefront.
+  resellerProductId String?
+
+  // Availability + reliability (for ranking)
+  status          String   @default("active") // active | suspended | exhausted | expired
+  reliabilityScore Float   @default(0.5) // 0.0–1.0, updated by reconciliation
+  lastProvisionedAt DateTime?
+  lastFailedAt    DateTime?
+  successCount    Int      @default(0)
+  failureCount    Int      @default(0)
+
+  // Validity window
+  validFrom       DateTime @default(now())
+  validUntil      DateTime?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([capabilityType])
+  @@index([providerType])
+  @@index([supplierId])
+  @@index([status])
+}
+
+// A reseller's markup rule on supplier offers.
+// The reseller can set a global default markup (on Tenant.defaultMarkupPercent)
+// and override per-capability or per-supplier.
+model ResellerMarkup {
+  id              String   @id @default(cuid())
+  tenantId        String
+  // Scope: which offers does this markup apply to?
+  // null = global default (overrides Tenant.defaultMarkupPercent)
+  // non-null = scoped to a specific capabilityType, providerType, or supplierId
+  capabilityType  String?
+  providerType    String?
+  supplierId      String?
+  // The markup as a percentage added to wholesale price
+  // customerPrice = wholesalePrice * (1 + markupPercent / 100)
+  markupPercent   Float    @default(0)
+  // OR a fixed markup in minor units (if markupPercent is 0)
+  markupFixedMinor Int     @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, capabilityType, providerType, supplierId])
+  @@index([tenantId])
+}
+
+// A customer's connectivity request, to be resolved by the ranking engine.
+// This is the "intent" that the ranking engine matches against offers.
+model ConnectivityIntent {
+  id              String   @id @default(cuid())
+  tenantId        String   // the reseller's storefront
+  customerId      String?
+
+  // What the customer wants
+  capabilityType  String?  // null = any
+  // JSON: { downloadMbps, uploadMbps, dataLimitBytes, validityDays,
+  //         allowedCountries[] }
+  desiredSpec     String?
+
+  // Where the customer is / wants connectivity
+  // JSON: { country, region, city, lat, lng }
+  location        String?
+
+  // Budget constraint (in minor units)
+  maxPriceMinor   Int?
+
+  // The ranked results (stored for analytics + debugging)
+  // JSON: [{ offerId, score, customerPrice, matchReasons[] }, ...]
+  rankedResults   String?
+
+  createdAt       DateTime @default(now())
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([customerId])
 }
