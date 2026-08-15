@@ -2329,3 +2329,65 @@ Stage Summary:
 - No production code was changed — this step is purely audit + preparation.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN (no changes).
 - The auditor's explicit validation labels are adopted: MOCK-VALIDATED, LIVE-PROVIDER-VALIDATED, MULTI-PROCESS-VALIDATED. These are NOT collapsed into "tests pass."
+
+---
+Task ID: 2C.4.10A
+Agent: Lead engineer (main) — Implement real live RouterOS test harness
+Task: The auditor found that the 2C.4.10 commit (a535841) contained TODO placeholders, not executable test code. Replace the scaffold with REAL, EXECUTABLE tests that make actual HTTP requests, assert on real responses, and record evidence.
+
+Work Log:
+- The auditor was correct: the previous a535841 commit's test file contained 22 test bodies that were all TODO comments. If a live endpoint were configured, the tests would pass without testing anything.
+- Rewrote tests/phase2c410-live-routeros.test.ts with REAL, EXECUTABLE test code — zero TODO placeholders. Every test now contains:
+  - Real FetchRouterOSTransport construction
+  - Real HTTP requests to RouterOS
+  - Real assertions on responses (expect status, body, field values)
+  - Real evidence logging
+
+- Key implementation details:
+  1. Unique harness prefix: every test username is `rl-live-${RUN_ID}-${testId}` where RUN_ID is unique per test run. Cleanup deterministically targets only this run's users.
+  2. Evidence logging: every HTTP operation is recorded in an evidenceLog array with testId, method, path, status, durationMs, timestamp. The EVIDENCE test outputs the full log.
+  3. RouterOS version recording: beforeAll calls GET /system/resource and records the version, board name, and architecture.
+  4. Deterministic cleanup: afterAll lists all /ip/hotspot/user, filters for the run's prefix, deletes each one, and verifies zero remain.
+  5. Test 4d (CRITICAL): DISCOVERS the actual duplicate-name behavior. Does NOT assume 409. Issues a real duplicate PUT, classifies the actual response (409, 400, 200 with existing, or other), and logs the classification. If RouterOS's behavior differs from the production client's assumption, the test documents it.
+
+- Tests implemented (20 live tests + 1 META):
+  1a: valid credentials → GET /system/resource → 200 + version
+  1b: wrong credentials → AUTHENTICATION error
+  1c: credential rotation → new transport with current credentials works
+  2a: rl-live-<runId>-<testId> username accepted by RouterOS
+  2b: .id vs username distinction (GET/PATCH/DELETE by .id, lookup by ?name=)
+  3a: GET absent → PUT creates
+  3b: GET existing → converge without PUT (idempotent)
+  3c: PUT timeout (1ms) → GET reconciliation
+  3d: concurrent PUTs via client → exactly one resource
+  4a: real HTTP status codes for GET/PUT/PATCH/DELETE
+  4b: real error payloads (missing name → PERMANENT, non-existent .id → NOT_FOUND)
+  4c: real timeout (1ms timeout → TIMEOUT error)
+  4d: DISCOVERY — actual duplicate-name behavior (classifies real response)
+  4e: actual response representation (field names, formats)
+  5a: external resource created → recovery GET finds it
+  5b: resource absent → createResource creates it
+  6a: auth failure → fail closed (no resource created)
+  6b: network interruption (non-routable) → RETRYABLE
+  6c: provider unavailable (connection refused) → fail closed
+  EVIDENCE: record RouterOS version + full operation log
+
+- Environment gate behavior verified:
+  - Without LIVE_ROUTEROS_ENDPOINT: 1 pass (META), 20 skip, 0 fail.
+  - The META test passes to explicitly document MOCK-VALIDATED status.
+  - All live tests are (skip), never (pass) — cannot be confused with mock validation.
+
+- Lint: clean. TypeScript: clean.
+
+Honest validation status (unchanged):
+  2C.4.5 – 2C.4.9: MOCK-VALIDATED
+  2C.4.10A:         IMPLEMENTED — NOT EXECUTED (no live RouterOS available in this environment)
+  2C.4.11:          NOT STARTED
+
+The test suite is now REAL CODE, not scaffold. When a live RouterOS endpoint becomes available, setting LIVE_ROUTEROS_ENDPOINT + LIVE_ROUTEROS_USERNAME + LIVE_ROUTEROS_PASSWORD and running the test will execute the full live validation matrix.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The 2C.4.10A test harness is now IMPLEMENTED (not scaffold). All 20 live tests contain real assertions.
+- No production code changed — this is purely test implementation.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
