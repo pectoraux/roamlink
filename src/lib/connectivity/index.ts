@@ -16,6 +16,8 @@ export {
   listResourceBindings,
   reconcileConnectivityEntitlements,
   reconcileBindingWithProvider,
+  claimProvisioning,
+  provisionBinding,
   createProviderInstance,
   listProviderInstances,
   getProviderInstance,
