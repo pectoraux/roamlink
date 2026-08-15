@@ -2138,3 +2138,38 @@ Stage Summary:
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: extended (documentation + lease enforcement). RouterOS client: extended (CONFLICT reconciliation).
 - REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED (no physical router available)
 - The auditor's exact test scenario (Test S) is proven: A claims → A sends PUT → A loses lease → B takes over → B reconciles → exactly ONE resource, ONE binding, same providerResourceId, stale A cannot overwrite.
+
+---
+Task ID: 2C.4.7
+Agent: Lead engineer (main) — Genuine Concurrent Provisioning/Conflict Harness
+Task: Address the auditor's critique that the 2C.4.6b convergence tests simulated the race with direct transport calls and manual DB mutations rather than running two REAL workers concurrently. Build a genuine concurrent harness that runs real createResource() and provisionBinding() workers simultaneously. The auditor specifically required: real concurrent PUT race in the client, two concurrent provisionBinding() workers, and stale worker overlapping live provisionBinding().
+
+Work Log:
+- Added GET gate + PUT-create pause to MockRouterOSTransport (Phase 2C.4.7 concurrency test harness):
+  - GET gate: when armed, GET-by-username requests block until releaseGetGate() is called. All blocked GETs resolve to "absent" ([]). This lets two real createResource() workers both observe "absent" before either issues a PUT — the genuine concurrent-PUT race.
+  - PUT-create pause: when armed, after a PUT creates a resource, the transport signals putCreated and blocks the PUT response until release() is called. This simulates a worker that has created the external resource but is still in-flight (slow provider response).
+- Created tests/phase2c47-concurrent-harness.test.ts with three genuine concurrent tests:
+  V: Two REAL RouterOSProviderClient.createResource() calls run concurrently. Both GET (blocked on gate) → released → both see absent → both PUT → first creates, second CONFLICT → second reconciles via GET → bind. Both return SAME providerResourceId. Exactly ONE resource. Proves the concurrent-PUT race at the client level, independent of the lease.
+  W: Two REAL provisionBinding() calls via Promise.all. The lease ensures only ONE wins the claim and issues a PUT. The loser gets claim_lost or already_provisioned. Exactly ONE resource, ONE PUT, ONE BOUND.
+  X: THE HARDEST RACE — Worker A's REAL provisionBinding() is blocked inside adapter.provision() AFTER the PUT created the resource (PUT-create pause). A's lease expires (20s test lease, heartbeat disabled at 120s). Worker B's REAL provisionBinding() takes over, GET finds A's resource, B finalizes to BOUND. A is released → A's claim-guarded transition rejects A (B already finalized) → A returns claim_lost. Exactly ONE resource, ONE PUT, ONE BOUND, stale A cannot overwrite.
+
+CRITICAL BUG FOUND AND FIXED (P0):
+- Test X exposed a P0 bug in claimGuardedTransition's return value handling. The function returns Promise<{ transitioned: boolean }>, but the success and explicit-failure paths in provisionBinding checked `if (!transitioned)` — which checks the truthiness of the OBJECT { transitioned: boolean }, not the boolean property. An object is ALWAYS truthy, so `!transitioned` was always false. This means the claim-guarded finalization NEVER rejected a stale worker unless the heartbeat caught it first.
+- The prior 2C.4.5 tests (Test G) didn't catch this because they tested the DB updateMany directly, not the claimGuardedTransition function. The prior 2C.4.6 tests (Test M) didn't catch this because they relied on the heartbeat setting heartbeatLost=true, which short-circuits before the buggy check.
+- Fix: changed `if (!transitioned)` to `if (!transitioned.transitioned)` at both call sites (success path and explicit-failure path). The catch branch already correctly checked `failureTransition.transitioned`.
+- This is exactly the kind of bug the auditor's demand for genuine concurrent tests was designed to expose: the simulated tests proved the DB guard worked, but didn't prove the calling code correctly interpreted the guard's return value.
+
+Test Results:
+- Phase 2C.4.7 (new): 4/4 PASSING (V, W, X, static)
+- Phase 2C.4.6 (regression): static tests 4/4 PASSING
+- Phase 2C.4.6b (regression): fast tests 5/5 PASSING
+- Lint: clean. TypeScript: clean.
+
+Stage Summary:
+- The genuine concurrent harness proves all three concurrency dimensions the auditor required:
+  1. Real concurrent PUT race in the client (Test V) — two real createResource() calls converge via CONFLICT.
+  2. Two real concurrent provisionBinding() workers (Test W) — lease ensures one winner, one resource.
+  3. Stale worker overlapping live provisionBinding() (Test X) — A blocked in adapter.provision(), B takes over, A's claim-guarded finalization rejects A.
+- The P0 bug in claimGuardedTransition's return value handling is FIXED. Without the genuine concurrent test, this bug would have remained undetected — the claim guard appeared to work in all prior tests because the heartbeat caught stale workers first.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN.
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED (no physical router available)

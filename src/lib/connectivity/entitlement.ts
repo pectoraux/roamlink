@@ -1769,7 +1769,7 @@ export async function provisionBinding(bindingId: string): Promise<{
         provisioningState: "COMPLETED",
       });
 
-      if (!transitioned) {
+      if (!transitioned.transitioned) {
         // Our lease was taken over by another worker — our result is stale
         logger.warn("connectivity.provisioning_result_stale", {
           bindingId, attemptId,
@@ -1793,7 +1793,7 @@ export async function provisionBinding(bindingId: string): Promise<{
         reason: result.error,
       });
 
-      if (!transitioned) {
+      if (!transitioned.transitioned) {
         // Our lease was taken over — another worker is handling it now
         return { status: "claim_lost", error: "Claim was taken over before failure finalization" };
       }

@@ -270,6 +270,79 @@ export class MockRouterOSTransport implements RouterOSTransport {
     this.strictConflictMode = enabled;
   }
 
+  // -------------------------------------------------------------------------
+  // Phase 2C.4.7: Concurrency Test Harness
+  //
+  // These features let tests create GENUINE concurrent races — two real
+  // workers executing createResource() or provisionBinding() simultaneously
+  // — rather than simulated races via direct transport calls.
+  //
+  // GET gate: when armed, GET-by-username requests block until released.
+  //   This lets two workers both observe "absent" before either issues a
+  //   PUT, creating the genuine concurrent-PUT race:
+  //     A: GET → absent (blocked)    B: GET → absent (blocked)
+  //     release both
+  //     A: PUT → creates             B: PUT → CONFLICT → GET → bind existing
+  //
+  // PUT-create pause: when armed, after a PUT creates a resource, the
+  //   transport signals putCreated and blocks the PUT response until
+  //   release() is called. This simulates a worker that has created the
+  //   external resource but is still in-flight (e.g., slow response):
+  //     A: PUT → resource created → BLOCKS (resource exists at provider)
+  //     B: takes over → GET → finds A's resource → binds it
+  //     release A → A returns → A cannot finalize (B already did)
+  // -------------------------------------------------------------------------
+
+  private getGateArmed = false;
+  private getGateResolvers: Array<(v: unknown) => void> = [];
+
+  armGetGate(): void {
+    this.getGateArmed = true;
+  }
+
+  get gatePendingCount(): number {
+    return this.getGateResolvers.length;
+  }
+
+  async waitForGetGateCount(n: number, timeoutMs = 5000): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (this.getGateResolvers.length >= n) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error(`waitForGetGateCount timed out after ${timeoutMs}ms (got ${this.getGateResolvers.length}, expected ${n})`);
+  }
+
+  releaseGetGate(): void {
+    this.getGateArmed = false;
+    const resolvers = this.getGateResolvers;
+    this.getGateResolvers = [];
+    for (const resolve of resolvers) {
+      resolve([]); // all blocked GETs see "absent"
+    }
+  }
+
+  private putPauseDeferred: { promise: Promise<void>; resolve: () => void } | null = null;
+  private putCreatedResolver: (() => void) | null = null;
+  private putCreatedPromise: Promise<void> | null = null;
+
+  armPutCreatePause(): { putCreated: Promise<void>; release: () => void } {
+    let resolvePause!: () => void;
+    let resolveCreated!: () => void;
+    this.putPauseDeferred = {
+      promise: new Promise((r) => { resolvePause = r; }),
+      resolve: () => resolvePause(),
+    };
+    this.putCreatedPromise = new Promise((r) => { resolveCreated = r; });
+    this.putCreatedResolver = () => resolveCreated();
+    return {
+      putCreated: this.putCreatedPromise,
+      release: () => {
+        this.putPauseDeferred?.resolve();
+      },
+    };
+  }
+
   /**
    * Set a failure mode for the next requests.
    * @param type error type to simulate
@@ -315,6 +388,13 @@ export class MockRouterOSTransport implements RouterOSTransport {
       const params = new URLSearchParams(hotspotUserQuery[1]);
       const name = params.get("name");
       if (name) {
+        // Phase 2C.4.7: GET gate — when armed, block this request until
+        // releaseGetGate() is called. All blocked GETs resolve to "absent".
+        if (this.getGateArmed) {
+          return new Promise<T | null>((resolve) => {
+            this.getGateResolvers.push(resolve as (v: unknown) => void);
+          });
+        }
         const resource = this.resources.get(name);
         if (!resource) return [] as T; // empty array
         return [resource] as T;
@@ -364,6 +444,18 @@ export class MockRouterOSTransport implements RouterOSTransport {
         ...input.body,
       };
       this.resources.set(username, resource);
+
+      // Phase 2C.4.7: PUT-create pause — when armed, signal that the resource
+      // has been created (so tests can proceed with worker B) and block this
+      // PUT response until release() is called (simulating a slow provider
+      // response while the resource already exists at the provider).
+      if (this.putPauseDeferred) {
+        this.putCreatedResolver?.();
+        this.putCreatedResolver = null;
+        await this.putPauseDeferred.promise;
+        this.putPauseDeferred = null;
+      }
+
       return resource as T;
     }
 
