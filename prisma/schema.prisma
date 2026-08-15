@@ -434,6 +434,8 @@ model Organization {
   esims     OrganizationESIM[]
   orders    CorporateOrder[]
   numbers   VirtualNumber[] @relation("OrgNumbers")
+  // Phase 6: B2B employee connectivity
+  employeeEntitlements EmployeeEntitlement[]
 }
 
 model OrganizationMember {
@@ -1044,6 +1046,11 @@ model Tenant {
   connectivityOffers ConnectivityOffer2[]
   resellerMarkups  ResellerMarkup[]
   connectivityIntents ConnectivityIntent[]
+  // Phase 6: reseller economics + marketplace intelligence
+  resellerEarnings ResellerEarning[]
+  providerCosts   ProviderCost[]
+  payouts         ResellerPayout[]
+  intentRequests  IntentRequest[]
 
   @@index([status])
 }
@@ -1812,4 +1819,108 @@ model ConnectivityIntent {
 
   @@index([tenantId])
   @@index([customerId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Business Layer: Reseller Economics + B2B + Intelligence
+//
+// Extends the existing commerce layer (not a replacement). Every financial
+// action still goes through the frozen double-entry ledger. These models
+// provide the commercial view on top of the ledger:
+//   - ResellerEarning: what the reseller netted per order
+//   - ProviderCost: what the reseller owes the supplier
+//   - ResellerPayout: withdrawal of earnings
+//   - IntentRequest: natural language intent → structured ranking
+//   - EmployeeEntitlement: B2B employee connectivity
+// ---------------------------------------------------------------------------
+
+model ResellerEarning {
+  id              String   @id @default(cuid())
+  tenantId        String
+  orderId         String
+  customerPaymentMinor Int  // what the customer paid
+  wholesaleCostMinor Int   // what the reseller paid the supplier (0 for own infra)
+  paymentFeeMinor Int      // payment processing fee
+  platformFeeMinor Int     // RoamLink's platform fee
+  resellerEarningMinor Int // customerPayment - wholesale - paymentFee - platformFee
+  currency        String   @default("USD")
+  createdAt       DateTime @default(now())
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId])
+  @@index([tenantId])
+}
+
+model ProviderCost {
+  id              String   @id @default(cuid())
+  tenantId        String
+  orderId         String
+  offerId         String?
+  supplierId      String?
+  wholesaleCostMinor Int
+  currency        String   @default("USD")
+  status          String   @default("pending") // pending | settled | disputed
+  settledAt       DateTime?
+  ledgerTransactionId String?
+  createdAt       DateTime @default(now())
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([orderId])
+  @@index([supplierId])
+}
+
+model ResellerPayout {
+  id              String   @id @default(cuid())
+  tenantId        String
+  amountMinor     Int
+  currency        String   @default("USD")
+  status          String   @default("pending") // pending | processing | completed | failed
+  method          String   // bank_transfer | mobile_money | stripe_transfer
+  destinationRef  String?
+  ledgerTransactionId String?
+  processedAt     DateTime?
+  failedAt        DateTime?
+  failureReason   String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status])
+}
+
+model IntentRequest {
+  id              String   @id @default(cuid())
+  tenantId        String
+  customerId      String?
+  rawText         String?
+  parsedIntent    String   // JSON: { capabilityType, desiredSpec, location, maxPriceMinor }
+  rankedOfferIds  String?  // JSON: [offerId, ...]
+  selectedOfferId String?
+  status          String   @default("pending") // pending | ranked | selected | purchased | expired
+  createdAt       DateTime @default(now())
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status])
+}
+
+model EmployeeEntitlement {
+  id              String   @id @default(cuid())
+  organizationId  String
+  memberId        String
+  entitlementId   String?
+  productId       String?
+  status          String   @default("pending") // pending | active | suspended | revoked
+  createdAt       DateTime @default(now())
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([memberId])
 }

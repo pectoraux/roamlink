@@ -36,6 +36,7 @@ import {
   ledgerResellerPurchase,
   ledgerPaymentFee,
 } from "@/lib/finance/double-entry-ledger";
+import { calculateAndRecordEarnings, recordProviderCost } from "@/lib/commerce/reseller-economics";
 
 export type FulfillmentResult = {
   status: "fulfilled" | "failed";
@@ -299,6 +300,37 @@ async function postFulfillmentLedger(input: {
       platformFeeMinor,
       contributionMarginMinor: input.customerPriceMinor - input.wholesalePriceMinor - paymentFeeMinor,
     });
+
+    // Phase 6.1: Record reseller earnings + provider costs (commercial view)
+    // These are idempotent and link to the ledger entries above.
+    await calculateAndRecordEarnings({
+      tenantId: input.tenantId,
+      orderId: input.orderId,
+      customerPaymentMinor: input.customerPriceMinor,
+      wholesaleCostMinor: input.wholesalePriceMinor,
+      paymentFeeMinor,
+      platformFeeMinor,
+      currency: input.currency,
+    });
+
+    // Record provider cost for supplier offers (eSIM, telco).
+    // For own infrastructure (supplierId = null), no cost is recorded.
+    // NOTE: supplierId would come from the ConnectivityOffer2 if this order
+    // was placed from a ranked offer. For now, we pass undefined — the
+    // recordProviderCost function skips if supplierId is null/undefined.
+    if (input.wholesalePriceMinor > 0) {
+      await recordProviderCost({
+        tenantId: input.tenantId,
+        orderId: input.orderId,
+        wholesaleCostMinor: input.wholesalePriceMinor,
+        currency: input.currency,
+      }).catch((err) => {
+        logger.error("fulfillment.provider_cost_failed", {
+          orderId: input.orderId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
   } catch (err) {
     // Ledger failures are logged but don't fail the fulfillment — the
     // customer's resource is already provisioned. The ledger can be

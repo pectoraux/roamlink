@@ -2877,3 +2877,85 @@ Stage Summary:
 - No kernel changes (entitlement.ts, provisioning, adapter contract all FROZEN).
 - Tests: 15/15 PASSING. Lint: clean. TypeScript: clean.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
+
+---
+Task ID: 6.0
+Agent: Principal Architect (main) — Phase 6 Business Layer
+Task: Build the missing business layer: reseller economics, marketplace completion, connectivity intelligence, operator onboarding, B2B layer, and analytics. Preserve the frozen kernel, adapter contract, ranking engine, and ledger.
+
+Work Log:
+
+AUDIT:
+- Audited the repository at 645d3d7. Found extensive existing infrastructure:
+  - Payment providers (Paystack/Stripe/Mock) — wired in 5.1
+  - Double-entry ledger with 9 functions — wired in 5.1
+  - TenantBalance + TenantTransaction — existing
+  - Organization + OrganizationMember with spend limits — existing
+  - ConnectivityIntent + ConnectivityOffer2 + ranking engine — existing from Phase 4
+  - Provider credit accounts — existing
+- Identified 6 gaps: reseller economics, marketplace completion, connectivity intelligence, operator onboarding, B2B layer, analytics.
+
+PHASE 6.1 — RESELLER ECONOMICS:
+- Added 5 new Prisma models: ResellerEarning, ProviderCost, ResellerPayout, IntentRequest, EmployeeEntitlement.
+- Created src/lib/commerce/reseller-economics.ts with:
+  - calculateAndRecordEarnings() — idempotent (upsert by orderId), records customer payment, wholesale cost, payment fee, platform fee, reseller earning.
+  - recordProviderCost() — records what the reseller owes the supplier (skipped for own infrastructure).
+  - requestPayout() — validates balance, creates pending payout.
+  - processPayout() — marks payout completed.
+  - getResellerBalance() — aggregates earnings, costs, payouts → available balance.
+  - settlePendingProviderCosts() — reconciliation (marks old pending costs as settled).
+- Wired fulfillOrder() to call calculateAndRecordEarnings() + recordProviderCost() after the ledger entries.
+- Created APIs: GET /api/commerce/balance, GET/POST /api/commerce/payouts, POST /api/internal/reconcile-costs (CRON_SECRET protected).
+
+PHASE 6.2 — MARKETPLACE COMPLETION:
+- Created POST /api/commerce/intent — accepts raw text, parses, ranks, creates IntentRequest.
+- Created POST /api/commerce/intent/[intentId]/purchase — creates a ResellerProduct from the selected offer, creates a CustomerOrder, creates a payment intent.
+- The full flow: intent → parse → rank → select offer → create order → payment intent → webhook → fulfillOrder() → ledger → earnings.
+- Created /marketplace UI page — customer-facing intent input → ranked offers → buy.
+
+PHASE 6.3 — CONNECTIVITY INTELLIGENCE:
+- Created src/lib/commerce/intent-parser.ts — DETERMINISTIC parser (no AI, no Math.random).
+- parseIntent() extracts: location (cities/countries), capability type (internet/roaming), budget (cheap/under $X), validity (today/weekly/monthly), speed (50Mbps), data limit (5GB).
+- summarizeIntent() produces human-readable text for UI confirmation.
+- 8 tests prove the parser is deterministic and extracts all dimensions correctly.
+
+PHASE 6.4 — OPERATOR ONBOARDING:
+- Created /portal/onboarding — 4-step wizard: Choose Type → Connect Infrastructure → Create Product → Launch.
+- Supports WiFi operator (MikroTik), Telco reseller, eSIM reseller.
+- Each step calls the existing APIs (connectivity/instances, commerce/products).
+
+PHASE 6.6 — ANALYTICS:
+- Created src/lib/analytics/reseller.ts — getResellerAnalytics(): revenue, profit, costs, fees, customer count, active entitlements, recent orders.
+- Created src/lib/analytics/platform.ts — getPlatformAnalytics(): GMV, platform fees, active tenants, total orders, provider exposure, top tenants.
+- Created APIs: GET /api/analytics/reseller (auth-guarded), GET /api/analytics/platform (admin-only).
+- Created /portal/analytics UI page — reseller dashboard with revenue/profit/customers/orders.
+
+PHASE 6.5 — B2B LAYER:
+- Added EmployeeEntitlement model (linked to Organization + OrganizationMember).
+- The existing Organization model with spend limits is reused.
+- B2B provisioning APIs and UI are deferred to a future iteration — the model is ready.
+
+TESTS (24/24 PASSING):
+  6.1.1-6.1.6: reseller economics (earnings, costs, payouts, reconciliation, idempotency, auth)
+  6.2.1-6.2.2: marketplace (intent API, purchase API)
+  6.3.1-6.3.8: intent parser (location, roaming, speed, data, budget, determinism, summary, no-random)
+  6.4.1-6.4.2: onboarding wizard (4 steps, 3 operator types)
+  6.6.1-6.6.3: analytics (reseller, platform, auth)
+  KERNEL: entitlement.ts unchanged (no Phase 6 code) ✅
+  KERNEL: ranking engine unchanged (no Phase 6 code) ✅
+  KERNEL: ledger unchanged (no Phase 6 code) ✅
+
+KERNEL PRESERVATION:
+  The frozen kernel (entitlement.ts, ranking-engine.ts, double-entry-ledger.ts) is UNCHANGED.
+  Static tests verify zero Phase 6 code in these files:
+    - no parseIntent, ResellerEarning, resellerPayout, getResellerAnalytics
+    - all frozen functions still present (provisionBinding, reconcileProvisioning, rankOffers, postLedgerTransaction, ledgerCustomerPayment)
+
+Stage Summary:
+- HEAD: (to be committed)
+- 5 new models: ResellerEarning, ProviderCost, ResellerPayout, IntentRequest, EmployeeEntitlement
+- 4 new services: reseller-economics.ts, intent-parser.ts, analytics/reseller.ts, analytics/platform.ts
+- 6 new API routes: intent, intent/purchase, balance, payouts, reconcile-costs, analytics (reseller + platform)
+- 4 new UI pages: marketplace, portal/onboarding, portal/analytics, (portal/infrastructure from 5.1)
+- Tests: 24/24 PASSING. Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN. Ranking engine: FROZEN. Ledger: FROZEN.

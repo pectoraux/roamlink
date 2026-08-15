@@ -22,7 +22,7 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Plus, Wifi, Smartphone, Package, ShoppingCart, CheckCircle2, XCircle, Clock, Router } from "lucide-react";
+import { Plus, Wifi, Smartphone, Package, ShoppingCart, CheckCircle2, XCircle, Clock, Router, TrendingUp, Search } from "lucide-react";
 
 export default async function PortalPage() {
   const user = await getCurrentUser();
@@ -114,6 +114,18 @@ export default async function PortalPage() {
               <Link href="/portal/infrastructure">
                 <Router className="mr-2 h-4 w-4" />
                 Infrastructure
+              </Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link href="/portal/analytics">
+                <TrendingUp className="mr-2 h-4 w-4" />
+                Analytics
+              </Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link href="/marketplace">
+                <Search className="mr-2 h-4 w-4" />
+                Marketplace
               </Link>
             </Button>
             <Button asChild>
