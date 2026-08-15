@@ -67,7 +67,7 @@ export interface RouterOSTransport {
    * @throws MikroTikProviderError on any failure
    */
   request<T = unknown>(input: {
-    method: "GET" | "POST" | "PATCH" | "DELETE";
+    method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     path: string; // e.g., "/ip/hotspot/user/testuser"
     body?: Record<string, unknown>;
   }): Promise<T | null>;
@@ -118,7 +118,7 @@ export class FetchRouterOSTransport implements RouterOSTransport {
   }
 
   async request<T = unknown>(input: {
-    method: "GET" | "POST" | "PATCH" | "DELETE";
+    method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     path: string;
     body?: Record<string, unknown>;
   }): Promise<T | null> {
@@ -254,7 +254,7 @@ export class MockRouterOSTransport implements RouterOSTransport {
   }
 
   async request<T = unknown>(input: {
-    method: "GET" | "POST" | "PATCH" | "DELETE";
+    method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
     path: string;
     body?: Record<string, unknown>;
   }): Promise<T | null> {
@@ -273,18 +273,41 @@ export class MockRouterOSTransport implements RouterOSTransport {
       }
     }
 
-    // Parse path: /ip/hotspot/user/{name}
+    // Parse path: /ip/hotspot/user/{id} or /ip/hotspot/user?name={username}
     const hotspotUserMatch = input.path.match(/^\/ip\/hotspot\/user\/(.+)$/);
+    const hotspotUserQuery = input.path.match(/^\/ip\/hotspot\/user\?(.+)$/);
     const hotspotUserBase = input.path === "/ip/hotspot/user";
 
-    if (input.method === "GET" && hotspotUserMatch) {
-      const username = decodeURIComponent(hotspotUserMatch[1]);
-      const resource = this.resources.get(username);
-      if (!resource) return null; // 404
-      return resource as T;
+    // GET /ip/hotspot/user?name={username} — lookup by name
+    if (input.method === "GET" && hotspotUserQuery) {
+      const params = new URLSearchParams(hotspotUserQuery[1]);
+      const name = params.get("name");
+      if (name) {
+        const resource = this.resources.get(name);
+        if (!resource) return [] as T; // empty array
+        return [resource] as T;
+      }
     }
 
-    if (input.method === "POST" && hotspotUserBase) {
+    // GET /ip/hotspot/user/{id} — get by .id
+    if (input.method === "GET" && hotspotUserMatch) {
+      const idOrUsername = decodeURIComponent(hotspotUserMatch[1]);
+      // Try by .id first, then by username
+      for (const [username, resource] of this.resources) {
+        if (resource[".id"] === idOrUsername || username === idOrUsername) {
+          return resource as T;
+        }
+      }
+      return null; // 404
+    }
+
+    // GET /ip/hotspot/user — list all
+    if (input.method === "GET" && hotspotUserBase) {
+      return Array.from(this.resources.values()) as T;
+    }
+
+    // PUT /ip/hotspot/user — create (RouterOS REST CRUD: PUT = create)
+    if (input.method === "PUT" && hotspotUserBase) {
       const username = input.body?.name as string;
       if (!username) throw new MikroTikProviderError("PERMANENT", "Missing 'name' in create body");
       // Idempotent: if exists, return it
@@ -303,22 +326,41 @@ export class MockRouterOSTransport implements RouterOSTransport {
       return resource as T;
     }
 
+    // PATCH /ip/hotspot/user/{id} — update by .id
     if (input.method === "PATCH" && hotspotUserMatch) {
-      const username = decodeURIComponent(hotspotUserMatch[1]);
-      const existing = this.resources.get(username);
-      if (!existing) {
-        throw new MikroTikProviderError("NOT_FOUND", `Resource not found: ${username}`);
+      const idOrUsername = decodeURIComponent(hotspotUserMatch[1]);
+      // Find by .id or username
+      let foundUsername: string | null = null;
+      for (const [username, resource] of this.resources) {
+        if (resource[".id"] === idOrUsername || username === idOrUsername) {
+          foundUsername = username;
+          break;
+        }
       }
+      if (!foundUsername) {
+        throw new MikroTikProviderError("NOT_FOUND", `Resource not found: ${idOrUsername}`);
+      }
+      const existing = this.resources.get(foundUsername)!;
       const updated = { ...existing, ...input.body };
-      this.resources.set(username, updated);
+      this.resources.set(foundUsername, updated);
       return updated as T;
     }
 
+    // DELETE /ip/hotspot/user/{id} — delete by .id
     if (input.method === "DELETE" && hotspotUserMatch) {
-      const username = decodeURIComponent(hotspotUserMatch[1]);
-      // Idempotent: deleting non-existent is a no-op
-      this.resources.delete(username);
-      return null; // 204
+      const idOrUsername = decodeURIComponent(hotspotUserMatch[1]);
+      // Find by .id or username
+      let foundUsername: string | null = null;
+      for (const [username, resource] of this.resources) {
+        if (resource[".id"] === idOrUsername || username === idOrUsername) {
+          foundUsername = username;
+          break;
+        }
+      }
+      if (foundUsername) {
+        this.resources.delete(foundUsername);
+      }
+      return null; // 204 — idempotent
     }
 
     // GET /ip/hotspot/active — active sessions (for usage)

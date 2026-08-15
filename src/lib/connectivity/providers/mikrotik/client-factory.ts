@@ -59,13 +59,9 @@ export async function createRouterOSClientForInstance(
   providerInstanceId: string,
   secretResolver: ProviderInstanceSecretResolver = new EnvProviderInstanceSecretResolver(),
 ): Promise<MikroTikProviderClient> {
-  // Check cache first (keyed by providerInstanceId — NOT global)
-  const cached = clientCache.get(providerInstanceId);
-  if (cached) {
-    return cached;
-  }
-
-  // Step 1: Load the provider instance from PostgreSQL
+  // Step 1: Load the provider instance from PostgreSQL FIRST (before cache check)
+  // This ensures the database state is authoritative — a cached client cannot
+  // override the current provider-instance configuration/status.
   const instance = await db.connectivityProviderInstance.findUnique({
     where: { id: providerInstanceId },
     select: {
@@ -76,6 +72,7 @@ export async function createRouterOSClientForInstance(
       status: true,
       configuration: true,
       configurationKey: true,
+      updatedAt: true,
     },
   });
 
@@ -102,14 +99,24 @@ export async function createRouterOSClientForInstance(
     );
   }
 
-  // Step 4: Resolve secrets via configurationKey
+  // Step 4: Check cache — but include a configuration fingerprint to detect changes
+  // The fingerprint includes configurationKey + updatedAt, so if either changes,
+  // the cache is invalidated.
+  const fingerprint = `${instance.configurationKey ?? ""}:${instance.updatedAt.toISOString()}`;
+  const cacheKey = `${providerInstanceId}:${fingerprint}`;
+  const cached = clientCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  // Step 5: Resolve secrets via configurationKey
   const configuration = instance.configuration ? JSON.parse(instance.configuration) : null;
   const credentials = await secretResolver.resolve({
     configurationKey: instance.configurationKey,
     configuration,
   });
 
-  // Step 5: Construct the transport + client
+  // Step 6: Construct the transport + client
   const transport = new FetchRouterOSTransport({
     endpoint: credentials.endpoint,
     username: credentials.username,
@@ -120,13 +127,16 @@ export async function createRouterOSClientForInstance(
 
   const client = new RouterOSProviderClient(transport, instance.name);
 
-  // Cache by providerInstanceId (NOT global)
-  clientCache.set(providerInstanceId, client);
+  // Cache by providerInstanceId + fingerprint (NOT global)
+  // Old cache entries for the same instance with different fingerprints
+  // are effectively orphaned (they won't be hit because the fingerprint changed).
+  clientCache.set(cacheKey, client);
 
   logger.info("routeros.client_created", {
     providerInstanceId,
     instanceName: instance.name,
     endpoint: credentials.endpoint, // endpoint is not secret
+    fingerprint, // for debugging cache invalidation
   });
 
   return client;

@@ -1,30 +1,30 @@
 /**
- * Phase 2C.4 — Real RouterOS Provider Client
+ * Phase 2C.4 / 2C.4.1 — Real RouterOS Provider Client
  *
  * Implements the MikroTikProviderClient interface using the RouterOS REST API.
- * This is the production client that talks to real MikroTik routers.
  *
- * Architecture:
- *   MikroTikConnectivityAdapter (generic contract translation)
- *     → RouterOSProviderClient (this file — RouterOS-specific operations)
- *       → RouterOSTransport (HTTP transport — injectable for tests)
+ * Phase 2C.4.1 — PROTOCOL CORRECTNESS:
+ *   - Uses PUT for create (RouterOS REST CRUD: PUT=create, PATCH=update,
+ *     DELETE=delete, GET=read, POST=command)
+ *   - Uses RouterOS .id (returned from PUT) for GET/PATCH/DELETE addressing
+ *   - Username (name) used for lookup, .id used for resource addressing
+ *   - Create retries: after timeout/ambiguity, GET to reconcile before retry
+ *   - No blind retry of non-idempotent create
  *
- * The client translates generic resource operations (create, get, suspend,
- * resume, delete, getUsage) into RouterOS REST API calls.
+ * Idempotency strategy for create:
+ *   1. GET by username → if exists, return it (idempotent)
+ *   2. PUT create → if timeout/error, DON'T blindly retry
+ *   3. After ambiguity: GET by username → if exists, return it (reconcile)
+ *   4. Only retry PUT if GET confirms resource is absent
  *
- * Error classification:
- *   RouterOS HTTP errors → MikroTikProviderError with typed errorType
- *   No RouterOS error strings leak into the generic entitlement layer.
- *
- * Idempotency:
- *   createResource: if user exists, return it (GET first, create if 404)
- *   suspendResource: PATCH disabled=true (idempotent)
- *   resumeResource: PATCH disabled=false (idempotent)
- *   deleteResource: DELETE (RouterOS returns 204 even if already deleted)
- *   getResource: GET (returns null on 404)
+ * Resource identity:
+ *   - RoamLink providerResourceId = RouterOS .id (the internal record ID)
+ *   - HotSpot username (name) = immutable correlation attribute
+ *   - GET by username uses ?name= query; GET/PATCH/DELETE by .id uses /{.id}
  */
 
 import type { MikroTikProviderClient, MikroTikResource, MikroTikResourceConfig } from "./client";
+import { MikroTikProviderError } from "./client";
 import type { RouterOSTransport } from "./transport";
 import { logger } from "@/lib/logger";
 
@@ -36,14 +36,14 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
   ) {}
 
   async createResource(config: MikroTikResourceConfig): Promise<MikroTikResource> {
-    // Idempotent: check if resource already exists
-    const existing = await this.getResource(config.username);
+    // Step 1: Check if resource already exists (idempotent)
+    const existing = await this.getResourceByUsername(config.username);
     if (existing) {
       logger.info("routeros.create_idempotent", { username: config.username, instance: this.instanceLabel });
       return existing;
     }
 
-    // Create the hotspot user
+    // Step 2: Create using PUT (RouterOS REST CRUD: PUT = create)
     const rateLimit = this.formatRateLimit(
       config.downloadRateLimitBps ?? 0,
       config.uploadRateLimitBps ?? 0,
@@ -63,62 +63,116 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
       body["limit-bytes-total"] = String(config.dataQuotaBytes);
     }
 
-    const created = await this.transport.request<Record<string, unknown>>({
-      method: "POST",
-      path: "/ip/hotspot/user",
-      body,
-    });
+    try {
+      const created = await this.transport.request<Record<string, unknown>>({
+        method: "PUT",
+        path: "/ip/hotspot/user",
+        body,
+      });
 
-    logger.info("routeros.created", { username: config.username, instance: this.instanceLabel });
+      logger.info("routeros.created", { username: config.username, instance: this.instanceLabel });
+      return this.parseResource(created ?? {});
+    } catch (err) {
+      // Phase 2C.4.1: Don't blindly retry create on timeout/network error.
+      // Instead, reconcile: check if the resource was actually created.
+      if (err instanceof MikroTikProviderError && (err.errorType === "TIMEOUT" || err.errorType === "RETRYABLE")) {
+        logger.warn("routeros.create_uncertain", {
+          username: config.username, instance: this.instanceLabel,
+          error: err.message,
+          message: "Create request had uncertain outcome — reconciling via GET before retry.",
+        });
 
-    return this.parseResource(config.username, created ?? {});
+        // Reconcile: check if the resource was created despite the error
+        const reconciled = await this.getResourceByUsername(config.username);
+        if (reconciled) {
+          logger.info("routeros.create_reconciled", {
+            username: config.username, instance: this.instanceLabel,
+            message: "Resource exists despite uncertain create — returning existing resource.",
+          });
+          return reconciled;
+        }
+
+        // Resource doesn't exist — safe to retry create
+        logger.info("routeros.create_retry_after_reconcile", {
+          username: config.username, instance: this.instanceLabel,
+        });
+        const created = await this.transport.request<Record<string, unknown>>({
+          method: "PUT",
+          path: "/ip/hotspot/user",
+          body,
+        });
+        logger.info("routeros.created_retry", { username: config.username, instance: this.instanceLabel });
+        return this.parseResource(created ?? {});
+      }
+
+      // Non-retryable error — rethrow
+      throw err;
+    }
   }
 
-  async getResource(username: string): Promise<MikroTikResource | null> {
+  /**
+   * Get a resource by its RouterOS .id (the internal record ID).
+   * This is the primary resource addressing method for GET/PATCH/DELETE.
+   */
+  async getResource(routerOSId: string): Promise<MikroTikResource | null> {
     const data = await this.transport.request<Record<string, unknown>>({
       method: "GET",
-      path: `/ip/hotspot/user/${encodeURIComponent(username)}`,
+      path: `/ip/hotspot/user/${encodeURIComponent(routerOSId)}`,
     });
 
     if (data === null) return null;
-
-    return this.parseResource(username, data);
+    return this.parseResource(data);
   }
 
-  async suspendResource(username: string): Promise<void> {
+  /**
+   * Lookup a resource by username (the HotSpot user name).
+   * Uses the ?name= query parameter.
+   * This is used for idempotency checks during create.
+   */
+  private async getResourceByUsername(username: string): Promise<MikroTikResource | null> {
+    const results = await this.transport.request<Array<Record<string, unknown>>>({
+      method: "GET",
+      path: `/ip/hotspot/user?name=${encodeURIComponent(username)}`,
+    });
+
+    if (!results || results.length === 0) return null;
+    return this.parseResource(results[0]);
+  }
+
+  async suspendResource(routerOSId: string): Promise<void> {
     await this.transport.request({
       method: "PATCH",
-      path: `/ip/hotspot/user/${encodeURIComponent(username)}`,
+      path: `/ip/hotspot/user/${encodeURIComponent(routerOSId)}`,
       body: { disabled: "true" },
     });
-    logger.info("routeros.suspended", { username, instance: this.instanceLabel });
+    logger.info("routeros.suspended", { routerOSId, instance: this.instanceLabel });
   }
 
-  async resumeResource(username: string): Promise<void> {
+  async resumeResource(routerOSId: string): Promise<void> {
     await this.transport.request({
       method: "PATCH",
-      path: `/ip/hotspot/user/${encodeURIComponent(username)}`,
+      path: `/ip/hotspot/user/${encodeURIComponent(routerOSId)}`,
       body: { disabled: "false" },
     });
-    logger.info("routeros.resumed", { username, instance: this.instanceLabel });
+    logger.info("routeros.resumed", { routerOSId, instance: this.instanceLabel });
   }
 
-  async deleteResource(username: string): Promise<void> {
+  async deleteResource(routerOSId: string): Promise<void> {
     await this.transport.request({
       method: "DELETE",
-      path: `/ip/hotspot/user/${encodeURIComponent(username)}`,
+      path: `/ip/hotspot/user/${encodeURIComponent(routerOSId)}`,
     });
-    logger.info("routeros.deleted", { username, instance: this.instanceLabel });
+    logger.info("routeros.deleted", { routerOSId, instance: this.instanceLabel });
   }
 
-  async getResourceUsage(username: string): Promise<{
+  async getResourceUsage(routerOSId: string): Promise<{
     downloadBytes: number;
     uploadBytes: number;
     sessionDurationSeconds: number;
     isActive: boolean;
   } | null> {
-    // Check if resource exists first
-    const resource = await this.getResource(username);
+    // Get the resource to check if it exists and get its username
+    const resource = await this.getResource(routerOSId);
     if (!resource) return null;
 
     // Get active sessions (for usage data)
@@ -127,7 +181,8 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
       path: "/ip/hotspot/active",
     });
 
-    // Find the session for this user
+    // Find the session for this user (by username, not .id)
+    const username = resource.id; // We store username as id for now; see parseResource
     const session = (activeSessions ?? []).find((s) => s.user === username);
 
     return {
@@ -142,23 +197,31 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
   // Helpers
   // ---------------------------------------------------------------------------
 
-  private parseResource(username: string, data: Record<string, unknown>): MikroTikResource {
+  /**
+   * Parse a RouterOS resource response into MikroTikResource.
+   *
+   * Phase 2C.4.1: Resource identity:
+   *   - id = RouterOS .id (the internal record ID, used for addressing)
+   *   - username = the HotSpot user name (used for lookup/correlation)
+   *
+   * The RoamLink providerResourceId stores the RouterOS .id.
+   */
+  private parseResource(data: Record<string, unknown>): MikroTikResource {
+    const routerOSId = data[".id"] as string | undefined;
+    const username = data.name as string | undefined;
+
     return {
-      id: username,
+      id: routerOSId ?? username ?? "", // Use .id as primary; fall back to username
       resourceType: "hotspot_user",
       isActive: data.disabled !== "true",
       downloadRateLimitBps: this.parseRateLimit(data["rate-limit"] as string | undefined, "down"),
       uploadRateLimitBps: this.parseRateLimit(data["rate-limit"] as string | undefined, "up"),
       sessionTimeoutSeconds: this.parseDurationSeconds(data["session-timeout"] as string | undefined),
       dataQuotaBytes: this.parseIntSafe(data["limit-bytes-total"] as string | undefined),
-      createdAt: new Date(), // RouterOS doesn't expose creation time via REST
+      createdAt: new Date(),
     };
   }
 
-  /**
-   * Format rate limit for RouterOS.
-   * RouterOS format: "down/up" (e.g., "50M/10M" for 50Mbps down, 10Mbps up)
-   */
   private formatRateLimit(downBps: number, upBps: number): string | null {
     if (downBps === 0 && upBps === 0) return null;
     const down = downBps > 0 ? `${Math.floor(downBps / 1_000_000)}M` : "0";
@@ -166,9 +229,6 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
     return `${down}/${up}`;
   }
 
-  /**
-   * Parse RouterOS rate limit string (e.g., "50M/10M") into bps.
-   */
   private parseRateLimit(rateLimit: string | undefined, direction: "down" | "up"): number | undefined {
     if (!rateLimit) return undefined;
     const parts = rateLimit.split("/");
@@ -182,10 +242,6 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
     return num * multiplier;
   }
 
-  /**
-   * Format duration in seconds as RouterOS duration string.
-   * RouterOS format: "1d2h3m4s" etc.
-   */
   private formatDuration(seconds: number): string {
     const days = Math.floor(seconds / 86400);
     const hours = Math.floor((seconds % 86400) / 3600);
@@ -199,9 +255,6 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
     return result || "0s";
   }
 
-  /**
-   * Parse RouterOS duration string (e.g., "1d2h3m4s") into seconds.
-   */
   private parseDurationSeconds(duration: string | undefined): number {
     if (!duration) return 0;
     let total = 0;
@@ -215,9 +268,6 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
     return total;
   }
 
-  /**
-   * Parse a RouterOS numeric string (may be empty or "0").
-   */
   private parseIntSafe(value: string | undefined): number {
     if (!value) return 0;
     const parsed = parseInt(value, 10);
