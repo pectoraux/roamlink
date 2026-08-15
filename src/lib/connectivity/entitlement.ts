@@ -1146,73 +1146,188 @@ export async function resolveBindingRuntime(bindingId: string): Promise<{
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2C.4.4: Durable Provisioning Claim
+// Phase 2C.4.5: Durable Provisioning Claim with Lease + Attempt Identity
 // ---------------------------------------------------------------------------
 
 /**
- * Phase 2C.4.4: Atomic provisioning claim.
+ * Phase 2C.4.5: Lease duration for provisioning claims (5 minutes).
+ * After this time, another worker may take over the claim.
+ */
+const PROVISIONING_LEASE_MS = 5 * 60 * 1000;
+
+/**
+ * Phase 2C.4.5: Atomic provisioning claim with attempt identity + lease.
  *
- * Transitions a binding from UNBOUND → PROVISIONING using a PostgreSQL-atomic
- * conditional mutation. Only ONE worker can win this claim. The loser gets
- * count=0 and must reconcile (GET) rather than issuing another PUT.
+ * Two claim paths:
+ *   1. UNBOUND → PROVISIONING (initial claim)
+ *   2. PROVISIONING + expired lease → PROVISIONING (lease takeover)
  *
- * This prevents the race where two concurrent workers both observe GET → absent
- * and both issue PUT create, potentially creating duplicate external resources.
+ * In both cases, a new provisioningAttemptId is generated and claimExpiresAt
+ * is set. Only the worker holding the attemptId may execute provider
+ * operations or finalize the binding.
  *
- * The claim is durable — if the winner crashes after claiming PROVISIONING,
- * the reconciliation worker will eventually retry (the binding is stuck in
- * PROVISIONING, which the stuck-binding scan detects).
+ * A stale worker (whose attemptId no longer matches) cannot mutate the binding
+ * — the finalization writes are guarded by WHERE provisioningAttemptId = X.
  *
  * Returns:
- *   { claimed: true } — this worker owns the provisioning attempt
- *   { claimed: false, currentStatus } — another worker owns it; reconcile instead
+ *   { claimed: true, attemptId } — this worker owns the provisioning attempt
+ *   { claimed: false, currentStatus } — another active worker owns it
  */
 export async function claimProvisioning(bindingId: string): Promise<{
   claimed: boolean;
+  attemptId?: string;
   currentStatus?: string;
 }> {
-  // Atomic conditional mutation: only UNBOUND → PROVISIONING
-  const result = await db.providerResourceBinding.updateMany({
+  const now = new Date();
+  const attemptId = `attempt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const claimExpiresAt = new Date(now.getTime() + PROVISIONING_LEASE_MS);
+
+  // Path 1: UNBOUND → PROVISIONING (initial claim)
+  const initialClaim = await db.providerResourceBinding.updateMany({
     where: { id: bindingId, status: BINDING_STATES.UNBOUND },
-    data: { status: BINDING_STATES.PROVISIONING, provisioningState: "PENDING" },
+    data: {
+      status: BINDING_STATES.PROVISIONING,
+      provisioningState: "PENDING",
+      provisioningAttemptId: attemptId,
+      claimExpiresAt,
+    },
   });
 
-  if (result.count === 0) {
-    // Another worker already claimed it (or it's in a different state)
-    const current = await db.providerResourceBinding.findUnique({
-      where: { id: bindingId },
-      select: { status: true },
-    });
-    return { claimed: false, currentStatus: current?.status };
+  if (initialClaim.count > 0) {
+    logger.info("connectivity.provisioning_claimed", { bindingId, attemptId, claimType: "initial" });
+    return { claimed: true, attemptId };
   }
 
-  logger.info("connectivity.provisioning_claimed", { bindingId });
-  return { claimed: true };
+  // Path 2: PROVISIONING + expired lease → takeover
+  // The current claim's lease has expired — another worker may take over.
+  const current = await db.providerResourceBinding.findUnique({
+    where: { id: bindingId },
+    select: { status: true, claimExpiresAt: true, provisioningAttemptId: true },
+  });
+
+  if (!current) {
+    return { claimed: false, currentStatus: "not_found" };
+  }
+
+  // If the current status is not PROVISIONING, we can't claim (it's BOUND, FAILED, etc.)
+  if (current.status !== BINDING_STATES.PROVISIONING) {
+    return { claimed: false, currentStatus: current.status };
+  }
+
+  // Check if the lease has expired
+  if (current.claimExpiresAt && current.claimExpiresAt > now) {
+    // Lease is still active — another worker owns it
+    return { claimed: false, currentStatus: current.status };
+  }
+
+  // Lease has expired — take over atomically
+  const takeoverClaim = await db.providerResourceBinding.updateMany({
+    where: {
+      id: bindingId,
+      status: BINDING_STATES.PROVISIONING,
+      // Only take over if the lease has expired (or is null — legacy)
+      OR: [
+        { claimExpiresAt: { lt: now } },
+        { claimExpiresAt: null },
+      ],
+    },
+    data: {
+      provisioningAttemptId: attemptId,
+      claimExpiresAt,
+    },
+  });
+
+  if (takeoverClaim.count > 0) {
+    logger.info("connectivity.provisioning_claimed", {
+      bindingId, attemptId, claimType: "takeover",
+      previousAttemptId: current.provisioningAttemptId,
+    });
+    return { claimed: true, attemptId };
+  }
+
+  // Another worker took over between our read and write
+  return { claimed: false, currentStatus: current.status };
 }
 
 /**
- * Phase 2C.4.4: Kernel-level provisioning orchestration.
+ * Phase 2C.4.5: Claim-guarded finalization.
+ *
+ * Transitions the binding to a new state ONLY if the caller holds the
+ * current provisioning attempt. This prevents a stale worker from
+ * mutating the binding after its lease has expired and another worker
+ * has taken over.
+ *
+ * WHERE id = bindingId
+ *   AND provisioningAttemptId = attemptId
+ *   AND status = expectedStatus
+ */
+async function claimGuardedTransition(input: {
+  bindingId: string;
+  attemptId: string;
+  toState: BindingState;
+  providerResourceId?: string;
+  providerMetadata?: Record<string, unknown>;
+  provisioningState?: string;
+  reason?: string;
+}): Promise<{ transitioned: boolean }> {
+  const updateData: Record<string, unknown> = {
+    status: input.toState,
+    failureReason: input.reason ?? null,
+    provisioningAttemptId: null, // Clear the claim after finalization
+    claimExpiresAt: null,
+  };
+  if (input.providerResourceId !== undefined) {
+    updateData.providerResourceId = input.providerResourceId;
+  }
+  if (input.providerMetadata !== undefined) {
+    updateData.providerMetadata = JSON.stringify(input.providerMetadata);
+  }
+  if (input.provisioningState !== undefined) {
+    updateData.provisioningState = input.provisioningState;
+  }
+
+  const result = await db.providerResourceBinding.updateMany({
+    where: {
+      id: input.bindingId,
+      provisioningAttemptId: input.attemptId,
+      status: BINDING_STATES.PROVISIONING,
+    },
+    data: updateData,
+  });
+
+  if (result.count === 0) {
+    // The caller's attemptId no longer matches — lease was taken over by another worker
+    logger.warn("connectivity.provisioning_stale_worker", {
+      bindingId: input.bindingId,
+      attemptId: input.attemptId,
+      message: "CRITICAL: Stale worker attempted finalization — claim was taken over by another worker.",
+    });
+    return { transitioned: false };
+  }
+
+  return { transitioned: true };
+}
+
+/**
+ * Phase 2C.4.5: Kernel-level provisioning orchestration with lease.
  *
  * This is the canonical way to provision a binding. It:
  *   1. Atomically claims the provisioning (UNBOUND → PROVISIONING)
+ *      with a unique attemptId + lease expiry
  *   2. Only the winner calls the adapter's provision()
- *   3. The loser reconciles (GET) instead of issuing another PUT
- *   4. On success: transitions to BOUND + stores providerResourceId
- *   5. On failure: transitions to FAILED
+ *   3. The loser gets claim_lost and reconciles instead
+ *   4. On success: claim-guarded transition to BOUND
+ *   5. On failure: claim-guarded transition to FAILED
+ *   6. If the winner crashes, the lease expires and another worker takes over
  *
- * This prevents the race where two concurrent workers both observe
- * GET → absent and both issue PUT create to the provider.
- *
- * The adapter contract is unchanged — the adapter still receives the
- * generic binding/entitlement inputs. The claim is a kernel-level
- * durable state machine concern, not an adapter concern.
+ * A stale worker (whose attemptId no longer matches) cannot finalize the binding.
  */
 export async function provisionBinding(bindingId: string): Promise<{
   status: "success" | "failed_retryable" | "failed_permanent" | "already_provisioned" | "claim_lost";
   providerResourceId?: string;
   error?: string;
 }> {
-  // Step 1: Resolve the runtime context (adapter, binding, entitlement, instance)
+  // Step 1: Resolve the runtime context
   const { adapter, binding, entitlement } = await resolveBindingRuntime(bindingId);
 
   // Step 2: If already BOUND, return success (idempotent)
@@ -1220,36 +1335,17 @@ export async function provisionBinding(bindingId: string): Promise<{
     return { status: "already_provisioned", providerResourceId: binding.providerResourceId ?? undefined };
   }
 
-  // Step 3: If PROVISIONING with no providerResourceId, another worker may be
-  // handling it OR the previous attempt failed and left it stuck.
-  // For retry: if the binding is PROVISIONING but has no providerResourceId,
-  // and the caller is explicitly retrying (from FAILED → PROVISIONING),
-  // we allow the provision attempt. The claim is already held.
-  if (binding.status === BINDING_STATES.PROVISIONING) {
-    if (binding.providerResourceId) {
-      // The resource was already created — return it
-      return { status: "already_provisioned", providerResourceId: binding.providerResourceId };
-    }
-    // No providerResourceId — either another worker is in-flight, or
-    // this is a retry from a previous failure that left the binding in PROVISIONING.
-    // We proceed with the provision attempt — the adapter's own idempotency
-    // (GET before PUT) will handle the case where the resource was already created.
-    // This is safe because the adapter does GET → absent → PUT, and the
-    // GET-before-PUT check is the real idempotency boundary.
-    logger.info("connectivity.provisioning_retry", { bindingId, message: "Binding in PROVISIONING with no providerResourceId — retrying provision." });
-    // Fall through to step 5 (skip the claim — it's already PROVISIONING)
-  } else {
-    // Step 4: Atomic claim — UNBOUND → PROVISIONING
-    const claim = await claimProvisioning(bindingId);
-    if (!claim.claimed) {
-      // Another worker won the claim
-      return { status: "claim_lost", error: `Another worker claimed provisioning (status: ${claim.currentStatus})` };
-    }
+  // Step 3: Atomic claim (with lease + attempt identity)
+  const claim = await claimProvisioning(bindingId);
+  if (!claim.claimed) {
+    return { status: "claim_lost", error: `Another worker owns the provisioning claim (status: ${claim.currentStatus})` };
   }
 
-  // Step 5: Winner — call the adapter's provision()
+  const attemptId = claim.attemptId!;
+
+  // Step 4: Winner — call the adapter's provision()
   try {
-    // Re-resolve the binding (it's now PROVISIONING)
+    // Re-resolve the binding (it's now PROVISIONING with our attemptId)
     const { binding: updatedBinding, entitlement: updatedEntitlement } = await resolveBindingRuntime(bindingId);
 
     const result = await adapter.provision({
@@ -1258,46 +1354,63 @@ export async function provisionBinding(bindingId: string): Promise<{
     });
 
     if (result.status === "success") {
-      // Step 6: Transition to BOUND + store providerResourceId
-      await transitionBinding({
+      // Step 5: Claim-guarded transition to BOUND
+      const transitioned = await claimGuardedTransition({
         bindingId,
+        attemptId,
         toState: BINDING_STATES.BOUND,
         providerResourceId: result.providerResourceId,
         providerMetadata: result.providerMetadata,
         provisioningState: "COMPLETED",
       });
 
+      if (!transitioned) {
+        // Our lease was taken over by another worker — our result is stale
+        logger.warn("connectivity.provisioning_result_stale", {
+          bindingId, attemptId,
+          message: "Provider operation succeeded but claim was taken over — result is stale.",
+        });
+        return { status: "claim_lost", error: "Claim was taken over before finalization" };
+      }
+
       logger.info("connectivity.provisioning_succeeded", {
-        bindingId, providerResourceId: result.providerResourceId,
+        bindingId, attemptId, providerResourceId: result.providerResourceId,
       });
 
       return { status: "success", providerResourceId: result.providerResourceId };
     } else {
-      // Provisioning failed — transition to FAILED
-      await transitionBinding({
+      // Provisioning failed — claim-guarded transition to FAILED
+      const transitioned = await claimGuardedTransition({
         bindingId,
+        attemptId,
         toState: BINDING_STATES.FAILED,
         provisioningState: "FAILED",
         reason: result.error,
       });
 
+      if (!transitioned) {
+        // Our lease was taken over — another worker is handling it now
+        return { status: "claim_lost", error: "Claim was taken over before failure finalization" };
+      }
+
       logger.warn("connectivity.provisioning_failed", {
-        bindingId, error: result.error, classification: result.status,
+        bindingId, attemptId, error: result.error, classification: result.status,
       });
 
       return { status: result.status, error: result.error };
     }
   } catch (err) {
-    // Unexpected error — transition to FAILED
+    // Unexpected error — claim-guarded transition to FAILED
     const errorMsg = err instanceof Error ? err.message : String(err);
-    await transitionBinding({
+    await claimGuardedTransition({
       bindingId,
+      attemptId,
       toState: BINDING_STATES.FAILED,
       provisioningState: "FAILED",
       reason: errorMsg,
-    }).catch(() => {}); // best-effort
+    }).catch(() => {});
 
-    logger.error("connectivity.provisioning_error", { bindingId, error: errorMsg });
+    logger.error("connectivity.provisioning_error", { bindingId, attemptId, error: errorMsg });
 
     return { status: "failed_permanent", error: errorMsg };
   }

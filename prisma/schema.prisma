@@ -1522,6 +1522,14 @@ model ProviderResourceBinding {
   // CLASS; providerInstanceId selects the specific infrastructure INSTANCE.
   // Immutable after provisioning begins (PROVISIONING or later states).
   providerInstanceId String?
+  // Phase 2C.4.5: Durable provisioning claim identity + lease.
+  // Only the worker holding provisioningAttemptId may execute provider operations
+  // or finalize the binding. A stale worker (whose attemptId no longer matches)
+  // cannot mutate the binding.
+  provisioningAttemptId String?
+  // Phase 2C.4.5: When the current provisioning claim expires.
+  // After this time, another worker may atomically take over the claim.
+  claimExpiresAt  DateTime?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
