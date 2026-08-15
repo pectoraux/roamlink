@@ -36,22 +36,28 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
   ) {}
 
   async createResource(config: MikroTikResourceConfig): Promise<MikroTikResource> {
-    // Step 1: Check if resource already exists (idempotent)
-    // If the GET lookup fails with a retryable error, proceed to create —
-    // the lookup is an optimization, not a requirement.
-    let existing: MikroTikResource | null = null;
+    // Step 1: Check if resource already exists (idempotent).
+    // Phase 2C.4.3: FAIL CLOSED on lookup uncertainty.
+    // Unknown external state ≠ resource absent.
+    // If the GET lookup fails with a retryable/timeout error, we do NOT
+    // proceed to PUT — we don't know whether the resource already exists.
+    // Only confirmed absence permits creation.
+    let existing: MikroTikResource | null;
     try {
       existing = await this.getResourceByUsername(config.username);
     } catch (err) {
-      if (err instanceof MikroTikProviderError && (err.errorType === "RETRYABLE" || err.errorType === "TIMEOUT")) {
-        logger.warn("routeros.create_lookup_failed", {
+      // Any lookup failure (retryable, timeout, auth, permanent) → FAIL CLOSED.
+      // Do NOT proceed to PUT with unknown external state.
+      if (err instanceof MikroTikProviderError) {
+        logger.error("routeros.create_lookup_failed_closed", {
           username: config.username, instance: this.instanceLabel,
+          errorType: err.errorType,
           error: err.message,
-          message: "Idempotency lookup failed — proceeding to create.",
+          message: "CRITICAL: Idempotency lookup failed — refusing to create with unknown external state.",
         });
-      } else {
-        throw err;
+        throw err; // Re-throw — the caller (adapter) will classify it
       }
+      throw err;
     }
     if (existing) {
       logger.info("routeros.create_idempotent", { username: config.username, instance: this.instanceLabel });
