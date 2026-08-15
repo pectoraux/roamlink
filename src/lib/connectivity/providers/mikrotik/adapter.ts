@@ -110,14 +110,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
   readonly label = "MikroTik Connectivity Provider";
 
   /**
-   * Phase 2C.3.3: The adapter receives a client RESOLVER, not a fixed client.
+   * Phase 2C.3.3 / 2C.3.4: The adapter receives a client RESOLVER, not a fixed client.
    *
    * The resolver maps providerInstanceId → MikroTikProviderClient.
    * This allows the SAME adapter class to operate against different MikroTik
    * routers using different clients.
    *
-   * If no providerInstanceId is set on the binding (legacy/null), the resolver
-   * is called with null — it should return a default client for backward compat.
+   * Phase 2C.3.4: There is NO default client. If providerInstanceId is null
+   * or the resolver cannot find a client for the instance, the operation
+   * FAILS CLOSED. No backward-compat fallback to a default infrastructure.
    */
   constructor(private readonly clientResolver: MikroTikClientResolver) {}
 

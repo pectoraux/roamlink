@@ -1,40 +1,52 @@
 /**
- * Phase 2C.3 / 2C.3.1 / 2C.3.3 — MikroTik provider registration.
+ * Phase 2C.3 / 2C.3.1 / 2C.3.3 / 2C.3.4 — MikroTik provider registration.
  *
  * Registers the MikroTik connectivity adapter with the provider registry.
  * The adapter receives a MikroTikClientResolver (not a fixed client).
  *
- * The resolver maps providerInstanceId → MikroTikProviderClient.
- * This allows the SAME adapter class to operate against different MikroTik
- * routers using different clients.
+ * Phase 2C.3.4 — FAIL-CLOSED RESOLUTION:
+ *   The production resolver MUST NEVER fall back to a default client for
+ *   an unknown providerInstanceId. If a client cannot be resolved for the
+ *   specific instance, the operation FAILS CLOSED.
  *
- * Development/testing: uses a mock client registry that returns
- * MockMikroTikProviderClient instances.
- * Production (future): would create/cache RouterOSProviderClient instances
- * based on the provider instance configuration (endpoint URL, credentials
- * from secrets manager, etc.).
+ *   known configured instance → resolve specific client
+ *   unknown instance          → typed provider-instance-not-configured error
+ *   inactive instance         → reject
+ *   invalid configuration     → reject
+ *
+ *   There is NO default provider instance. No silent fallback.
+ *
+ * Test/development: uses a mock client registry (registerMockClientForInstance).
+ * Production (future Phase 2C.4): would create/cache RouterOSProviderClient
+ * instances based on the provider instance configuration (endpoint URL,
+ * credentials from secrets manager, etc.).
  */
 
 import { registerConnectivityProvider } from "../../registry";
 import { MikroTikConnectivityAdapter } from "./adapter";
-import { mockMikroTikProviderClient } from "./mock-client";
-import type { MikroTikClientResolver } from "./client";
+import { MikroTikProviderError } from "./client";
+import type { MikroTikClientResolver, MikroTikProviderClient } from "./client";
+
+// ---------------------------------------------------------------------------
+// Test-only mock client registry
+// ---------------------------------------------------------------------------
 
 /**
- * Phase 2C.3.3: Mock client registry for development/testing.
+ * TEST-ONLY mock client registry.
  *
- * Maps providerInstanceId → MikroTikProviderClient.
- * In production, this would be a real client factory that creates
- * RouterOSProviderClient instances based on instance configuration.
+ * Maps providerInstanceId → MikroTikProviderClient for testing.
+ * This is NOT used by the production resolver — it's a separate test
+ * facility that tests can inject via a custom resolver.
  *
- * For testing, callers can register specific clients for specific instances
- * using registerMockClientForInstance().
+ * In production, the resolver would load ConnectivityProviderInstance
+ * from PostgreSQL, resolve secrets via configurationKey, and construct
+ * a real RouterOSProviderClient. That factory doesn't exist yet (Phase 2C.4).
  */
 const mockClientRegistry = new Map<string, MikroTikProviderClient>();
 
 /**
  * Register a specific mock client for a specific provider instance.
- * Test-only — allows tests to verify that binding A uses client A.
+ * TEST-ONLY — allows tests to verify that binding A uses client A.
  */
 export function registerMockClientForInstance(providerInstanceId: string, client: MikroTikProviderClient): void {
   mockClientRegistry.set(providerInstanceId, client);
@@ -42,30 +54,55 @@ export function registerMockClientForInstance(providerInstanceId: string, client
 
 /**
  * Clear all mock client registrations (test cleanup).
+ * TEST-ONLY.
  */
 export function clearMockClientRegistry(): void {
   mockClientRegistry.clear();
 }
 
+// ---------------------------------------------------------------------------
+// Fail-closed client resolver
+// ---------------------------------------------------------------------------
+
 /**
- * The client resolver used by the registered MikroTik adapter.
+ * Phase 2C.3.4: The production client resolver.
  *
- * For each providerInstanceId:
- *   1. If a specific client is registered for that instance → use it
- *   2. Otherwise → fall back to the default mock client
+ * This resolver is FAIL-CLOSED. It does NOT fall back to a default client.
  *
- * In production, this resolver would create RouterOSProviderClient instances
- * based on the provider instance configuration (endpoint, credentials, etc.).
+ * Resolution path:
+ *   1. Check the test-only mock registry (if a client is registered for
+ *      this instance, return it — this is how tests inject specific clients)
+ *   2. If no client is registered → throw MikroTikProviderError(PERMANENT)
+ *
+ * In production (Phase 2C.4), step 1 would be replaced with:
+ *   1. Load ConnectivityProviderInstance from PostgreSQL
+ *   2. Verify instance.providerType === "mikrotik"
+ *   3. Verify instance.status === "active"
+ *   4. Resolve secrets via configurationKey
+ *   5. Construct/cache RouterOSProviderClient
+ *
+ * But the fail-closed behavior remains: if the client cannot be resolved
+ * for THIS SPECIFIC instance, the operation fails. No fallback.
  */
-const defaultResolver: MikroTikClientResolver = (input) => {
+const failClosedResolver: MikroTikClientResolver = (input) => {
+  // Check the test-only mock registry
   const registered = mockClientRegistry.get(input.providerInstanceId);
   if (registered) {
     return registered;
   }
-  // Fall back to the default mock client (backward compatibility)
-  return mockMikroTikProviderClient;
+
+  // Phase 2C.3.4: FAIL CLOSED — no default client fallback.
+  // In production, this is where the real client factory would run.
+  // For now, any instance not explicitly registered in the test registry
+  // is "not configured" and must fail.
+  throw new MikroTikProviderError(
+    "PERMANENT",
+    `Provider instance "${input.providerInstanceId}" has no configured MikroTik client. ` +
+    `No fallback to a default client — each infrastructure instance must be explicitly configured. ` +
+    `(In production, this would load the instance configuration and create a RouterOSProviderClient.)`,
+  );
 };
 
-// Register the MikroTik adapter with the client resolver.
-const mikrotikAdapter = new MikroTikConnectivityAdapter(defaultResolver);
+// Register the MikroTik adapter with the fail-closed resolver.
+const mikrotikAdapter = new MikroTikConnectivityAdapter(failClosedResolver);
 registerConnectivityProvider(mikrotikAdapter);
