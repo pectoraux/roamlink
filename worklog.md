@@ -2173,3 +2173,39 @@ Stage Summary:
 - The P0 bug in claimGuardedTransition's return value handling is FIXED. Without the genuine concurrent test, this bug would have remained undetected — the claim guard appeared to work in all prior tests because the heartbeat caught stale workers first.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN.
 - REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED (no physical router available)
+
+---
+Task ID: 2C.4.8
+Agent: Lead engineer (main) — Lease Acquisition Race Hardening
+Task: Address the three remaining adversarial concerns from the auditor's review of 2C.4.7: (1) heartbeat-vs-takeover race, (2) takeover ABA problem, (3) provider convergence identity verification.
+
+Work Log:
+- Audited all three concerns against the current implementation:
+  1. HEARTBEAT-VS-TAKEOVER RACE (P0 confirmed): extendProvisioningLease's WHERE clause was {id, provisioningAttemptId, status=PROVISIONING} — it did NOT check if the lease was expired. A delayed heartbeat (firing after the lease expired) could "resurrect" the expired lease by setting claimExpiresAt to a future value, blocking a concurrent takeover that legitimately observed the expired lease.
+  2. TAKEOVER ABA (confirmed): the takeover UPDATE conditioned on {status=PROVISIONING, claimExpiresAt<now OR null} but did NOT condition on the observed provisioningAttemptId. If another worker took over between the read and the write (changing the attemptId), the stale worker's UPDATE could still match if the new lease was also expired.
+  3. CONVERGENCE IDENTITY (verified OK): username = `rl-${binding.id.slice(-12)}` — binding.id is a cuid() generated at creation, immutable. The derivation is deterministic. Correct.
+
+- Fix 1 (heartbeat): Added `claimExpiresAt: { gt: now }` to extendProvisioningLease's WHERE clause. A delayed heartbeat now fails (0 rows) once the lease has expired — it cannot resurrect an expired lease. The worker detects the loss (heartbeatLost=true) and discards its result. The takeover can proceed unimpeded. The lease and the heartbeat are now mutually exclusive with the takeover: lease NOT expired → heartbeat succeeds, takeover fails; lease IS expired → heartbeat fails, takeover succeeds.
+
+- Fix 2 (takeover ABA): Added `provisioningAttemptId: current.provisioningAttemptId` to the takeover UPDATE's WHERE clause. The takeover is now conditional on the exact observed (attemptId, expiry) pair, not just the expiry. If another worker took over between the read and the write (changing the attemptId), the stale worker's UPDATE matches 0 rows and returns claimed=false, forcing a re-read. This closes the ABA problem.
+
+- Created tests/phase2c48-lease-acquisition-races.test.ts — 7 tests:
+  Y: heartbeat fails when lease has expired (cannot resurrect). Proves the delayed-heartbeat race is closed.
+  Z: takeover fails if another worker took over between read and write (ABA). Proves the takeover is conditional on the observed attemptId.
+  AA: same binding always produces the same RouterOS username (deterministic identity). Verifies the convergence key is immutable.
+  AB: heartbeat and takeover are mutually exclusive in both lease states (fresh vs expired). Proves the combined race is closed.
+  2 static tests: verify the claimExpiresAt > now guard and the provisioningAttemptId = observed guard are present in the source.
+
+Test Results:
+- Phase 2C.4.8 (new): 7/7 PASSING (5 runtime + 2 static)
+- Lint: clean. TypeScript: clean.
+- Regression: 2C.4.7 static tests pass.
+
+Stage Summary:
+- The three auditor concerns are addressed:
+  1. Heartbeat cannot resurrect an expired lease (claimExpiresAt > now guard).
+  2. Takeover is conditional on the observed attemptId (ABA fence).
+  3. Provider convergence identity is deterministic (username derived from immutable binding.id).
+- The heartbeat-vs-takeover race is now formally mutually exclusive: the two operations cannot both succeed at the same point in time, because the lease state (expired vs not-expired) is the mutually exclusive condition in their WHERE clauses.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN.
+- REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED (no physical router available)

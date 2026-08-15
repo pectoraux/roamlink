@@ -1270,10 +1270,21 @@ export async function claimProvisioning(bindingId: string): Promise<{
   //     treated as the reconciliation, and
   //   - any reconciler observing the binding knows the previous attempt was
   //     superseded and its outcome was never durably finalized.
+  //
+  // Phase 2C.4.8: The takeover UPDATE is conditional on the OBSERVED old
+  // attemptId (current.provisioningAttemptId), not just on the lease being
+  // expired. This closes the ABA problem: if another worker took over
+  // between our read and our write (changing the attemptId), our UPDATE
+  // matches zero rows and we return claimed=false, forcing a re-read.
+  // The lease expiry alone is NOT the fence — the (attemptId, expiry) pair
+  // is the fence, ensuring the takeover is based on the exact observed state.
   const takeoverClaim = await db.providerResourceBinding.updateMany({
     where: {
       id: bindingId,
       status: BINDING_STATES.PROVISIONING,
+      // Phase 2C.4.8: condition on the OBSERVED old attemptId (ABA fence).
+      // Prisma generates "provisioningAttemptId" = <value> or IS NULL.
+      provisioningAttemptId: current.provisioningAttemptId,
       // Only take over if the lease has expired (or is null — legacy)
       OR: [
         { claimExpiresAt: { lt: now } },
@@ -1464,13 +1475,37 @@ export async function extendProvisioningLease(
   bindingId: string,
   attemptId: string,
 ): Promise<{ extended: boolean; reason?: string; newExpiresAt?: Date }> {
+  const now = new Date();
   const newExpiresAt = new Date(Date.now() + provisioningLeaseMs);
 
+  // Phase 2C.4.8: The heartbeat (lease extension) is conditional on the lease
+  // NOT being expired. This closes the heartbeat-vs-takeover race:
+  //
+  //   Without this check, a delayed heartbeat (firing after the lease expired)
+  //   could "resurrect" an expired lease by setting claimExpiresAt to a future
+  //   value. This would block a concurrent takeover that legitimately observed
+  //   the expired lease.
+  //
+  //   With this check, a delayed heartbeat fails (0 rows) once the lease has
+  //   expired. The worker detects the loss (heartbeatLost=true) and discards
+  //   its result. The takeover can proceed unimpeded.
+  //
+  //   The lease and the heartbeat are now mutually exclusive with the takeover:
+  //     - lease NOT expired → heartbeat succeeds (extends), takeover fails
+  //     - lease IS expired  → heartbeat fails, takeover succeeds
+  //
+  // Note: a null claimExpiresAt (legacy binding) is treated as expired — the
+  // heartbeat cannot extend it, forcing the worker through claimProvisioning's
+  // takeover path (which sets a fresh non-null lease).
   const result = await db.providerResourceBinding.updateMany({
     where: {
       id: bindingId,
       provisioningAttemptId: attemptId,
       status: BINDING_STATES.PROVISIONING,
+      // Phase 2C.4.8: only extend if the lease is NOT expired.
+      // In SQL: claimExpiresAt > now(). NULL > now() evaluates to NULL (not
+      // true), so legacy bindings with null claimExpiresAt are NOT extended.
+      claimExpiresAt: { gt: now },
     },
     data: {
       claimExpiresAt: newExpiresAt,
@@ -1480,7 +1515,7 @@ export async function extendProvisioningLease(
   if (result.count === 0) {
     return {
       extended: false,
-      reason: "Claim was taken over by another worker or binding is no longer PROVISIONING",
+      reason: "Claim was taken over, binding is no longer PROVISIONING, or lease has expired",
     };
   }
 
