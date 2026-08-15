@@ -251,20 +251,35 @@ function makeUsername(testId: string): string {
 }
 
 /**
- * Phase 2C.4.10B: Controllable test proxy for forcing the concurrent-PUT race.
+ * Phase 2C.4.10C: Controllable test proxy for forcing the concurrent-PUT race.
  *
  * Real RouterOS cannot be instructed to pause its GET responses. To force the
  * exact concurrent-PUT/409 path (both GETs observe absence before either PUT),
  * we route requests through a local in-process proxy that can delay GET
  * responses until both workers have issued their initial GET.
  *
- * This is only used by test 3d-force-concurrent. All other tests use the
- * direct transport.
+ * PHASE 2C.4.10C FIX (auditor P1):
+ * The previous implementation had a bug: only the FIRST GET blocked, because
+ * `gateResolve` was set by the first GET, making the condition
+ * `gateResolve === null` false for the second GET. The second GET sailed
+ * through without blocking, so the race was NOT forced.
+ *
+ * The fix: armGate() creates a SINGLE shared gatePromise upfront. ALL matching
+ * GETs increment waitingGets and await the SAME promise. waitForGetsAndRelease()
+ * ASSERTS waitingGets === requiredGets before resolving the shared promise,
+ * which unblocks all waiting GETs simultaneously.
+ *
+ * This is only used by test 3d-force. All other tests use the direct transport.
  */
 class ControllableProxyTransport implements RouterOSTransport {
+  /** The shared promise that all blocked GETs await. Created in armGate(). */
   private gatePromise: Promise<void> | null = null;
+  /** The resolver for gatePromise. Called by releaseGate() to unblock all. */
   private gateResolve: (() => void) | null = null;
-  private getsWaiting = 0;
+  /** Whether the gate is armed (blocking GET-by-username requests). */
+  private gateArmed = false;
+  /** Count of GETs currently waiting on the gate. */
+  private waitingGets = 0;
   private readonly requiredGets: number;
 
   constructor(
@@ -274,22 +289,49 @@ class ControllableProxyTransport implements RouterOSTransport {
     this.requiredGets = requiredGets;
   }
 
-  /** Arm the gate — subsequent GET-by-username requests will block. */
+  /**
+   * Arm the gate — create the shared gatePromise and start blocking
+   * subsequent GET-by-username requests until releaseGate() is called.
+   */
   armGate(): void {
-    this.getsWaiting = 0;
+    this.waitingGets = 0;
+    this.gateArmed = true;
+    this.gatePromise = new Promise<void>((resolve) => {
+      this.gateResolve = resolve;
+    });
   }
 
-  /** Wait until `requiredGets` GETs are blocked, then release them all. */
+  /** Returns the number of GETs currently blocked on the gate. */
+  getWaitingGets(): number {
+    return this.waitingGets;
+  }
+
+  /**
+   * Wait until `requiredGets` GETs are blocked, then release them all.
+   * CRITICAL: asserts waitingGets === requiredGets before releasing, so the
+   * test fails loudly if the gate isn't working as expected.
+   */
   async waitForGetsAndRelease(timeoutMs = 5000): Promise<void> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
-      if (this.getsWaiting >= this.requiredGets) break;
+      if (this.waitingGets >= this.requiredGets) break;
       await new Promise((r) => setTimeout(r, 10));
+    }
+    // Assert the invariant: both GETs must be blocked before we release.
+    // If this fails, the gate is broken and the race is NOT forced.
+    if (this.waitingGets < this.requiredGets) {
+      this.gateArmed = false;
+      throw new Error(
+        `ControllableProxyTransport: expected ${this.requiredGets} waiting GETs, ` +
+        `got ${this.waitingGets}. The gate did not block both requests — ` +
+        `the concurrent-PUT race is NOT forced.`,
+      );
     }
     this.releaseGate();
   }
 
   releaseGate(): void {
+    this.gateArmed = false;
     if (this.gateResolve) {
       this.gateResolve();
       this.gateResolve = null;
@@ -302,14 +344,18 @@ class ControllableProxyTransport implements RouterOSTransport {
     path: string;
     body?: Record<string, unknown>;
   }): Promise<T | null> {
-    // If this is a GET-by-username (idempotency lookup) and the gate is armed,
-    // block until releaseGate() is called.
-    if (input.method === "GET" && input.path.includes("/ip/hotspot/user?name=") && this.gateResolve === null && this.getsWaiting < this.requiredGets) {
-      this.getsWaiting++;
-      this.gatePromise = new Promise<void>((resolve) => {
-        this.gateResolve = resolve;
-      });
-      await this.gatePromise;
+    // If the gate is armed and this is a GET-by-username (idempotency lookup),
+    // increment the waiting count and await the SHARED gatePromise.
+    // ALL matching GETs block on the same promise — none sail through.
+    if (
+      this.gateArmed &&
+      input.method === "GET" &&
+      input.path.includes("/ip/hotspot/user?name=")
+    ) {
+      this.waitingGets++;
+      if (this.gatePromise) {
+        await this.gatePromise;
+      }
     }
     return this.upstream.request<T>(input);
   }
@@ -791,7 +837,16 @@ describe("Phase 2C.4.10A — Live RouterOS Compatibility Validation (IMPLEMENTED
     // Wait until both GETs are blocked, then release them simultaneously.
     // Both GETs will return "absent" (the resource doesn't exist yet), so
     // both workers proceed to PUT — forcing the concurrent-PUT race.
+    //
+    // PHASE 2C.4.10C: explicitly assert that BOTH GETs are blocked before
+    // release. This is the mechanical verification the auditor required:
+    // if the gate is broken (only one GET blocks), this assertion fails
+    // loudly instead of silently degrading into a non-forced test.
     await proxy.waitForGetsAndRelease(5000);
+    // The waitForGetsAndRelease call above already asserts waitingGets === 2
+    // internally and throws if not. This explicit check is redundant but
+    // documents the invariant for anyone reading the test.
+    expect(proxy.getWaitingGets()).toBe(2);
 
     const [resA, resB] = await Promise.all([promiseA, promiseB]);
 

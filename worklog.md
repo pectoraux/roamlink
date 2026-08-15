@@ -2432,3 +2432,40 @@ Stage Summary:
 - HEAD: (to be committed)
 - No production code changed — this is purely test-harness correctness.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
+
+---
+Task ID: 2C.4.10C
+Agent: Lead engineer (main) — Fix ControllableProxyTransport gate bug
+Task: The auditor found a P1 bug in the ControllableProxyTransport: only the first GET blocked, because gateResolve was set by the first GET, making the condition `gateResolve === null` false for the second GET. The second GET sailed through without blocking, so the concurrent-PUT race was NOT forced.
+
+Work Log:
+- The auditor was correct. The previous condition was:
+    `this.gateResolve === null && this.getsWaiting < this.requiredGets`
+  After the first GET set gateResolve, the second GET's condition was false, so it proceeded directly to the upstream without blocking. waitForGetsAndRelease() timed out waiting for getsWaiting >= 2 (stuck at 1), then released only the first GET.
+
+- Fix: redesigned the gate to use a shared gatePromise:
+  - armGate() creates the gatePromise upfront and sets gateArmed = true.
+  - ALL matching GETs (method=GET, path includes "/ip/hotspot/user?name=") increment waitingGets and await the SAME gatePromise.
+  - The condition is now just `this.gateArmed` — no `gateResolve === null` check that would let the second GET through.
+  - waitForGetsAndRelease() ASSERTS waitingGets >= requiredGets before releasing, throwing if the gate didn't block both requests.
+  - releaseGate() resolves the shared promise, unblocking all waiting GETs simultaneously.
+
+- Added getWaitingGets() method so the test can assert the waiting count.
+- Added explicit assertion in test 3d-force: `expect(proxy.getWaitingGets()).toBe(2)` after waitForGetsAndRelease(), documenting the invariant for test readers.
+
+- The fix is verified by reasoning through the execution:
+  1. armGate() → gateArmed=true, gatePromise created.
+  2. Worker A GET → gateArmed is true → waitingGets=1 → awaits gatePromise (blocks).
+  3. Worker B GET → gateArmed is true → waitingGets=2 → awaits SAME gatePromise (blocks).
+  4. waitForGetsAndRelease() → waitingGets=2 → asserts OK → releaseGate() → resolves promise.
+  5. Both GETs unblock simultaneously → both return absent → both PUT → one creates, one 409.
+
+Test Results:
+- Without LIVE_ROUTEROS_ENDPOINT: 1 pass (META), 21 skip, 0 fail.
+- Lint: clean. TypeScript: clean (only pre-existing mobile app error).
+
+Stage Summary:
+- HEAD: (to be committed)
+- The ControllableProxyTransport gate bug is fixed. Both GETs now genuinely block before release.
+- No production code changed — this is purely test-harness correctness.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
