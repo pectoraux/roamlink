@@ -2742,3 +2742,57 @@ Stage Summary:
 - Tests: 12/12 PASSING (10 runtime + 2 static)
 - Lint: clean. TypeScript: clean.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN (zero changes).
+
+---
+Task ID: AUDIT
+Agent: Principal Architect (main) — Commercial Architecture Audit
+Task: Audit the current architecture at 3fb56a9 against the business "RoamLink OS: the operating system for connectivity resellers." Produce gaps, missing models/APIs, security/financial/scalability risks, and a prioritized migration plan. Do not implement code.
+
+Work Log:
+- Audited the actual codebase at 3fb56a9: 67 Prisma models, 4 commerce lib files, 2 connectivity providers, 7 commerce API routes, existing auth/payments/ledger infrastructure.
+- Assessed 8 business capabilities:
+  1. Multi-tenant reseller SaaS — model exists, onboarding missing
+  2. MikroTik operator management — adapter exists, operator UI missing
+  3. Telco reseller integrations — model supports it, no adapter exists
+  4. eSIM suppliers — adapter exists, no live supplier connected
+  5. Local WiFi zones — fully supported
+  6. Connectivity offer marketplace — ranking exists, marketplace UI doesn't
+  7. Customer intent routing — engine exists, not wired to UI
+  8. Provider-independent provisioning — excellent (frozen kernel)
+
+- Identified 8 architecture gaps:
+  GAP-1 (P0): No payment integration in checkout — simulated payment only
+  GAP-2 (P0): No financial ledger wiring in fulfillment — zero ledger calls in fulfillOrder()
+  GAP-3 (P1): No reseller onboarding flow — manual tenant creation only
+  GAP-4 (P1): Unauthenticated customer creation API — security vulnerability
+  GAP-5 (P1): No provider instance management UI/API
+  GAP-6 (P2): No reconciliation cron for offers
+  GAP-7 (P2): No offer → product → checkout flow
+  GAP-8 (P3): Legacy model collision (ConnectivityProduct vs ResellerProduct)
+
+- Identified 6 missing domain models (WebhookEvent P0, PayoutAccount P1, others P2-P3).
+- Identified 8 missing APIs (payment initiation P0, webhook handler P0, onboarding P1, provider instance P1, others P2).
+- Identified 5 security risks (unauthenticated customer API is HIGH).
+- Identified 6 financial risks (no ledger entries + no payment integration are CRITICAL).
+- Identified 5 scalability risks (ranking engine loads all offers, no background job queue).
+
+- Produced a 5-priority migration plan:
+  Priority 1: Revenue Generation (2-3 weeks) — payment + ledger + auth fix
+  Priority 2: Operator Onboarding (2-3 weeks) — self-service signup + router UI
+  Priority 3: Payment Flows (1-2 weeks) — refunds + payouts + tax
+  Priority 4: Supply Aggregation (2-3 weeks) — supplier feeds + eSIM connection
+  Priority 5: Marketplace Readiness (3-4 weeks) — marketplace UI + scaling
+
+Key finding: The kernel is over-engineered relative to the commerce layer's under-implementation. The 5 things that must happen before revenue:
+  1. Wire payment into checkout (3 days)
+  2. Wire ledger into fulfillment (2 days)
+  3. Fix customer API auth (1 day)
+  4. Add reseller onboarding (5 days)
+  5. Add provider instance UI (3 days)
+Total: ~2 weeks to first paying customer.
+
+Stage Summary:
+- HEAD: 3fb56a9 (no code changes — audit document only)
+- New artifact: docs/COMMERCIAL-AUDIT.md
+- The kernel is the crown jewel. The commerce layer is the revenue path. Close the 5 gaps and RoamLink OS is ready for its first paying reseller.
+- No code changes. SaaS kernel FROZEN. Adapter contract FROZEN. Entitlement kernel FROZEN.
