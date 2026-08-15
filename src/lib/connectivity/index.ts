@@ -80,5 +80,15 @@ export type { RouterOSTransport, RouterOSTransportConfig } from "./providers/mik
 export { EnvProviderInstanceSecretResolver, TestSecretResolver } from "./providers/mikrotik/secret-resolver";
 export type { ProviderInstanceSecretResolver, ResolvedProviderCredentials } from "./providers/mikrotik/secret-resolver";
 
-// Register the MikroTik provider at module load time
+// Phase 2C.5: eSIM supplier provider (first real connectivity supplier)
+export { EsimConnectivityAdapter } from "./providers/esim/adapter";
+export type { EsimProviderClient, EsimResource, EsimResourceConfig, EsimErrorType, EsimClientResolver, AsyncEsimClientResolver } from "./providers/esim/client";
+export { EsimProviderError } from "./providers/esim/client";
+export { registerMockEsimClientForInstance, clearEsimMockClientRegistry } from "./providers/esim/mock-client";
+export { MockEsimTransport, FetchEsimTransport } from "./providers/esim/transport";
+export type { EsimTransport, EsimTransportConfig } from "./providers/esim/transport";
+export { EsimSupplierClient } from "./providers/esim/esim-client";
+
+// Register both providers at module load time
 import "./providers/mikrotik";
+import "./providers/esim";

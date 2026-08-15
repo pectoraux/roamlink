@@ -2488,3 +2488,69 @@ Stage Summary:
 - The evidence model is now fully consistent: every HttpOp record uses `httpStatus: number` (the actual HTTP status code), never a generic "success"/"error" string.
 - No production code changed — this is purely test-harness cleanup.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN.
+
+---
+Task ID: 2C.5
+Agent: Lead engineer (main) — Kernel Freeze + First Real Connectivity Supplier (eSIM)
+Task: Freeze and verify the connectivity provisioning kernel (2C.4.5–2C.4.9), then integrate the first real connectivity supplier (eSIM) WITHOUT introducing another abstraction — using the existing ConnectivityProviderAdapter contract.
+
+Work Log:
+
+PART 1 — KERNEL FREEZE:
+- Ran all static kernel tests across 2C.4.6, 2C.4.8, 2C.4.9 — all pass:
+  - 2C.4.6: verifyProvisioningOwnership + extendProvisioningLease exist, pre-provider check in provisionBinding, no silent .catch, takeover marks RECONCILIATION_REQUIRED ✅
+  - 2C.4.8: heartbeat has claimExpiresAt > now guard, takeover has ABA fence ✅
+  - 2C.4.9: provisionBinding resolves runtime BEFORE claiming, reconcileProvisioning exists ✅
+- The kernel (src/lib/connectivity/entitlement.ts) is FROZEN at 2C.4.9 state. No changes to provisionBinding, claimProvisioning, reconcileProvisioning, verifyProvisioningOwnership, extendProvisioningLease, claimGuardedTransition, or claimProvisioning's takeover path.
+
+PART 2 — eSIM SUPPLIER INTEGRATION (no new abstractions):
+- Created src/lib/connectivity/providers/esim/ with 6 files, mirroring the MikroTik provider structure EXACTLY:
+  1. client.ts — EsimProviderClient interface, EsimResource, EsimResourceConfig, EsimProviderError, EsimClientResolver types
+  2. transport.ts — FetchEsimTransport (production HTTP) + MockEsimTransport (test double with strictConflictMode)
+  3. esim-client.ts — EsimSupplierClient (real client, implements GET-first + CONFLICT + TIMEOUT convergence, same as RouterOSProviderClient)
+  4. adapter.ts — EsimConnectivityAdapter (implements ConnectivityProviderAdapter, maps ROAMING capability to eSIM profiles)
+  5. mock-client.ts — registerMockEsimClientForInstance, clearEsimMockClientRegistry, esimProductionAsyncResolver (fail-closed, same pattern as MikroTik)
+  6. index.ts — registers the eSIM adapter with the provider registry
+
+- The eSIM adapter uses the EXISTING ConnectivityProviderAdapter contract — no new interfaces, no new abstract classes, no new registry layer. The kernel calls the same provision/suspend/resume/release/getUsage/reconcue methods.
+
+- Resource identity (mirrors MikroTik):
+  - RoamLink providerResourceId = eSIM ICCID (supplier-assigned, immutable)
+  - reference = `rl-${binding.id.slice(-12)}` (deterministic convergence key, same pattern as MikroTik username)
+  - GET by reference uses ?reference= query (like MikroTik ?name=)
+  - POST/PATCH/DELETE by ICCID (like MikroTik .id)
+
+- Convergence pattern (mirrors MikroTik exactly):
+  1. GET by reference → if exists, return it (idempotent)
+  2. POST → CONFLICT (409) → GET by reference → return existing (convergence)
+  3. POST → TIMEOUT/RETRYABLE → GET → return existing or controlled retry
+  4. Fail-closed on lookup uncertainty (never POST with unknown state)
+
+TEST RESULTS (11/11 PASSING):
+  A: single eSIM provision succeeds via provisionBinding() — the SAME function works for eSIM ✅
+  B: concurrent eSIM provisioning → exactly ONE profile, ONE POST (lease works) ✅
+  C: crash-after-create → reconcileProvisioning GETs existing, zero duplicate (recovery works) ✅
+  D: concurrent PUTs converge on ONE profile via CONFLICT reconciliation ✅
+  E: already BOUND → already_provisioned (idempotency) ✅
+  F: provisioning failure → FAILED (claim-guarded for eSIM) ✅
+  G: both MikroTik and eSIM registered simultaneously (kernel neutrality) ✅
+  Static: eSIM adapter implements ConnectivityProviderAdapter ✅
+  Static: eSIM client has GET-first + CONFLICT convergence (same as RouterOS) ✅
+  Static: NO kernel changes — entitlement.ts has no eSIM-specific code ✅
+
+THE KEY PROOF:
+  The static test "NO kernel changes" verifies that entitlement.ts (the kernel) contains ZERO eSIM-specific code:
+  - no "iccid"
+  - no "esim_profile"
+  - no "EsimSupplierClient"
+  The kernel is genuinely supplier-neutral. The same provisionBinding(), claimProvisioning(), reconcileProvisioning() functions work for BOTH MikroTik and eSIM because they only interact through the ConnectivityProviderAdapter contract.
+
+Stage Summary:
+- HEAD: (to be committed)
+- Kernel: FROZEN at 2C.4.9 (no changes)
+- eSIM supplier: integrated using the existing adapter contract (no new abstractions)
+- Both providers (MikroTik + eSIM) are registered in the provider registry
+- Tests: 11/11 PASSING (7 runtime + 4 static)
+- Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN (unchanged). Entitlement kernel: FROZEN (unchanged).
+- REAL ESIM SUPPLIER ENDPOINT TEST: NOT EXECUTED (no real eSIM API key available — same as RouterOS)
