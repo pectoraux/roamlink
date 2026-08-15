@@ -2209,3 +2209,33 @@ Stage Summary:
 - The heartbeat-vs-takeover race is now formally mutually exclusive: the two operations cannot both succeed at the same point in time, because the lease state (expired vs not-expired) is the mutually exclusive condition in their WHERE clauses.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN.
 - REAL ROUTEROS ENDPOINT TEST: NOT EXECUTED (no physical router available)
+
+---
+Task ID: 2C.4.8.ACCEPT
+Agent: Lead engineer (main) — Phase 2C.4.8 Acceptance + Architecture Milestone
+Task: Record the auditor's acceptance of Phase 2C.4.8 and the honest status of what is and isn't proven across the 2C.4.5 → 2C.4.8 arc.
+
+Work Log:
+- The auditor inspected the actual public commit 4724fdf on GitHub and ACCEPTED Phase 2C.4.8 as an implementation hardening step.
+- The auditor confirmed all four layers of the provisioning invariant are correctly implemented in the source:
+  1. Durable attempt identity + expiring lease + ABA-protected takeover ✅
+  2. Ownership fencing (pre-provider gate + heartbeat that cannot resurrect an expired lease) ✅
+  3. Provider convergence (GET-first, CONFLICT reconciliation, timeout reconciliation, stable identity) ✅
+  4. Claim-guarded finalization (stale worker = 0 rows, caller checks .transitioned property) ✅
+- The auditor affirmed the conceptual separation is correct: DB lease fencing ≠ external-operation fencing. The safety proof depends on BOTH layers, not the lease alone. This is a strength of the architecture, not a defect.
+- The auditor's final assessment: "That is now a coherent distributed-side-effect architecture, rather than a collection of optimistic retries."
+
+Honest verification gaps (NOT to be represented as proven):
+- Live RouterOS endpoint test: NOT EXECUTED. No physical router was available. All provider convergence tests use MockRouterOSTransport with strictConflictMode simulating real RouterOS 409 behavior. The convergence logic is structurally correct but has not been validated against a live RouterOS device.
+- Production distributed deployment test: NOT EXECUTED. All concurrent tests run against a single PostgreSQL instance (Neon) in a single process. Multi-node distributed deployment (multiple workers on separate machines, network partitions, clock skew) has not been tested.
+
+Stage Summary:
+- HEAD: 4724fdf (origin/main, pushed)
+- Phase 2C.4.8: ACCEPTED ✅
+- The 2C.4.5 → 2C.4.8 arc is complete. The connectivity provisioning architecture is now a coherent four-layer distributed-side-effect system:
+  Layer 1: PostgreSQL lease (attemptId + expiry + ABA fence)
+  Layer 2: Ownership fencing (pre-provider gate + non-resurrectable heartbeat)
+  Layer 3: Provider convergence (GET/PUT/409/timeout → one resource, stable identity)
+  Layer 4: Claim-guarded finalization (stale worker = 0 rows)
+- Two honest gaps remain for future work: live RouterOS validation and multi-node distributed deployment. Neither is an architecture blocker; both are validation scope expansions.
+- SaaS billing kernel: FROZEN throughout. Adapter contract: FROZEN throughout.
