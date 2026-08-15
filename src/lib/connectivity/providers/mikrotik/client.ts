@@ -123,3 +123,29 @@ export interface MikroTikProviderClient {
     isActive: boolean;
   } | null>;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2C.3.3: Provider Client Resolver
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 2C.3.3: Client resolver — maps a provider instance to a specific
+ * MikroTikProviderClient instance.
+ *
+ * The adapter does NOT hold a fixed client. Instead, it receives a resolver
+ * that returns the correct client for each providerInstanceId.
+ *
+ * This allows the SAME adapter class to operate against different MikroTik
+ * routers (e.g., Accra Router 01, Kumasi Router 02) using different clients.
+ *
+ * Production: the resolver would create/cache RouterOSProviderClient instances
+ * based on the provider instance configuration (endpoint URL, credentials from
+ * secrets manager, etc.).
+ *
+ * Testing: the resolver returns pre-configured mock clients, allowing tests to
+ * verify that binding A uses client A and binding B uses client B.
+ */
+export type MikroTikClientResolver = (input: {
+  providerInstanceId: string;
+  providerInstanceConfiguration: Record<string, unknown> | null;
+}) => MikroTikProviderClient;

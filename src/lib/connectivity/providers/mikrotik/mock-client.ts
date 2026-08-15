@@ -65,13 +65,30 @@ function checkFailure(operation: string): void {
 }
 
 export class MockMikroTikProviderClient implements MikroTikProviderClient {
+  /**
+   * Phase 2C.3.3: Per-instance resource map. Each MockMikroTikProviderClient
+   * instance has its own resources — proving that client A and client B
+   * don't share state.
+   */
+  private readonly resources = new Map<string, MockResource>();
+  /**
+   * Phase 2C.3.3: Operation log — records every operation called on this client.
+   * Tests can inspect this to prove that binding A only called client A.
+   */
+  readonly operationLog: Array<{ operation: string; resource: string; timestamp: Date }> = [];
+
+  constructor(
+    /** Optional label for logging/debugging (e.g., "clientA", "clientB") */
+    public readonly clientLabel?: string,
+  ) {}
+
   async createResource(config: MikroTikResourceConfig): Promise<MikroTikResource> {
     checkFailure("create");
 
     // Idempotent: if resource already exists, return it
-    const existing = mockResources.get(config.username);
+    const existing = this.resources.get(config.username);
     if (existing) {
-      logger.info("mikrotik.mock.create_idempotent", { username: config.username });
+      logger.info("mikrotik.mock.create_idempotent", { username: config.username, client: this.clientLabel });
       return this.toResource(existing);
     }
 
@@ -89,8 +106,9 @@ export class MockMikroTikProviderClient implements MikroTikProviderClient {
       sessionStartTime: new Date(),
     };
 
-    mockResources.set(config.username, resource);
-    logger.info("mikrotik.mock.created", { username: config.username, resourceType: config.resourceType });
+    this.resources.set(config.username, resource);
+    this.operationLog.push({ operation: "create", resource: config.username, timestamp: new Date() });
+    logger.info("mikrotik.mock.created", { username: config.username, resourceType: config.resourceType, client: this.clientLabel });
 
     return this.toResource(resource);
   }
@@ -98,7 +116,8 @@ export class MockMikroTikProviderClient implements MikroTikProviderClient {
   async getResource(username: string): Promise<MikroTikResource | null> {
     checkFailure("get");
 
-    const resource = mockResources.get(username);
+    const resource = this.resources.get(username);
+    this.operationLog.push({ operation: "get", resource: username, timestamp: new Date() });
     if (!resource) return null;
     return this.toResource(resource);
   }
@@ -106,35 +125,38 @@ export class MockMikroTikProviderClient implements MikroTikProviderClient {
   async suspendResource(username: string): Promise<void> {
     checkFailure("suspend");
 
-    const resource = mockResources.get(username);
+    const resource = this.resources.get(username);
+    this.operationLog.push({ operation: "suspend", resource: username, timestamp: new Date() });
     if (!resource) {
       throw new MikroTikProviderError("NOT_FOUND", `Resource not found: ${username}`);
     }
     resource.isActive = false;
-    logger.info("mikrotik.mock.suspended", { username });
+    logger.info("mikrotik.mock.suspended", { username, client: this.clientLabel });
   }
 
   async resumeResource(username: string): Promise<void> {
     checkFailure("resume");
 
-    const resource = mockResources.get(username);
+    const resource = this.resources.get(username);
+    this.operationLog.push({ operation: "resume", resource: username, timestamp: new Date() });
     if (!resource) {
       throw new MikroTikProviderError("NOT_FOUND", `Resource not found: ${username}`);
     }
     resource.isActive = true;
-    logger.info("mikrotik.mock.resumed", { username });
+    logger.info("mikrotik.mock.resumed", { username, client: this.clientLabel });
   }
 
   async deleteResource(username: string): Promise<void> {
     checkFailure("delete");
 
+    this.operationLog.push({ operation: "delete", resource: username, timestamp: new Date() });
     // Idempotent: deleting non-existent is a no-op
-    if (!mockResources.has(username)) {
-      logger.info("mikrotik.mock.delete_idempotent", { username });
+    if (!this.resources.has(username)) {
+      logger.info("mikrotik.mock.delete_idempotent", { username, client: this.clientLabel });
       return;
     }
-    mockResources.delete(username);
-    logger.info("mikrotik.mock.deleted", { username });
+    this.resources.delete(username);
+    logger.info("mikrotik.mock.deleted", { username, client: this.clientLabel });
   }
 
   async getResourceUsage(username: string): Promise<{
@@ -145,7 +167,8 @@ export class MockMikroTikProviderClient implements MikroTikProviderClient {
   } | null> {
     checkFailure("getUsage");
 
-    const resource = mockResources.get(username);
+    const resource = this.resources.get(username);
+    this.operationLog.push({ operation: "getUsage", resource: username, timestamp: new Date() });
     if (!resource) return null;
 
     // Simulate some usage

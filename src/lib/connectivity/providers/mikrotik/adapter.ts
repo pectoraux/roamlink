@@ -35,7 +35,7 @@ import type {
   ConnectivityEntitlementInput,
   ProviderResourceBindingInput,
 } from "../../adapter";
-import type { MikroTikProviderClient, MikroTikResourceConfig } from "./client";
+import type { MikroTikProviderClient, MikroTikResourceConfig, MikroTikClientResolver } from "./client";
 import { MikroTikProviderError } from "./client";
 import { logger } from "@/lib/logger";
 
@@ -109,16 +109,42 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
   readonly providerType = "mikrotik";
   readonly label = "MikroTik Connectivity Provider";
 
-  constructor(private readonly client: MikroTikProviderClient) {}
+  /**
+   * Phase 2C.3.3: The adapter receives a client RESOLVER, not a fixed client.
+   *
+   * The resolver maps providerInstanceId → MikroTikProviderClient.
+   * This allows the SAME adapter class to operate against different MikroTik
+   * routers using different clients.
+   *
+   * If no providerInstanceId is set on the binding (legacy/null), the resolver
+   * is called with null — it should return a default client for backward compat.
+   */
+  constructor(private readonly clientResolver: MikroTikClientResolver) {}
+
+  /**
+   * Phase 2C.3.3: Resolve the correct provider client for this binding.
+   * Uses the binding's providerInstanceId to select the infrastructure instance.
+   */
+  private resolveClient(binding: ProviderResourceBindingInput): MikroTikProviderClient {
+    const instanceId = binding.providerInstanceId;
+    if (!instanceId) {
+      throw new MikroTikProviderError("PERMANENT", "No providerInstanceId on binding — cannot resolve MikroTik client");
+    }
+    return this.clientResolver({
+      providerInstanceId: instanceId,
+      providerInstanceConfiguration: binding.providerInstanceConfiguration,
+    });
+  }
 
   async provision(input: {
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ProvisionResult> {
     try {
+      const client = this.resolveClient(input.binding);
       // If the binding already has a providerResourceId, it's idempotent — return it.
       if (input.binding.providerResourceId) {
-        const existing = await this.client.getResource(input.binding.providerResourceId);
+        const existing = await client.getResource(input.binding.providerResourceId);
         if (existing) {
           logger.info("mikrotik.provision_idempotent", {
             bindingId: input.binding.id,
@@ -140,7 +166,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       }
 
       const config = mapCapabilityToMikroTikConfig(input.entitlement, input.binding);
-      const resource = await this.client.createResource(config);
+      const resource = await client.createResource(config);
 
       logger.info("mikrotik.provisioned", {
         bindingId: input.binding.id,
@@ -181,7 +207,8 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     }
 
     try {
-      await this.client.suspendResource(input.binding.providerResourceId);
+      const client = this.resolveClient(input.binding);
+      await client.suspendResource(input.binding.providerResourceId);
       return { status: "success" };
     } catch (err) {
       const classified = classifyError(err);
@@ -198,7 +225,8 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     }
 
     try {
-      await this.client.resumeResource(input.binding.providerResourceId);
+      const client = this.resolveClient(input.binding);
+      await client.resumeResource(input.binding.providerResourceId);
       return { status: "success" };
     } catch (err) {
       const classified = classifyError(err);
@@ -216,7 +244,8 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     }
 
     try {
-      await this.client.deleteResource(input.binding.providerResourceId);
+      const client = this.resolveClient(input.binding);
+      await client.deleteResource(input.binding.providerResourceId);
       return { status: "success" };
     } catch (err) {
       const classified = classifyError(err);
@@ -231,7 +260,8 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     if (!input.binding.providerResourceId) return undefined;
 
     try {
-      const usage = await this.client.getResourceUsage(input.binding.providerResourceId);
+      const client = this.resolveClient(input.binding);
+      const usage = await client.getResourceUsage(input.binding.providerResourceId);
       if (!usage) return undefined;
 
       return {
@@ -266,7 +296,8 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     }
 
     try {
-      const resource = await this.client.getResource(input.binding.providerResourceId);
+      const client = this.resolveClient(input.binding);
+      const resource = await client.getResource(input.binding.providerResourceId);
 
       if (!resource) {
         // Resource was deleted at the provider

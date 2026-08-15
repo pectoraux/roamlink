@@ -60,9 +60,10 @@ export { mockConnectivityProvider, MockConnectivityProvider } from "./mock-provi
 
 // Phase 2C.3: MikroTik provider (reference implementation)
 export { MikroTikConnectivityAdapter } from "./providers/mikrotik/adapter";
-export type { MikroTikProviderClient, MikroTikResource, MikroTikResourceConfig, MikroTikErrorType } from "./providers/mikrotik/client";
+export type { MikroTikProviderClient, MikroTikResource, MikroTikResourceConfig, MikroTikErrorType, MikroTikClientResolver } from "./providers/mikrotik/client";
 export { MikroTikProviderError } from "./providers/mikrotik/client";
 export { MockMikroTikProviderClient, mockMikroTikProviderClient, setMockFailureSimulation, clearMockFailureSimulation, clearMockMikroTikResources } from "./providers/mikrotik/mock-client";
+export { registerMockClientForInstance, clearMockClientRegistry } from "./providers/mikrotik";
 
 // Register the MikroTik provider at module load time
 import "./providers/mikrotik";
