@@ -1861,3 +1861,24 @@ Stage Summary:
 - SaaS billing kernel: FROZEN (no changes)
 - The three-level separation is now complete: providerType (adapter class) → providerInstanceId (infrastructure instance) → providerResourceId (specific resource)
 - Next step: real RouterOS REST client implementation.
+
+---
+Task ID: 2C.3.3
+Agent: Lead engineer (main) — Provider Instance → Client Resolution
+Task: Prove that different providerInstanceId values resolve to different provider clients, with real runtime evidence that no cross-instance operations occur.
+
+Work Log:
+- Created MikroTikClientResolver type — maps providerInstanceId → MikroTikProviderClient.
+- Refactored MikroTikConnectivityAdapter to use clientResolver instead of a fixed client. The resolveClient() method resolves the correct client for each binding based on providerInstanceId.
+- Updated MockMikroTikProviderClient to have per-instance resources (not global) and an operationLog that records every operation. Tests inspect the log to prove binding A only called client A.
+- Created mock client registry: registerMockClientForInstance(instanceId, client) — test-only function that maps a specific instance to a specific mock client.
+- All adapter methods (provision, suspend, resume, release, getUsage, reconcile) now call resolveClient(input.binding) to get the correct client for the binding's provider instance.
+
+Stage Summary:
+- HEAD: c3b61f2638da4935bfaa93d85e5d4e44afdbdbdd
+- origin/main: c3b61f2638da4935bfaa93d85e5d4e44afdbdbdd (pushed)
+- Tests: 9 — all EXECUTED + PASSED (4 runtime + 5 static)
+- Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN (no changes)
+- The three-level separation is now proven at runtime: providerType → adapter, providerInstanceId → client, providerResourceId → resource
+- Next step: real RouterOS REST client implementation.
