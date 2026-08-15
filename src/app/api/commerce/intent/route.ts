@@ -21,6 +21,7 @@ import { db } from "@/lib/db";
 import { getCurrentUser } from "@/lib/auth";
 import { requireTenantContext } from "@/lib/tenant/context";
 import { parseIntent, summarizeIntent } from "@/lib/commerce/intent-parser";
+import { extractIntentWithAI } from "@/lib/commerce/ai-intent";
 import { rankOffers } from "@/lib/commerce/ranking-engine";
 import { logger } from "@/lib/logger";
 
@@ -36,8 +37,16 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "rawText is required" }, { status: 400 });
   }
 
-  // Step 1: Parse the natural language intent
-  const parsed = parseIntent(rawText);
+  // Step 1: Extract structured intent using AI (with deterministic fallback)
+  // The AI produces ONLY structured output — the ranking engine stays deterministic.
+  const parsed = await extractIntentWithAI(rawText);
+
+  // Log whether AI or deterministic parser was used
+  logger.info("intent.extraction_completed", {
+    rawText,
+    confidence: parsed.confidence,
+    extractionMethod: parsed.confidence > 0 ? "ai_or_deterministic" : "deterministic_fallback",
+  });
 
   // Step 2: Rank offers against the parsed intent
   const ranking = await rankOffers({

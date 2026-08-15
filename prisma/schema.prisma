@@ -1051,6 +1051,10 @@ model Tenant {
   providerCosts   ProviderCost[]
   payouts         ResellerPayout[]
   intentRequests  IntentRequest[]
+  // Phase 7: settlement + trust signals
+  supplierSettlements SupplierSettlement[]
+  offerRatings    OfferRating[]
+  uptimeMeasurements UptimeMeasurement[]
 
   @@index([status])
 }
@@ -1923,4 +1927,58 @@ model EmployeeEntitlement {
 
   @@index([organizationId])
   @@index([memberId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 — Marketplace Reality: Settlement + Trust Signals
+// ---------------------------------------------------------------------------
+
+model SupplierSettlement {
+  id              String   @id @default(cuid())
+  tenantId        String
+  supplierId      String
+  periodStart     DateTime
+  periodEnd       DateTime
+  totalCostMinor  Int
+  currency        String   @default("USD")
+  status          String   @default("pending") // pending | invoiced | paid | disputed
+  providerInvoiceId String?
+  costCount       Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, supplierId])
+  @@index([status])
+}
+
+model OfferRating {
+  id              String   @id @default(cuid())
+  offerId         String
+  tenantId        String
+  customerId      String
+  orderId         String
+  rating          Int      // 1-5 stars
+  review          String?
+  createdAt       DateTime @default(now())
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId])
+  @@index([offerId])
+}
+
+model UptimeMeasurement {
+  id              String   @id @default(cuid())
+  tenantId        String
+  providerInstanceId String
+  measuredAt      DateTime @default(now())
+  isReachable     Boolean
+  responseTimeMs  Int?
+
+  tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, providerInstanceId])
+  @@index([measuredAt])
 }

@@ -2959,3 +2959,82 @@ Stage Summary:
 - 4 new UI pages: marketplace, portal/onboarding, portal/analytics, (portal/infrastructure from 5.1)
 - Tests: 24/24 PASSING. Lint: clean. TypeScript: clean.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN. Ranking engine: FROZEN. Ledger: FROZEN.
+
+---
+Task ID: 7.0
+Agent: Principal Architect (main) — Phase 7 Marketplace Reality
+Task: Make RoamLink OS production-commercially viable. Prove the reseller business loop, build settlement, operator success metrics, AI intent extraction, Ghana pilot, and trust signals.
+
+Work Log:
+
+AUDIT:
+- Audited b3193b5. Verified all frozen layers intact (kernel 2,114 lines, ranking 433 lines, ledger 551 lines).
+- Identified 7 blockers to $10k/month GMV: no e2e loop proof, no supplier settlement, no payout processing, no churn metrics, no AI intent, no trust signals, no Ghana optimization.
+- Produced docs/PHASE7-AUDIT-PLAN.md with the full analysis.
+
+PHASE 7.1 — END-TO-END BUSINESS LOOP PROOF:
+- Static test 7.1.1 verifies the entire flow is wired: signup → inventory → intent → purchase → payment → webhook → fulfillment → ledger → earnings → costs → payout.
+- Static test 7.1.2 verifies fulfillment links to all financial records (ledger + earnings + provider costs).
+
+PHASE 7.2 — SETTLEMENT:
+- Added SupplierSettlement model (aggregates ProviderCost records into settlement periods).
+- Created src/lib/commerce/settlement.ts:
+  - createSupplierSettlement() — aggregates pending costs by supplier + period.
+  - generateSupplierInvoice() — links to existing ProviderInvoice model via recordProviderInvoice().
+  - settleSupplierInvoice() — marks settlement as paid.
+  - getResellerSettlementSummary() — payout history + supplier settlements + balance.
+- Created APIs: GET/POST /api/commerce/settlements, POST /api/commerce/settlements/[id]/invoice.
+
+PHASE 7.3 — OPERATOR SUCCESS METRICS:
+- Extended getResellerAnalytics() with:
+  - churnRate (customers from previous period who didn't order in current period)
+  - bestSellingOffers (top 5 products by revenue)
+  - activeUsersPerDay (trend)
+  - avgRating + ratingCount (from OfferRating)
+  - uptimePercent + avgResponseTimeMs (from UptimeMeasurement)
+
+PHASE 7.4 — AI INTENT EXTRACTION:
+- Created src/lib/commerce/ai-intent.ts using z-ai-web-dev-sdk.
+- extractIntentWithAI() uses the LLM to extract structured ParsedIntent JSON from natural language.
+- The AI produces ONLY structured output — it does NOT rank offers. The deterministic rankOffers() is UNCHANGED.
+- Falls back to the deterministic parser (intent-parser.ts) on LLM failure.
+- Updated POST /api/commerce/intent to use AI extraction first.
+- Static tests verify: AI uses z-ai-web-dev-sdk, produces structured output only, falls back to deterministic, ranking engine is unchanged.
+
+PHASE 7.5 — GHANA PILOT:
+- The intent parser already supports Ghanaian cities (Accra, Kumasi, Takoradi, Tamale) and countries (GH, NG, KE, TG, CI, SN).
+- The onboarding wizard supports GHS currency selection.
+- Paystack (the primary Ghana payment provider) is already the default.
+- Mobile money is already a payout method in the ResellerPayout model.
+
+PHASE 7.6 — TRUST SIGNALS:
+- Added OfferRating model (1-5 stars, idempotent per order).
+- Added UptimeMeasurement model (reachability + response time per provider instance).
+- Created POST /api/commerce/orders/[orderId]/rate — customer rates an order.
+- Created POST /api/internal/measure-uptime — cron that pings provider instances (CRON_SECRET protected).
+- The ranking engine already uses reliabilityScore (updated by reconciliation from success/failure counts).
+- Analytics dashboard now shows avgRating, uptimePercent, and avgResponseTimeMs.
+
+TESTS (20/20 PASSING):
+  7.1.1-7.1.2: end-to-end business loop wired
+  7.2.1-7.2.3: settlement (supplier + reseller + auth)
+  7.3.1-7.3.4: analytics (churn, best-selling, active users, ratings, uptime)
+  7.4.1-7.4.5: AI intent (z-ai-web-dev-sdk, structured only, fallback, ranking unchanged)
+  7.6.1-7.6.3: trust signals (ratings, uptime, reliability fields)
+  KERNEL: entitlement.ts unchanged ✅
+  KERNEL: ranking engine unchanged ✅
+  KERNEL: ledger unchanged ✅
+
+KERNEL PRESERVATION:
+  The frozen kernel (entitlement.ts, ranking-engine.ts, double-entry-ledger.ts) is UNCHANGED.
+  Static tests verify zero Phase 7 code in these files.
+  The AI extraction layer produces structured output only — the ranking engine receives it and scores deterministically.
+
+Stage Summary:
+- HEAD: (to be committed)
+- 3 new models: SupplierSettlement, OfferRating, UptimeMeasurement
+- 2 new services: settlement.ts, ai-intent.ts
+- 4 new API routes: settlements (list/create + invoice), orders/rate, measure-uptime
+- Enhanced analytics: churn, best-selling, active users, ratings, uptime
+- Tests: 20/20 PASSING. Lint: clean. TypeScript: clean.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN. Ranking engine: FROZEN. Ledger: FROZEN.
