@@ -20,6 +20,7 @@ export {
   listProviderInstances,
   getProviderInstance,
   resolveBindingWithInstance,
+  resolveBindingRuntime,
   CAPABILITY_TYPES,
   ENTITLEMENT_STATES,
   BINDING_STATES,

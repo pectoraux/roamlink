@@ -790,54 +790,20 @@ export async function reconcileBindingWithProvider(bindingId: string): Promise<{
   error?: string;
 }> {
   try {
-    // Step 1: Resolve the adapter from the persisted binding's providerType
-    const { resolveBindingAdapter } = await import("./registry");
-    const { adapter, binding: bindingSummary } = await resolveBindingAdapter(bindingId);
-
-    // Step 2: Load the full binding + entitlement for the adapter call
-    const fullBinding = await db.providerResourceBinding.findUnique({
-      where: { id: bindingId },
-      select: { id: true, entitlementId: true, providerType: true, providerResourceId: true, providerMetadata: true, status: true, provisioningState: true },
-    });
-    if (!fullBinding) {
-      return { status: "error", error: "Binding not found" };
-    }
-
-    const entitlement = await db.connectivityEntitlement.findUnique({
-      where: { id: fullBinding.entitlementId },
-      include: { capability: true },
-    });
-    if (!entitlement) {
-      return { status: "error", error: "Entitlement not found" };
-    }
+    // Phase 2C.3.2: Use the canonical runtime resolver.
+    // This validates tenant isolation, type match, and instance status
+    // at RUNTIME — not just at creation time.
+    const { adapter, binding: bindingInput, entitlement: entitlementInput } = await resolveBindingRuntime(bindingId);
 
     // Capture the observed binding status BEFORE the adapter call.
-    // This is used for stale-observation prevention in the transaction.
-    const observedBindingStatus = fullBinding.status;
+    const observedBindingStatus = bindingInput.status;
 
-    // Step 3: Call the adapter's reconcile() — this is an OBSERVATION, not a mutation.
-    // The adapter does NOT touch the database. It only reports what it sees at the provider.
+    // Call the adapter's reconcile() — this is an OBSERVATION, not a mutation.
+    // The adapter receives the full binding input INCLUDING providerInstanceId
+    // and providerInstanceConfiguration.
     const adapterResult = await adapter.reconcile({
-      entitlement: {
-        id: entitlement.id,
-        tenantId: entitlement.tenantId,
-        subscriptionId: entitlement.subscriptionId,
-        status: entitlement.status,
-        capabilityType: entitlement.capability.type,
-        capabilitySet: JSON.parse(entitlement.capabilitySet),
-        policy: entitlement.policy ? JSON.parse(entitlement.policy) : null,
-        validFrom: entitlement.validFrom,
-        validUntil: entitlement.validUntil,
-      },
-      binding: {
-        id: fullBinding.id,
-        entitlementId: fullBinding.entitlementId,
-        providerType: fullBinding.providerType,
-        providerResourceId: fullBinding.providerResourceId,
-        providerMetadata: fullBinding.providerMetadata ? JSON.parse(fullBinding.providerMetadata) : null,
-        status: fullBinding.status,
-        provisioningState: fullBinding.provisioningState,
-      },
+      entitlement: entitlementInput,
+      binding: bindingInput,
     });
 
     // Step 4: Map the observation to a kernel decision (target state + metadata).
@@ -1034,4 +1000,147 @@ export async function resolveBindingWithInstance(bindingId: string): Promise<{
   }
 
   return { adapter, binding, providerInstance };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2C.3.2: Canonical Runtime Resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 2C.3.2: The canonical runtime resolver.
+ *
+ * This is the ONLY correct way to resolve a binding's full runtime context:
+ *   1. Load the ProviderResourceBinding
+ *   2. Load the associated ConnectivityEntitlement (for tenantId)
+ *   3. Load the ConnectivityProviderInstance (if providerInstanceId is set)
+ *   4. Verify tenant isolation: instance.tenantId === entitlement.tenantId
+ *   5. Verify type match: instance.providerType === binding.providerType
+ *   6. Verify instance status: must be "active"
+ *   7. Resolve the adapter through the registry
+ *
+ * This resolver does NOT rely on creation-time authorization. It validates
+ * the CURRENT relationship every time. If the instance's ownership, type,
+ * or status has changed since binding creation, the resolver fails closed.
+ *
+ * Returns the full runtime context: adapter, binding, entitlement, providerInstance.
+ */
+export async function resolveBindingRuntime(bindingId: string): Promise<{
+  adapter: import("./adapter").ConnectivityProviderAdapter;
+  binding: import("./adapter").ProviderResourceBindingInput;
+  entitlement: import("./adapter").ConnectivityEntitlementInput;
+  providerInstance: {
+    id: string;
+    tenantId: string;
+    providerType: string;
+    name: string;
+    status: string;
+    configuration: Record<string, unknown> | null;
+    configurationKey: string | null;
+  } | null;
+}> {
+  const { resolveBindingAdapter } = await import("./registry");
+
+  // Step 1: Load the binding (includes providerInstanceId from 2C.3.1)
+  const { adapter, binding: bindingSummary } = await resolveBindingAdapter(bindingId);
+
+  // Step 2: Load the full binding with all fields needed for the adapter input
+  const fullBinding = await db.providerResourceBinding.findUnique({
+    where: { id: bindingId },
+    select: {
+      id: true, entitlementId: true, providerType: true,
+      providerResourceId: true, providerMetadata: true,
+      status: true, provisioningState: true,
+      providerInstanceId: true,
+    },
+  });
+  if (!fullBinding) {
+    throw new Error(`ProviderResourceBinding not found: ${bindingId}`);
+  }
+
+  // Step 3: Load the entitlement (for tenantId + capability info)
+  const entitlement = await db.connectivityEntitlement.findUnique({
+    where: { id: fullBinding.entitlementId },
+    include: { capability: true },
+  });
+  if (!entitlement) {
+    throw new Error(`Entitlement not found for binding ${bindingId}`);
+  }
+
+  // Step 4: Load the provider instance (if set)
+  let providerInstance: {
+    id: string; tenantId: string; providerType: string;
+    name: string; status: string;
+    configuration: Record<string, unknown> | null;
+    configurationKey: string | null;
+  } | null = null;
+
+  if (fullBinding.providerInstanceId) {
+    const instance = await db.connectivityProviderInstance.findUnique({
+      where: { id: fullBinding.providerInstanceId },
+      select: { id: true, tenantId: true, providerType: true, name: true, status: true, configuration: true, configurationKey: true },
+    });
+
+    if (!instance) {
+      throw new Error(
+        `Provider instance not found: ${fullBinding.providerInstanceId} (binding ${bindingId}). ` +
+        `The instance may have been deleted after binding creation.`,
+      );
+    }
+
+    // Step 5: Runtime tenant isolation — verify CURRENT ownership
+    if (instance.tenantId !== entitlement.tenantId) {
+      throw new Error(
+        `Cross-tenant provider instance access denied: binding ${bindingId} belongs to tenant ` +
+        `"${entitlement.tenantId}" but instance "${instance.id}" belongs to tenant "${instance.tenantId}".`,
+      );
+    }
+
+    // Step 6: Runtime type match — verify CURRENT providerType
+    if (instance.providerType !== fullBinding.providerType) {
+      throw new Error(
+        `Provider type mismatch: binding providerType is "${fullBinding.providerType}" ` +
+        `but instance "${instance.id}" has providerType "${instance.providerType}".`,
+      );
+    }
+
+    // Step 7: Instance status — must be active
+    if (instance.status !== "active") {
+      throw new Error(
+        `Provider instance "${instance.id}" status is "${instance.status}". ` +
+        `Only "active" instances can be used for runtime operations.`,
+      );
+    }
+
+    providerInstance = {
+      ...instance,
+      configuration: instance.configuration ? JSON.parse(instance.configuration) : null,
+    };
+  }
+
+  // Build the adapter inputs
+  const bindingInput: import("./adapter").ProviderResourceBindingInput = {
+    id: fullBinding.id,
+    entitlementId: fullBinding.entitlementId,
+    providerType: fullBinding.providerType,
+    providerResourceId: fullBinding.providerResourceId,
+    providerMetadata: fullBinding.providerMetadata ? JSON.parse(fullBinding.providerMetadata) : null,
+    status: fullBinding.status,
+    provisioningState: fullBinding.provisioningState,
+    providerInstanceId: fullBinding.providerInstanceId,
+    providerInstanceConfiguration: providerInstance?.configuration ?? null,
+  };
+
+  const entitlementInput: import("./adapter").ConnectivityEntitlementInput = {
+    id: entitlement.id,
+    tenantId: entitlement.tenantId,
+    subscriptionId: entitlement.subscriptionId,
+    status: entitlement.status,
+    capabilityType: entitlement.capability.type,
+    capabilitySet: JSON.parse(entitlement.capabilitySet),
+    policy: entitlement.policy ? JSON.parse(entitlement.policy) : null,
+    validFrom: entitlement.validFrom,
+    validUntil: entitlement.validUntil,
+  };
+
+  return { adapter, binding: bindingInput, entitlement: entitlementInput, providerInstance };
 }

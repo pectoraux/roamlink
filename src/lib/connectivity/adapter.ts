@@ -41,6 +41,21 @@ export type ProviderResourceBindingInput = {
   providerMetadata: Record<string, unknown> | null;
   status: string;
   provisioningState: string | null;
+  /**
+   * Phase 2C.3.2: The specific infrastructure instance this binding is
+   * provisioned against. The adapter receives this through the generic
+   * contract so it can resolve instance-specific configuration/credentials.
+   *
+   * providerType selects the adapter CLASS.
+   * providerInstanceId selects the specific infrastructure INSTANCE.
+   */
+  providerInstanceId: string | null;
+  /**
+   * Phase 2C.3.2: Non-secret provider instance configuration (parsed from
+   * ConnectivityProviderInstance.configuration JSON). The adapter may use
+   * this to resolve endpoints, API versions, etc.
+   */
+  providerInstanceConfiguration: Record<string, unknown> | null;
 };
 
 // ---------------------------------------------------------------------------
