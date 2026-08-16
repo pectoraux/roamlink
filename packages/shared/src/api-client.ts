@@ -20,6 +20,7 @@ import type {
   EdgeObservationAck,
   EdgeDeviceRegistration,
   EdgePolicyContext,
+  CurrentConnectivity,
 } from "./index";
 
 export class ApiError extends Error {
@@ -269,6 +270,16 @@ export class RoamLinkClient {
     return this.request<{ ok: true }>("/api/v1/connectivity/edge/policy-context", {
       method: "POST",
       body: JSON.stringify({ deviceId, context }),
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  // --- Phase 9.2: Current Connectivity (read-only) ---
+  // Fetches the user's current connectivity state. Strictly read-only — the
+  // mobile UI reports state; the server remains authoritative.
+
+  async getCurrentConnectivity(token: string) {
+    return this.request<CurrentConnectivity>("/api/v1/connectivity/current", {
       headers: { Cookie: `esim_session=${token}` },
     });
   }

@@ -1,15 +1,21 @@
 /**
- * Home — "Where are you going?" + active eSIM status + quick actions.
+ * Home — Current Connectivity primary + destinations.
+ *
+ * Phase 9.2: The top-level object is now "Current Connectivity" (read-only
+ * control-plane view). The eSIM card remains as a secondary resource detail,
+ * shown only when the current resource happens to be an eSIM.
  */
 
 import { useState, useEffect, useCallback } from "react";
 import { View, Text, TextInput, Pressable, FlatList, ActivityIndicator, RefreshControl } from "react-native";
 import { useRouter } from "expo-router";
-import { Search, Smartphone, Zap, Plus, Clock } from "lucide-react-native";
-import type { PublicPlan, ESIM } from "@roamlink/shared";
+import { Search, Zap, Plus } from "lucide-react-native";
+import type { PublicPlan, ESIM, CurrentConnectivity } from "@roamlink/shared";
 import { formatPrice, formatDataSize, countryFlag } from "@roamlink/shared";
 import { api, getSession } from "../../../lib/api";
 import { useAuth } from "../../../lib/auth";
+import { getCurrentConnectivity } from "../../../lib/connectivity/current-connectivity";
+import { CurrentConnectivityCard } from "../../../components/connectivity/CurrentConnectivityCard";
 
 export default function HomeScreen() {
   const { user } = useAuth();
@@ -17,19 +23,22 @@ export default function HomeScreen() {
   const [query, setQuery] = useState("");
   const [destinations, setDestinations] = useState<{ country: string; countryCode: string; minPriceMinor: number }[]>([]);
   const [esims, setEsims] = useState<ESIM[]>([]);
+  const [currentConnectivity, setCurrentConnectivity] = useState<CurrentConnectivity | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
   const loadData = useCallback(async () => {
     try {
       const token = await getSession();
-      const [plansRes, esimRes] = await Promise.all([
+      const [plansRes, esimRes, currentRes] = await Promise.all([
         api.getPlans(),
         token ? api.listESIMs(token) : Promise.resolve({ esims: [] as ESIM[] }),
+        token ? getCurrentConnectivity(true) : Promise.resolve(null),
       ]);
       setDestinations(plansRes.destinations);
       setEsims(esimRes.esims);
-    } catch (e) {
+      setCurrentConnectivity(currentRes);
+    } catch {
       // silent
     } finally {
       setLoading(false);
@@ -38,6 +47,15 @@ export default function HomeScreen() {
   }, []);
 
   useEffect(() => { loadData(); }, [loadData]);
+
+  // Refresh current connectivity every 30s (read-only polling)
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const current = await getCurrentConnectivity();
+      if (current) setCurrentConnectivity(current);
+    }, 30_000);
+    return () => clearInterval(interval);
+  }, []);
 
   const activeESIM = esims.find((e) => e.status === "active");
 
@@ -64,6 +82,13 @@ export default function HomeScreen() {
             <Text style={{ fontSize: 28, fontWeight: "bold", color: "#0f172a", marginBottom: 4 }}>Hi, {user?.name?.split(" ")[0] || "Traveler"} 👋</Text>
             <Text style={{ fontSize: 16, color: "#64748b", marginBottom: 20 }}>Where are you going?</Text>
 
+            {/* Phase 9.2: Current Connectivity is the primary view */}
+            {currentConnectivity && (
+              <View style={{ marginBottom: 24 }}>
+                <CurrentConnectivityCard data={currentConnectivity} />
+              </View>
+            )}
+
             {/* Search */}
             <View style={{ flexDirection: "row", alignItems: "center", backgroundColor: "white", borderRadius: 14, paddingHorizontal: 14, paddingVertical: 4, marginBottom: 24, shadowColor: "#000", shadowOpacity: 0.05, shadowRadius: 8, elevation: 2 }}>
               <Search size={20} color="#94a3b8" />
@@ -77,7 +102,7 @@ export default function HomeScreen() {
               />
             </View>
 
-            {/* Active eSIM card */}
+            {/* Active eSIM card (secondary — shown when current resource is eSIM) */}
             {activeESIM && (
               <Pressable
                 onPress={() => router.push(`/esim/${activeESIM.id}`)}
