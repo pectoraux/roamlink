@@ -219,14 +219,47 @@ export async function releaseResource(resourceId: string, sessionId: string): Pr
 }
 
 // ---------------------------------------------------------------------------
-// Mark Resource In Use (after activation)
+// Mark Resource In Use (after activation) — fail closed
 // ---------------------------------------------------------------------------
 
-export async function markResourceInUse(resourceId: string, sessionId: string): Promise<void> {
-  await db.protocolResource.updateMany({
-    where: { id: resourceId, reservedBy: sessionId },
+/**
+ * Mark a reserved resource as IN_USE. Returns a structured result so the
+ * caller can fail closed if the update affected 0 rows (ownership mismatch
+ * or wrong state).
+ *
+ * Phase 8.5.1: Previously returned void and silently ignored failures.
+ * Now returns { activated, reason? } like reserveResource().
+ */
+export async function markResourceInUse(resourceId: string, sessionId: string): Promise<{
+  activated: boolean;
+  reason?: string;
+}> {
+  const result = await db.protocolResource.updateMany({
+    where: {
+      id: resourceId,
+      reservedBy: sessionId,
+      state: "RESERVED", // only transition from RESERVED → IN_USE
+    },
     data: { state: "IN_USE" },
   });
+
+  if (result.count === 0) {
+    const resource = await db.protocolResource.findUnique({
+      where: { id: resourceId },
+      select: { state: true, reservedBy: true },
+    });
+
+    if (!resource) {
+      return { activated: false, reason: "Resource not found" };
+    }
+    if (resource.reservedBy !== sessionId) {
+      return { activated: false, reason: `Ownership mismatch: reserved by "${resource.reservedBy}", not "${sessionId}"` };
+    }
+    return { activated: false, reason: `Resource is in state "${resource.state}", expected "RESERVED"` };
+  }
+
+  logger.info("resource.marked_in_use", { resourceId, sessionId });
+  return { activated: true };
 }
 
 // ---------------------------------------------------------------------------

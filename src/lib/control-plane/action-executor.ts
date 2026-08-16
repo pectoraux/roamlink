@@ -26,6 +26,7 @@ import { ACTION_TRANSITIONS } from "@/lib/protocol";
 import type { ActionState, ActionType } from "@/lib/protocol";
 import { transitionSessionState } from "./session-manager";
 import { reserveResource, releaseResource, markResourceInUse } from "./capability-registry";
+import { verifyResourceUsable } from "./kernel-bridge";
 
 // ---------------------------------------------------------------------------
 // Create Action
@@ -38,8 +39,26 @@ export async function createAction(input: {
   targetResourceId?: string;
   reason?: string;
   policyVersion?: string;
+  idempotencyKey?: string; // caller-supplied durable key (Phase 8.5.3)
 }): Promise<{ id: string; state: string; idempotencyKey: string }> {
-  const idempotencyKey = `action-${input.sessionId}-${input.type}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  // Phase 8.5.3: accept caller-supplied idempotency key for durable retry.
+  // If not supplied, generate one (backward compat).
+  const idempotencyKey = input.idempotencyKey ?? `action-${input.sessionId}-${input.type}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+  // Phase 8.5.3: idempotent create — if an action with this key already exists,
+  // return it instead of creating a duplicate.
+  const existing = await db.connectivityAction.findUnique({
+    where: { idempotencyKey },
+  });
+
+  if (existing) {
+    logger.info("action.idempotent_return", {
+      actionId: existing.id,
+      idempotencyKey,
+      state: existing.state,
+    });
+    return { id: existing.id, state: existing.state, idempotencyKey };
+  }
 
   const action = await db.connectivityAction.create({
     data: {
@@ -59,6 +78,7 @@ export async function createAction(input: {
     sessionId: input.sessionId,
     type: input.type,
     targetResourceId: input.targetResourceId,
+    idempotencyKey,
   });
 
   return { id: action.id, state: action.state, idempotencyKey };
@@ -174,10 +194,23 @@ export async function executeAction(actionId: string): Promise<{
           throw new Error(`Failed to reserve resource ${targetResourceId}: ${reserveResult.reason}`);
         }
 
-        // 3b. Mark resource as IN_USE
-        await markResourceInUse(targetResourceId, session.id);
+        // 3b. Mark resource as IN_USE — fail closed (Phase 8.5.1)
+        const activateResult = await markResourceInUse(targetResourceId, session.id);
+        if (!activateResult.activated) {
+          // Activation failed — release the reservation and fail
+          await releaseResource(targetResourceId, session.id);
+          throw new Error(`Failed to mark resource IN_USE: ${activateResult.reason}`);
+        }
 
-        // 3c. Update session
+        // 3c. Verify the resource is actually IN_USE (Phase 8.5.4: real verification)
+        const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
+        if (!verifyResult.usable) {
+          // Verification failed — release and fail
+          await releaseResource(targetResourceId, session.id);
+          throw new Error(`Resource verification failed: ${verifyResult.reason}`);
+        }
+
+        // 3d. Update session
         await db.connectivitySession.update({
           where: { id: session.id },
           data: {
@@ -187,7 +220,7 @@ export async function executeAction(actionId: string): Promise<{
           },
         });
 
-        // 3d. Transition session to ACTIVE
+        // 3e. Transition session to ACTIVE
         if (session.state === "PLANNED" || session.state === "DISCOVERING" || session.state === "RESERVED") {
           await transitionSessionState(session.id, "ACTIVE");
         }
@@ -219,20 +252,22 @@ export async function executeAction(actionId: string): Promise<{
           throw new Error(`Failed to reserve target resource ${targetResourceId}: ${reserveResult.reason}`);
         }
 
-        // 3c. Mark target as IN_USE
-        await markResourceInUse(targetResourceId, session.id);
+        // 3c. Mark target as IN_USE — fail closed (Phase 8.5.1)
+        const activateResult = await markResourceInUse(targetResourceId, session.id);
+        if (!activateResult.activated) {
+          // Activation failed — release target, recover session
+          await releaseResource(targetResourceId, session.id);
+          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          throw new Error(`Failed to mark target IN_USE: ${activateResult.reason}`);
+        }
 
-        // 3d. Verify target is usable (check it's IN_USE)
-        const targetResource = await db.protocolResource.findUnique({
-          where: { id: targetResourceId },
-          select: { state: true, reservedBy: true },
-        });
-
-        if (!targetResource || targetResource.state !== "IN_USE" || targetResource.reservedBy !== session.id) {
+        // 3d. Verify target is usable — DB state + kernel reconcile (Phase 8.5.4)
+        const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
+        if (!verifyResult.usable) {
           // Verification failed — release target, recover session
           await releaseResource(targetResourceId, session.id);
           await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
-          throw new Error(`Target resource ${targetResourceId} verification failed — state: ${targetResource?.state ?? "null"}`);
+          throw new Error(`Target resource ${targetResourceId} verification failed: ${verifyResult.reason}`);
         }
 
         // 3e. Atomically update session to point to new resource
@@ -353,4 +388,115 @@ export async function getActionHistory(sessionId: string) {
   });
 
   return actions;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8.5.3: Durable Action Recovery Worker
+// ---------------------------------------------------------------------------
+
+/**
+ * Recover EXECUTING actions that were interrupted by a crash.
+ *
+ * An action in EXECUTING state means the process died mid-execution.
+ * The recovery worker inspects the session + resource state and converges:
+ *
+ *   - If the target resource is IN_USE and owned by the session → SUCCEEDED
+ *   - If the target resource is RESERVED but not IN_USE → release + FAILED
+ *   - If the target resource is AVAILABLE (never reserved) → FAILED
+ *   - If the session is SWITCHING and target is IN_USE → complete the switch
+ *   - Otherwise → RECONCILIATION_REQUIRED
+ *
+ * This is the control-plane equivalent of the kernel's reconcileProvisioning().
+ */
+export async function recoverStaleActions(): Promise<{
+  recovered: number;
+  succeeded: number;
+  failed: number;
+  reconciliationRequired: number;
+}> {
+  // Find all actions in EXECUTING state (stale = process crashed mid-execution)
+  const staleActions = await db.connectivityAction.findMany({
+    where: { state: "EXECUTING" },
+    include: { session: true },
+  });
+
+  let succeeded = 0;
+  let failed = 0;
+  let reconciliationRequired = 0;
+
+  for (const action of staleActions) {
+    const session = action.session;
+    const targetResourceId = action.targetResourceId;
+
+    if (!targetResourceId) {
+      // No target — can't recover
+      await transitionActionState(action.id, "FAILED", "No targetResourceId on EXECUTING action");
+      failed++;
+      continue;
+    }
+
+    // Check the target resource state
+    const resource = await db.protocolResource.findUnique({
+      where: { id: targetResourceId },
+      select: { state: true, reservedBy: true },
+    });
+
+    if (!resource) {
+      await transitionActionState(action.id, "FAILED", "Target resource not found during recovery");
+      failed++;
+      continue;
+    }
+
+    if (resource.state === "IN_USE" && resource.reservedBy === session.id) {
+      // Target is IN_USE and owned by this session → the action likely succeeded
+      // but the process died before marking it. Complete the switch if needed.
+      if (session.state === "SWITCHING") {
+        // Complete the switch: update session + release old resource
+        const previousResourceId = session.activeResourceId;
+        await db.connectivitySession.update({
+          where: { id: session.id },
+          data: {
+            activeResourceId: targetResourceId,
+            lastObservedAt: new Date(),
+          },
+        });
+        await transitionSessionState(session.id, "ACTIVE");
+
+        // Release old resource (best-effort)
+        if (previousResourceId && previousResourceId !== targetResourceId) {
+          await releaseResource(previousResourceId, session.id).catch(() => {});
+        }
+      }
+
+      await transitionActionState(action.id, "SUCCEEDED");
+      succeeded++;
+      logger.info("action.recovered_succeeded", { actionId: action.id, targetResourceId });
+    } else if (resource.state === "RESERVED" && resource.reservedBy === session.id) {
+      // Reserved but never activated → release and fail
+      await releaseResource(targetResourceId, session.id);
+      if (session.state === "SWITCHING") {
+        await transitionSessionState(session.id, "ACTIVE");
+      }
+      await transitionActionState(action.id, "FAILED", "Resource was RESERVED but never IN_USE — recovered by releasing");
+      failed++;
+      logger.info("action.recovered_failed_reserved", { actionId: action.id, targetResourceId });
+    } else {
+      // Unknown state — needs manual reconciliation
+      await transitionActionState(action.id, "RECONCILIATION_REQUIRED", `Resource in unexpected state: ${resource.state}, reservedBy: ${resource.reservedBy}`);
+      reconciliationRequired++;
+      logger.warn("action.recovered_reconciliation_required", {
+        actionId: action.id,
+        targetResourceId,
+        resourceState: resource.state,
+        reservedBy: resource.reservedBy,
+      });
+    }
+  }
+
+  const recovered = staleActions.length;
+  logger.info("action.recovery_completed", {
+    recovered, succeeded, failed, reconciliationRequired,
+  });
+
+  return { recovered, succeeded, failed, reconciliationRequired };
 }

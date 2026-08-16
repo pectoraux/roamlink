@@ -68,19 +68,53 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
     city: (input.location as Record<string, unknown>)?.city as string | undefined,
   });
 
-  // Step 2: For each capability, discover AVAILABLE resources
-  let bestResource: { id: string; capabilityId: string } | null = null;
-  let bestCapability: { id: string; type: string; providerType: string; reliability: number } | null = null;
+  // Step 2: For each capability, discover ALL available resources and score them
+  // Phase 8.5.5: evaluate all candidates, not just first available.
+  type Candidate = {
+    resourceId: string;
+    capabilityId: string;
+    capabilityType: string;
+    providerType: string;
+    reliability: number;
+    score: number;
+  };
+
+  const candidates: Candidate[] = [];
 
   for (const cap of capabilities) {
     const resources = await discoverResources(cap.id);
-    if (resources.length > 0) {
-      // Pick the first available resource (round-robin via createdAt ordering)
-      bestResource = { id: resources[0].id, capabilityId: cap.id };
-      bestCapability = cap;
-      break;
+    for (const resource of resources) {
+      // Score each resource based on capability reliability + capacity
+      let resourceScore = cap.reliability;
+
+      // Boost score if resource has capacity info
+      if (resource.capacity) {
+        const capacity = resource.capacity as Record<string, unknown>;
+        const available = capacity.availableBandwidthMbps as number | undefined;
+        if (available && available > 0) {
+          resourceScore = Math.min(1.0, resourceScore + (available / 1000));
+        }
+      }
+
+      candidates.push({
+        resourceId: resource.id,
+        capabilityId: cap.id,
+        capabilityType: cap.type,
+        providerType: cap.providerType,
+        reliability: cap.reliability,
+        score: resourceScore,
+      });
     }
   }
+
+  // Sort candidates by score descending — best resource first
+  candidates.sort((a, b) => b.score - a.score);
+
+  const bestCandidate = candidates[0] ?? null;
+  const bestResource = bestCandidate ? { id: bestCandidate.resourceId, capabilityId: bestCandidate.capabilityId } : null;
+  const bestCapability = bestCandidate
+    ? { id: bestCandidate.capabilityId, type: bestCandidate.capabilityType, providerType: bestCandidate.providerType, reliability: bestCandidate.reliability }
+    : null;
 
   // Step 3: Also rank offers for pricing/scoring (commerce layer, unchanged)
   const ranking = await rankOffers({
