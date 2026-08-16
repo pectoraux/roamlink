@@ -99,9 +99,23 @@ export async function createOrUpdatePolicy(input: {
     where: { subjectId: input.subjectId },
   });
 
-  // Start with preset or existing values
+  // Phase 9.3.1: When no preset is provided, preserve existing values
+  // instead of defaulting to MANUAL. This prevents a mode-only update
+  // (e.g. autoSwitchEnabled=true → mode=automatic) from overwriting the
+  // user's chosen preset parameters.
   const preset = input.preset ? POLICY_PRESETS[input.preset] : null;
-  const base = preset ?? POLICY_PRESETS.MANUAL;
+
+  // Build the base values: preset > existing > MANUAL
+  const existingParsed = existing ? {
+    mode: existing.mode as "automatic" | "manual",
+    maxAutoSpendMinor: existing.maxAutoSpendMinor,
+    preferredTransports: existing.preferredTransports ? JSON.parse(existing.preferredTransports) : [],
+    minReliability: existing.minReliability,
+    switchHysteresis: existing.switchHysteresis,
+    requireUserApprovalForPurchase: existing.requireUserApprovalForPurchase,
+    neverInterruptActiveCall: existing.neverInterruptActiveCall,
+  } : null;
+  const base = preset ?? existingParsed ?? POLICY_PRESETS.MANUAL;
 
   const data = {
     subjectId: input.subjectId,

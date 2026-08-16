@@ -2313,8 +2313,17 @@ model EdgeDevice {
   // Phase 9.3: Persisted policy context (last-known). The device reports
   // context hints; the server applies them to the policy engine. Persisting
   // the context lets the mobile settings UI read the current state.
-  policyContext   String?  // JSON of EdgePolicyContext
+  // Phase 9.3.1: This is a CONTEXT SNAPSHOT, not authoritative policy.
+  // Device context (batterySaver, roaming, metered) is transient and
+  // per-device. It does NOT overwrite the user's base policy. The decision
+  // engine derives an effective policy from base policy + device context.
+  policyContext   String?  // JSON of EdgePolicyContext (context snapshot)
   policyContextUpdatedAt DateTime?
+  // Phase 9.3.1: Versioning + timestamp fencing for context updates.
+  // A stale update (observedAt < current) is rejected to prevent network
+  // reordering from regressing the context.
+  policyContextVersion Int  @default(0)
+  policyContextObservedAt DateTime?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 

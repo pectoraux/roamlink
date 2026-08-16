@@ -38,6 +38,11 @@ export type DecisionInput = {
   location?: Record<string, unknown>;
   maxPriceMinor?: number;
   policy?: ConnectivityPolicy;
+  // Phase 9.3.1: Optional device ID for effective-policy derivation.
+  // When provided, the decision engine derives the effective policy from
+  // base policy + device context (batterySaver, workMode, etc.) instead of
+  // using the base policy directly.
+  deviceId?: string;
 };
 
 export type DecisionOutput = {
@@ -275,7 +280,19 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
   }
 
   // Step 7: Policy evaluation
-  const policy = input.policy ?? await getPolicy(input.subjectId);
+  // Phase 9.3.1: Derive effective policy from base + device context.
+  // If input.policy is explicitly provided, use it (caller override).
+  // If deviceId is provided, derive effective policy (base + device context).
+  // Otherwise, fall back to the base policy.
+  let policy = input.policy;
+  if (!policy && input.deviceId) {
+    const { deriveEffectivePolicy } = await import("./effective-policy");
+    const effective = await deriveEffectivePolicy(input.subjectId, input.deviceId);
+    policy = effective as ConnectivityPolicy;
+  }
+  if (!policy) {
+    policy = await getPolicy(input.subjectId);
+  }
   const policyResult = evaluatePolicy({
     policy,
     action: action === "ACTIVATE" ? "ACTIVATE" : action === "SWITCH" ? "SWITCH" : "KEEP",
