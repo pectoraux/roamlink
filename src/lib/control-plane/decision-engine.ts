@@ -23,6 +23,7 @@
 import { db } from "@/lib/db";
 import { logger } from "@/lib/logger";
 import { rankOffers } from "@/lib/commerce/ranking-engine";
+import { getPolicy, evaluatePolicy } from "@/lib/control-plane/policy-engine";
 import type { ConnectivityPolicy } from "@/lib/protocol";
 
 // ---------------------------------------------------------------------------
@@ -98,39 +99,74 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
       const policy = input.policy;
       const switchThreshold = policy?.switchHysteresis ?? 0.15;
 
-      // If the top offer's score is significantly better than the current
-      // session's quality, SWITCH. Otherwise KEEP.
-      // For v1, we use a simple heuristic: if the top offer score > 0.7
-      // and the session has no recent measurements showing good quality, SWITCH.
-      const recentMeasurements = await db.connectivityMeasurement.findMany({
-        where: { sessionId: activeSession.id, capturedAt: { gte: new Date(Date.now() - 300000) } },
-        orderBy: { capturedAt: "desc" },
-        take: 3,
-      });
+      // Phase 8.3: Hysteresis — prevent oscillation.
+      // 1. Minimum dwell time: don't switch if the session was activated <60s ago
+      // 2. Cooldown: don't switch if the last switch was <120s ago
+      // 3. Confidence: require at least 2 recent measurements agreeing on degradation
+      const MIN_DWELL_MS = 60_000; // 60 seconds
+      const COOLDOWN_MS = 120_000; // 2 minutes
+      const MIN_MEASUREMENTS_FOR_SWITCH = 2;
 
-      if (recentMeasurements.length === 0) {
-        // No recent measurements — can't evaluate, KEEP current
+      // Check dwell time
+      if (activeSession.startedAt && Date.now() - activeSession.startedAt.getTime() < MIN_DWELL_MS) {
         action = "KEEP";
-        reasons.push("No recent measurements to evaluate switching");
-        constraintsSatisfied.push("SESSION_ACTIVE");
+        reasons.push(`Session started <${MIN_DWELL_MS / 1000}s ago — dwell time not met`);
+        constraintsSatisfied.push("DWELL_TIME_ENFORCED");
       } else {
-        // Check if current quality is degraded
-        const lastMeasurement = recentMeasurements[0];
-        const metrics = JSON.parse(lastMeasurement.metrics);
-        const currentQuality = (metrics.throughputDownMbps ?? 0) > 0
-          ? Math.min(1, (metrics.throughputDownMbps ?? 0) / 50)
-          : 0.3;
+        // Check cooldown — look for recent SWITCH actions
+        const recentSwitch = await db.connectivityAction.findFirst({
+          where: {
+            sessionId: activeSession.id,
+            type: "SWITCH",
+            state: "SUCCEEDED",
+            completedAt: { gte: new Date(Date.now() - COOLDOWN_MS) },
+          },
+        });
 
-        if (topOffer.score - currentQuality > switchThreshold) {
-          action = "SWITCH";
-          targetResourceId = topOffer.offerId; // would be resource ID in full impl
-          reasons.push(`Top offer score ${topOffer.score.toFixed(2)} exceeds current quality ${currentQuality.toFixed(2)} by more than threshold ${switchThreshold}`);
-          constraintsSatisfied.push("SWITCH_THRESHOLD_MET");
-        } else {
+        if (recentSwitch) {
           action = "KEEP";
-          reasons.push(`Current quality ${currentQuality.toFixed(2)} is within threshold of top offer ${topOffer.score.toFixed(2)}`);
-          constraintsSatisfied.push("SESSION_ACTIVE");
-          constraintsSatisfied.push("QUALITY_ACCEPTABLE");
+          reasons.push(`Last switch was <${COOLDOWN_MS / 1000}s ago — cooldown active`);
+          constraintsSatisfied.push("COOLDOWN_ENFORCED");
+        } else {
+          // If the top offer's score is significantly better than the current
+          // session's quality, SWITCH. Otherwise KEEP.
+          const recentMeasurements = await db.connectivityMeasurement.findMany({
+            where: { sessionId: activeSession.id, capturedAt: { gte: new Date(Date.now() - 300000) } },
+            orderBy: { capturedAt: "desc" },
+            take: 5,
+          });
+
+          if (recentMeasurements.length === 0) {
+            // No recent measurements — can't evaluate, KEEP current
+            action = "KEEP";
+            reasons.push("No recent measurements to evaluate switching");
+            constraintsSatisfied.push("SESSION_ACTIVE");
+          } else if (recentMeasurements.length < MIN_MEASUREMENTS_FOR_SWITCH) {
+            // Not enough measurements for confidence — KEEP
+            action = "KEEP";
+            reasons.push(`Only ${recentMeasurements.length} measurement(s) — need ${MIN_MEASUREMENTS_FOR_SWITCH} for switch confidence`);
+            constraintsSatisfied.push("CONFIDENCE_THRESHOLD_ENFORCED");
+          } else {
+            // Check if current quality is degraded
+            const lastMeasurement = recentMeasurements[0];
+            const metrics = JSON.parse(lastMeasurement.metrics);
+            const currentQuality = (metrics.throughputDownMbps ?? 0) > 0
+              ? Math.min(1, (metrics.throughputDownMbps ?? 0) / 50)
+              : 0.3;
+
+            if (topOffer.score - currentQuality > switchThreshold) {
+              action = "SWITCH";
+              targetResourceId = topOffer.offerId;
+              reasons.push(`Top offer score ${topOffer.score.toFixed(2)} exceeds current quality ${currentQuality.toFixed(2)} by more than threshold ${switchThreshold}`);
+              constraintsSatisfied.push("SWITCH_THRESHOLD_MET");
+              constraintsSatisfied.push("HYSTERESIS_PASSED");
+            } else {
+              action = "KEEP";
+              reasons.push(`Current quality ${currentQuality.toFixed(2)} is within threshold of top offer ${topOffer.score.toFixed(2)}`);
+              constraintsSatisfied.push("SESSION_ACTIVE");
+              constraintsSatisfied.push("QUALITY_ACCEPTABLE");
+            }
+          }
         }
       }
     } else {
@@ -172,6 +208,23 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
         constraintsViolated.push("BELOW_MIN_RELIABILITY");
       }
     }
+  }
+
+  // Step 5.5: Evaluate policy — can the action proceed automatically?
+  // If the policy doesn't allow it, downgrade to ASK_USER.
+  const policy = input.policy ?? await getPolicy(input.subjectId);
+  const policyResult = evaluatePolicy({
+    policy,
+    action: action === "ACTIVATE" ? "ACTIVATE" : action === "SWITCH" ? "SWITCH" : "KEEP",
+    estimatedCostMinor: ranking.ranked[0]?.customerPriceMinor,
+  });
+
+  if (!policyResult.allowed && action !== "KEEP" && action !== "WAIT") {
+    reasons.push(`Policy blocked action: ${policyResult.reason}`);
+    constraintsViolated.push("POLICY_BLOCKED");
+    action = "ASK_USER";
+  } else if (policyResult.allowed) {
+    constraintsSatisfied.push("POLICY_ALLOWED");
   }
 
   // Step 6: Persist the decision

@@ -1765,12 +1765,15 @@ model ConnectivityOffer2 {
   updatedAt       DateTime @updatedAt
 
   tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  capability      ProtocolCapability? @relation(fields: [capabilityId], references: [id], onDelete: SetNull)
+  capabilityId    String?
 
   @@index([tenantId])
   @@index([capabilityType])
   @@index([providerType])
   @@index([supplierId])
   @@index([status])
+  @@index([capabilityId])
 }
 
 // A reseller's markup rule on supplier offers.
@@ -2096,5 +2099,68 @@ model ConnectivityAction {
 
   @@index([sessionId])
   @@index([decisionId])
+  @@index([state])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8.3 — First-class Protocol Models (Capability + Resource)
+//
+// The auditor correctly identified that using ConnectivityOffer2 with zero
+// pricing as a "capability" collapses supply and commerce. These models
+// separate them:
+//
+//   ConnectivityCapability = what CAN be provided (technical supply)
+//   ConnectivityResource   = what ACTUALLY EXISTS (allocatable instance)
+//   ConnectivityOffer2     = commercial realization (price + terms)
+//
+// Relationship: Capability → Resources → Offers
+// ---------------------------------------------------------------------------
+
+model ProtocolCapability {
+  id              String   @id @default(cuid())
+  tenantId        String
+  providerInstanceId String
+  type            String   // INTERNET | ROAMING | LOCAL_NETWORK | VPN_ACCESS
+  providerType    String   // mikrotik | esim | telco | future
+  // JSON: { downloadMbps, uploadMbps, typicalLatencyMs, maxLatencyMs, mobility, metering }
+  technicalSpec   String
+  // JSON: { countries, regions, cities, lat, lng, radiusKm }
+  coverage        String
+  reliability     Float    @default(0.5)
+  status          String   @default("active") // active | suspended | retired
+  validFrom       DateTime @default(now())
+  validUntil      DateTime?
+  version         Int      @default(1)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  resources       ProtocolResource[]
+  offers          ConnectivityOffer2[]
+
+  @@index([tenantId])
+  @@index([providerInstanceId])
+  @@index([type])
+  @@index([status])
+}
+
+model ProtocolResource {
+  id              String   @id @default(cuid())
+  capabilityId    String
+  providerInstanceId String
+  // JSON: { hotspotId, iccid, sessionId, ipAddress, ... }
+  identifiers     String?
+  state           String   @default("AVAILABLE") // AVAILABLE | IN_USE | DEGRADED | OFFLINE | RESERVED
+  // JSON: { maxConcurrentUsers, totalBandwidthMbps, availableBandwidthMbps }
+  capacity        String?
+  location        String?  // JSON: { country, region, city, lat, lng }
+  reservedAt      DateTime?
+  reservedBy      String?  // session ID
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  capability      ProtocolCapability @relation(fields: [capabilityId], references: [id], onDelete: Cascade)
+
+  @@index([capabilityId])
+  @@index([providerInstanceId])
   @@index([state])
 }

@@ -39,9 +39,9 @@ describe("Phase 8.2 — North-Star: Autonomous Switching (Static)", () => {
     expect(source).not.toContain("resellerProduct");
     expect(source).not.toContain("customerOrder");
     expect(source).not.toContain("fulfillOrder");
-    // It creates a ConnectivityOffer2 with zero pricing (capability, not commerce)
-    expect(source).toContain("wholesalePriceMinor: 0");
-    expect(source).toContain("customerPriceMinor: 0");
+    // v2: uses first-class ProtocolCapability (not ConnectivityOffer2 with zero pricing)
+    expect(source).toContain("db.protocolCapability.create");
+    expect(source).not.toContain("connectivityOffer2.create");
   });
 
   it("NS.3: discoverCapabilities filters by location + type + reliability", async () => {

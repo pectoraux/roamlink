@@ -1,94 +1,95 @@
 /**
- * Control Plane — Capability Registry
+ * Control Plane — Capability Registry v2 (Phase 8.3)
  *
- * Allows providers to advertise connectivity capabilities WITHOUT creating
- * commercial products. This is the moment RoamLink genuinely becomes a
- * protocol: a provider can publish "I have 100Mbps WiFi in Accra" without
- * creating a Product, Order, or Checkout flow.
+ * Uses first-class ProtocolCapability + ProtocolResource models instead of
+ * reusing ConnectivityOffer2 with zero pricing. This correctly separates:
  *
- * Architecture:
- *   Provider → advertiseCapabilities() → ConnectivityCapability records
- *   Decision Engine → queries capabilities → matches against intent
- *   Commerce (optional) → creates ConnectivityOffer from capability + price
+ *   ProtocolCapability = what CAN be provided (technical supply)
+ *   ProtocolResource   = what ACTUALLY EXISTS (allocatable instance)
+ *   ConnectivityOffer2 = commercial realization (price + terms)
+ *
+ * Relationship: Capability → Resources → Offers
+ *
+ * A provider advertises a capability (technical supply). Resources are
+ * concrete instances (hotspot APs, eSIM profiles). Offers are the
+ * commercial packaging of capabilities with pricing.
  */
 
 import { db } from "@/lib/db";
 import { logger } from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
-// Advertise a Capability
+// Advertise a Capability (first-class model)
 // ---------------------------------------------------------------------------
 
-/**
- * A provider advertises a connectivity capability. This is the supply-side
- * of the protocol — it says "I can provide this type of connectivity with
- * these quality characteristics in this geographic area."
- *
- * This does NOT create a product, offer, or price. It only registers the
- * technical supply. The commerce layer can later create an offer from this
- * capability + commercial terms.
- */
 export async function advertiseCapability(input: {
   tenantId: string;
   providerInstanceId: string;
-  type: string; // INTERNET | ROAMING | LOCAL_NETWORK | VPN_ACCESS
-  providerType: string; // mikrotik | esim | telco | future
-  bandwidth?: { downloadMbps?: number; uploadMbps?: number };
-  latency?: { typicalMs?: number; maxMs?: number };
-  reliability?: number; // 0.0–1.0
-  geographicCoverage?: { countries?: string[]; regions?: string[]; cities?: string[] };
-  mobility?: boolean;
-  metering?: string; // UNMETERED | METERED | PREPAID
+  type: string;
+  providerType: string;
+  technicalSpec: Record<string, unknown>;
+  coverage: Record<string, unknown>;
+  reliability?: number;
+  validUntil?: Date;
 }): Promise<{ capabilityId: string }> {
-  // Store as a ConnectivityOffer2 with no pricing (wholesalePrice = 0, customerPrice = 0)
-  // This reuses the existing model — the capability IS an offer with zero price
-  // until commerce assigns pricing.
-  const spec: Record<string, unknown> = {};
-  if (input.bandwidth?.downloadMbps) spec.downloadMbps = input.bandwidth.downloadMbps;
-  if (input.bandwidth?.uploadMbps) spec.uploadMbps = input.bandwidth.uploadMbps;
-
-  const coverage: Record<string, unknown> = {};
-  if (input.geographicCoverage?.countries) coverage.countries = input.geographicCoverage.countries;
-  if (input.geographicCoverage?.regions) coverage.regions = input.geographicCoverage.regions;
-  if (input.geographicCoverage?.cities) coverage.cities = input.geographicCoverage.cities;
-
-  const offer = await db.connectivityOffer2.create({
+  const capability = await db.protocolCapability.create({
     data: {
       tenantId: input.tenantId,
-      capabilityType: input.type,
+      providerInstanceId: input.providerInstanceId,
+      type: input.type,
       providerType: input.providerType,
-      spec: JSON.stringify(spec),
-      coverage: JSON.stringify(coverage),
-      wholesalePriceMinor: 0,
-      customerPriceMinor: 0,
-      currency: "USD",
-      supplierId: null, // own infrastructure
+      technicalSpec: JSON.stringify(input.technicalSpec),
+      coverage: JSON.stringify(input.coverage),
+      reliability: input.reliability ?? 0.5,
       status: "active",
-      reliabilityScore: input.reliability ?? 0.5,
+      validUntil: input.validUntil ?? null,
     },
   });
 
-  logger.info("capability.advertised", {
-    capabilityId: offer.id,
+  logger.info("capability.advertised_v2", {
+    capabilityId: capability.id,
     tenantId: input.tenantId,
     type: input.type,
     providerType: input.providerType,
   });
 
-  return { capabilityId: offer.id };
+  return { capabilityId: capability.id };
+}
+
+// ---------------------------------------------------------------------------
+// Register a Resource (concrete allocatable instance)
+// ---------------------------------------------------------------------------
+
+export async function registerResource(input: {
+  capabilityId: string;
+  providerInstanceId: string;
+  identifiers?: Record<string, unknown>;
+  capacity?: Record<string, unknown>;
+  location?: Record<string, unknown>;
+}): Promise<{ resourceId: string }> {
+  const resource = await db.protocolResource.create({
+    data: {
+      capabilityId: input.capabilityId,
+      providerInstanceId: input.providerInstanceId,
+      identifiers: input.identifiers ? JSON.stringify(input.identifiers) : null,
+      capacity: input.capacity ? JSON.stringify(input.capacity) : null,
+      location: input.location ? JSON.stringify(input.location) : null,
+      state: "AVAILABLE",
+    },
+  });
+
+  logger.info("resource.registered", {
+    resourceId: resource.id,
+    capabilityId: input.capabilityId,
+  });
+
+  return { resourceId: resource.id };
 }
 
 // ---------------------------------------------------------------------------
 // Discover Capabilities
 // ---------------------------------------------------------------------------
 
-/**
- * Discover capabilities that match a location and/or type.
- *
- * This is what the decision engine calls to find candidate connectivity
- * options for a user's intent. It does NOT return prices — capabilities
- * are technical supply, not commercial offers.
- */
 export async function discoverCapabilities(input: {
   tenantId: string;
   type?: string;
@@ -99,32 +100,35 @@ export async function discoverCapabilities(input: {
   id: string;
   type: string;
   providerType: string;
-  spec: Record<string, unknown>;
+  technicalSpec: Record<string, unknown>;
   coverage: Record<string, unknown>;
   reliability: number;
+  resourceCount: number;
 }>> {
-  const offers = await db.connectivityOffer2.findMany({
+  const capabilities = await db.protocolCapability.findMany({
     where: {
       tenantId: input.tenantId,
       status: "active",
-      ...(input.type && { capabilityType: input.type }),
-      ...(input.minReliability && { reliabilityScore: { gte: input.minReliability } }),
+      ...(input.type && { type: input.type }),
+      ...(input.minReliability && { reliability: { gte: input.minReliability } }),
     },
-    orderBy: { reliabilityScore: "desc" },
+    include: {
+      _count: { select: { resources: true } },
+    },
+    orderBy: { reliability: "desc" },
   });
 
-  // Filter by location if specified
-  return offers
-    .map((o) => {
-      const spec = JSON.parse(o.spec);
-      const coverage = JSON.parse(o.coverage);
+  return capabilities
+    .map((cap) => {
+      const coverage = JSON.parse(cap.coverage);
       return {
-        id: o.id,
-        type: o.capabilityType,
-        providerType: o.providerType,
-        spec,
+        id: cap.id,
+        type: cap.type,
+        providerType: cap.providerType,
+        technicalSpec: JSON.parse(cap.technicalSpec),
         coverage,
-        reliability: o.reliabilityScore,
+        reliability: cap.reliability,
+        resourceCount: cap._count.resources,
       };
     })
     .filter((cap) => {
@@ -138,29 +142,92 @@ export async function discoverCapabilities(input: {
 }
 
 // ---------------------------------------------------------------------------
+// Reserve a Resource (for switching)
+// ---------------------------------------------------------------------------
+
+export async function reserveResource(resourceId: string, sessionId: string): Promise<{
+  reserved: boolean;
+  reason?: string;
+}> {
+  const result = await db.protocolResource.updateMany({
+    where: {
+      id: resourceId,
+      state: "AVAILABLE",
+    },
+    data: {
+      state: "RESERVED",
+      reservedAt: new Date(),
+      reservedBy: sessionId,
+    },
+  });
+
+  if (result.count === 0) {
+    return { reserved: false, reason: "Resource not available or already reserved" };
+  }
+
+  logger.info("resource.reserved", { resourceId, sessionId });
+  return { reserved: true };
+}
+
+// ---------------------------------------------------------------------------
+// Release a Resource
+// ---------------------------------------------------------------------------
+
+export async function releaseResource(resourceId: string): Promise<{
+  released: boolean;
+}> {
+  await db.protocolResource.updateMany({
+    where: { id: resourceId },
+    data: {
+      state: "AVAILABLE",
+      reservedAt: null,
+      reservedBy: null,
+    },
+  });
+
+  logger.info("resource.released", { resourceId });
+  return { released: true };
+}
+
+// ---------------------------------------------------------------------------
+// Mark Resource In Use (after activation)
+// ---------------------------------------------------------------------------
+
+export async function markResourceInUse(resourceId: string): Promise<void> {
+  await db.protocolResource.updateMany({
+    where: { id: resourceId },
+    data: { state: "IN_USE" },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Get Capability
 // ---------------------------------------------------------------------------
 
 export async function getCapability(capabilityId: string) {
-  const offer = await db.connectivityOffer2.findUnique({
+  const cap = await db.protocolCapability.findUnique({
     where: { id: capabilityId },
+    include: {
+      resources: true,
+    },
   });
 
-  if (!offer) return null;
+  if (!cap) return null;
 
   return {
-    id: offer.id,
-    type: offer.capabilityType,
-    providerType: offer.providerType,
-    spec: JSON.parse(offer.spec),
-    coverage: JSON.parse(offer.coverage),
-    reliability: offer.reliabilityScore,
-    wholesalePriceMinor: offer.wholesalePriceMinor,
-    customerPriceMinor: offer.customerPriceMinor,
-    currency: offer.currency,
-    supplierId: offer.supplierId,
-    status: offer.status,
-    successCount: offer.successCount,
-    failureCount: offer.failureCount,
+    id: cap.id,
+    type: cap.type,
+    providerType: cap.providerType,
+    technicalSpec: JSON.parse(cap.technicalSpec),
+    coverage: JSON.parse(cap.coverage),
+    reliability: cap.reliability,
+    status: cap.status,
+    version: cap.version,
+    resources: cap.resources.map((r) => ({
+      id: r.id,
+      state: r.state,
+      identifiers: r.identifiers ? JSON.parse(r.identifiers) : null,
+      capacity: r.capacity ? JSON.parse(r.capacity) : null,
+    })),
   };
 }
