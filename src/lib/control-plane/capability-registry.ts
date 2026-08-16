@@ -170,14 +170,25 @@ export async function reserveResource(resourceId: string, sessionId: string): Pr
 }
 
 // ---------------------------------------------------------------------------
-// Release a Resource
+// Release a Resource (ownership-safe)
 // ---------------------------------------------------------------------------
 
-export async function releaseResource(resourceId: string): Promise<{
+/**
+ * Release a resource. The release MUST be ownership-safe: only the session
+ * that reserved (or is using) the resource can release it.
+ *
+ * This prevents session A from releasing a resource reserved by session B.
+ */
+export async function releaseResource(resourceId: string, sessionId: string): Promise<{
   released: boolean;
+  reason?: string;
 }> {
-  await db.protocolResource.updateMany({
-    where: { id: resourceId },
+  // Only release if the resource is owned by this session
+  const result = await db.protocolResource.updateMany({
+    where: {
+      id: resourceId,
+      reservedBy: sessionId, // ownership guard
+    },
     data: {
       state: "AVAILABLE",
       reservedAt: null,
@@ -185,7 +196,25 @@ export async function releaseResource(resourceId: string): Promise<{
     },
   });
 
-  logger.info("resource.released", { resourceId });
+  if (result.count === 0) {
+    // Check if the resource exists at all
+    const resource = await db.protocolResource.findUnique({
+      where: { id: resourceId },
+      select: { reservedBy: true, state: true },
+    });
+
+    if (!resource) {
+      return { released: false, reason: "Resource not found" };
+    }
+
+    if (resource.reservedBy !== sessionId) {
+      return { released: false, reason: `Ownership mismatch: resource is reserved by "${resource.reservedBy}", not "${sessionId}"` };
+    }
+
+    return { released: false, reason: `Resource is in state "${resource.state}", cannot release` };
+  }
+
+  logger.info("resource.released", { resourceId, sessionId });
   return { released: true };
 }
 
@@ -193,11 +222,45 @@ export async function releaseResource(resourceId: string): Promise<{
 // Mark Resource In Use (after activation)
 // ---------------------------------------------------------------------------
 
-export async function markResourceInUse(resourceId: string): Promise<void> {
+export async function markResourceInUse(resourceId: string, sessionId: string): Promise<void> {
   await db.protocolResource.updateMany({
-    where: { id: resourceId },
+    where: { id: resourceId, reservedBy: sessionId },
     data: { state: "IN_USE" },
   });
+}
+
+// ---------------------------------------------------------------------------
+// Discover Available Resources for a Capability
+// ---------------------------------------------------------------------------
+
+/**
+ * Find AVAILABLE resources for a given capability. This is what the decision
+ * engine calls to resolve a concrete allocatable resource from a capability.
+ *
+ * Intent → Capability → AVAILABLE Resources → pick best → reserve
+ */
+export async function discoverResources(capabilityId: string): Promise<Array<{
+  id: string;
+  state: string;
+  identifiers: Record<string, unknown> | null;
+  capacity: Record<string, unknown> | null;
+  location: Record<string, unknown> | null;
+}>> {
+  const resources = await db.protocolResource.findMany({
+    where: {
+      capabilityId,
+      state: "AVAILABLE",
+    },
+    orderBy: { createdAt: "asc" }, // oldest first (round-robin)
+  });
+
+  return resources.map((r) => ({
+    id: r.id,
+    state: r.state,
+    identifiers: r.identifiers ? JSON.parse(r.identifiers) : null,
+    capacity: r.capacity ? JSON.parse(r.capacity) : null,
+    location: r.location ? JSON.parse(r.location) : null,
+  }));
 }
 
 // ---------------------------------------------------------------------------

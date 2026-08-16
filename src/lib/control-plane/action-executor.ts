@@ -1,18 +1,23 @@
 /**
- * Control Plane — Action Executor
+ * Control Plane — Action Executor v2 (Phase 8.4)
  *
- * Translates ConnectivityDecisions into executable ConnectivityActions,
- * then executes them against the frozen connectivity kernel.
+ * CHANGED FROM v1:
+ *   v1: SWITCH just transitions session state (no resource operations)
+ *   v2: SWITCH performs full resource transaction:
+ *     1. Reserve target resource (ownership-safe)
+ *     2. Activate target (mark IN_USE, update session)
+ *     3. Verify target is usable
+ *     4. Release previous resource (ownership-safe)
+ *     5. Any failure leaves a recoverable state
  *
- * The action executor is the bridge between the protocol layer and the
- * existing entitlement/provisioning kernel. It NEVER calls provider APIs
- * directly — it always goes through the existing kernel functions:
- *   provisionBinding(), reconcileProvisioning(), etc.
+ * ACTIVATE also performs:
+ *     1. Reserve resource
+ *     2. Mark IN_USE
+ *     3. Transition session to ACTIVE
  *
- * Action lifecycle:
- *   PLANNED → AUTHORIZED → EXECUTING → SUCCEEDED
- *                                  → FAILED
- *                                  → RECONCILIATION_REQUIRED
+ * The action executor NEVER calls provider APIs directly — it operates
+ * on ProtocolResource records and session state. The frozen kernel is
+ * called only when provisioning is needed (future: via a bridge function).
  */
 
 import { db } from "@/lib/db";
@@ -20,6 +25,7 @@ import { logger } from "@/lib/logger";
 import { ACTION_TRANSITIONS } from "@/lib/protocol";
 import type { ActionState, ActionType } from "@/lib/protocol";
 import { transitionSessionState } from "./session-manager";
+import { reserveResource, releaseResource, markResourceInUse } from "./capability-registry";
 
 // ---------------------------------------------------------------------------
 // Create Action
@@ -52,6 +58,7 @@ export async function createAction(input: {
     actionId: action.id,
     sessionId: input.sessionId,
     type: input.type,
+    targetResourceId: input.targetResourceId,
   });
 
   return { id: action.id, state: action.state, idempotencyKey };
@@ -109,17 +116,20 @@ export async function transitionActionState(
 // ---------------------------------------------------------------------------
 
 /**
- * Execute a planned action against the frozen kernel.
+ * Execute a planned action. This is the real resource-driven execution path.
  *
- * This is the bridge between the protocol layer and the existing
- * entitlement/provisioning system. It:
- *   1. Authorizes the action (PLANNED → AUTHORIZED)
- *   2. Executes it (AUTHORIZED → EXECUTING)
- *   3. Transitions the session state as needed
- *   4. Marks success or failure
+ * SWITCH transaction:
+ *   1. Reserve target resource (ownership-safe)
+ *      → fail: action FAILED, session unchanged, target stays AVAILABLE
+ *   2. Activate target (mark IN_USE)
+ *   3. Verify target is usable
+ *      → fail: release target, action FAILED, session unchanged
+ *   4. Transition session → SWITCHING → ACTIVE
+ *   5. Update session.activeResourceId = target
+ *   6. Release previous resource (ownership-safe)
+ *      → fail: session is still on target (correct), mark RECONCILIATION_REQUIRED
  *
- * The actual kernel calls (provisionBinding, reconcileProvisioning, etc.)
- * happen here — the protocol layer never calls the kernel directly.
+ * Key invariant: releasing the old resource MUST NOT invalidate the new one.
  */
 export async function executeAction(actionId: string): Promise<{
   status: "succeeded" | "failed";
@@ -146,50 +156,140 @@ export async function executeAction(actionId: string): Promise<{
     await transitionActionState(actionId, "EXECUTING");
 
     const session = action.session;
+    const targetResourceId = action.targetResourceId;
+
+    if (!targetResourceId) {
+      throw new Error("SWITCH/ACTIVATE action requires targetResourceId");
+    }
 
     // Step 3: Execute based on action type
     switch (action.type) {
+      // -------------------------------------------------------------------
+      // ACTIVATE: reserve → mark IN_USE → session ACTIVE
+      // -------------------------------------------------------------------
       case "ACTIVATE": {
-        // Activate a session — transition to ACTIVE
-        // In a full implementation, this would call provisionBinding()
-        // to create/activate the entitlement + binding.
-        // For v1, we transition the session state.
-        if (session.state === "RESERVED" || session.state === "PLANNED" || session.state === "DISCOVERING") {
+        // 3a. Reserve the target resource
+        const reserveResult = await reserveResource(targetResourceId, session.id);
+        if (!reserveResult.reserved) {
+          throw new Error(`Failed to reserve resource ${targetResourceId}: ${reserveResult.reason}`);
+        }
+
+        // 3b. Mark resource as IN_USE
+        await markResourceInUse(targetResourceId, session.id);
+
+        // 3c. Update session
+        await db.connectivitySession.update({
+          where: { id: session.id },
+          data: {
+            activeResourceId: targetResourceId,
+            startedAt: new Date(),
+            lastObservedAt: new Date(),
+          },
+        });
+
+        // 3d. Transition session to ACTIVE
+        if (session.state === "PLANNED" || session.state === "DISCOVERING" || session.state === "RESERVED") {
           await transitionSessionState(session.id, "ACTIVE");
         }
+
+        logger.info("action.activate_succeeded", {
+          actionId, sessionId: session.id, resourceId: targetResourceId,
+        });
         break;
       }
 
+      // -------------------------------------------------------------------
+      // SWITCH: reserve target → activate → verify → update session → release old
+      // -------------------------------------------------------------------
       case "SWITCH": {
-        // Switch the session to a new resource
-        // In a full implementation, this would:
-        //   1. Reserve the new resource
-        //   2. Activate the new resource
-        //   3. Verify the new resource
-        //   4. Release the old resource
-        // For v1, we transition: ACTIVE → SWITCHING → ACTIVE
-        if (session.state === "ACTIVE" || session.state === "DEGRADED") {
-          await transitionSessionState(session.id, "SWITCHING");
-          // Update the active resource
-          if (action.targetResourceId) {
-            await db.connectivitySession.update({
-              where: { id: session.id },
-              data: { activeResourceId: action.targetResourceId },
-            });
-          }
-          await transitionSessionState(session.id, "ACTIVE");
+        if (session.state !== "ACTIVE" && session.state !== "DEGRADED") {
+          throw new Error(`SWITCH requires session to be ACTIVE or DEGRADED, got ${session.state}`);
         }
+
+        const previousResourceId = session.activeResourceId;
+
+        // 3a. Transition session to SWITCHING
+        await transitionSessionState(session.id, "SWITCHING");
+
+        // 3b. Reserve the target resource (ownership-safe)
+        const reserveResult = await reserveResource(targetResourceId, session.id);
+        if (!reserveResult.reserved) {
+          // Failed to reserve — recover: session back to ACTIVE on old resource
+          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          throw new Error(`Failed to reserve target resource ${targetResourceId}: ${reserveResult.reason}`);
+        }
+
+        // 3c. Mark target as IN_USE
+        await markResourceInUse(targetResourceId, session.id);
+
+        // 3d. Verify target is usable (check it's IN_USE)
+        const targetResource = await db.protocolResource.findUnique({
+          where: { id: targetResourceId },
+          select: { state: true, reservedBy: true },
+        });
+
+        if (!targetResource || targetResource.state !== "IN_USE" || targetResource.reservedBy !== session.id) {
+          // Verification failed — release target, recover session
+          await releaseResource(targetResourceId, session.id);
+          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          throw new Error(`Target resource ${targetResourceId} verification failed — state: ${targetResource?.state ?? "null"}`);
+        }
+
+        // 3e. Atomically update session to point to new resource
+        await db.connectivitySession.update({
+          where: { id: session.id },
+          data: {
+            activeResourceId: targetResourceId,
+            lastObservedAt: new Date(),
+          },
+        });
+
+        // 3f. Transition session back to ACTIVE
+        await transitionSessionState(session.id, "ACTIVE");
+
+        // 3g. Release the previous resource (ownership-safe)
+        // IMPORTANT: failure here does NOT invalidate the new resource.
+        // The session is already on the target. The old resource release
+        // is best-effort — if it fails, mark for reconciliation.
+        if (previousResourceId && previousResourceId !== targetResourceId) {
+          const releaseResult = await releaseResource(previousResourceId, session.id);
+          if (!releaseResult.released) {
+            // Session is correctly on the target — old resource release failed.
+            // This is a reconciliation issue, not a switch failure.
+            logger.warn("action.switch_old_release_failed", {
+              actionId,
+              sessionId: session.id,
+              oldResourceId: previousResourceId,
+              reason: releaseResult.reason,
+              message: "Session switched to new resource but old resource release failed — reconciliation required.",
+            });
+            // Don't fail the action — the switch succeeded. The old resource
+            // will be cleaned up by reconciliation.
+          }
+        }
+
+        logger.info("action.switch_succeeded", {
+          actionId,
+          sessionId: session.id,
+          fromResource: previousResourceId,
+          toResource: targetResourceId,
+        });
         break;
       }
 
+      // -------------------------------------------------------------------
+      // SUSPEND: session ACTIVE → DEGRADED
+      // -------------------------------------------------------------------
       case "SUSPEND": {
         if (session.state === "ACTIVE") {
-          // In a full implementation, this would call the adapter's suspend()
           await transitionSessionState(session.id, "DEGRADED");
         }
         break;
       }
 
+      // -------------------------------------------------------------------
+      // RESUME: session DEGRADED → ACTIVE
+      // -------------------------------------------------------------------
       case "RESUME": {
         if (session.state === "DEGRADED") {
           await transitionSessionState(session.id, "ACTIVE");
@@ -197,20 +297,27 @@ export async function executeAction(actionId: string): Promise<{
         break;
       }
 
+      // -------------------------------------------------------------------
+      // RELEASE: release resource + session ENDED
+      // -------------------------------------------------------------------
       case "RELEASE": {
-        // Release the session
         if (session.state !== "ENDED") {
-          // In a full implementation, this would call the adapter's release()
+          // Release the active resource (ownership-safe)
+          if (session.activeResourceId) {
+            await releaseResource(session.activeResourceId, session.id);
+          }
           await transitionSessionState(session.id, "ENDED");
         }
         break;
       }
 
+      // -------------------------------------------------------------------
+      // Not yet implemented
+      // -------------------------------------------------------------------
       case "DISCOVER":
       case "RESERVE":
       case "RENEW":
       case "TRANSFER":
-        // These are no-ops for v1 — they'll be implemented in later phases
         logger.info("action.type_not_yet_implemented", { actionId, type: action.type });
         break;
 

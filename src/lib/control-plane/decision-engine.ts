@@ -1,29 +1,24 @@
 /**
- * Control Plane — Decision Engine v1
+ * Control Plane — Decision Engine v2 (Phase 8.4)
  *
- * Wraps the existing deterministic ranking engine. The ranking engine answers
- * "which candidate is better?" The decision engine answers "what should the
- * connectivity system do now?"
+ * CHANGED FROM v1:
+ *   v1: Intent → rankOffers() → topOffer.offerId as "resourceId" (WRONG)
+ *   v2: Intent → discoverCapabilities() → discoverResources() → ProtocolResource.id (CORRECT)
  *
- * Inputs:
- *   ConnectivityIntent
- *   ConnectivityOffer[] (from the ranking engine)
- *   ConnectivitySession (current state, if any)
- *   ConnectivityMeasurement[] (quality observations)
- *   ConnectivityPolicy (autonomous rules)
+ * The decision engine now resolves a concrete ProtocolResource, not a
+ * ConnectivityOffer2 ID. Offers are still queried for pricing/scoring, but
+ * the targetResourceId always references a ProtocolResource.id.
  *
- * Output:
- *   ConnectivityDecision
+ * Hysteresis (Phase 8.3): M-of-N degraded measurements required, not just count >= 2.
  *
- * The decision engine is PURE DETERMINISTIC — same inputs always produce
- * the same decision. No AI. The AI only extracts intent; the decision is
- * deterministic.
+ * Policy (Phase 8.3): evaluatePolicy() is called before the action proceeds.
  */
 
 import { db } from "@/lib/db";
 import { logger } from "@/lib/logger";
 import { rankOffers } from "@/lib/commerce/ranking-engine";
 import { getPolicy, evaluatePolicy } from "@/lib/control-plane/policy-engine";
+import { discoverCapabilities, discoverResources } from "@/lib/control-plane/capability-registry";
 import type { ConnectivityPolicy } from "@/lib/protocol";
 
 // ---------------------------------------------------------------------------
@@ -47,7 +42,8 @@ export type DecisionOutput = {
   decisionId: string;
   action: "KEEP" | "SWITCH" | "ACTIVATE" | "RESERVE" | "RENEW" | "RELEASE" | "WAIT" | "ASK_USER";
   targetOfferId?: string;
-  targetResourceId?: string;
+  targetResourceId?: string; // ALWAYS a ProtocolResource.id, never an offer ID
+  targetCapabilityId?: string;
   score: number;
   constraintsSatisfied: string[];
   constraintsViolated: string[];
@@ -60,7 +56,33 @@ export type DecisionOutput = {
 // ---------------------------------------------------------------------------
 
 export async function makeDecision(input: DecisionInput): Promise<DecisionOutput> {
-  // Step 1: Rank offers using the existing deterministic ranking engine
+  const constraintsSatisfied: string[] = [];
+  const constraintsViolated: string[] = [];
+  const reasons: string[] = [];
+
+  // Step 1: Discover capabilities (first-class ProtocolCapability)
+  const capabilities = await discoverCapabilities({
+    tenantId: input.tenantId,
+    type: input.capabilityType,
+    country: (input.location as Record<string, unknown>)?.country as string | undefined,
+    city: (input.location as Record<string, unknown>)?.city as string | undefined,
+  });
+
+  // Step 2: For each capability, discover AVAILABLE resources
+  let bestResource: { id: string; capabilityId: string } | null = null;
+  let bestCapability: { id: string; type: string; providerType: string; reliability: number } | null = null;
+
+  for (const cap of capabilities) {
+    const resources = await discoverResources(cap.id);
+    if (resources.length > 0) {
+      // Pick the first available resource (round-robin via createdAt ordering)
+      bestResource = { id: resources[0].id, capabilityId: cap.id };
+      bestCapability = cap;
+      break;
+    }
+  }
+
+  // Step 3: Also rank offers for pricing/scoring (commerce layer, unchanged)
   const ranking = await rankOffers({
     tenantId: input.tenantId,
     customerId: input.subjectId,
@@ -70,42 +92,54 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
     maxPriceMinor: input.maxPriceMinor,
   });
 
-  const constraintsSatisfied: string[] = [];
-  const constraintsViolated: string[] = [];
-  const reasons: string[] = [];
-
-  // Step 2: Check if there's an active session
-  const activeSession = input.sessionId
-    ? await db.connectivitySession.findUnique({ where: { id: input.sessionId } })
-    : null;
-
-  // Step 3: Determine the action
   let action: DecisionOutput["action"] = "WAIT";
   let targetOfferId: string | undefined;
   let targetResourceId: string | undefined;
+  let targetCapabilityId: string | undefined;
   let score = 0;
 
-  if (ranking.ranked.length === 0) {
-    action = "WAIT";
-    reasons.push("No offers matched the intent");
-    constraintsViolated.push("NO_OFFERS_AVAILABLE");
+  if (!bestResource || !bestCapability) {
+    // No available resources
+    if (ranking.ranked.length > 0) {
+      // There are offers but no resources — might need provisioning
+      action = "WAIT";
+      reasons.push("Offers exist but no AVAILABLE resources found — provisioning may be needed");
+      constraintsViolated.push("NO_AVAILABLE_RESOURCES");
+    } else {
+      action = "WAIT";
+      reasons.push("No capabilities or offers matched the intent");
+      constraintsViolated.push("NO_CAPABILITIES_AVAILABLE");
+    }
   } else {
-    const topOffer = ranking.ranked[0];
-    score = topOffer.score;
-    targetOfferId = topOffer.offerId;
+    targetResourceId = bestResource.id; // ProtocolResource.id — NOT an offer ID
+    targetCapabilityId = bestCapability.id;
+    score = bestCapability.reliability; // use capability reliability as base score
+
+    // If there's a matching offer, use its score
+    const matchingOffer = ranking.ranked.find((r) =>
+      r.offer.capabilityType === bestCapability!.type
+    );
+    if (matchingOffer) {
+      targetOfferId = matchingOffer.offerId;
+      score = matchingOffer.score;
+    }
+
+    // Step 4: Check if there's an active session
+    const activeSession = input.sessionId
+      ? await db.connectivitySession.findUnique({ where: { id: input.sessionId } })
+      : null;
 
     if (activeSession && activeSession.state === "ACTIVE") {
-      // There's an active session — check if we should KEEP or SWITCH
+      // Active session — evaluate KEEP vs SWITCH
       const policy = input.policy;
       const switchThreshold = policy?.switchHysteresis ?? 0.15;
 
-      // Phase 8.3: Hysteresis — prevent oscillation.
-      // 1. Minimum dwell time: don't switch if the session was activated <60s ago
-      // 2. Cooldown: don't switch if the last switch was <120s ago
-      // 3. Confidence: require at least 2 recent measurements agreeing on degradation
-      const MIN_DWELL_MS = 60_000; // 60 seconds
-      const COOLDOWN_MS = 120_000; // 2 minutes
-      const MIN_MEASUREMENTS_FOR_SWITCH = 2;
+      // Hysteresis parameters
+      const MIN_DWELL_MS = 60_000;
+      const COOLDOWN_MS = 120_000;
+      const MIN_MEASUREMENTS_FOR_SWITCH = 3; // need at least 3 measurements
+      const MIN_DEGRADED_COUNT = 2; // at least 2 of them must show degradation
+      const DEGRADATION_THRESHOLD = 0.4; // quality below this = degraded
 
       // Check dwell time
       if (activeSession.startedAt && Date.now() - activeSession.startedAt.getTime() < MIN_DWELL_MS) {
@@ -113,7 +147,7 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
         reasons.push(`Session started <${MIN_DWELL_MS / 1000}s ago — dwell time not met`);
         constraintsSatisfied.push("DWELL_TIME_ENFORCED");
       } else {
-        // Check cooldown — look for recent SWITCH actions
+        // Check cooldown
         const recentSwitch = await db.connectivityAction.findFirst({
           where: {
             sessionId: activeSession.id,
@@ -128,63 +162,66 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
           reasons.push(`Last switch was <${COOLDOWN_MS / 1000}s ago — cooldown active`);
           constraintsSatisfied.push("COOLDOWN_ENFORCED");
         } else {
-          // If the top offer's score is significantly better than the current
-          // session's quality, SWITCH. Otherwise KEEP.
+          // Fetch recent measurements
           const recentMeasurements = await db.connectivityMeasurement.findMany({
             where: { sessionId: activeSession.id, capturedAt: { gte: new Date(Date.now() - 300000) } },
             orderBy: { capturedAt: "desc" },
             take: 5,
           });
 
-          if (recentMeasurements.length === 0) {
-            // No recent measurements — can't evaluate, KEEP current
-            action = "KEEP";
-            reasons.push("No recent measurements to evaluate switching");
-            constraintsSatisfied.push("SESSION_ACTIVE");
-          } else if (recentMeasurements.length < MIN_MEASUREMENTS_FOR_SWITCH) {
-            // Not enough measurements for confidence — KEEP
+          if (recentMeasurements.length < MIN_MEASUREMENTS_FOR_SWITCH) {
             action = "KEEP";
             reasons.push(`Only ${recentMeasurements.length} measurement(s) — need ${MIN_MEASUREMENTS_FOR_SWITCH} for switch confidence`);
             constraintsSatisfied.push("CONFIDENCE_THRESHOLD_ENFORCED");
           } else {
-            // Check if current quality is degraded
-            const lastMeasurement = recentMeasurements[0];
-            const metrics = JSON.parse(lastMeasurement.metrics);
-            const currentQuality = (metrics.throughputDownMbps ?? 0) > 0
-              ? Math.min(1, (metrics.throughputDownMbps ?? 0) / 50)
-              : 0.3;
+            // Phase 8.4: M-of-N degraded check — not just the latest measurement
+            const degradedMeasurements = recentMeasurements.filter((m) => {
+              const metrics = JSON.parse(m.metrics);
+              const quality = (metrics.throughputDownMbps ?? 0) > 0
+                ? Math.min(1, (metrics.throughputDownMbps ?? 0) / 50)
+                : 0.3;
+              return quality < DEGRADATION_THRESHOLD;
+            });
 
-            if (topOffer.score - currentQuality > switchThreshold) {
-              action = "SWITCH";
-              targetResourceId = topOffer.offerId;
-              reasons.push(`Top offer score ${topOffer.score.toFixed(2)} exceeds current quality ${currentQuality.toFixed(2)} by more than threshold ${switchThreshold}`);
-              constraintsSatisfied.push("SWITCH_THRESHOLD_MET");
-              constraintsSatisfied.push("HYSTERESIS_PASSED");
+            if (degradedMeasurements.length >= MIN_DEGRADED_COUNT) {
+              // M-of-N degraded — eligible to switch
+              const avgQuality = recentMeasurements.reduce((sum, m) => {
+                const metrics = JSON.parse(m.metrics);
+                const q = (metrics.throughputDownMbps ?? 0) > 0
+                  ? Math.min(1, (metrics.throughputDownMbps ?? 0) / 50)
+                  : 0.3;
+                return sum + q;
+              }, 0) / recentMeasurements.length;
+
+              if (score - avgQuality > switchThreshold) {
+                action = "SWITCH";
+                reasons.push(`${degradedMeasurements.length}/${recentMeasurements.length} measurements degraded — switch threshold met (avg quality ${avgQuality.toFixed(2)} vs candidate ${score.toFixed(2)})`);
+                constraintsSatisfied.push("SWITCH_THRESHOLD_MET");
+                constraintsSatisfied.push("M_OF_N_DEGRADED");
+                constraintsSatisfied.push("HYSTERESIS_PASSED");
+              } else {
+                action = "KEEP";
+                reasons.push(`Degraded but improvement ${score.toFixed(2)} - ${avgQuality.toFixed(2)} < threshold ${switchThreshold}`);
+                constraintsSatisfied.push("QUALITY_ACCEPTABLE");
+              }
             } else {
               action = "KEEP";
-              reasons.push(`Current quality ${currentQuality.toFixed(2)} is within threshold of top offer ${topOffer.score.toFixed(2)}`);
-              constraintsSatisfied.push("SESSION_ACTIVE");
+              reasons.push(`Only ${degradedMeasurements.length}/${recentMeasurements.length} measurements degraded — need ${MIN_DEGRADED_COUNT} for switch`);
               constraintsSatisfied.push("QUALITY_ACCEPTABLE");
             }
           }
         }
       }
     } else {
-      // No active session — ACTIVATE the top offer
+      // No active session — ACTIVATE
       action = "ACTIVATE";
-      targetResourceId = topOffer.offerId;
-      reasons.push(`Top offer selected with score ${topOffer.score.toFixed(2)}`);
-      constraintsSatisfied.push("OFFER_SELECTED");
-
-      // Check policy for purchase approval
-      if (input.policy?.requireUserApprovalForPurchase ?? true) {
-        // For v1, we still return ACTIVATE but note that approval is needed
-        reasons.push("Policy requires user approval for purchase");
-      }
+      reasons.push(`Resource ${bestResource.id} (capability ${bestCapability.type}) selected with reliability ${bestCapability.reliability.toFixed(2)}`);
+      constraintsSatisfied.push("RESOURCE_SELECTED");
+      constraintsSatisfied.push("CAPABILITY_RESOLVED");
     }
   }
 
-  // Step 4: Check budget constraint
+  // Step 5: Budget check
   if (input.maxPriceMinor && ranking.ranked.length > 0) {
     const topOffer = ranking.ranked[0];
     if (topOffer.customerPriceMinor <= input.maxPriceMinor) {
@@ -198,20 +235,16 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
     }
   }
 
-  // Step 5: Check reliability constraint
-  if (input.policy?.minReliability) {
-    if (ranking.ranked.length > 0) {
-      const topOffer = ranking.ranked[0];
-      if (topOffer.scores.reliability >= input.policy.minReliability) {
-        constraintsSatisfied.push("MEETS_RELIABILITY");
-      } else {
-        constraintsViolated.push("BELOW_MIN_RELIABILITY");
-      }
+  // Step 6: Reliability check
+  if (input.policy?.minReliability && bestCapability) {
+    if (bestCapability.reliability >= input.policy.minReliability) {
+      constraintsSatisfied.push("MEETS_RELIABILITY");
+    } else {
+      constraintsViolated.push("BELOW_MIN_RELIABILITY");
     }
   }
 
-  // Step 5.5: Evaluate policy — can the action proceed automatically?
-  // If the policy doesn't allow it, downgrade to ASK_USER.
+  // Step 7: Policy evaluation
   const policy = input.policy ?? await getPolicy(input.subjectId);
   const policyResult = evaluatePolicy({
     policy,
@@ -227,7 +260,7 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
     constraintsSatisfied.push("POLICY_ALLOWED");
   }
 
-  // Step 6: Persist the decision
+  // Step 8: Persist
   const decision = await db.connectivityDecision.create({
     data: {
       intentId: input.intentId ?? "unknown",
@@ -243,10 +276,12 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
     },
   });
 
-  logger.info("decision.made", {
+  logger.info("decision.made_v2", {
     decisionId: decision.id,
     action,
     score,
+    targetResourceId,
+    targetCapabilityId,
     satisfied: constraintsSatisfied.length,
     violated: constraintsViolated.length,
   });
@@ -256,6 +291,7 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
     action,
     targetOfferId,
     targetResourceId,
+    targetCapabilityId,
     score,
     constraintsSatisfied,
     constraintsViolated,
