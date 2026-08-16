@@ -27,6 +27,11 @@ import type { ActionState, ActionType } from "@/lib/protocol";
 import { transitionSessionState } from "./session-manager";
 import { reserveResource, releaseResource, markResourceInUse } from "./capability-registry";
 import { resolveResourceBinding, verifyResourceUsable } from "./kernel-bridge";
+import { assertActiveConnectivityInvariant } from "./invariant-checker";
+
+// Phase 8.5.10: Recovery timing constants
+const RECOVERY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes — actions EXECUTING longer than this are stale
+const RECOVERY_LEASE_MS = 10 * 60 * 1000; // 10 minutes — abandoned recovery claims can be reclaimed after this
 
 // ---------------------------------------------------------------------------
 // Create Action
@@ -273,6 +278,17 @@ export async function executeAction(actionId: string): Promise<{
           await transitionSessionState(session.id, "ACTIVE");
         }
 
+        // Phase 8.5.10: Verify the active connectivity invariant
+        const invariant = await assertActiveConnectivityInvariant(session.id);
+        if (!invariant.valid) {
+          await transitionActionState(actionId, "RECONCILIATION_REQUIRED",
+            `Invariant check failed after ACTIVATE: ${invariant.violations.join(", ")}`);
+          logger.error("action.activate_invariant_failed", {
+            actionId, sessionId: session.id, violations: invariant.violations,
+          });
+          return { status: "failed", error: `Invariant failed: ${invariant.violations.join(", ")}` };
+        }
+
         logger.info("action.activate_succeeded", {
           actionId, sessionId: session.id, resourceId: targetResourceId,
         });
@@ -389,6 +405,18 @@ export async function executeAction(actionId: string): Promise<{
           await transitionActionState(actionId, "RECONCILIATION_REQUIRED", `Old resource ${previousResourceId} release failed — session is on target but cleanup needed`);
           return { status: "succeeded", error: `Switch succeeded but old resource release failed — reconciliation required` };
         }
+
+        // Phase 8.5.10: Verify the active connectivity invariant after SWITCH
+        const switchInvariant = await assertActiveConnectivityInvariant(session.id);
+        if (!switchInvariant.valid) {
+          await transitionActionState(actionId, "RECONCILIATION_REQUIRED",
+            `Invariant check failed after SWITCH: ${switchInvariant.violations.join(", ")}`);
+          logger.error("action.switch_invariant_failed", {
+            actionId, sessionId: session.id, violations: switchInvariant.violations,
+          });
+          return { status: "failed", error: `Invariant failed: ${switchInvariant.violations.join(", ")}` };
+        }
+
         break;
       }
 
@@ -494,19 +522,41 @@ export async function recoverStaleActions(): Promise<{
   failed: number;
   reconciliationRequired: number;
 }> {
-  // Phase 8.5.9: Real recovery-worker fencing with claim token.
-  // 1. Generate a unique claim ID for this worker invocation
-  // 2. Atomically transition EXECUTING → RECOVERY_CLAIMED with the claim ID
-  // 3. Query ONLY actions claimed by THIS worker (recoveryClaimId = claimId)
-  // This prevents two workers from processing the same action.
+  // Phase 8.5.10: Recovery with stale predicate + lease expiry.
+  //
+  // 1. Only claim EXECUTING actions older than RECOVERY_TIMEOUT_MS
+  //    (prevents stealing actions from a legitimate executor that's still running)
+  // 2. Also reclaim expired RECOVERY_CLAIMED actions (recoveryClaimExpiresAt < now)
+  //    (allows a dead recovery worker's claims to be reclaimed)
+  // 3. Generate a unique claim ID for this worker invocation
+  // 4. Atomically transition to RECOVERY_CLAIMED with the claim ID + lease expiry
+  // 5. Query ONLY actions claimed by THIS worker
   const claimId = `recovery-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const now = new Date();
+  const staleCutoff = new Date(now.getTime() - RECOVERY_TIMEOUT_MS);
+  const leaseExpiry = new Date(now.getTime() + RECOVERY_LEASE_MS);
 
+  // Claim stale EXECUTING actions + expired RECOVERY_CLAIMED actions
   const claimResult = await db.connectivityAction.updateMany({
-    where: { state: "EXECUTING" },
+    where: {
+      OR: [
+        // Stale EXECUTING: running longer than RECOVERY_TIMEOUT_MS
+        {
+          state: "EXECUTING",
+          executedAt: { lt: staleCutoff },
+        },
+        // Expired RECOVERY_CLAIMED: a previous recovery worker's lease has expired
+        {
+          state: "RECOVERY_CLAIMED",
+          recoveryClaimExpiresAt: { lt: now },
+        },
+      ],
+    },
     data: {
       state: "RECOVERY_CLAIMED",
       recoveryClaimId: claimId,
-      recoveryClaimedAt: new Date(),
+      recoveryClaimedAt: now,
+      recoveryClaimExpiresAt: leaseExpiry,
     },
   });
 
@@ -632,9 +682,21 @@ export async function recoverStaleActions(): Promise<{
         }
       }
 
+      // Phase 8.5.10: Verify invariant before declaring recovery SUCCEEDED
+      const recoveryInvariant = await assertActiveConnectivityInvariant(session.id);
+      if (!recoveryInvariant.valid) {
+        await transitionActionState(action.id, "RECONCILIATION_REQUIRED",
+          `Recovery invariant failed: ${recoveryInvariant.violations.join(", ")}`);
+        reconciliationRequired++;
+        logger.warn("action.recovered_invariant_failed", {
+          actionId: action.id, violations: recoveryInvariant.violations,
+        });
+        continue;
+      }
+
       await transitionActionState(action.id, "SUCCEEDED");
       succeeded++;
-      logger.info("action.recovered_succeeded", { actionId: action.id, targetResourceId, verified: true });
+      logger.info("action.recovered_succeeded", { actionId: action.id, targetResourceId, verified: true, invariantChecked: true });
     } else if (resource.state === "RESERVED" && resource.reservedBy === session.id) {
       await releaseResource(targetResourceId, session.id);
       if (session.state === "SWITCHING") {

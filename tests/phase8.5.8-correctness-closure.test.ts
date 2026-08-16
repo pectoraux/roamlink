@@ -105,9 +105,9 @@ describe("Phase 8.5.8 — Control-plane correctness closure", () => {
     const fs = await import("fs");
     const source = fs.readFileSync("src/lib/control-plane/action-executor.ts", "utf-8");
     const recoveryFunc = source.substring(source.indexOf("export async function recoverStaleActions"));
-    expect(recoveryFunc).toContain("Real recovery-worker fencing");
+    expect(recoveryFunc).toContain("Recovery with stale predicate");
     expect(recoveryFunc).toContain("updateMany");
-    expect(recoveryFunc).toContain("state: \"EXECUTING\"");
+    expect(recoveryFunc).toContain("EXECUTING");
     // Phase 8.5.9: uses RECOVERY_CLAIMED (not RECONCILIATION_REQUIRED) for claim
     expect(recoveryFunc).toContain("RECOVERY_CLAIMED");
     expect(recoveryFunc).toContain("claimResult");

@@ -2092,6 +2092,8 @@ model ConnectivityAction {
   // Phase 8.5.9: Recovery-worker fencing — unique claim token per worker
   recoveryClaimId String?
   recoveryClaimedAt DateTime?
+  // Phase 8.5.10: Recovery lease expiry — abandoned claims can be reclaimed
+  recoveryClaimExpiresAt DateTime?
   createdAt       DateTime @default(now())
   executedAt      DateTime?
   completedAt     DateTime?
