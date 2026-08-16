@@ -247,7 +247,17 @@ export async function executeAction(actionId: string): Promise<{
           throw new Error(`Resource verification failed: ${verifyResult.reason}`);
         }
 
-        // 3e. Update session with entitlement link
+        // Phase 8.5.9: UNKNOWN → release target, do NOT activate session, RECONCILIATION_REQUIRED
+        if (verifyResult.status === "UNKNOWN") {
+          await releaseResource(targetResourceId, session.id);
+          await transitionActionState(actionId, "RECONCILIATION_REQUIRED", `Verification UNKNOWN: ${verifyResult.reason}`);
+          logger.warn("action.activate_unknown_verification", {
+            actionId, targetResourceId, reason: verifyResult.reason,
+          });
+          return { status: "failed", error: `Verification UNKNOWN — target released, reconciliation required: ${verifyResult.reason}` };
+        }
+
+        // 3e. Update session with entitlement link (only if USABLE)
         await db.connectivitySession.update({
           where: { id: session.id },
           data: {
@@ -261,15 +271,6 @@ export async function executeAction(actionId: string): Promise<{
         // 3f. Transition session to ACTIVE
         if (session.state === "PLANNED" || session.state === "DISCOVERING" || session.state === "RESERVED") {
           await transitionSessionState(session.id, "ACTIVE");
-        }
-
-        // Phase 8.5.8: UNKNOWN → RECONCILIATION_REQUIRED (NOT SUCCEEDED)
-        if (verifyResult.status === "UNKNOWN") {
-          await transitionActionState(actionId, "RECONCILIATION_REQUIRED", `Verification UNKNOWN: ${verifyResult.reason}`);
-          logger.warn("action.activate_unknown_verification", {
-            actionId, targetResourceId, reason: verifyResult.reason,
-          });
-          return { status: "failed", error: `Verification UNKNOWN — reconciliation required: ${verifyResult.reason}` };
         }
 
         logger.info("action.activate_succeeded", {
@@ -493,23 +494,29 @@ export async function recoverStaleActions(): Promise<{
   failed: number;
   reconciliationRequired: number;
 }> {
-  // Phase 8.5.8: Recovery-worker fencing — atomically claim EXECUTING actions
-  // by transitioning them to RECONCILIATION_REQUIRED first. This prevents two
-  // recovery workers from processing the same action concurrently.
-  // Only actions still in EXECUTING are claimed; if another worker already
-  // claimed them, the updateMany matches 0 rows and we skip.
+  // Phase 8.5.9: Real recovery-worker fencing with claim token.
+  // 1. Generate a unique claim ID for this worker invocation
+  // 2. Atomically transition EXECUTING → RECOVERY_CLAIMED with the claim ID
+  // 3. Query ONLY actions claimed by THIS worker (recoveryClaimId = claimId)
+  // This prevents two workers from processing the same action.
+  const claimId = `recovery-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+
   const claimResult = await db.connectivityAction.updateMany({
     where: { state: "EXECUTING" },
-    data: { state: "RECONCILIATION_REQUIRED" },
+    data: {
+      state: "RECOVERY_CLAIMED",
+      recoveryClaimId: claimId,
+      recoveryClaimedAt: new Date(),
+    },
   });
 
   if (claimResult.count === 0) {
     return { recovered: 0, succeeded: 0, failed: 0, reconciliationRequired: 0 };
   }
 
-  // Now query the claimed actions
+  // Query ONLY the actions claimed by this worker
   const staleActions = await db.connectivityAction.findMany({
-    where: { state: "RECONCILIATION_REQUIRED" },
+    where: { recoveryClaimId: claimId },
     include: { session: true },
   });
 
@@ -522,7 +529,6 @@ export async function recoverStaleActions(): Promise<{
     const targetResourceId = action.targetResourceId;
 
     if (!targetResourceId) {
-      // No target — can't recover
       await transitionActionState(action.id, "FAILED", "No targetResourceId on EXECUTING action");
       failed++;
       continue;
@@ -531,7 +537,7 @@ export async function recoverStaleActions(): Promise<{
     // Check the target resource state
     const resource = await db.protocolResource.findUnique({
       where: { id: targetResourceId },
-      select: { state: true, reservedBy: true },
+      select: { state: true, reservedBy: true, providerBindingId: true },
     });
 
     if (!resource) {
@@ -541,12 +547,36 @@ export async function recoverStaleActions(): Promise<{
     }
 
     if (resource.state === "IN_USE" && resource.reservedBy === session.id) {
-      // Target is IN_USE and owned by this session.
-      // Phase 8.5.7: Don't just assume success — verify via kernel bridge.
+      // Phase 8.5.9: Use the kernel bridge to validate binding ownership
+      // (same authority as normal execution, not a weaker manual lookup)
+      const bridgeResult = await resolveResourceBinding({
+        protocolResourceId: targetResourceId,
+        subjectId: session.subjectId,
+      });
+
+      if (bridgeResult.status === "failed") {
+        await releaseResource(targetResourceId, session.id);
+        if (session.state === "SWITCHING") {
+          await transitionSessionState(session.id, "ACTIVE");
+        }
+        await transitionActionState(action.id, "FAILED", `Recovery binding validation failed: ${bridgeResult.error}`);
+        failed++;
+        continue;
+      }
+
+      if (bridgeResult.status === "reconciliation_required") {
+        if (session.state === "SWITCHING") {
+          await transitionSessionState(session.id, "ACTIVE");
+        }
+        await transitionActionState(action.id, "RECONCILIATION_REQUIRED", `Recovery binding reconciliation: ${bridgeResult.error}`);
+        reconciliationRequired++;
+        continue;
+      }
+
+      // Bridge validated — now verify provider truth
       const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
 
       if (verifyResult.status === "NOT_USABLE") {
-        // Provider says not usable — release and fail
         await releaseResource(targetResourceId, session.id);
         if (session.state === "SWITCHING") {
           await transitionSessionState(session.id, "ACTIVE");
@@ -557,7 +587,6 @@ export async function recoverStaleActions(): Promise<{
       }
 
       if (verifyResult.status === "UNKNOWN") {
-        // Can't establish provider truth — mark for reconciliation
         if (session.state === "SWITCHING") {
           await transitionSessionState(session.id, "ACTIVE");
         }
@@ -570,34 +599,36 @@ export async function recoverStaleActions(): Promise<{
       if (session.state === "SWITCHING") {
         const previousResourceId = session.activeResourceId;
 
-        // Phase 8.5.8: Derive entitlementId from the resource's binding
-        const targetResource = await db.protocolResource.findUnique({
-          where: { id: targetResourceId },
-          select: { providerBindingId: true },
-        });
-        let recoveryEntitlementId = session.entitlementId;
-        if (targetResource?.providerBindingId) {
-          const binding = await db.providerResourceBinding.findUnique({
-            where: { id: targetResource.providerBindingId },
-            select: { entitlementId: true },
-          });
-          if (binding?.entitlementId) {
-            recoveryEntitlementId = binding.entitlementId;
-          }
-        }
-
+        // entitlementId comes from the validated bridge result
         await db.connectivitySession.update({
           where: { id: session.id },
           data: {
             activeResourceId: targetResourceId,
-            entitlementId: recoveryEntitlementId, // FIX: restore entitlementId
+            entitlementId: bridgeResult.entitlementId,
             lastObservedAt: new Date(),
           },
         });
         await transitionSessionState(session.id, "ACTIVE");
 
+        // Phase 8.5.9: Recovery old-release failure → RECONCILIATION_REQUIRED
+        // (not swallowed .catch — same invariant as normal SWITCH)
+        let oldReleaseFailed = false;
         if (previousResourceId && previousResourceId !== targetResourceId) {
-          await releaseResource(previousResourceId, session.id).catch(() => {});
+          const releaseResult = await releaseResource(previousResourceId, session.id);
+          if (!releaseResult.released) {
+            oldReleaseFailed = true;
+            logger.warn("recovery.switch_old_release_failed", {
+              actionId: action.id,
+              oldResourceId: previousResourceId,
+              reason: releaseResult.reason,
+            });
+          }
+        }
+
+        if (oldReleaseFailed) {
+          await transitionActionState(action.id, "RECONCILIATION_REQUIRED", `Recovery: old resource ${previousResourceId} release failed — session on target but cleanup needed`);
+          reconciliationRequired++;
+          continue;
         }
       }
 
@@ -605,7 +636,6 @@ export async function recoverStaleActions(): Promise<{
       succeeded++;
       logger.info("action.recovered_succeeded", { actionId: action.id, targetResourceId, verified: true });
     } else if (resource.state === "RESERVED" && resource.reservedBy === session.id) {
-      // Reserved but never activated → release and fail
       await releaseResource(targetResourceId, session.id);
       if (session.state === "SWITCHING") {
         await transitionSessionState(session.id, "ACTIVE");
@@ -614,7 +644,6 @@ export async function recoverStaleActions(): Promise<{
       failed++;
       logger.info("action.recovered_failed_reserved", { actionId: action.id, targetResourceId });
     } else {
-      // Unknown state — needs manual reconciliation
       await transitionActionState(action.id, "RECONCILIATION_REQUIRED", `Resource in unexpected state: ${resource.state}, reservedBy: ${resource.reservedBy}`);
       reconciliationRequired++;
       logger.warn("action.recovered_reconciliation_required", {
@@ -628,7 +657,7 @@ export async function recoverStaleActions(): Promise<{
 
   const recovered = staleActions.length;
   logger.info("action.recovery_completed", {
-    recovered, succeeded, failed, reconciliationRequired,
+    recovered, succeeded, failed, reconciliationRequired, claimId,
   });
 
   return { recovered, succeeded, failed, reconciliationRequired };

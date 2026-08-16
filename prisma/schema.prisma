@@ -2089,6 +2089,9 @@ model ConnectivityAction {
   policyVersion   String?
   idempotencyKey  String   @unique
   kernelExecutionId String?
+  // Phase 8.5.9: Recovery-worker fencing — unique claim token per worker
+  recoveryClaimId String?
+  recoveryClaimedAt DateTime?
   createdAt       DateTime @default(now())
   executedAt      DateTime?
   completedAt     DateTime?
@@ -2100,6 +2103,7 @@ model ConnectivityAction {
   @@index([sessionId])
   @@index([decisionId])
   @@index([state])
+  @@index([recoveryClaimId])
 }
 
 // ---------------------------------------------------------------------------
