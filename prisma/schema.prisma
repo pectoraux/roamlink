@@ -2287,3 +2287,63 @@ model ReevaluationEvent {
   @@index([sessionId])
   @@index([claimExpiresAt])
 }
+
+// ---------------------------------------------------------------------------
+// Phase 9.1 — Edge Observation (mobile agent contract)
+//
+// The mobile agent uploads EdgeObservation events. These are IMMUTABLE — the
+// server derives authoritative ConnectivityMeasurement from them (source=DEVICE).
+// The device never submits health/decisions; the control plane remains
+// authoritative.
+//
+//   EdgeObservation (immutable, device-reported)
+//        → ConnectivityMeasurement (derived, source=DEVICE)
+//        → ResourceHealth (projection)
+//        → ReevaluationEvent → Decision → Action
+// ---------------------------------------------------------------------------
+
+model EdgeDevice {
+  id              String   @id @default(cuid())
+  deviceId        String   @unique // client-generated stable identifier
+  userId          String   // authenticated owner — validated on every request
+  platform        String   // ios | android | web | unknown
+  appVersion      String
+  registeredAt    DateTime @default(now())
+  lastSeenAt      DateTime? // updated on each observation upload
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  observations    EdgeObservationRecord[]
+
+  @@index([userId])
+}
+
+model EdgeObservationRecord {
+  id              String   @id @default(cuid())
+  // Idempotent dedup: observationId is caller-supplied UUID. Duplicate uploads
+  // collapse to one row (unique constraint).
+  observationId   String   @unique
+  deviceId        String
+  userId          String   // denormalized for fast auth-scoped queries
+  sessionId       String?
+  // The resource the device BELIEVES it's using. Validated against the
+  // authenticated session's active resource — treated as a HINT, not authoritative.
+  resourceId      String?
+  sequence        Int      // per-device monotonic sequence
+  source          String   // DEVICE | PROBE
+  observedAt      DateTime
+  // The full observation payload (connectivity, network, location, device context).
+  payload         String   // JSON
+  // The derived ConnectivityMeasurement id (audit link to the control plane).
+  derivedMeasurementId String?
+  receivedAt      DateTime @default(now())
+
+  edgeDevice      EdgeDevice @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+
+  @@unique([deviceId, sequence]) // per-device sequence dedup
+  @@index([deviceId])
+  @@index([userId])
+  @@index([sessionId])
+  @@index([resourceId])
+  @@index([observedAt])
+}

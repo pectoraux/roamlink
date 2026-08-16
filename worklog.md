@@ -3229,3 +3229,37 @@ Stage Summary:
 - The control plane is now concurrency-safe: decision execution is fenced, reconciliation propagates correctly, observation is decoupled from the command path, and no duplicate provider traffic.
 - Frozen layers unchanged: entitlement.ts, adapter contract, ranking engine, ledger.
 - Phase 8.6.6 COMPLETE. Control plane ready for Phase 9 (mobile agent as edge observer).
+
+---
+Task ID: 9.1
+Agent: Principal Architect (main) — Phase 9.1 Edge Observation Contract
+Task: Define the mobile-to-control-plane measurement/event protocol, device context model, offline buffering, batching, freshness, backpressure. Implement the edge observation substrate underneath the current eSIM-centric mobile app, against the frozen Phase 8 control plane. The mobile agent must NOT become a second control plane.
+
+Work Log:
+- 9.1.1-9.1.3: Added edge types to packages/shared (EdgeObservation, EdgeDeviceContext, EdgeConnectivityState, EdgeNetworkContext, EdgeLocationContext, EdgePolicyContext). Source provenance: DEVICE | PROBE. Client never submits health/decisions.
+- 9.1.4: Batch + sequence semantics. EdgeObservationBatch + EdgeObservationAck (acceptedThroughSequence, duplicateCount, rejected[]). Per-device monotonic sequence with @@unique([deviceId, sequence]).
+- 9.1.5: Mobile outbox (apps/mobile/lib/connectivity/outbox.ts) — durable AsyncStorage outbox, bounded (500 max, 24h TTL), preferentially discards OLD observations.
+- 9.1.6-9.1.7: Server endpoint POST /api/v1/connectivity/edge/observations. Auth binds user→device→session. Device-supplied resourceId is a HINT (validated against session's active resource). Dedup on observationId + (deviceId, sequence).
+- 9.1.7: Server ingestion pipeline: authenticate → authorize device/session → validate schema → dedupe → persist immutable EdgeObservationRecord → project to ConnectivityMeasurement (source=DEVICE) → emit MEASUREMENT_RECEIVED. The mobile edge NEVER calls Decision Engine, Action Executor, Kernel, or Adapter.
+- 9.1.8: Edge policy context — device reports CONTEXT (batterySaver=true), not DECISIONS (SWITCH_TO_WIFI). Server-side policy engine remains authoritative.
+- 9.1.9: Mobile service (apps/mobile/lib/connectivity/) — observation.ts, outbox.ts, device-context.ts, connectivity-state.ts, sync.ts. Exposes startObservation/stopObservation/recordObservation/flushOutbox. No action/provisioning API.
+- Schema: EdgeDevice + EdgeObservationRecord models (immutable observations, derived measurement link).
+
+Tests (12/12 DB-backed, all green):
+  9.1.1  valid observation → persisted
+  9.1.2  duplicate observation → one measurement (dedup)
+  9.1.3  out-of-order sequence → accepted without duplication
+  9.1.4  unauthorized device → rejected
+  9.1.5  device-supplied resourceId validated (hint, not authoritative)
+  9.1.5b device cannot impersonate another user's session
+  9.1.6  batch of observations → all accepted
+  9.1.7  re-upload → duplicates detected
+  9.1.8  observation → ConnectivityMeasurement + MEASUREMENT_RECEIVED event
+  9.1.9  observation does NOT directly create actions (only telemetry)
+  9.1.10 client health/decision fields ignored — server derives
+  9.1.NS north-star: mobile observes degraded WiFi → ResourceHealth DEGRADED via control plane
+
+Stage Summary:
+- The edge observation contract is frozen. The mobile agent is an edge observer + policy/context source — it NEVER becomes a second control plane.
+- Architecture: Mobile → EdgeObservation → Server → Measurement (source=DEVICE) → ResourceHealth → ReevaluationEvent → Decision → Action → Phase 8 controller.
+- Frozen layers unchanged: entitlement.ts kernel, adapter contract, ranking engine, ledger, Phase 8.6.6 control plane.

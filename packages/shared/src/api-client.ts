@@ -16,6 +16,10 @@ import type {
   TopUpPackage,
   UsageSample,
   CompatibilityResult,
+  EdgeObservationBatch,
+  EdgeObservationAck,
+  EdgeDeviceRegistration,
+  EdgePolicyContext,
 } from "./index";
 
 export class ApiError extends Error {
@@ -236,6 +240,35 @@ export class RoamLinkClient {
 
   async getCalls(token: string, vnId: string) {
     return this.request<{ calls: Call[] }>(`/api/virtual-numbers/${vnId}/calls`, {
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  // --- Phase 9.1: Edge Observation ---
+  // The mobile agent uploads connectivity observations. The server derives
+  // authoritative measurements/health/decisions — the client never submits
+  // health scores or decisions.
+
+  async registerEdgeDevice(token: string, registration: Omit<EdgeDeviceRegistration, "registeredAt">) {
+    return this.request<{ deviceId: string; registered: boolean }>("/api/v1/connectivity/edge/devices", {
+      method: "POST",
+      body: JSON.stringify(registration),
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  async uploadEdgeObservations(token: string, batch: EdgeObservationBatch) {
+    return this.request<EdgeObservationAck>("/api/v1/connectivity/edge/observations", {
+      method: "POST",
+      body: JSON.stringify(batch),
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  async updateEdgePolicyContext(token: string, deviceId: string, context: EdgePolicyContext) {
+    return this.request<{ ok: true }>("/api/v1/connectivity/edge/policy-context", {
+      method: "POST",
+      body: JSON.stringify({ deviceId, context }),
       headers: { Cookie: `esim_session=${token}` },
     });
   }
