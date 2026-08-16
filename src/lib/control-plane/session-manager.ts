@@ -139,7 +139,7 @@ export async function recordMeasurement(input: {
       providerInstanceId: input.providerInstanceId ?? null,
       type: input.type,
       metrics: JSON.stringify(input.metrics),
-      freshness: input.freshness ?? "RECENT",
+      freshness: input.freshness ?? "UNKNOWN",
       source: input.source ?? "system",
       confidence: input.confidence ?? 0.5,
     },

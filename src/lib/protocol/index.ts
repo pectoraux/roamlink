@@ -197,6 +197,36 @@ export const SESSION_TRANSITIONS: Record<ConnectivitySessionState, ConnectivityS
 
 export const MeasurementTypeSchema = z.enum(["USAGE", "QUALITY", "AVAILABILITY"]);
 
+/**
+ * Phase 8.6: Measurement provenance. The source field is the critical
+ * provenance marker — provider-reported metrics and client-observed metrics
+ * must never be mixed without preserving which is which.
+ *
+ *   ADAPTER  — the provider adapter reported this (getUsage/reconcile)
+ *   DEVICE   — the end-user device observed this (client telemetry)
+ *   PROBE    — an independent probe/synthetic check observed this
+ *   PROVIDER — the supplier's own API reported this (raw, pre-adapter)
+ *   DERIVED  — computed from other measurements (aggregates, sma)
+ */
+export const MeasurementSourceSchema = z.enum([
+  "ADAPTER",
+  "DEVICE",
+  "PROBE",
+  "PROVIDER",
+  "DERIVED",
+]);
+export type MeasurementSource = z.infer<typeof MeasurementSourceSchema>;
+
+/**
+ * Phase 8.6: Measurement freshness, computed from capturedAt at ingestion.
+ *   FRESH   age < 30s   — may trigger automatic decisions
+ *   STALE   30s–120s    — informs health, must NOT be the sole switch trigger
+ *   EXPIRED > 120s      — excluded from health derivation entirely
+ *   UNKNOWN              — capturedAt missing / not computed
+ */
+export const MeasurementFreshnessSchema = z.enum(["FRESH", "STALE", "EXPIRED", "UNKNOWN"]);
+export type MeasurementFreshness = z.infer<typeof MeasurementFreshnessSchema>;
+
 export const ConnectivityMeasurementSchema = z.object({
   id: z.string().optional(),
   sessionId: z.string().optional(),
@@ -215,13 +245,51 @@ export const ConnectivityMeasurementSchema = z.object({
     dataRemainingBytes: z.number().optional(),
     isActive: z.boolean().optional(),
   }),
-  freshness: z.enum(["REALTIME", "RECENT", "STALE", "UNKNOWN"]).default("UNKNOWN"),
-  source: z.string().optional(),
+  freshness: MeasurementFreshnessSchema.default("UNKNOWN"),
+  source: MeasurementSourceSchema.default("PROVIDER"),
   confidence: z.number().min(0).max(1).default(0.5),
   capturedAt: z.string().datetime(),
 });
 
 export type ConnectivityMeasurement = z.infer<typeof ConnectivityMeasurementSchema>;
+
+// ---------------------------------------------------------------------------
+// Phase 8.6 — Resource Health (persisted, derived from the measurement stream)
+// ---------------------------------------------------------------------------
+
+export const HealthStatusSchema = z.enum(["HEALTHY", "DEGRADED", "UNKNOWN"]);
+export type HealthStatus = z.infer<typeof HealthStatusSchema>;
+
+export const ResourceHealthSchema = z.object({
+  id: z.string().optional(),
+  resourceId: z.string(),
+  sessionId: z.string().optional(),
+  status: HealthStatusSchema.default("UNKNOWN"),
+  quality: z.number().min(0).max(1).default(0),
+  sampleCount: z.number().int().default(0),
+  degradedCount: z.number().int().default(0),
+  freshness: MeasurementFreshnessSchema.default("UNKNOWN"),
+  derivedFromSources: z.string().optional(),
+  latestMeasurementId: z.string().optional(),
+  updatedAt: z.string().datetime().optional(),
+});
+
+export type ResourceHealth = z.infer<typeof ResourceHealthSchema>;
+
+// ---------------------------------------------------------------------------
+// Phase 8.6 — Re-evaluation Events (event-driven decision triggers)
+// ---------------------------------------------------------------------------
+
+export const ReevaluationEventTypeSchema = z.enum([
+  "MEASUREMENT_RECEIVED",
+  "RESOURCE_DEGRADED",
+  "RESOURCE_RECOVERED",
+  "QUOTA_THRESHOLD_REACHED",
+  "PROVIDER_UNAVAILABLE",
+  "LOCATION_CHANGED",
+  "POLICY_CHANGED",
+]);
+export type ReevaluationEventType = z.infer<typeof ReevaluationEventTypeSchema>;
 
 // ---------------------------------------------------------------------------
 // ConnectivityPolicy — deterministic rules for autonomous decisions

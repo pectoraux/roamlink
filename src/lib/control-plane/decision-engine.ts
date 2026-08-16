@@ -19,6 +19,8 @@ import { logger } from "@/lib/logger";
 import { rankOffers } from "@/lib/commerce/ranking-engine";
 import { getPolicy, evaluatePolicy } from "@/lib/control-plane/policy-engine";
 import { discoverCapabilities, discoverResources } from "@/lib/control-plane/capability-registry";
+import { getResourceHealth } from "@/lib/control-plane/health-derivation";
+import { mayTriggerAutomaticSwitch } from "@/lib/control-plane/freshness";
 import type { ConnectivityPolicy } from "@/lib/protocol";
 
 // ---------------------------------------------------------------------------
@@ -164,24 +166,25 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
       : null;
 
     if (activeSession && activeSession.state === "ACTIVE") {
-      // Active session — evaluate KEEP vs SWITCH
+      // Active session — evaluate KEEP vs SWITCH using the PERSISTED health
+      // snapshot (Phase 8.6). Health is derived from the measurement stream
+      // by deriveResourceHealth() at ingestion time — not recomputed here.
+      // This makes hysteresis a genuine control-system property.
       const policy = input.policy;
       const switchThreshold = policy?.switchHysteresis ?? 0.15;
 
-      // Hysteresis parameters
+      // Control-system gates: dwell + cooldown (unchanged)
       const MIN_DWELL_MS = 60_000;
       const COOLDOWN_MS = 120_000;
-      const MIN_MEASUREMENTS_FOR_SWITCH = 3; // need at least 3 measurements
-      const MIN_DEGRADED_COUNT = 2; // at least 2 of them must show degradation
-      const DEGRADATION_THRESHOLD = 0.4; // quality below this = degraded
+      const MIN_SAMPLES_FOR_SWITCH = 3; // need at least 3 samples for switch confidence
 
-      // Check dwell time
+      // Dwell check
       if (activeSession.startedAt && Date.now() - activeSession.startedAt.getTime() < MIN_DWELL_MS) {
         action = "KEEP";
         reasons.push(`Session started <${MIN_DWELL_MS / 1000}s ago — dwell time not met`);
         constraintsSatisfied.push("DWELL_TIME_ENFORCED");
       } else {
-        // Check cooldown
+        // Cooldown check
         const recentSwitch = await db.connectivityAction.findFirst({
           where: {
             sessionId: activeSession.id,
@@ -195,54 +198,47 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
           action = "KEEP";
           reasons.push(`Last switch was <${COOLDOWN_MS / 1000}s ago — cooldown active`);
           constraintsSatisfied.push("COOLDOWN_ENFORCED");
+        } else if (!activeSession.activeResourceId) {
+          action = "KEEP";
+          reasons.push("Active session has no activeResourceId — nothing to switch from");
+          constraintsViolated.push("NO_ACTIVE_RESOURCE");
         } else {
-          // Fetch recent measurements
-          const recentMeasurements = await db.connectivityMeasurement.findMany({
-            where: { sessionId: activeSession.id, capturedAt: { gte: new Date(Date.now() - 300000) } },
-            orderBy: { capturedAt: "desc" },
-            take: 5,
-          });
+          // Phase 8.6: consult the PERSISTED ResourceHealth snapshot.
+          const health = await getResourceHealth(activeSession.activeResourceId);
 
-          if (recentMeasurements.length < MIN_MEASUREMENTS_FOR_SWITCH) {
+          if (!health) {
             action = "KEEP";
-            reasons.push(`Only ${recentMeasurements.length} measurement(s) — need ${MIN_MEASUREMENTS_FOR_SWITCH} for switch confidence`);
-            constraintsSatisfied.push("CONFIDENCE_THRESHOLD_ENFORCED");
-          } else {
-            // Phase 8.4: M-of-N degraded check — not just the latest measurement
-            const degradedMeasurements = recentMeasurements.filter((m) => {
-              const metrics = JSON.parse(m.metrics);
-              const quality = (metrics.throughputDownMbps ?? 0) > 0
-                ? Math.min(1, (metrics.throughputDownMbps ?? 0) / 50)
-                : 0.3;
-              return quality < DEGRADATION_THRESHOLD;
-            });
-
-            if (degradedMeasurements.length >= MIN_DEGRADED_COUNT) {
-              // M-of-N degraded — eligible to switch
-              const avgQuality = recentMeasurements.reduce((sum, m) => {
-                const metrics = JSON.parse(m.metrics);
-                const q = (metrics.throughputDownMbps ?? 0) > 0
-                  ? Math.min(1, (metrics.throughputDownMbps ?? 0) / 50)
-                  : 0.3;
-                return sum + q;
-              }, 0) / recentMeasurements.length;
-
-              if (score - avgQuality > switchThreshold) {
-                action = "SWITCH";
-                reasons.push(`${degradedMeasurements.length}/${recentMeasurements.length} measurements degraded — switch threshold met (avg quality ${avgQuality.toFixed(2)} vs candidate ${score.toFixed(2)})`);
-                constraintsSatisfied.push("SWITCH_THRESHOLD_MET");
-                constraintsSatisfied.push("M_OF_N_DEGRADED");
-                constraintsSatisfied.push("HYSTERESIS_PASSED");
-              } else {
-                action = "KEEP";
-                reasons.push(`Degraded but improvement ${score.toFixed(2)} - ${avgQuality.toFixed(2)} < threshold ${switchThreshold}`);
-                constraintsSatisfied.push("QUALITY_ACCEPTABLE");
-              }
+            reasons.push("No persisted health snapshot for active resource — insufficient observation");
+            constraintsSatisfied.push("HEALTH_UNKNOWN");
+          } else if (health.status === "DEGRADED") {
+            // Freshness gating: a stale/expired health snapshot must NOT
+            // trigger an automatic switch as though it were current.
+            if (!mayTriggerAutomaticSwitch(health.freshness)) {
+              action = "KEEP";
+              reasons.push(`Active resource DEGRADED but health freshness is ${health.freshness} — will not auto-switch on stale observation`);
+              constraintsSatisfied.push("FRESHNESS_GATE_ENFORCED");
+              constraintsViolated.push("STALE_HEALTH");
+            } else if (health.sampleCount < MIN_SAMPLES_FOR_SWITCH) {
+              action = "KEEP";
+              reasons.push(`Only ${health.sampleCount} sample(s) — need ${MIN_SAMPLES_FOR_SWITCH} for switch confidence`);
+              constraintsSatisfied.push("CONFIDENCE_THRESHOLD_ENFORCED");
+            } else if (score - health.quality > switchThreshold) {
+              action = "SWITCH";
+              reasons.push(`Active resource DEGRADED (quality ${health.quality.toFixed(2)}, ${health.degradedCount}/${health.sampleCount} samples degraded) — improvement to candidate ${score.toFixed(2)} exceeds threshold ${switchThreshold}`);
+              constraintsSatisfied.push("SWITCH_THRESHOLD_MET");
+              constraintsSatisfied.push("M_OF_N_DEGRADED");
+              constraintsSatisfied.push("HYSTERESIS_PASSED");
+              constraintsSatisfied.push("HEALTH_FRESH");
             } else {
               action = "KEEP";
-              reasons.push(`Only ${degradedMeasurements.length}/${recentMeasurements.length} measurements degraded — need ${MIN_DEGRADED_COUNT} for switch`);
+              reasons.push(`Degraded but improvement ${score.toFixed(2)} - ${health.quality.toFixed(2)} < threshold ${switchThreshold}`);
               constraintsSatisfied.push("QUALITY_ACCEPTABLE");
             }
+          } else {
+            // HEALTHY or UNKNOWN → keep
+            action = "KEEP";
+            reasons.push(`Active resource health is ${health.status} (quality ${health.quality.toFixed(2)}) — no switch needed`);
+            constraintsSatisfied.push("QUALITY_ACCEPTABLE");
           }
         }
       }

@@ -273,8 +273,16 @@ export async function executeAction(actionId: string): Promise<{
           },
         });
 
-        // 3f. Transition session to ACTIVE
+        // 3f. Transition session to ACTIVE.
+        // Phase 8.6 runtime fix: the session state machine requires
+        // PLANNED → DISCOVERING → ACTIVE (PLANNED → ACTIVE is illegal). This
+        // bug was invisible to static tests and only surfaced when the
+        // DB-backed runtime test exercised ACTIVATE from a freshly-created
+        // (PLANNED) session.
         if (session.state === "PLANNED" || session.state === "DISCOVERING" || session.state === "RESERVED") {
+          if (session.state === "PLANNED") {
+            await transitionSessionState(session.id, "DISCOVERING");
+          }
           await transitionSessionState(session.id, "ACTIVE");
         }
 

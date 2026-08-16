@@ -156,7 +156,10 @@ describe("Phase 8 — Connectivity Control Plane", () => {
     expect(source).toContain("USAGE");
     expect(source).toContain("QUALITY");
     expect(source).toContain("AVAILABILITY");
-    expect(source).toContain("recordMeasurement");
+    // Phase 8.6: the route now uses the canonical ingestion path (ingestMeasurement)
+    // which validates source provenance, computes freshness, derives health, and
+    // emits re-evaluation events.
+    expect(source).toContain("ingestMeasurement");
   });
 
   it("8.17: actions API creates and optionally executes actions", async () => {

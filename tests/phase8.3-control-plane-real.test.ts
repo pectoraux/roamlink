@@ -71,7 +71,9 @@ describe("Phase 8.3 — Control Plane Real", () => {
     const source = fs.readFileSync("src/lib/control-plane/decision-engine.ts", "utf-8");
     expect(source).toContain("MIN_DWELL_MS");
     expect(source).toContain("COOLDOWN_MS");
-    expect(source).toContain("MIN_MEASUREMENTS_FOR_SWITCH");
+    // Phase 8.6: the decision engine consults the PERSISTED ResourceHealth
+    // snapshot (sampleCount) rather than fetching raw measurements inline.
+    expect(source).toContain("MIN_SAMPLES_FOR_SWITCH");
     expect(source).toContain("DWELL_TIME_ENFORCED");
     expect(source).toContain("COOLDOWN_ENFORCED");
     expect(source).toContain("CONFIDENCE_THRESHOLD_ENFORCED");

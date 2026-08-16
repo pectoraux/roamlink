@@ -1498,6 +1498,13 @@ model ConnectivityEntitlement {
   // Reconciliation: tracks drift between desired and observed state
   reconciliationState String? // null | RECONCILIATION_REQUIRED | RECONCILED
   failureReason   String?
+  // Phase 8.6: Schema drift correction. The control-plane kernel-bridge and
+  // invariant-checker query entitlement.userId to scope entitlements to a
+  // subject (user). The frozen kernel (entitlement.ts) does not write this
+  // field — it passes userId only to the audit log — so kernel-created
+  // entitlements remain NULL here. User-scoped flows and test fixtures set it.
+  // This column is additive (nullable) and unblocks the runtime control loop.
+  userId          String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -1509,6 +1516,7 @@ model ConnectivityEntitlement {
   @@index([subscriptionId])
   @@index([status])
   @@index([capabilityId])
+  @@index([userId])
 }
 
 // ---------------------------------------------------------------------------
@@ -2027,8 +2035,13 @@ model ConnectivityMeasurement {
   providerInstanceId String?
   type            String
   metrics         String
+  // Phase 8.6: freshness computed from capturedAt at ingestion time.
+  // FRESH (age<30s) | STALE (30s–120s) | EXPIRED (>120s) | UNKNOWN
   freshness       String   @default("UNKNOWN")
-  source          String?
+  // Phase 8.6: provenance — MUST be one of ADAPTER|DEVICE|PROBE|PROVIDER|DERIVED.
+  // Provider-reported and client-observed metrics are never mixed without
+  // preserving which is which. Validated at ingestion time (measurement-store).
+  source          String   @default("PROVIDER")
   confidence      Float    @default(0.5)
   capturedAt      DateTime @default(now())
 
@@ -2037,6 +2050,8 @@ model ConnectivityMeasurement {
   @@index([sessionId])
   @@index([resourceId])
   @@index([capturedAt])
+  @@index([source])
+  @@index([freshness])
 }
 
 model ConnectivityPolicy {
@@ -2172,4 +2187,67 @@ model ProtocolResource {
   @@index([capabilityId])
   @@index([providerInstanceId])
   @@index([state])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8.6 — Continuous Connectivity Observation
+//
+// ResourceHealth is the persisted, derived health snapshot for a resource.
+// It is computed from the measurement stream by deriveResourceHealth() and
+// consumed by the decision engine. Persisting it (rather than recomputing ad
+// hoc in the decision engine) makes hysteresis a genuine control-system
+// property: health is queryable, auditable, and event-addressable.
+// ---------------------------------------------------------------------------
+
+model ResourceHealth {
+  id              String   @id @default(cuid())
+  resourceId      String   @unique
+  sessionId       String?
+  // HEALTHY | DEGRADED | UNKNOWN
+  status          String   @default("UNKNOWN")
+  // Normalized quality 0–1 derived from the last-N measurement samples.
+  quality         Float    @default(0)
+  sampleCount     Int      @default(0)
+  degradedCount   Int      @default(0)
+  // Freshness of the most recent sample that fed this snapshot.
+  freshness       String   @default("UNKNOWN")
+  // Provenance mix that fed this snapshot (e.g. "ADAPTER" or "ADAPTER+DEVICE").
+  derivedFromSources String?
+  // The measurement id of the most recent sample (audit link).
+  latestMeasurementId String?
+  updatedAt       DateTime @updatedAt
+
+  @@index([status])
+  @@index([sessionId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8.6 — Re-evaluation Events
+//
+// Persisted events that may trigger a decision re-evaluation. The ingestion
+// layer emits them; a worker (or the synchronous path) processes them. This
+// replaces blind polling with event-driven re-evaluation — the foundation for
+// a lightweight mobile agent.
+// ---------------------------------------------------------------------------
+
+model ReevaluationEvent {
+  id              String   @id @default(cuid())
+  // MEASUREMENT_RECEIVED | RESOURCE_DEGRADED | RESOURCE_RECOVERED |
+  // QUOTA_THRESHOLD_REACHED | PROVIDER_UNAVAILABLE | LOCATION_CHANGED |
+  // POLICY_CHANGED
+  type            String
+  resourceId      String?
+  sessionId       String?
+  subjectId       String?
+  payload         String   // JSON
+  // null = unprocessed. Set when a worker consumes the event.
+  processedAt     DateTime?
+  // Result of processing (e.g. "reevaluated:KEEP", "reevaluated:SWITCH", "skipped").
+  result          String?
+  createdAt       DateTime @default(now())
+
+  @@index([processedAt])
+  @@index([type])
+  @@index([resourceId])
+  @@index([sessionId])
 }

@@ -3038,3 +3038,75 @@ Stage Summary:
 - Enhanced analytics: churn, best-selling, active users, ratings, uptime
 - Tests: 20/20 PASSING. Lint: clean. TypeScript: clean.
 - SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN. Ranking engine: FROZEN. Ledger: FROZEN.
+
+---
+Task ID: 8.6
+Agent: Principal Architect (main) — Phase 8.6 Continuous Connectivity Observation
+Task: Build the continuous observation loop that supplies trustworthy measurements to the decision engine. Make measurements first-class events with provenance, enforce freshness, persist hysteresis as a control-system property, drive re-evaluation by events, and prove the full loop end-to-end against the real PostgreSQL database + mock provider adapter (not another collection of static tests). Freeze the rule: SUCCEEDED only when provider truth + session + resource + binding + entitlement converge.
+
+Work Log:
+
+AUDIT (verified against real DB):
+- All 122 prior Phase 8 tests were STATIC source inspection — none ever executed against a database.
+- Found a LATENT RUNTIME BUG: ConnectivityEntitlement had NO `userId` column in PostgreSQL, yet the kernel-bridge (resolveResourceBinding) and invariant-checker both query `entitlement.userId`. A direct runtime query confirms Prisma rejects it. This means the ACTIVATE/SWITCH/recovery paths have NEVER run against a DB — the "close the loop" work (8.5.7) and invariant checker (8.5.9) were source-only.
+- Found a SECOND latent bug in the action executor: ACTIVATE tried `PLANNED → ACTIVE` directly, but the session state machine requires `PLANNED → DISCOVERING → ACTIVE`. Invisible to static tests.
+- Decision-engine hysteresis was inline (no freshness gating, no provenance, recomputed ad hoc).
+
+SCHEMA (prisma/schema.prisma):
+- Added `userId String?` + index to ConnectivityEntitlement (schema drift fix — the control plane already queries it; the frozen kernel does not write it, so existing entitlements stay NULL). Additive, nullable, no kernel-code change.
+- ConnectivityMeasurement.source: `String?` → `String @default("PROVIDER")` (non-null) + `@@index([source])` + `@@index([freshness])`.
+- New model ResourceHealth (persisted derived health snapshot: status, quality, sampleCount, degradedCount, freshness, derivedFromSources, latestMeasurementId; resourceId @unique).
+- New model ReevaluationEvent (durable event queue: type, resourceId, sessionId, subjectId, payload, processedAt, result).
+- db:push applied + verified (userId query works, new tables exist).
+
+PROTOCOL VOCABULARY (src/lib/protocol/index.ts):
+- MeasurementSourceSchema enum: ADAPTER | DEVICE | PROBE | PROVIDER | DERIVED.
+- MeasurementFreshnessSchema: FRESH | STALE | EXPIRED | UNKNOWN.
+- HealthStatusSchema + ResourceHealthSchema + ReevaluationEventTypeSchema (7 event types).
+
+OBSERVATION LAYER (new modules):
+- freshness.ts: classifyFreshness() (FRESH<30s / STALE 30s–120s / EXPIRED>120s, policy-overridable), mayTriggerAutomaticSwitch() (only FRESH), contributesToHealth() (FRESH+STALE).
+- health-derivation.ts: deriveResourceHealth() — last-N measurements (EXPIRED excluded) → per-sample quality (throughput/latency/packet-loss normalized 0–1) → M-of-N degraded → persisted ResourceHealth (upsert by resourceId). getResourceHealth() for the decision engine to read.
+- measurement-store.ts: ingestMeasurement() — validates source ∈ enum (rejects unknown, "must preserve provenance"), computes freshness, persists ConnectivityMeasurement, derives + persists ResourceHealth, emits MEASUREMENT_RECEIVED + RESOURCE_DEGRADED/RESOURCE_RECOVERED transition events, triggers synchronous re-evaluation (lazily imported to avoid static cycles).
+- reevaluation.ts: isReevaluationNecessary() (event affects an ACTIVE session?), triggerReevaluation() (makeDecision → createAction → executeAction), processPendingEventsForResource() (inline), processPendingEvents() (worker), emitReevaluationEvent() (manual triggers).
+- observation.ts: probeAndIngest() — resolves ProtocolResource → ProviderResourceBinding → adapter (via registry), calls adapter.getUsage(), converts UsageMetrics → measurement with source=ADAPTER, ingests. probeSession() + probeAllActiveSessions() (cron entry).
+
+DECISION ENGINE REFACTOR (decision-engine.ts):
+- Replaced inline measurement-fetching + M-of-N logic with consultation of the PERSISTED ResourceHealth snapshot (getResourceHealth). Hysteresis is now a genuine control-system property.
+- Added freshness gating: DEGRADED + FRESH → eligible to switch (subject to dwell/cooldown/improvement-margin); DEGRADED + STALE/EXPIRED → KEEP with FRESHNESS_GATE_ENFORCED + STALE_HEALTH. A stale measurement must NOT trigger an automatic switch.
+- Kept dwell (60s) + cooldown (120s) + improvement-margin gates.
+
+ACTION EXECUTOR FIX (action-executor.ts):
+- ACTIVATE now transitions PLANNED → DISCOVERING → ACTIVE (was PLANNED → ACTIVE, illegal). Runtime bug surfaced by the DB-backed test.
+
+API:
+- measurements route → ingestMeasurement (validates source, returns freshness + health + eventsEmitted).
+- New internal/observe-connectivity cron route (CRON_SECRET) → probeAllActiveSessions + processPendingEvents.
+- Fixed recordMeasurement freshness default ("RECENT" → "UNKNOWN", valid enum).
+
+TESTS (21 new, all passing):
+  DB-BACKED RUNTIME (tests/phase8.6-observation-loop.test.ts, 7 tests, 371s against PostgreSQL + mock adapter):
+    8.6.1: ACTIVATE A → kernel bridge → mock adapter reconcile → A IN_USE → invariant → Session A ACTIVE
+    8.6.2: inject 3 degraded measurements (source=ADAPTER) → deriveResourceHealth(A) = DEGRADED (M-of-N)
+    8.6.3: freshness classification FRESH/STALE/EXPIRED/UNKNOWN boundaries
+    8.6.4: triggerReevaluation → makeDecision → SWITCH B (policy ALLOW, HEALTH_FRESH, M_OF_N_DEGRADED)
+    8.6.5: SWITCH executed → B IN_USE, A AVAILABLE, invariant holds, Session B ACTIVE
+    8.6.6: STALE health snapshot does NOT trigger auto-switch (FRESHNESS_GATE_ENFORCED, STALE_HEALTH)
+    8.6.7: crash mid-EXECUTING → recoverStaleActions → reconcile ACTIVE → converge → invariant
+  STATIC WIRING (tests/phase8.6-wiring.test.ts, 14 tests): source provenance, freshness, health derivation, re-evaluation events, observation probe, decision-engine refactor, schema, API, action-executor fix, kernel preservation.
+  EXISTING Phase 8 tests (121): all still pass, including 3 updated to reflect the M-of-N move to health-derivation + the route's new ingestMeasurement path.
+
+FROZEN LAYERS (verified unchanged):
+- entitlement.ts (kernel) — no Phase 8.6 code (no ingestMeasurement, deriveResourceHealth, ResourceHealth, ReevaluationEvent, probeAndIngest).
+- adapter.ts (contract) — still exports getUsage + reconcile.
+- ranking-engine.ts — no observation code.
+- ledger — untouched.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The control loop is now PROVEN end-to-end against a real database + mock adapter — not just source-inspected. Two latent runtime bugs (entitlement.userId schema drift, PLANNED→ACTIVE state-machine) were found and fixed.
+- Architecture: Provider Adapter → observation → Measurement Store (provenance) → persisted ResourceHealth → Decision Engine (freshness-gated) → Action Executor → kernel bridge → frozen kernel → adapter → provider truth → invariant → Session.
+- Re-evaluation is event-driven (7 event types, persisted), not blind polling.
+- Tests: 21 new (7 DB-backed runtime + 14 static wiring) + 121 existing Phase 8 still green.
+- SaaS billing kernel: FROZEN. Adapter contract: FROZEN. Entitlement kernel: FROZEN. Ranking engine: FROZEN. Ledger: FROZEN.
+- Architectural rule frozen: the control plane may only declare SUCCEEDED when provider truth, session state, resource state, binding identity, and entitlement identity all converge (enforced by assertActiveConnectivityInvariant, now exercised at runtime).

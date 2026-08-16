@@ -48,15 +48,21 @@ describe("Phase 8.4 — Real Resource-Controlled Switching", () => {
     expect(source).toContain("targetCapabilityId");
   });
 
-  it("8.4.3: hysteresis uses M-of-N degraded measurements, not just count >= 2", async () => {
+  it("8.4.3: hysteresis uses M-of-N degraded (Phase 8.6: persisted in health-derivation)", async () => {
     const fs = await import("fs");
-    const source = fs.readFileSync("src/lib/control-plane/decision-engine.ts", "utf-8");
-    expect(source).toContain("MIN_DEGRADED_COUNT");
-    expect(source).toContain("DEGRADATION_THRESHOLD");
-    expect(source).toContain("degradedMeasurements");
-    expect(source).toContain("M_OF_N_DEGRADED");
-    // Must filter measurements by quality, not just count them
-    expect(source).toContain("quality < DEGRADATION_THRESHOLD");
+    // Phase 8.6: M-of-N degradation moved out of inline decision-engine logic
+    // into the persisted health-derivation module — a genuine control-system
+    // property. The decision engine now consults the persisted snapshot.
+    const healthSource = fs.readFileSync("src/lib/control-plane/health-derivation.ts", "utf-8");
+    expect(healthSource).toContain("degradedThreshold");
+    expect(healthSource).toContain("minDegradedCount");
+    expect(healthSource).toContain("DEGRADED");
+    expect(healthSource).toContain("deriveSampleQuality");
+
+    const decisionSource = fs.readFileSync("src/lib/control-plane/decision-engine.ts", "utf-8");
+    expect(decisionSource).toContain("getResourceHealth");
+    expect(decisionSource).toContain("M_OF_N_DEGRADED");
+    expect(decisionSource).toContain("health.status");
   });
 
   // -------------------------------------------------------------------------
