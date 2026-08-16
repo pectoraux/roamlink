@@ -2155,6 +2155,9 @@ model ProtocolResource {
   location        String?  // JSON: { country, region, city, lat, lng }
   reservedAt      DateTime?
   reservedBy      String?  // session ID
+  // Phase 8.5.7: explicit link to the frozen kernel's ProviderResourceBinding.
+  // Eliminates the identity ambiguity: ProtocolResource #17 → which binding?
+  providerBindingId String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 

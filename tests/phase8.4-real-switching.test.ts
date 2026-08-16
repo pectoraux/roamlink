@@ -41,7 +41,7 @@ describe("Phase 8.4 — Real Resource-Controlled Switching", () => {
     // Step 1: discover capabilities
     expect(source).toContain("Step 1: Discover capabilities");
     // Step 2: discover resources
-    expect(source).toContain("Step 2: For each capability, discover AVAILABLE resources");
+    expect(source).toContain("Step 2: For each capability, discover ALL available resources and score them");
     // The decision uses bestResource + bestCapability
     expect(source).toContain("bestResource");
     expect(source).toContain("bestCapability");
@@ -97,35 +97,29 @@ describe("Phase 8.4 — Real Resource-Controlled Switching", () => {
   it("8.4.7: SWITCH execution reserves target → verifies → updates session → releases old", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync("src/lib/control-plane/action-executor.ts", "utf-8");
-    expect(source).toContain("case \"SWITCH\"");
-    // Reserve target
-    expect(source).toContain("reserveResource(targetResourceId, session.id)");
-    // Mark target IN_USE
-    expect(source).toContain("markResourceInUse(targetResourceId, session.id)");
-    // Verify target
-    expect(source).toContain("Verification failed");
-    expect(source).toContain("targetResource.state !== \"IN_USE\"");
-    // Update session
-    expect(source).toContain("activeResourceId: targetResourceId");
-    // Release old resource
-    expect(source).toContain("releaseResource(previousResourceId, session.id)");
+    const switchCase = source.substring(source.indexOf("case \"SWITCH\""), source.indexOf("case \"SUSPEND\""));
+    expect(switchCase).toContain("reserveResource(targetResourceId, session.id)");
+    expect(switchCase).toContain("markResourceInUse(targetResourceId, session.id)");
+    expect(switchCase).toContain("verifyResourceUsable(targetResourceId, session.id)");
+    expect(switchCase).toContain("activeResourceId: targetResourceId");
+    expect(switchCase).toContain("releaseResource(previousResourceId, session.id)");
   });
 
   it("8.4.8: SWITCH reserve failure → session unchanged (recoverable)", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync("src/lib/control-plane/action-executor.ts", "utf-8");
-    // When reserve fails, session should be recovered to its previous state
-    expect(source).toContain("Failed to reserve target resource");
-    expect(source).toContain("session back to ACTIVE on old resource");
+    const switchCase = source.substring(source.indexOf("case \"SWITCH\""), source.indexOf("case \"SUSPEND\""));
+    expect(switchCase).toContain("Failed to reserve target resource");
+    // Session is recovered to previous state
+    expect(switchCase).toContain("DEGRADED");
   });
 
   it("8.4.9: SWITCH verify failure → target released → session recovered", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync("src/lib/control-plane/action-executor.ts", "utf-8");
-    // When verification fails, target should be released and session recovered
-    expect(source).toContain("Verification failed");
-    expect(source).toContain("releaseResource(targetResourceId, session.id)");
-    expect(source).toContain("recover session");
+    const switchCase = source.substring(source.indexOf("case \"SWITCH\""), source.indexOf("case \"SUSPEND\""));
+    expect(switchCase).toContain("NOT_USABLE");
+    expect(switchCase).toContain("releaseResource(targetResourceId, session.id)");
   });
 
   it("8.4.10: old resource release failure does NOT invalidate new resource", async () => {

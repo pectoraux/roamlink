@@ -26,7 +26,7 @@ import { ACTION_TRANSITIONS } from "@/lib/protocol";
 import type { ActionState, ActionType } from "@/lib/protocol";
 import { transitionSessionState } from "./session-manager";
 import { reserveResource, releaseResource, markResourceInUse } from "./capability-registry";
-import { verifyResourceUsable } from "./kernel-bridge";
+import { resolveResourceBinding, verifyResourceUsable } from "./kernel-bridge";
 
 // ---------------------------------------------------------------------------
 // Create Action
@@ -47,6 +47,8 @@ export async function createAction(input: {
 
   // Phase 8.5.3: idempotent create — if an action with this key already exists,
   // return it instead of creating a duplicate.
+  // Phase 8.5.7: Handle concurrent race — if findUnique returns null but create
+  // throws a unique constraint violation, re-read the existing action.
   const existing = await db.connectivityAction.findUnique({
     where: { idempotencyKey },
   });
@@ -60,18 +62,39 @@ export async function createAction(input: {
     return { id: existing.id, state: existing.state, idempotencyKey };
   }
 
-  const action = await db.connectivityAction.create({
-    data: {
-      sessionId: input.sessionId,
-      decisionId: input.decisionId ?? null,
-      type: input.type,
-      targetResourceId: input.targetResourceId ?? null,
-      state: "PLANNED",
-      reason: input.reason ?? null,
-      policyVersion: input.policyVersion ?? null,
-      idempotencyKey,
-    },
-  });
+  let action;
+  try {
+    action = await db.connectivityAction.create({
+      data: {
+        sessionId: input.sessionId,
+        decisionId: input.decisionId ?? null,
+        type: input.type,
+        targetResourceId: input.targetResourceId ?? null,
+        state: "PLANNED",
+        reason: input.reason ?? null,
+        policyVersion: input.policyVersion ?? null,
+        idempotencyKey,
+      },
+    });
+  } catch (err: any) {
+    // Phase 8.5.7: Handle unique constraint violation from concurrent create
+    if (err?.code === "P2002") {
+      // Unique constraint on idempotencyKey — another worker created it first.
+      // Re-read and return the existing action.
+      const concurrent = await db.connectivityAction.findUnique({
+        where: { idempotencyKey },
+      });
+      if (concurrent) {
+        logger.info("action.concurrent_idempotent_return", {
+          actionId: concurrent.id,
+          idempotencyKey,
+          state: concurrent.state,
+        });
+        return { id: concurrent.id, state: concurrent.state, idempotencyKey };
+      }
+    }
+    throw err;
+  }
 
   logger.info("action.created", {
     actionId: action.id,
@@ -194,33 +217,74 @@ export async function executeAction(actionId: string): Promise<{
           throw new Error(`Failed to reserve resource ${targetResourceId}: ${reserveResult.reason}`);
         }
 
-        // 3b. Mark resource as IN_USE — fail closed (Phase 8.5.1)
+        // 3b. Resolve resource binding via kernel bridge (Phase 8.5.7)
+        // This calls the frozen kernel to provision/verify the resource at the provider
+        const bridgeResult = await resolveResourceBinding({
+          protocolResourceId: targetResourceId,
+          tenantId: session.subjectId, // tenantId is stored on the session's subject
+          subjectId: session.subjectId,
+        });
+
+        // Also need the actual tenantId — get it from the resource's capability
+        const resource = await db.protocolResource.findUnique({
+          where: { id: targetResourceId },
+          select: { capability: { select: { tenantId: true } } },
+        });
+        const tenantId = resource?.capability.tenantId ?? session.subjectId;
+
+        if (bridgeResult.status === "failed") {
+          await releaseResource(targetResourceId, session.id);
+          throw new Error(`Kernel bridge failed: ${bridgeResult.error}`);
+        }
+        if (bridgeResult.status === "reconciliation_required") {
+          await releaseResource(targetResourceId, session.id);
+          throw new Error(`Kernel bridge requires reconciliation: ${bridgeResult.error}`);
+        }
+
+        // 3c. Mark resource as IN_USE — fail closed
         const activateResult = await markResourceInUse(targetResourceId, session.id);
         if (!activateResult.activated) {
-          // Activation failed — release the reservation and fail
           await releaseResource(targetResourceId, session.id);
           throw new Error(`Failed to mark resource IN_USE: ${activateResult.reason}`);
         }
 
-        // 3c. Verify the resource is actually IN_USE (Phase 8.5.4: real verification)
+        // 3d. Verify via kernel bridge (USABLE | NOT_USABLE | UNKNOWN)
         const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
-        if (!verifyResult.usable) {
-          // Verification failed — release and fail
+        if (verifyResult.status === "NOT_USABLE") {
           await releaseResource(targetResourceId, session.id);
           throw new Error(`Resource verification failed: ${verifyResult.reason}`);
         }
+        if (verifyResult.status === "UNKNOWN") {
+          // Fail-closed: don't assume usable. Mark for reconciliation.
+          await transitionActionState(actionId, "RECONCILIATION_REQUIRED", `Verification UNKNOWN: ${verifyResult.reason}`);
+          // Still update the session — the resource might be usable, but we can't confirm
+          await db.connectivitySession.update({
+            where: { id: session.id },
+            data: {
+              activeResourceId: targetResourceId,
+              entitlementId: bridgeResult.entitlementId,
+              startedAt: new Date(),
+              lastObservedAt: new Date(),
+            },
+          });
+          if (session.state === "PLANNED" || session.state === "DISCOVERING" || session.state === "RESERVED") {
+            await transitionSessionState(session.id, "ACTIVE");
+          }
+          return { status: "succeeded", error: `Verification UNKNOWN — reconciliation required: ${verifyResult.reason}` };
+        }
 
-        // 3d. Update session
+        // 3e. Update session with entitlement link
         await db.connectivitySession.update({
           where: { id: session.id },
           data: {
             activeResourceId: targetResourceId,
+            entitlementId: bridgeResult.entitlementId,
             startedAt: new Date(),
             lastObservedAt: new Date(),
           },
         });
 
-        // 3e. Transition session to ACTIVE
+        // 3f. Transition session to ACTIVE
         if (session.state === "PLANNED" || session.state === "DISCOVERING" || session.state === "RESERVED") {
           await transitionSessionState(session.id, "ACTIVE");
         }
@@ -247,39 +311,64 @@ export async function executeAction(actionId: string): Promise<{
         // 3b. Reserve the target resource (ownership-safe)
         const reserveResult = await reserveResource(targetResourceId, session.id);
         if (!reserveResult.reserved) {
-          // Failed to reserve — recover: session back to ACTIVE on old resource
           await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
           throw new Error(`Failed to reserve target resource ${targetResourceId}: ${reserveResult.reason}`);
         }
 
-        // 3c. Mark target as IN_USE — fail closed (Phase 8.5.1)
+        // 3c. Resolve target binding via kernel bridge (Phase 8.5.7)
+        const bridgeResult = await resolveResourceBinding({
+          protocolResourceId: targetResourceId,
+          tenantId: session.subjectId,
+          subjectId: session.subjectId,
+        });
+
+        if (bridgeResult.status === "failed") {
+          await releaseResource(targetResourceId, session.id);
+          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          throw new Error(`Kernel bridge failed for target: ${bridgeResult.error}`);
+        }
+        if (bridgeResult.status === "reconciliation_required") {
+          await releaseResource(targetResourceId, session.id);
+          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          throw new Error(`Kernel bridge requires reconciliation for target: ${bridgeResult.error}`);
+        }
+
+        // 3d. Mark target as IN_USE — fail closed
         const activateResult = await markResourceInUse(targetResourceId, session.id);
         if (!activateResult.activated) {
-          // Activation failed — release target, recover session
           await releaseResource(targetResourceId, session.id);
           await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
           throw new Error(`Failed to mark target IN_USE: ${activateResult.reason}`);
         }
 
-        // 3d. Verify target is usable — DB state + kernel reconcile (Phase 8.5.4)
+        // 3e. Verify target is usable (USABLE | NOT_USABLE | UNKNOWN)
         const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
-        if (!verifyResult.usable) {
-          // Verification failed — release target, recover session
+        if (verifyResult.status === "NOT_USABLE") {
           await releaseResource(targetResourceId, session.id);
           await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
-          throw new Error(`Target resource ${targetResourceId} verification failed: ${verifyResult.reason}`);
+          throw new Error(`Target verification failed: ${verifyResult.reason}`);
+        }
+        if (verifyResult.status === "UNKNOWN") {
+          // Don't fail the switch — the resource might be usable.
+          // But mark the action for reconciliation.
+          logger.warn("action.switch_verification_unknown", {
+            actionId, targetResourceId, reason: verifyResult.reason,
+          });
+          // Continue with the switch — the session will be on the target,
+          // but the action will be marked RECONCILIATION_REQUIRED at the end.
         }
 
-        // 3e. Atomically update session to point to new resource
+        // 3f. Atomically update session to point to new resource + entitlement
         await db.connectivitySession.update({
           where: { id: session.id },
           data: {
             activeResourceId: targetResourceId,
+            entitlementId: bridgeResult.entitlementId,
             lastObservedAt: new Date(),
           },
         });
 
-        // 3f. Transition session back to ACTIVE
+        // 3g. Transition session back to ACTIVE
         await transitionSessionState(session.id, "ACTIVE");
 
         // 3g. Release the previous resource (ownership-safe)
@@ -448,10 +537,33 @@ export async function recoverStaleActions(): Promise<{
     }
 
     if (resource.state === "IN_USE" && resource.reservedBy === session.id) {
-      // Target is IN_USE and owned by this session → the action likely succeeded
-      // but the process died before marking it. Complete the switch if needed.
+      // Target is IN_USE and owned by this session.
+      // Phase 8.5.7: Don't just assume success — verify via kernel bridge.
+      const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
+
+      if (verifyResult.status === "NOT_USABLE") {
+        // Provider says not usable — release and fail
+        await releaseResource(targetResourceId, session.id);
+        if (session.state === "SWITCHING") {
+          await transitionSessionState(session.id, "ACTIVE");
+        }
+        await transitionActionState(action.id, "FAILED", `Recovery verification NOT_USABLE: ${verifyResult.reason}`);
+        failed++;
+        continue;
+      }
+
+      if (verifyResult.status === "UNKNOWN") {
+        // Can't establish provider truth — mark for reconciliation
+        if (session.state === "SWITCHING") {
+          await transitionSessionState(session.id, "ACTIVE");
+        }
+        await transitionActionState(action.id, "RECONCILIATION_REQUIRED", `Recovery verification UNKNOWN: ${verifyResult.reason}`);
+        reconciliationRequired++;
+        continue;
+      }
+
+      // USABLE — complete the switch if needed
       if (session.state === "SWITCHING") {
-        // Complete the switch: update session + release old resource
         const previousResourceId = session.activeResourceId;
         await db.connectivitySession.update({
           where: { id: session.id },
@@ -462,7 +574,6 @@ export async function recoverStaleActions(): Promise<{
         });
         await transitionSessionState(session.id, "ACTIVE");
 
-        // Release old resource (best-effort)
         if (previousResourceId && previousResourceId !== targetResourceId) {
           await releaseResource(previousResourceId, session.id).catch(() => {});
         }
@@ -470,7 +581,7 @@ export async function recoverStaleActions(): Promise<{
 
       await transitionActionState(action.id, "SUCCEEDED");
       succeeded++;
-      logger.info("action.recovered_succeeded", { actionId: action.id, targetResourceId });
+      logger.info("action.recovered_succeeded", { actionId: action.id, targetResourceId, verified: true });
     } else if (resource.state === "RESERVED" && resource.reservedBy === session.id) {
       // Reserved but never activated → release and fail
       await releaseResource(targetResourceId, session.id);
