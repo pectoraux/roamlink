@@ -6,6 +6,7 @@
  * forces a fallback if the var is missing or empty.
  */
 
+/* eslint-disable @typescript-eslint/no-require-imports */
 const { execSync } = require("child_process");
 
 // Force-set fallback env vars if missing OR empty

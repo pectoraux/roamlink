@@ -1988,3 +1988,113 @@ model UptimeMeasurement {
   @@index([tenantId, providerInstanceId])
   @@index([measuredAt])
 }
+
+// ---------------------------------------------------------------------------
+// Phase 8 — Connectivity Control Plane: Protocol Models
+// ---------------------------------------------------------------------------
+
+model ConnectivitySession {
+  id              String   @id @default(cuid())
+  subjectId       String
+  intentId        String?
+  entitlementId   String?
+  activeResourceId String?
+  state           String   @default("PLANNED")
+  policyId        String?
+  startedAt       DateTime?
+  lastObservedAt  DateTime?
+  endedAt         DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  measurements    ConnectivityMeasurement[]
+  decisions       ConnectivityDecision[]
+  actions         ConnectivityAction[]
+  policy          ConnectivityPolicy? @relation(fields: [policyId], references: [id], onDelete: SetNull)
+
+  @@index([subjectId])
+  @@index([state])
+  @@index([entitlementId])
+}
+
+model ConnectivityMeasurement {
+  id              String   @id @default(cuid())
+  sessionId       String?
+  resourceId      String?
+  providerInstanceId String?
+  type            String
+  metrics         String
+  freshness       String   @default("UNKNOWN")
+  source          String?
+  confidence      Float    @default(0.5)
+  capturedAt      DateTime @default(now())
+
+  session         ConnectivitySession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  @@index([sessionId])
+  @@index([resourceId])
+  @@index([capturedAt])
+}
+
+model ConnectivityPolicy {
+  id              String   @id @default(cuid())
+  subjectId       String
+  mode            String   @default("manual")
+  maxAutoSpendMinor Int    @default(0)
+  preferredTransports String?
+  minReliability  Float    @default(0.5)
+  switchHysteresis Float   @default(0.15)
+  requireUserApprovalForPurchase Boolean @default(true)
+  neverInterruptActiveCall Boolean @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  sessions        ConnectivitySession[]
+
+  @@index([subjectId])
+}
+
+model ConnectivityDecision {
+  id              String   @id @default(cuid())
+  intentId        String
+  sessionId       String?
+  action          String
+  targetResourceId String?
+  targetOfferId   String?
+  score           Float
+  constraintsSatisfied String?
+  constraintsViolated String?
+  reasons         String?
+  policyVersion   String?
+  createdAt       DateTime @default(now())
+
+  session         ConnectivitySession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  actions         ConnectivityAction[]
+
+  @@index([intentId])
+  @@index([sessionId])
+}
+
+model ConnectivityAction {
+  id              String   @id @default(cuid())
+  sessionId       String
+  decisionId      String?
+  type            String
+  targetResourceId String?
+  state           String   @default("PLANNED")
+  reason          String?
+  policyVersion   String?
+  idempotencyKey  String   @unique
+  kernelExecutionId String?
+  createdAt       DateTime @default(now())
+  executedAt      DateTime?
+  completedAt     DateTime?
+  error           String?
+
+  session         ConnectivitySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  decision        ConnectivityDecision? @relation(fields: [decisionId], references: [id], onDelete: SetNull)
+
+  @@index([sessionId])
+  @@index([decisionId])
+  @@index([state])
+}
