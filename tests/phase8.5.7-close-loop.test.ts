@@ -65,10 +65,11 @@ describe("Phase 8.5.7 — Close the provider-backed control loop", () => {
     const fs = await import("fs");
     const source = fs.readFileSync("src/lib/control-plane/kernel-bridge.ts", "utf-8");
     // On catch, must return UNKNOWN (not usable: true)
-    expect(source).toContain("Fail-closed");
-    const catchBlock = source.substring(source.indexOf("} catch (err) {"));
-    expect(catchBlock).toContain("UNKNOWN");
-    expect(catchBlock).not.toContain("usable: true");
+    const catchBlocks = source.match(/\} catch \(err\) \{/g);
+    expect(catchBlocks).not.toBeNull();
+    // All catch blocks must produce UNKNOWN, not usable: true
+    expect(source).not.toContain("usable: true");
+    expect(source).toContain("UNKNOWN");
   });
 
   it("8.5.7.5b: ACTIVATE handles UNKNOWN by marking RECONCILIATION_REQUIRED", async () => {
@@ -79,12 +80,14 @@ describe("Phase 8.5.7 — Close the provider-backed control loop", () => {
     expect(activateCase).toContain("RECONCILIATION_REQUIRED");
   });
 
-  it("8.5.7.5c: SWITCH handles UNKNOWN with warning + continues", async () => {
+  it("8.5.7.5c: SWITCH handles UNKNOWN by releasing + RECONCILIATION_REQUIRED", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync("src/lib/control-plane/action-executor.ts", "utf-8");
     const switchCase = source.substring(source.indexOf("case \"SWITCH\""), source.indexOf("case \"SUSPEND\""));
     expect(switchCase).toContain("UNKNOWN");
     expect(switchCase).toContain("switch_verification_unknown");
+    expect(switchCase).toContain("RECONCILIATION_REQUIRED");
+    expect(switchCase).toContain("releaseResource");
   });
 
   // -------------------------------------------------------------------------

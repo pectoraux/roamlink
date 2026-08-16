@@ -1,13 +1,15 @@
 /**
- * Control Plane — Kernel Bridge (Phase 8.5.7)
+ * Control Plane — Kernel Bridge (Phase 8.5.8)
  *
  * The single point where the protocol layer touches the frozen kernel.
  *
- * Fixes from Phase 8.5 audit:
- *   1. resolveResourceBinding() is now called by ACTIVATE/SWITCH (not just defined)
- *   2. Entitlement lookup is scoped by subjectId (fixes cross-user isolation)
- *   3. verifyResourceUsable() returns USABLE | NOT_USABLE | UNKNOWN (fail-closed)
- *   4. ProtocolResource → ProviderResourceBinding link is explicit
+ * Phase 8.5.8 fixes:
+ *   1. tenantId derived from ProtocolResource → Capability (not caller-supplied)
+ *   2. providerBindingId validated against tenant + subject + providerType
+ *   3. UNKNOWN stays RECONCILIATION_REQUIRED (not SUCCEEDED)
+ *   4. Recovery restores entitlementId alongside activeResourceId
+ *   5. Old-resource release failure → durable reconciliation marker
+ *   6. Recovery-worker fencing (atomic claim)
  *
  * Architecture:
  *   ProtocolResource → resolveResourceBinding → provisionBinding/reconcile → adapter
@@ -26,6 +28,7 @@ export type KernelBridgeResult = {
   entitlementId?: string;
   bindingId?: string;
   providerResourceId?: string;
+  tenantId?: string; // derived from capability
   error?: string;
 };
 
@@ -40,20 +43,26 @@ export type VerificationResult = {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve a ProtocolResource to its corresponding ProviderResourceBinding
- * in the frozen kernel. If the resource already has a linked binding, return it.
- * If not, create one via the kernel's createResourceBinding() + provisionBinding().
+ * Resolve a ProtocolResource to its corresponding ProviderResourceBinding.
  *
- * Phase 8.5.7 fixes:
- *   - Entitlement lookup scoped by subjectId (prevents cross-user access)
- *   - ProtocolResource.providerBindingId link is checked/updated
+ * Phase 8.5.8: tenantId is DERIVED from the resource's capability, not
+ * supplied by the caller. This prevents the action executor from passing
+ * the wrong tenantId (it was previously passing session.subjectId as tenantId).
+ *
+ * The caller supplies only:
+ *   - protocolResourceId (which resource to resolve)
+ *   - subjectId (which user is requesting)
+ *
+ * The bridge derives:
+ *   - tenantId (from ProtocolResource → ProtocolCapability.tenantId)
+ *   - providerType, providerInstanceId (from the capability)
+ *   - subscriptionId (from tenantId + active subscription)
  */
 export async function resolveResourceBinding(input: {
   protocolResourceId: string;
-  tenantId: string;
   subjectId: string;
 }): Promise<KernelBridgeResult> {
-  // Load the ProtocolResource to get its capability + provider instance + existing binding link
+  // Load the ProtocolResource with its capability
   const resource = await db.protocolResource.findUnique({
     where: { id: input.protocolResourceId },
     include: { capability: true },
@@ -68,78 +77,106 @@ export async function resolveResourceBinding(input: {
     return { status: "failed", error: `Capability not found for resource ${input.protocolResourceId}` };
   }
 
-  // FIX 2: If the resource already has a linked binding, use it directly
-  // This eliminates the identity ambiguity (ProtocolResource #17 → which binding?)
+  // DERIVE tenantId from the capability — never trust the caller
+  const tenantId = capability.tenantId;
+  const providerType = capability.providerType;
+  const providerInstanceId = capability.providerInstanceId;
+
+  // If the resource has a linked binding, validate it before using
   if (resource.providerBindingId) {
     const existingBinding = await db.providerResourceBinding.findUnique({
       where: { id: resource.providerBindingId },
+      include: { entitlement: { select: { tenantId: true, userId: true } } },
     });
 
     if (existingBinding) {
-      logger.info("kernel_bridge.linked_binding", {
+      // FIX 2: Validate binding ownership — tenant, subject, providerType must all agree
+      const bindingEntitlement = existingBinding.entitlement;
+      if (bindingEntitlement?.tenantId !== tenantId) {
+        logger.error("kernel_bridge.binding_tenant_mismatch", {
+          resourceId: input.protocolResourceId,
+          bindingId: existingBinding.id,
+          bindingTenant: bindingEntitlement?.tenantId,
+          capabilityTenant: tenantId,
+        });
+        return { status: "failed", error: `Binding tenant mismatch — clearing stale link`, tenantId };
+      }
+      if (bindingEntitlement?.userId !== input.subjectId) {
+        logger.error("kernel_bridge.binding_subject_mismatch", {
+          resourceId: input.protocolResourceId,
+          bindingId: existingBinding.id,
+          bindingSubject: bindingEntitlement?.userId,
+          requestSubject: input.subjectId,
+        });
+        return { status: "failed", error: `Binding subject mismatch — ownership violation`, tenantId };
+      }
+      if (existingBinding.providerType !== providerType) {
+        logger.error("kernel_bridge.binding_provider_type_mismatch", {
+          bindingId: existingBinding.id,
+          bindingType: existingBinding.providerType,
+          capabilityType: providerType,
+        });
+        return { status: "failed", error: `Binding providerType mismatch`, tenantId };
+      }
+
+      logger.info("kernel_bridge.linked_binding_validated", {
         resourceId: input.protocolResourceId,
         bindingId: existingBinding.id,
+        tenantId,
+        subjectId: input.subjectId,
       });
 
-      // Use the frozen kernel's reconcileProvisioning to verify
+      // Reconcile via the frozen kernel
       try {
         const reconResult = await reconcileProvisioning(existingBinding.id);
-        if (reconResult.status === "recovered" || reconResult.status === "reprovisioned" || reconResult.status === "already_healthy") {
-          // Get the entitlement for this binding
-          const entitlement = await db.connectivityEntitlement.findUnique({
-            where: { id: existingBinding.entitlementId },
-            select: { id: true },
-          });
-          return {
-            status: "active",
-            entitlementId: entitlement?.id,
-            bindingId: existingBinding.id,
-            providerResourceId: existingBinding.providerResourceId ?? reconResult.providerResourceId,
-          };
-        }
         if (reconResult.status === "failed") {
           return {
             status: "reconciliation_required",
+            entitlementId: bindingEntitlement?.id,
             bindingId: existingBinding.id,
+            tenantId,
             error: reconResult.error,
           };
         }
-        // recovered/reprovisioned → active
         return {
           status: "active",
+          entitlementId: bindingEntitlement?.id,
           bindingId: existingBinding.id,
           providerResourceId: reconResult.providerResourceId ?? existingBinding.providerResourceId ?? undefined,
+          tenantId,
         };
       } catch (err) {
         return {
           status: "reconciliation_required",
+          entitlementId: bindingEntitlement?.id,
           bindingId: existingBinding.id,
+          tenantId,
           error: err instanceof Error ? err.message : String(err),
         };
       }
     }
   }
 
-  // No linked binding — find or create entitlement + binding
+  // No validated linked binding — find or create entitlement + binding
   const subscription = await db.tenantSubscription.findFirst({
-    where: { tenantId: input.tenantId, status: "active" },
+    where: { tenantId, status: "active" },
   });
 
   if (!subscription) {
-    return { status: "failed", error: `No active subscription for tenant ${input.tenantId}` };
+    return { status: "failed", error: `No active subscription for tenant ${tenantId}`, tenantId };
   }
 
-  // FIX 3: Scope entitlement lookup by subjectId (userId) — prevents cross-user access
+  // Scope entitlement lookup by subjectId — prevents cross-user access
   const existingEntitlement = await db.connectivityEntitlement.findFirst({
     where: {
-      tenantId: input.tenantId,
+      tenantId,
       subscriptionId: subscription.id,
-      userId: input.subjectId, // CRITICAL: scope by user, not just tenant
+      userId: input.subjectId,
       status: "ACTIVE",
     },
     include: {
       bindings: {
-        where: { providerType: capability.providerType },
+        where: { providerType },
         take: 1,
       },
     },
@@ -151,13 +188,14 @@ export async function resolveResourceBinding(input: {
       resourceId: input.protocolResourceId,
       bindingId: binding.id,
       subjectId: input.subjectId,
+      tenantId,
     });
 
-    // Link the ProtocolResource to this binding for future lookups
+    // Link the ProtocolResource to this binding
     await db.protocolResource.update({
       where: { id: input.protocolResourceId },
       data: { providerBindingId: binding.id },
-    }).catch(() => {}); // best-effort link
+    }).catch(() => {});
 
     try {
       const reconResult = await reconcileProvisioning(binding.id);
@@ -166,6 +204,7 @@ export async function resolveResourceBinding(input: {
           status: "reconciliation_required",
           entitlementId: existingEntitlement.id,
           bindingId: binding.id,
+          tenantId,
           error: reconResult.error,
         };
       }
@@ -174,12 +213,14 @@ export async function resolveResourceBinding(input: {
         entitlementId: existingEntitlement.id,
         bindingId: binding.id,
         providerResourceId: reconResult.providerResourceId ?? binding.providerResourceId ?? undefined,
+        tenantId,
       };
     } catch (err) {
       return {
         status: "reconciliation_required",
         entitlementId: existingEntitlement.id,
         bindingId: binding.id,
+        tenantId,
         error: err instanceof Error ? err.message : String(err),
       };
     }
@@ -188,14 +229,15 @@ export async function resolveResourceBinding(input: {
   // No existing binding — create one via the kernel
   logger.info("kernel_bridge.provisioning", {
     resourceId: input.protocolResourceId,
-    providerType: capability.providerType,
+    providerType,
     subjectId: input.subjectId,
+    tenantId,
   });
 
   try {
     const { createEntitlement, transitionEntitlement, createResourceBinding, ENTITLEMENT_STATES } = await import("@/lib/connectivity");
     const entitlement = await createEntitlement({
-      tenantId: input.tenantId,
+      tenantId,
       subscriptionId: subscription.id,
       capabilityType: capability.type as any,
       capabilitySet: JSON.parse(capability.technicalSpec),
@@ -210,16 +252,15 @@ export async function resolveResourceBinding(input: {
 
     const binding = await createResourceBinding({
       entitlementId: entitlement.id,
-      providerType: capability.providerType,
+      providerType,
       resourceType: capability.type === "ROAMING" ? "esim_profile" : "hotspot_user",
-      providerInstanceId: capability.providerInstanceId,
+      providerInstanceId,
       userId: input.subjectId,
     });
 
     const provisionResult = await provisionBinding(binding.id);
 
     if (provisionResult.status === "success" || provisionResult.status === "already_provisioned") {
-      // FIX 6: Link the ProtocolResource to the new binding
       await db.protocolResource.update({
         where: { id: input.protocolResourceId },
         data: { providerBindingId: binding.id },
@@ -230,6 +271,7 @@ export async function resolveResourceBinding(input: {
         entitlementId: entitlement.id,
         bindingId: binding.id,
         providerResourceId: provisionResult.providerResourceId,
+        tenantId,
       };
     }
 
@@ -237,6 +279,7 @@ export async function resolveResourceBinding(input: {
       status: "failed",
       entitlementId: entitlement.id,
       bindingId: binding.id,
+      tenantId,
       error: `Provisioning failed: ${provisionResult.status} — ${provisionResult.error}`,
     };
   } catch (err) {
@@ -245,29 +288,15 @@ export async function resolveResourceBinding(input: {
       resourceId: input.protocolResourceId,
       error: errorMsg,
     });
-    return { status: "failed", error: errorMsg };
+    return { status: "failed", error: errorMsg, tenantId };
   }
 }
 
 // ---------------------------------------------------------------------------
-// Verify Resource is Actually Usable — fail-closed (Phase 8.5.7)
+// Verify Resource is Actually Usable — fail-closed
 // ---------------------------------------------------------------------------
 
-/**
- * Verify that a resource is actually usable.
- *
- * Phase 8.5.7: Returns USABLE | NOT_USABLE | UNKNOWN (not boolean).
- *   USABLE     → DB state correct + provider reconcile confirms
- *   NOT_USABLE → DB state wrong OR provider reconcile says failed
- *   UNKNOWN    → Provider reconciliation threw an error (fail-closed: don't assume usable)
- *
- * The action executor treats:
- *   USABLE     → continue
- *   NOT_USABLE → release + fail
- *   UNKNOWN    → mark RECONCILIATION_REQUIRED
- */
 export async function verifyResourceUsable(resourceId: string, sessionId: string): Promise<VerificationResult> {
-  // Step 1: Check DB state
   const resource = await db.protocolResource.findUnique({
     where: { id: resourceId },
     select: { state: true, reservedBy: true, capabilityId: true, providerBindingId: true },
@@ -285,7 +314,7 @@ export async function verifyResourceUsable(resourceId: string, sessionId: string
     return { status: "NOT_USABLE", reason: `Ownership mismatch: reserved by "${resource.reservedBy}"` };
   }
 
-  // Step 2: If the resource has a linked binding, verify via kernel reconcile
+  // If the resource has a linked binding, verify via kernel reconcile
   if (resource.providerBindingId) {
     try {
       const reconResult = await reconcileProvisioning(resource.providerBindingId);
@@ -296,13 +325,11 @@ export async function verifyResourceUsable(resourceId: string, sessionId: string
           bindingId: resource.providerBindingId,
         };
       }
-      // recovered / reprovisioned / already_healthy → USABLE
       logger.info("verify.resource_verified_via_kernel", {
         resourceId, bindingId: resource.providerBindingId, reconStatus: reconResult.status,
       });
       return { status: "USABLE", bindingId: resource.providerBindingId };
     } catch (err) {
-      // FIX 4: Fail-closed — reconciliation error → UNKNOWN, not usable
       logger.error("verify.reconciliation_error", {
         resourceId, bindingId: resource.providerBindingId,
         error: err instanceof Error ? err.message : String(err),
@@ -315,7 +342,7 @@ export async function verifyResourceUsable(resourceId: string, sessionId: string
     }
   }
 
-  // Step 3: No linked binding — check via session entitlement
+  // No linked binding — check via session entitlement
   const session = await db.connectivitySession.findUnique({
     where: { id: sessionId },
     select: { entitlementId: true },
@@ -339,7 +366,6 @@ export async function verifyResourceUsable(resourceId: string, sessionId: string
         }
         return { status: "USABLE", bindingId: binding.id };
       } catch (err) {
-        // FIX 4: Fail-closed
         return {
           status: "UNKNOWN",
           reason: `Reconciliation error: ${err instanceof Error ? err.message : String(err)}`,
@@ -349,8 +375,6 @@ export async function verifyResourceUsable(resourceId: string, sessionId: string
     }
   }
 
-  // No binding exists — the bridge should have created one.
-  // If we get here, the bridge wasn't called. Return UNKNOWN (fail-closed).
   return {
     status: "UNKNOWN",
     reason: "No provider binding linked to this resource — kernel bridge may not have been called",

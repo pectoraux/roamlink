@@ -125,12 +125,14 @@ describe("Phase 8.4 — Real Resource-Controlled Switching", () => {
   it("8.4.10: old resource release failure does NOT invalidate new resource", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync("src/lib/control-plane/action-executor.ts", "utf-8");
+    const switchCase = source.substring(source.indexOf("case \"SWITCH\""), source.indexOf("case \"SUSPEND\""));
     // The release of the old resource should NOT cause the action to fail
-    expect(source).toContain("switch_old_release_failed");
-    expect(source).toContain("Session switched to new resource but old resource release failed");
-    expect(source).toContain("reconciliation required");
-    // The comment should say the switch succeeded
-    expect(source).toContain("Don't fail the action");
+    expect(switchCase).toContain("switch_old_release_failed");
+    expect(switchCase).toContain("oldReleaseFailed");
+    // Phase 8.5.8: old release failure → RECONCILIATION_REQUIRED (not SUCCEEDED)
+    expect(switchCase).toContain("RECONCILIATION_REQUIRED");
+    expect(switchCase).toContain("Old resource");
+    expect(switchCase).toContain("release failed");
   });
 
   it("8.4.11: RELEASE execution releases resource + ends session", async () => {
