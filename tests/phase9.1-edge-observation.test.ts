@@ -129,14 +129,16 @@ async function setupFixture(): Promise<Fixture> {
   };
 }
 
-// Helper: build an observation
+// Helper: build an observation. Uses fx.deviceId by default; override with
+// the `deviceId` field in overrides for a fresh device.
 function makeObservation(fx: Fixture, overrides: Partial<EdgeObservation> = {}): EdgeObservation {
   const seq = overrides.sequence ?? Math.floor(Math.random() * 100000);
+  const deviceId = overrides.deviceId ?? fx.deviceId;
   return {
-    observationId: `obs-${fx.deviceId}-${seq}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
-    deviceId: fx.deviceId,
-    sessionId: fx.sessionId,
-    resourceId: fx.resourceAId,
+    observationId: `obs-${deviceId}-${seq}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+    deviceId,
+    sessionId: overrides.sessionId ?? fx.sessionId,
+    resourceId: overrides.resourceId ?? fx.resourceAId,
     observedAt: new Date().toISOString(),
     sequence: seq,
     source: "DEVICE",
@@ -160,6 +162,14 @@ function makeObservation(fx: Fixture, overrides: Partial<EdgeObservation> = {}):
   };
 }
 
+// Helper: register a fresh device for a test (isolates sequence space)
+let deviceCounter = 0;
+async function freshDevice(userId: string): Promise<string> {
+  const deviceId = `test-device-${Date.now().toString(36)}-${deviceCounter++}`;
+  await registerEdgeDevice({ userId, deviceId, platform: "android", appVersion: "0.1.0" });
+  return deviceId;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -179,33 +189,33 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
     const action = await createAction({ sessionId: fx.sessionId, decisionId: decision.decisionId, type: "ACTIVATE", targetResourceId: decision.targetResourceId, idempotencyKey: `p91-activate-${fx.sessionId}` });
     await executeAction(action.id);
 
-    const obs = makeObservation(fx, { sequence: 1001 });
-    const batch: EdgeObservationBatch = { deviceId: fx.deviceId, observations: [obs] };
-    const ack = await ingestEdgeObservationBatch(fx.userId, batch);
+    const dev = await freshDevice(fx.userId);
+    const obs = makeObservation(fx, { deviceId: dev, sequence: 1, sessionId: fx.sessionId, resourceId: fx.resourceAId });
+    const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs] });
 
-    expect(ack.acceptedThroughSequence).toBe(1001);
+    expect(ack.acceptedThroughSequence).toBe(1); // contiguous from 1
     expect(ack.duplicateCount).toBe(0);
     expect(ack.rejected).toHaveLength(0);
 
-    // The observation record is persisted
     const record = await db.edgeObservationRecord.findUnique({ where: { observationId: obs.observationId } });
     expect(record).not.toBeNull();
     expect(record?.userId).toBe(fx.userId);
-    expect(record?.resourceId).toBe(fx.resourceAId); // validated hint accepted
+    expect(record?.resourceId).toBe(fx.resourceAId);
   }, 60_000);
 
   // =========================================================================
   // 9.1.2 duplicate observation → one measurement (dedup)
   // =========================================================================
   it("9.1.2: duplicate observation (same observationId) → one measurement", async () => {
-    const obs = makeObservation(fx, { sequence: 1002 });
+    const dev = await freshDevice(fx.userId);
+    const obs = makeObservation(fx, { sequence: 1, deviceId: dev });
 
-    const ack1 = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs] });
-    const ack2 = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs] });
+    const ack1 = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs] });
+    const ack2 = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs] });
 
     expect(ack1.duplicateCount).toBe(0);
     expect(ack2.duplicateCount).toBe(1); // second upload is a duplicate
-    expect(ack2.acceptedThroughSequence).toBe(1002);
+    expect(ack2.acceptedThroughSequence).toBe(1); // contiguous from 1
 
     // Only one observation record exists
     const count = await db.edgeObservationRecord.count({ where: { observationId: obs.observationId } });
@@ -216,22 +226,23 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
   // 9.1.3 out-of-order sequence → accepted without duplication
   // =========================================================================
   it("9.1.3: out-of-order sequence → accepted without duplication", async () => {
-    const obs101 = makeObservation(fx, { sequence: 101, observationId: `oob-101-${Date.now()}` });
-    const obs103 = makeObservation(fx, { sequence: 103, observationId: `oob-103-${Date.now()}` });
-    const obs102 = makeObservation(fx, { sequence: 102, observationId: `oob-102-${Date.now()}` });
+    const dev = await freshDevice(fx.userId);
+    const obs1 = makeObservation(fx, { sequence: 1, observationId: `oob-1-${Date.now()}`, deviceId: dev });
+    const obs3 = makeObservation(fx, { sequence: 3, observationId: `oob-3-${Date.now()}`, deviceId: dev });
+    const obs2 = makeObservation(fx, { sequence: 2, observationId: `oob-2-${Date.now()}`, deviceId: dev });
 
-    // Upload out of order: 101, 103, 102
-    const ack1 = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs101, obs103] });
-    const ack2 = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs102] });
+    // Upload out of order: 1, 3, then 2
+    const ack1 = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs1, obs3] });
+    // After 1+3: contiguous through 1 (gap at 2)
+    expect(ack1.acceptedThroughSequence).toBe(1);
 
-    // ack1 accepted 101 + 103 → watermark is 103
-    expect(ack1.acceptedThroughSequence).toBe(103);
-    // ack2 accepted 102 → watermark is 102 (the max in THIS batch, not cumulative)
-    expect(ack2.acceptedThroughSequence).toBe(102);
+    const ack2 = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs2] });
+    // After 2: contiguous through 3 (gap filled)
+    expect(ack2.acceptedThroughSequence).toBe(3);
     expect(ack1.duplicateCount + ack2.duplicateCount).toBe(0);
 
     // All three persisted
-    const records = await db.edgeObservationRecord.count({ where: { observationId: { in: [obs101.observationId, obs102.observationId, obs103.observationId] } } });
+    const records = await db.edgeObservationRecord.count({ where: { observationId: { in: [obs1.observationId, obs2.observationId, obs3.observationId] } } });
     expect(records).toBe(3);
   }, 60_000);
 
@@ -239,7 +250,7 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
   // 9.1.4 unauthorized device → rejected
   // =========================================================================
   it("9.1.4: unauthorized device (not registered to user) → rejected", async () => {
-    const obs = makeObservation(fx, { sequence: 200, deviceId: "unknown-device" });
+    const obs = makeObservation(fx, { sequence: 1, deviceId: "unknown-device" });
 
     await expect(
       ingestEdgeObservationBatch(fx.userId, { deviceId: "unknown-device", observations: [obs] }),
@@ -252,10 +263,11 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
   it("9.1.5: device-supplied resourceId is validated (hint, not authoritative)", async () => {
     // Observation with a resourceId that doesn't match the session's active resource
     // The hint is dropped (set to null), but the observation is still accepted.
-    const obs = makeObservation(fx, { sequence: 300, resourceId: "fake-resource-id" });
-    const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs] });
+    const dev = await freshDevice(fx.userId);
+    const obs = makeObservation(fx, { sequence: 1, deviceId: dev, resourceId: "fake-resource-id" });
+    const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs] });
 
-    expect(ack.acceptedThroughSequence).toBe(300);
+    expect(ack.acceptedThroughSequence).toBe(1);
 
     // The record's resourceId is NULL (hint was invalid → dropped)
     const record = await db.edgeObservationRecord.findUnique({ where: { observationId: obs.observationId } });
@@ -264,8 +276,9 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
 
   it("9.1.5b: device cannot impersonate another user's session", async () => {
     // Observation with a sessionId belonging to a different user
-    const obs = makeObservation(fx, { sequence: 301, sessionId: "other-user-session" });
-    const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs] });
+    const dev = await freshDevice(fx.userId);
+    const obs = makeObservation(fx, { sequence: 1, deviceId: dev, sessionId: "other-user-session" });
+    const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs] });
 
     // The session hint is dropped (validated to null)
     const record = await db.edgeObservationRecord.findUnique({ where: { observationId: obs.observationId } });
@@ -276,13 +289,14 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
   // 9.1.6 offline observations → batch upload (simulated)
   // =========================================================================
   it("9.1.6: batch of observations → all accepted in one upload", async () => {
+    const dev = await freshDevice(fx.userId);
     const observations = Array.from({ length: 5 }, (_, i) =>
-      makeObservation(fx, { sequence: 400 + i, observationId: `batch-${400 + i}-${Date.now()}` }),
+      makeObservation(fx, { sequence: i + 1, observationId: `batch-${i + 1}-${Date.now()}`, deviceId: dev }),
     );
 
-    const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations });
+    const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations });
 
-    expect(ack.acceptedThroughSequence).toBe(404);
+    expect(ack.acceptedThroughSequence).toBe(5);
     expect(ack.duplicateCount).toBe(0);
     expect(ack.rejected).toHaveLength(0);
 
@@ -297,21 +311,19 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
   // 9.1.7 partial upload → acknowledged removed (simulated via dedup)
   // =========================================================================
   it("9.1.7: re-upload of acknowledged observations → duplicates detected", async () => {
-    const obs = makeObservation(fx, { sequence: 500, observationId: `partial-500-${Date.now()}` });
+    const dev = await freshDevice(fx.userId);
+    const obs = makeObservation(fx, { sequence: 1, observationId: `partial-1-${Date.now()}`, deviceId: dev });
 
-    // First upload — accepted
-    const ack1 = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs] });
+    const ack1 = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs] });
     expect(ack1.duplicateCount).toBe(0);
 
-    // Second upload of the same observation — duplicate
-    const ack2 = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs] });
+    const ack2 = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs] });
     expect(ack2.duplicateCount).toBe(1);
 
-    // A new observation in the same batch — accepted
-    const obs2 = makeObservation(fx, { sequence: 501, observationId: `partial-501-${Date.now()}` });
-    const ack3 = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs, obs2] });
-    expect(ack3.duplicateCount).toBe(1); // obs is duplicate
-    expect(ack3.acceptedThroughSequence).toBe(501); // obs2 accepted
+    const obs2 = makeObservation(fx, { sequence: 2, observationId: `partial-2-${Date.now()}`, deviceId: dev });
+    const ack3 = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs, obs2] });
+    expect(ack3.duplicateCount).toBe(1);
+    expect(ack3.acceptedThroughSequence).toBe(2);
   }, 60_000);
 
   // =========================================================================
@@ -320,8 +332,9 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
   it("9.1.8: observation with valid resourceId → ConnectivityMeasurement + MEASUREMENT_RECEIVED event", async () => {
     const eventsBefore = await db.reevaluationEvent.count({ where: { resourceId: fx.resourceAId } });
 
-    const obs = makeObservation(fx, { sequence: 600, observationId: `event-600-${Date.now()}` });
-    await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs] });
+    const dev = await freshDevice(fx.userId);
+    const obs = makeObservation(fx, { sequence: 1, observationId: `event-1-${Date.now()}`, deviceId: dev });
+    await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs] });
 
     // A MEASUREMENT_RECEIVED event was emitted for the resource
     const eventsAfter = await db.reevaluationEvent.count({ where: { resourceId: fx.resourceAId } });
@@ -342,8 +355,9 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
   it("9.1.9: observation does NOT directly create actions (only telemetry)", async () => {
     const actionsBefore = await db.connectivityAction.count({ where: { sessionId: fx.sessionId } });
 
-    const obs = makeObservation(fx, { sequence: 700, observationId: `noaction-700-${Date.now()}` });
-    await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs] });
+    const dev = await freshDevice(fx.userId);
+    const obs = makeObservation(fx, { sequence: 1, observationId: `noaction-1-${Date.now()}`, deviceId: dev });
+    await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs] });
 
     // No new ACTIONS were created by the observation directly. The observation
     // is telemetry — it feeds the control plane (measurement → health →
@@ -365,14 +379,12 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
   it("9.1.10: client-submitted health/decision fields are ignored — server derives", async () => {
     // The observation type has NO health/decision fields. The client can only
     // submit connectivity state. The server derives health via ResourceHealth.
-    const obs = makeObservation(fx, { sequence: 800, observationId: `derive-800-${Date.now()}` });
-
-    // Attempt to inject a fake health score (the type doesn't allow it, but
-    // simulate via extra fields that the server should ignore)
+    const dev = await freshDevice(fx.userId);
+    const obs = makeObservation(fx, { sequence: 1, observationId: `derive-1-${Date.now()}`, deviceId: dev });
     const obsWithJunk = { ...obs, healthScore: 0.99, decision: "SWITCH" } as EdgeObservation;
 
-    const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obsWithJunk] });
-    expect(ack.acceptedThroughSequence).toBe(800);
+    const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obsWithJunk] });
+    expect(ack.acceptedThroughSequence).toBe(1);
 
     // The server-derived measurement exists (source=DEVICE)
     const record = await db.edgeObservationRecord.findUnique({ where: { observationId: obs.observationId } });
@@ -409,11 +421,13 @@ describe("Phase 9.1 — North-star: edge observation → control plane", () => {
     await db.connectivityMeasurement.deleteMany({ where: { resourceId: fx.resourceAId } });
     await db.resourceHealth.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
 
-    // 2. Mobile observes degraded WiFi 3 times
+    // 2. Mobile observes degraded WiFi 3 times (sequences 1, 2, 3)
+    const nsDev = await freshDevice(fx.userId);
     for (let i = 0; i < 3; i++) {
       const obs = makeObservation(fx, {
-        sequence: 900 + i,
-        observationId: `ns-degraded-${900 + i}-${Date.now()}`,
+        sequence: i + 1,
+        observationId: `ns-degraded-${i + 1}-${Date.now()}`,
+        deviceId: nsDev,
         connectivity: {
           transport: "WIFI",
           connected: true,
@@ -424,7 +438,7 @@ describe("Phase 9.1 — North-star: edge observation → control plane", () => {
           signalQuality: 0.1,
         },
       });
-      const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: fx.deviceId, observations: [obs] });
+      const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: nsDev, observations: [obs] });
       expect(ack.rejected).toHaveLength(0);
     }
 

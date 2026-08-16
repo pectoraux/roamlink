@@ -1,14 +1,19 @@
 /**
- * Phase 9.1 — Observation
+ * Phase 9.1.1 — Observation
  *
  * Builds EdgeObservation events from device context + connectivity state.
  * The observation is the immutable telemetry unit — the device reports WHAT
  * IT SEES, never what the system should DO.
+ *
+ * Phase 9.1.1: sequence allocation + outbox write are now ATOMIC (via
+ * allocateSequenceAndEnqueue). This prevents the race where two concurrent
+ * observations read the same sequence number.
  */
 
 import type { EdgeObservation } from "@roamlink/shared";
-import { getDeviceContext, getDeviceId, getSequence } from "./device-context";
+import { getDeviceContext, getDeviceId } from "./device-context";
 import { getCurrentConnectivity } from "./connectivity-state";
+import { allocateSequenceAndEnqueue } from "./outbox";
 
 export type RecordObservationInput = {
   sessionId?: string;
@@ -16,20 +21,22 @@ export type RecordObservationInput = {
 };
 
 /**
- * Record a single connectivity observation. Generates a stable observationId,
- * assigns a monotonic sequence, captures device context + connectivity state.
+ * Record a single connectivity observation. Atomically allocates a sequence
+ * number AND enqueues the observation to the outbox under one mutex, so
+ * concurrent observations get unique sequences and aren't lost.
  *
- * The observation is returned (not yet persisted — the outbox handles that).
+ * Returns the persisted observation.
  */
 export async function recordObservation(input: RecordObservationInput = {}): Promise<EdgeObservation> {
-  const [deviceId, sequence, device, connectivity] = await Promise.all([
+  const [deviceId, device, connectivity] = await Promise.all([
     getDeviceId(),
-    getSequence(),
     getDeviceContext(),
     getCurrentConnectivity(),
   ]);
 
-  const observation: EdgeObservation = {
+  // Atomically allocate sequence + enqueue. The buildObservation callback
+  // receives the allocated sequence and constructs the full observation.
+  const obs = await allocateSequenceAndEnqueue(deviceId, (sequence) => ({
     observationId: `obs-${deviceId}-${sequence}-${Date.now().toString(36)}`,
     deviceId,
     sessionId: input.sessionId,
@@ -39,7 +46,7 @@ export async function recordObservation(input: RecordObservationInput = {}): Pro
     source: "DEVICE",
     connectivity,
     device,
-  };
+  }));
 
-  return observation;
+  return obs;
 }

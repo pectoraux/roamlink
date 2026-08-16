@@ -261,20 +261,36 @@ async function ingestOneObservation(
   const validatedSessionId = await validateSessionOwnership(userId, obs.sessionId);
   const validatedResourceId = await validateResourceHint(userId, validatedSessionId ?? undefined, obs.resourceId);
 
-  // 5. Persist the immutable observation record
-  const record = await db.edgeObservationRecord.create({
-    data: {
-      observationId: obs.observationId,
-      deviceId: obs.deviceId,
-      userId,
-      sessionId: validatedSessionId,
-      resourceId: validatedResourceId,
-      sequence: obs.sequence,
-      source: obs.source,
-      observedAt: new Date(obs.observedAt),
-      payload: JSON.stringify(obs),
-    },
-  });
+  // 5. Persist the immutable observation record.
+  // Phase 9.1.1: Handle P2002 (unique constraint) on concurrent create —
+  // two requests with the same (deviceId, sequence) can both pass the check
+  // above and race to create. The loser gets P2002 and is treated as a duplicate.
+  let record;
+  try {
+    record = await db.edgeObservationRecord.create({
+      data: {
+        observationId: obs.observationId,
+        deviceId: obs.deviceId,
+        userId,
+        sessionId: validatedSessionId,
+        resourceId: validatedResourceId,
+        sequence: obs.sequence,
+        source: obs.source,
+        observedAt: new Date(obs.observedAt),
+        payload: JSON.stringify(obs),
+      },
+    });
+  } catch (err: any) {
+    if (err?.code === "P2002") {
+      // Concurrent create race — the other request won. Treat as duplicate.
+      const existing = await db.edgeObservationRecord.findUnique({
+        where: { deviceId_sequence: { deviceId: obs.deviceId, sequence: obs.sequence } },
+        select: { derivedMeasurementId: true },
+      }).catch(() => null);
+      return { accepted: true, duplicate: true, measurementId: existing?.derivedMeasurementId ?? undefined };
+    }
+    throw err;
+  }
 
   // 6. Project to ConnectivityMeasurement (source=DEVICE) via the existing
   //    ingestion pipeline. This derives health + emits MEASUREMENT_RECEIVED.
@@ -315,6 +331,48 @@ async function ingestOneObservation(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 9.1.1: Compute contiguous-through sequence watermark
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute the highest sequence number N such that all sequences 1..N are
+ * persisted for this device. This is the "contiguous-through" watermark:
+ * the client can safely delete any observation with sequence <= N from its
+ * outbox, because the server has every sequence up to and including N.
+ *
+ * If there's a gap (e.g., 101 and 103 persisted but 102 missing), the
+ * watermark is 101 — NOT 103. This prevents the client from deleting 102
+ * (which the server never received).
+ *
+ * If no observations exist, returns 0.
+ */
+async function computeContiguousThroughSequence(deviceId: string): Promise<number> {
+  // Fetch all persisted sequences for this device, sorted ascending.
+  const records = await db.edgeObservationRecord.findMany({
+    where: { deviceId },
+    select: { sequence: true },
+    orderBy: { sequence: "asc" },
+  });
+
+  if (records.length === 0) return 0;
+
+  // Find the highest contiguous prefix starting from sequence 1.
+  // (Sequence numbers are 1-based per device.)
+  let expected = 1;
+  for (const record of records) {
+    if (record.sequence === expected) {
+      expected++;
+    } else if (record.sequence > expected) {
+      // Gap found — the watermark is expected - 1
+      break;
+    }
+    // If record.sequence < expected, it's a duplicate (already counted) — skip.
+  }
+
+  return expected - 1;
+}
+
+// ---------------------------------------------------------------------------
 // Ingest a batch (the HTTP endpoint entry point)
 // ---------------------------------------------------------------------------
 
@@ -340,7 +398,8 @@ export async function ingestEdgeObservationBatch(
     }
   }
 
-  let acceptedThroughSequence = 0;
+  // Track per-sequence outcomes for contiguous-through computation.
+  const sequenceOutcomes = new Map<number, "accepted" | "duplicate" | "rejected">();
   let duplicateCount = 0;
   const rejected: EdgeObservationAck["rejected"] = [];
 
@@ -350,18 +409,16 @@ export async function ingestEdgeObservationBatch(
       if (result.accepted) {
         if (result.duplicate) {
           duplicateCount++;
-        }
-        // Track the highest accepted sequence in this batch. The client uses
-        // this to delete acknowledged observations from its outbox: any
-        // observation with sequence <= acceptedThroughSequence is safely
-        // persisted server-side (or was a duplicate that's already there).
-        if (obs.sequence > acceptedThroughSequence) {
-          acceptedThroughSequence = obs.sequence;
+          sequenceOutcomes.set(obs.sequence, "duplicate");
+        } else {
+          sequenceOutcomes.set(obs.sequence, "accepted");
         }
       } else {
+        sequenceOutcomes.set(obs.sequence, "rejected");
         rejected.push({ observationId: obs.observationId, reason: result.reason ?? "unknown" });
       }
     } catch (err) {
+      sequenceOutcomes.set(obs.sequence, "rejected");
       rejected.push({
         observationId: obs.observationId,
         reason: err instanceof Error ? err.message.slice(0, 100) : "error",
@@ -369,15 +426,18 @@ export async function ingestEdgeObservationBatch(
     }
   }
 
-  // If this batch had duplicates but no new acceptances, report the max
-  // sequence from the duplicates so the client can clean them up.
-  if (acceptedThroughSequence === 0 && duplicateCount > 0) {
-    for (const obs of batch.observations) {
-      if (obs.sequence > acceptedThroughSequence) {
-        acceptedThroughSequence = obs.sequence;
-      }
-    }
-  }
+  // Phase 9.1.1: Compute acceptedThroughSequence as the highest CONTIGUOUS
+  // accepted prefix. The client uses this to safely delete observations from
+  // its outbox: any observation with sequence <= acceptedThroughSequence is
+  // safely persisted server-side (or was a duplicate that's already there).
+  //
+  // If 101 accepted, 102 rejected, 103 accepted, the watermark is 101 — NOT 103.
+  // This prevents the client from deleting 102 (which the server never persisted).
+  //
+  // We compute this by querying the DB for all persisted sequences for this
+  // device, then finding the highest N such that all sequences 1..N exist.
+  // (Duplicates count as "exists" — the server already has that sequence.)
+  const acceptedThroughSequence = await computeContiguousThroughSequence(batch.deviceId);
 
   // Update device lastSeen
   await db.edgeDevice.update({

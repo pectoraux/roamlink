@@ -10,7 +10,7 @@
 
 import { api, getSession, API_BASE_URL } from "../api";
 import { getDeviceId, getDeviceContext } from "./device-context";
-import { enqueueObservation, getPendingBatch, removeAcknowledged, loadOutbox } from "./outbox";
+import { getPendingBatch, removeAcknowledged, loadOutbox } from "./outbox";
 import { recordObservation } from "./observation";
 import type { EdgeObservation, EdgeObservationAck } from "@roamlink/shared";
 
@@ -35,12 +35,11 @@ export async function ensureDeviceRegistered(): Promise<void> {
 }
 
 /**
- * Record an observation and enqueue it for upload.
+ * Record an observation. Phase 9.1.1: this atomically allocates a sequence
+ * number AND enqueues to the outbox under one mutex — no separate enqueue call.
  */
 export async function recordAndEnqueue(input?: { sessionId?: string; resourceId?: string }): Promise<EdgeObservation> {
-  const obs = await recordObservation(input);
-  await enqueueObservation(obs);
-  return obs;
+  return recordObservation(input);
 }
 
 /**

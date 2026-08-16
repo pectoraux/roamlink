@@ -1,27 +1,16 @@
 /**
- * Phase 9.1 — Observation Outbox
+ * Phase 9.1.1 — Serialized Outbox Actor
  *
- * A durable local outbox for observations. Observations are persisted locally
- * before upload, so the UI never blocks on telemetry and observations survive
- * network failures.
+ * A single serialized queue for all outbox mutations (enqueue, remove, flush).
+ * Prevents the read-modify-write race where concurrent producers overwrite
+ * each other's observations.
  *
- * Flow:
- *   device observation
- *       ↓
- *   local outbox (AsyncStorage)
- *       ↓
- *   network available?
- *       ├── no → retain
- *       └── yes
- *            ↓
- *       batch upload
- *            ↓
- *       ack
- *            ↓
- *       delete acknowledged observations
+ *   record observation ─┐
+ *   record observation ─┼→ outbox mutex → load → mutate → save
+ *   flush              ─┘
  *
- * Bounded storage: when limits are reached, preferentially discard OLD
- * low-value observations, never the newest.
+ * All outbox mutations go through this single queue. The queue is
+ * per-process (mobile apps are single-process).
  */
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -32,30 +21,29 @@ const MAX_OBSERVATIONS = 500;
 const MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_BATCH_SIZE = 50;
 
+// ---------------------------------------------------------------------------
+// Serialized mutation queue (Phase 9.1.1)
+// ---------------------------------------------------------------------------
+
 /**
- * Add an observation to the outbox.
+ * A simple promise-chain mutex. Each mutation waits for the previous one to
+ * complete before running. This serializes load → mutate → save so concurrent
+ * operations don't overwrite each other.
  */
-export async function enqueueObservation(obs: EdgeObservation): Promise<void> {
-  const outbox = await loadOutbox();
-  outbox.push(obs);
+let mutexChain: Promise<unknown> = Promise.resolve();
 
-  // Enforce bounds: if over limit, drop the OLDEST observations (never the newest)
-  if (outbox.length > MAX_OBSERVATIONS) {
-    const overflow = outbox.length - MAX_OBSERVATIONS;
-    outbox.splice(0, overflow);
-  }
-
-  // Drop observations older than MAX_AGE (low-value, stale)
-  const cutoff = Date.now() - MAX_AGE_MS;
-  const filtered = outbox.filter((o) => new Date(o.observedAt).getTime() > cutoff);
-
-  await saveOutbox(filtered);
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const result = mutexChain.then(fn, fn);
+  // Swallow rejections in the chain so one failure doesn't block subsequent ops.
+  mutexChain = result.catch(() => {});
+  return result;
 }
 
-/**
- * Load all pending observations from the outbox.
- */
-export async function loadOutbox(): Promise<EdgeObservation[]> {
+// ---------------------------------------------------------------------------
+// Internal load/save (only called under the mutex)
+// ---------------------------------------------------------------------------
+
+async function loadOutboxUnsafe(): Promise<EdgeObservation[]> {
   const raw = await AsyncStorage.getItem(OUTBOX_KEY);
   if (!raw) return [];
   try {
@@ -65,28 +53,109 @@ export async function loadOutbox(): Promise<EdgeObservation[]> {
   }
 }
 
+async function saveOutboxUnsafe(outbox: EdgeObservation[]): Promise<void> {
+  await AsyncStorage.setItem(OUTBOX_KEY, JSON.stringify(outbox));
+}
+
+// ---------------------------------------------------------------------------
+// Public API (all serialized)
+// ---------------------------------------------------------------------------
+
+/**
+ * Add an observation to the outbox. Serialized so concurrent enqueues don't
+ * overwrite each other.
+ */
+export async function enqueueObservation(obs: EdgeObservation): Promise<void> {
+  return serialized(async () => {
+    const outbox = await loadOutboxUnsafe();
+    outbox.push(obs);
+
+    // Enforce bounds: if over limit, drop the OLDEST observations (never the newest)
+    if (outbox.length > MAX_OBSERVATIONS) {
+      const overflow = outbox.length - MAX_OBSERVATIONS;
+      outbox.splice(0, overflow);
+    }
+
+    // Drop observations older than MAX_AGE (low-value, stale)
+    const cutoff = Date.now() - MAX_AGE_MS;
+    const filtered = outbox.filter((o) => new Date(o.observedAt).getTime() > cutoff);
+
+    await saveOutboxUnsafe(filtered);
+  });
+}
+
+/**
+ * Load all pending observations from the outbox. Read-only (no mutation), but
+ * serialized to ensure a consistent snapshot (no partial writes visible).
+ */
+export async function loadOutbox(): Promise<EdgeObservation[]> {
+  return serialized(() => loadOutboxUnsafe());
+}
+
 /**
  * Get the next batch to upload (up to MAX_BATCH_SIZE, oldest first).
  */
 export async function getPendingBatch(deviceId: string): Promise<EdgeObservation[]> {
-  const outbox = await loadOutbox();
-  return outbox
-    .filter((o) => o.deviceId === deviceId)
-    .sort((a, b) => a.sequence - b.sequence)
-    .slice(0, MAX_BATCH_SIZE);
+  return serialized(async () => {
+    const outbox = await loadOutboxUnsafe();
+    return outbox
+      .filter((o) => o.deviceId === deviceId)
+      .sort((a, b) => a.sequence - b.sequence)
+      .slice(0, MAX_BATCH_SIZE);
+  });
 }
 
 /**
  * Remove acknowledged observations from the outbox (after a successful upload).
- * Uses observationId to match — duplicates that were collapsed server-side
- * are also removed.
+ * Serialized so a concurrent enqueue can't be lost during the remove.
  */
 export async function removeAcknowledged(acknowledgedIds: string[]): Promise<void> {
   if (acknowledgedIds.length === 0) return;
-  const outbox = await loadOutbox();
-  const ackSet = new Set(acknowledgedIds);
-  const remaining = outbox.filter((o) => !ackSet.has(o.observationId));
-  await saveOutbox(remaining);
+  return serialized(async () => {
+    const outbox = await loadOutboxUnsafe();
+    const ackSet = new Set(acknowledgedIds);
+    const remaining = outbox.filter((o) => !ackSet.has(o.observationId));
+    await saveOutboxUnsafe(remaining);
+  });
+}
+
+/**
+ * Atomically allocate the next sequence number AND enqueue the observation.
+ * This prevents the race where two concurrent observations read the same
+ * sequence number.
+ *
+ * Phase 9.1.1: sequence allocation + outbox write happen under one mutex.
+ */
+export async function allocateSequenceAndEnqueue(
+  deviceId: string,
+  buildObservation: (sequence: number) => EdgeObservation,
+): Promise<EdgeObservation> {
+  return serialized(async () => {
+    // Read current sequence
+    const seqStr = await AsyncStorage.getItem("roamlink_obs_sequence");
+    const currentSeq = seqStr ? parseInt(seqStr, 10) : 0;
+    const nextSeq = currentSeq + 1;
+
+    // Write the new sequence
+    await AsyncStorage.setItem("roamlink_obs_sequence", String(nextSeq));
+
+    // Build + enqueue the observation under the same mutex
+    const obs = buildObservation(nextSeq);
+    const outbox = await loadOutboxUnsafe();
+    outbox.push(obs);
+
+    if (outbox.length > MAX_OBSERVATIONS) {
+      const overflow = outbox.length - MAX_OBSERVATIONS;
+      outbox.splice(0, overflow);
+    }
+
+    const cutoff = Date.now() - MAX_AGE_MS;
+    const filtered = outbox.filter((o) => new Date(o.observedAt).getTime() > cutoff);
+
+    await saveOutboxUnsafe(filtered);
+
+    return obs;
+  });
 }
 
 /**
@@ -101,11 +170,5 @@ export async function getOutboxSize(): Promise<number> {
  * Clear the entire outbox (for testing/reset).
  */
 export async function clearOutbox(): Promise<void> {
-  await AsyncStorage.removeItem(OUTBOX_KEY);
-}
-
-// Internal helpers
-
-async function saveOutbox(outbox: EdgeObservation[]): Promise<void> {
-  await AsyncStorage.setItem(OUTBOX_KEY, JSON.stringify(outbox));
+  return serialized(() => AsyncStorage.removeItem(OUTBOX_KEY));
 }

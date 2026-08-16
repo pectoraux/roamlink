@@ -1,10 +1,14 @@
 /**
- * Phase 9.1 — Device Context
+ * Phase 9.1.1 — Device Context
  *
  * Collects device-level context needed by the controller: platform, app
  * version, network transport, roaming, battery, power-saver, metered.
  *
  * Privacy-minimal by construction — no arbitrary device telemetry.
+ *
+ * Phase 9.1.1: sequence allocation is now ATOMIC and combined with the outbox
+ * write (see outbox.ts allocateSequenceAndEnqueue). This file no longer
+ * exposes getSequence() directly — use allocateSequenceAndEnqueue() instead.
  */
 
 import { Platform } from "react-native";
@@ -54,6 +58,10 @@ function mapBatteryState(
 /**
  * Get or create a stable device identifier. Stored in AsyncStorage (not
  * SecureStore — it's not secret, just stable).
+ *
+ * The deviceId is an opaque app-generated identifier — NOT a hardware
+ * identifier. This is deliberate: hardware IDs raise privacy concerns and
+ * survive app uninstalls (which we don't want).
  */
 import * as AsyncStorage from "@react-native-async-storage/async-storage";
 
@@ -67,12 +75,4 @@ export async function getDeviceId(): Promise<string> {
     await AsyncStorage.setItem(DEVICE_ID_KEY, id);
   }
   return id;
-}
-
-export async function getSequence(): Promise<number> {
-  const seqStr = await AsyncStorage.getItem("roamlink_obs_sequence");
-  const seq = seqStr ? parseInt(seqStr, 10) : 0;
-  const next = seq + 1;
-  await AsyncStorage.setItem("roamlink_obs_sequence", String(next));
-  return next;
 }
