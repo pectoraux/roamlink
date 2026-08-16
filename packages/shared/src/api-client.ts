@@ -267,9 +267,28 @@ export class RoamLinkClient {
   }
 
   async updateEdgePolicyContext(token: string, deviceId: string, context: EdgePolicyContext) {
-    return this.request<{ ok: true }>("/api/v1/connectivity/edge/policy-context", {
+    return this.request<{ ok: true; context: EdgePolicyContext }>("/api/v1/connectivity/edge/policy-context", {
       method: "POST",
       body: JSON.stringify({ deviceId, context }),
+      headers: { Cookie: `esim_session=${token}` },
+    });
+  }
+
+  async getEdgePolicyContext(token: string, deviceId: string) {
+    return this.request<{
+      context: EdgePolicyContext;
+      policyContextUpdatedAt: string | null;
+      policy: {
+        mode: string;
+        preset: string | null;
+        maxAutoSpendMinor: number;
+        minReliability: number;
+        switchHysteresis: number;
+        preferredTransports: string[];
+        requireUserApprovalForPurchase: boolean;
+        neverInterruptActiveCall: boolean;
+      };
+    }>(`/api/v1/connectivity/edge/policy-context?deviceId=${encodeURIComponent(deviceId)}`, {
       headers: { Cookie: `esim_session=${token}` },
     });
   }

@@ -2310,6 +2310,11 @@ model EdgeDevice {
   appVersion      String
   registeredAt    DateTime @default(now())
   lastSeenAt      DateTime? // updated on each observation upload
+  // Phase 9.3: Persisted policy context (last-known). The device reports
+  // context hints; the server applies them to the policy engine. Persisting
+  // the context lets the mobile settings UI read the current state.
+  policyContext   String?  // JSON of EdgePolicyContext
+  policyContextUpdatedAt DateTime?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
