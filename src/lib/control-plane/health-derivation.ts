@@ -297,3 +297,65 @@ export async function getResourceHealth(resourceId: string): Promise<DerivedHeal
     latestMeasurementId: row.latestMeasurementId,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Phase 8.6.5: Rebuild — ResourceHealth is a PROJECTION, not a source of truth
+// ---------------------------------------------------------------------------
+
+/**
+ * Rebuild the ResourceHealth snapshot for a resource from its measurement
+ * stream, deterministically.
+ *
+ * Invariant:
+ *   delete ResourceHealth → replay measurements → same health state
+ *
+ * This guarantees ResourceHealth never becomes a second hidden state machine:
+ * it is always safely reconstructable from the immutable measurement log.
+ * The rebuild deletes the existing snapshot and re-derives from measurements,
+ * so the result is identical to what deriveResourceHealth() would produce
+ * given the same measurement set and parameters.
+ *
+ * Returns the rebuilt snapshot.
+ */
+export async function rebuildResourceHealth(
+  resourceId: string,
+  params: HealthDerivationParams = {},
+): Promise<DerivedHealth> {
+  // Delete the existing projection (measurements are NOT deleted — they are
+  // the immutable source of truth).
+  await db.resourceHealth.deleteMany({ where: { resourceId } }).catch(() => {});
+
+  // Re-derive from the measurement stream. deriveResourceHealth upserts the
+  // snapshot, so this recreates it deterministically.
+  return deriveResourceHealth(resourceId, params);
+}
+
+/**
+ * Phase 8.6.5: Verify the projection invariant at runtime — rebuilding a
+ * resource's health from its measurements must yield the same status, quality,
+ * and counts as the current persisted snapshot.
+ *
+ * Used by the runtime test to prove ResourceHealth is a true projection.
+ */
+export async function verifyProjectionInvariant(
+  resourceId: string,
+  params: HealthDerivationParams = {},
+): Promise<{ matches: boolean; before: DerivedHealth | null; after: DerivedHealth | null }> {
+  const before = await getResourceHealth(resourceId);
+  const after = await rebuildResourceHealth(resourceId, params);
+
+  if (!before) {
+    return { matches: after === null, before, after };
+  }
+  if (!after) {
+    return { matches: false, before, after };
+  }
+
+  const matches =
+    before.status === after.status &&
+    Math.abs(before.quality - after.quality) < 0.001 &&
+    before.sampleCount === after.sampleCount &&
+    before.degradedCount === after.degradedCount;
+
+  return { matches, before, after };
+}

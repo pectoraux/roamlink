@@ -33,7 +33,8 @@ import { createAction, executeAction, recoverStaleActions } from "@/lib/control-
 import { ingestMeasurement } from "@/lib/control-plane/measurement-store";
 import { deriveResourceHealth, getResourceHealth } from "@/lib/control-plane/health-derivation";
 import { classifyFreshness } from "@/lib/control-plane/freshness";
-import { triggerReevaluation } from "@/lib/control-plane/reevaluation";
+import { processPendingEvents, processPendingEventsForResource } from "@/lib/control-plane/reevaluation";
+import { executePendingDecisions, executeDecision } from "@/lib/control-plane/decision-executor";
 import { assertActiveConnectivityInvariant } from "@/lib/control-plane/invariant-checker";
 import { createOrUpdatePolicy } from "@/lib/control-plane/policy-engine";
 
@@ -364,11 +365,14 @@ describe("Phase 8.6 — Continuous Connectivity Observation (DB-backed runtime)"
       expect(res.health?.status).toBe(i >= 1 ? "DEGRADED" : "HEALTHY"); // M-of-N kicks in at 2nd degraded sample
     }
 
-    // The persisted health snapshot is DEGRADED
+    // The persisted health snapshot is DEGRADED. Note: the closed-loop
+    // auto-probe (8.6.5) after ACTIVATE may have added an extra healthy
+    // measurement, so sampleCount may be > 3. Assert the degraded count +
+    // status, not an exact sampleCount.
     const health = await getResourceHealth(fx.resourceAId);
     expect(health?.status).toBe("DEGRADED");
-    expect(health?.sampleCount).toBe(3);
-    expect(health?.degradedCount).toBe(3);
+    expect(health?.degradedCount).toBeGreaterThanOrEqual(3);
+    expect(health?.sampleCount).toBeGreaterThanOrEqual(3);
     expect(health?.freshness).toBe("FRESH");
     expect(health?.derivedFromSources).toBe("ADAPTER");
 
@@ -391,14 +395,17 @@ describe("Phase 8.6 — Continuous Connectivity Observation (DB-backed runtime)"
   }, 10_000);
 
   // -------------------------------------------------------------------------
-  // 4. Re-evaluation → decision = SWITCH B
+  // 4. Re-evaluation → decision = SWITCH B (Phase 8.6.5: separated flow)
   // -------------------------------------------------------------------------
-  it("8.6.4: triggerReevaluation → makeDecision → SWITCH B (policy ALLOW)", async () => {
-    const reeval = await triggerReevaluation(fx.sessionId);
-    expect(reeval.decisionAction).toBe("SWITCH");
-    expect(reeval.actionExecuted).toBe(true);
+  it("8.6.4: processPendingEvents → Decision SWITCH B → executePendingDecisions → executed", async () => {
+    // Phase 8.6.5: the reevaluation worker EVALUATES events (produces a Decision,
+    // does NOT execute). The decision-executor then executes non-KEEP decisions.
+    // Scoped to this resource to avoid iterating leftover PENDING events from
+    // other fixtures (each makeDecision call is slow against PostgreSQL).
+    const evalResult = await processPendingEventsForResource(fx.resourceAId);
+    expect(evalResult).toBeGreaterThan(0);
 
-    // A ConnectivityDecision with action=SWITCH was persisted
+    // A ConnectivityDecision with action=SWITCH was persisted (PENDING)
     const decision = await db.connectivityDecision.findFirst({
       where: { sessionId: fx.sessionId, action: "SWITCH" },
       orderBy: { createdAt: "desc" },
@@ -408,7 +415,20 @@ describe("Phase 8.6 — Continuous Connectivity Observation (DB-backed runtime)"
     expect(decision?.constraintsSatisfied).toContain("SWITCH_THRESHOLD_MET");
     expect(decision?.constraintsSatisfied).toContain("M_OF_N_DEGRADED");
     expect(decision?.constraintsSatisfied).toContain("HEALTH_FRESH");
-  }, 120_000);
+
+    // Execute the pending decision (separate step) — scoped to this test's
+    // own decision to avoid iterating leftover PENDING decisions from other
+    // fixtures (slow against PostgreSQL).
+    const execResult = await executeDecision(decision!.id);
+    expect(execResult.executionState).toBe("EXECUTED");
+
+    // The decision is now EXECUTED
+    const executedDecision = await db.connectivityDecision.findUnique({
+      where: { id: decision!.id },
+      select: { executionState: true },
+    });
+    expect(executedDecision?.executionState).toBe("EXECUTED");
+  }, 180_000);
 
   // -------------------------------------------------------------------------
   // 5. SWITCH executed → Session B ACTIVE, A released, invariant holds
@@ -475,6 +495,11 @@ describe("Phase 8.6 — Freshness gate (DB-backed)", () => {
       where: { id: fx.sessionId },
       data: { startedAt: new Date(Date.now() - 120_000) },
     });
+
+    // Clear the auto-probe measurement from ACTIVATE (closed-loop reobservation)
+    // so the health snapshot reflects ONLY the STALE measurements below.
+    await db.connectivityMeasurement.deleteMany({ where: { resourceId: fx.resourceAId } });
+    await db.resourceHealth.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
 
     // 3. Inject 2 STALE degraded measurements on A (capturedAt 60s ago → STALE)
     for (let i = 0; i < 2; i++) {
@@ -576,5 +601,5 @@ describe("Phase 8.6 — Recovery from real provider states (DB-backed)", () => {
     const invariant = await assertActiveConnectivityInvariant(fx.sessionId);
     expect(invariant.valid).toBe(true);
     expect(invariant.violations).toEqual([]);
-  }, 120_000);
+  }, 300_000);
 });

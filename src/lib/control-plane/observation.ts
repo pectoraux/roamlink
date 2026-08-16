@@ -201,9 +201,20 @@ export async function probeSession(sessionId: string): Promise<ProbeResult | nul
 // Probe all active sessions (worker entry point)
 // ---------------------------------------------------------------------------
 
-export async function probeAllActiveSessions(): Promise<{ probed: number; results: ProbeResult[] }> {
+/**
+ * Probe all active sessions. Accepts an optional set of resource IDs to
+ * EXCLUDE (e.g. resources already probed by probeStaleActiveResources in the
+ * same cycle), avoiding duplicate provider traffic.
+ */
+export async function probeAllActiveSessions(excludeResourceIds?: Set<string>): Promise<{ probed: number; results: ProbeResult[] }> {
   const sessions = await db.connectivitySession.findMany({
-    where: { state: { in: ["ACTIVE", "DEGRADED"] }, activeResourceId: { not: null } },
+    where: {
+      state: { in: ["ACTIVE", "DEGRADED"] },
+      activeResourceId: { not: null },
+      ...(excludeResourceIds && excludeResourceIds.size > 0
+        ? { activeResourceId: { notIn: Array.from(excludeResourceIds) } }
+        : {}),
+    },
     select: { id: true, activeResourceId: true },
   });
 
@@ -214,6 +225,67 @@ export async function probeAllActiveSessions(): Promise<{ probed: number; result
     results.push(r);
   }
 
-  logger.info("observation.probe_all", { probed: results.length });
+  logger.info("observation.probe_all", { probed: results.length, excluded: excludeResourceIds?.size ?? 0 });
   return { probed: results.length, results };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8.6.5: Re-observe resources with EXPIRED current measurements
+// ---------------------------------------------------------------------------
+
+/**
+ * Find active sessions whose current-resource health snapshot is EXPIRED (or
+ * UNKNOWN with no recent measurement) and probe them immediately.
+ *
+ * This implements the freshness clock policy: an expired CURRENT-resource
+ * measurement must cause re-observation, NOT merely cause the decision engine
+ * to refuse switching. Without this, the system would go blind precisely when
+ * connectivity is failing.
+ *
+ *   current measurement expired
+ *         ↓
+ *   schedule immediate probe
+ *         ↓
+ *   new observation
+ *         ↓
+ *   health recomputed
+ *         ↓
+ *   decision
+ *
+ * Expired resources are probed BEFORE the regular probeAllActiveSessions cycle
+ * so they get priority.
+ */
+export async function probeStaleActiveResources(): Promise<{ probed: number; results: ProbeResult[]; probedResourceIds: Set<string> }> {
+  const sessions = await db.connectivitySession.findMany({
+    where: { state: { in: ["ACTIVE", "DEGRADED"] }, activeResourceId: { not: null } },
+    select: { id: true, activeResourceId: true },
+  });
+
+  const results: ProbeResult[] = [];
+  const probedResourceIds = new Set<string>();
+  for (const session of sessions) {
+    if (!session.activeResourceId) continue;
+
+    // Check the persisted health snapshot's freshness.
+    const health = await db.resourceHealth.findUnique({
+      where: { resourceId: session.activeResourceId },
+      select: { freshness: true },
+    });
+
+    const needsReobservation = !health || health.freshness === "EXPIRED" || health.freshness === "UNKNOWN";
+
+    if (needsReobservation) {
+      logger.info("observation.reobserving_stale", {
+        resourceId: session.activeResourceId,
+        sessionId: session.id,
+        freshness: health?.freshness ?? "none",
+      });
+      const r = await probeAndIngest(session.activeResourceId, session.id);
+      results.push(r);
+      probedResourceIds.add(session.activeResourceId);
+    }
+  }
+
+  logger.info("observation.probe_stale", { probed: results.length });
+  return { probed: results.length, results, probedResourceIds };
 }

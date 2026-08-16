@@ -2044,6 +2044,11 @@ model ConnectivityMeasurement {
   source          String   @default("PROVIDER")
   confidence      Float    @default(0.5)
   capturedAt      DateTime @default(now())
+  // Phase 8.6.5: Idempotent observation identity. Two probes of the same
+  // (resourceId, observedAt, source, metrics-hash) MUST NOT create two
+  // measurements. Computed by ingestMeasurement() or caller-supplied.
+  // Nullable so pre-8.6.5 rows survive; new rows always set it.
+  deduplicationKey String? @unique
 
   session         ConnectivitySession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
@@ -2084,6 +2089,22 @@ model ConnectivityDecision {
   constraintsViolated String?
   reasons         String?
   policyVersion   String?
+  // Phase 8.6.5: Separation of decision triggering from decision execution.
+  // The reevaluation worker produces a Decision (PENDING); a separate
+  // decision-executor turns non-KEEP decisions into Actions (EXECUTED/FAILED).
+  // KEEP/WAIT/ASK_USER decisions are SKIPPED (no action needed).
+  // Phase 8.6.6: Fenced execution — PENDING → EXECUTION_CLAIMED → EXECUTING
+  //   → EXECUTED | FAILED | RECONCILIATION_REQUIRED | SKIPPED.
+  //   Two workers cannot execute the same decision concurrently.
+  executionState  String   @default("PENDING") // PENDING | EXECUTION_CLAIMED | EXECUTING | EXECUTED | FAILED | RECONCILIATION_REQUIRED | SKIPPED
+  // Phase 8.6.6: Execution fencing — only the worker holding executionClaimId
+  // may execute the decision. Expired claims are reclaimable.
+  executionClaimId String?
+  executionClaimedAt DateTime?
+  executionClaimExpiresAt DateTime?
+  executedAt      DateTime?
+  // Phase 8.6.6: The action id produced by execution (audit link).
+  executedActionId String?
   createdAt       DateTime @default(now())
 
   session         ConnectivitySession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
@@ -2091,6 +2112,8 @@ model ConnectivityDecision {
 
   @@index([intentId])
   @@index([sessionId])
+  @@index([executionState])
+  @@index([executionClaimExpiresAt])
 }
 
 model ConnectivityAction {
@@ -2240,14 +2263,27 @@ model ReevaluationEvent {
   sessionId       String?
   subjectId       String?
   payload         String   // JSON
-  // null = unprocessed. Set when a worker consumes the event.
+  // Phase 8.6.5: Event lifecycle — same fencing pattern as action recovery.
+  // PENDING → CLAIMED → (PROCESSING) → COMPLETED | FAILED | DEAD_LETTER
+  state           String   @default("PENDING")
+  // Idempotent event identity: duplicate emissions of the same logical event
+  // (e.g. two probes of the same observation) collapse to one.
+  idempotencyKey  String?  @unique
+  // Worker fencing — only the worker holding claimId may process the event.
+  claimId         String?
+  claimedAt       DateTime?
+  claimExpiresAt  DateTime?
+  attemptCount    Int      @default(0)
+  lastError       String?
+  // Legacy completion markers (state is now authoritative; kept for read compat).
   processedAt     DateTime?
-  // Result of processing (e.g. "reevaluated:KEEP", "reevaluated:SWITCH", "skipped").
   result          String?
   createdAt       DateTime @default(now())
 
   @@index([processedAt])
+  @@index([state])
   @@index([type])
   @@index([resourceId])
   @@index([sessionId])
+  @@index([claimExpiresAt])
 }

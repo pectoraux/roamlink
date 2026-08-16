@@ -180,7 +180,7 @@ export async function transitionActionState(
  * Key invariant: releasing the old resource MUST NOT invalidate the new one.
  */
 export async function executeAction(actionId: string): Promise<{
-  status: "succeeded" | "failed";
+  status: "succeeded" | "failed" | "reconciliation_required";
   error?: string;
 }> {
   const action = await db.connectivityAction.findUnique({
@@ -300,6 +300,14 @@ export async function executeAction(actionId: string): Promise<{
         logger.info("action.activate_succeeded", {
           actionId, sessionId: session.id, resourceId: targetResourceId,
         });
+
+        // Phase 8.6.6: Decoupled re-observation. Previously this called
+        // probeAndIngest() inline, coupling the command path to the telemetry
+        // path and making action completion depend on a potentially slow
+        // provider probe. Now it emits a REOBSERVE_REQUESTED event that the
+        // observation worker processes asynchronously — same closed-loop
+        // behavior (OBSERVE→...→ACT→VERIFY→OBSERVE AGAIN) without blocking.
+        await emitReobserveRequest(targetResourceId, session.id);
         break;
       }
 
@@ -409,9 +417,13 @@ export async function executeAction(actionId: string): Promise<{
         // Phase 8.5.8: If old resource release failed, mark RECONCILIATION_REQUIRED
         // instead of SUCCEEDED. The switch itself succeeded (session is on target),
         // but the old resource is leaked and needs cleanup.
+        // Phase 8.6.6: Return "reconciliation_required" (NOT "succeeded") so the
+        // decision-executor propagates the correct terminal state to the Decision.
+        // Overloading "succeeded" to mean "switch worked but cleanup remains"
+        // was an inconsistent state model.
         if (oldReleaseFailed) {
           await transitionActionState(actionId, "RECONCILIATION_REQUIRED", `Old resource ${previousResourceId} release failed — session is on target but cleanup needed`);
-          return { status: "succeeded", error: `Switch succeeded but old resource release failed — reconciliation required` };
+          return { status: "reconciliation_required", error: `Switch succeeded but old resource release failed — reconciliation required` };
         }
 
         // Phase 8.5.10: Verify the active connectivity invariant after SWITCH
@@ -425,6 +437,11 @@ export async function executeAction(actionId: string): Promise<{
           return { status: "failed", error: `Invariant failed: ${switchInvariant.violations.join(", ")}` };
         }
 
+        // Phase 8.6.6: Decoupled re-observation — emit REOBSERVE_REQUESTED
+        // instead of inline probeAndIngest. The observation worker processes
+        // it asynchronously, keeping the command path (action completion)
+        // separate from the telemetry path (observation).
+        await emitReobserveRequest(targetResourceId, session.id);
         break;
       }
 
@@ -731,4 +748,54 @@ export async function recoverStaleActions(): Promise<{
   });
 
   return { recovered, succeeded, failed, reconciliationRequired };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8.6.6: Decoupled re-observation (REOBSERVE_REQUESTED event)
+// ---------------------------------------------------------------------------
+
+/**
+ * Emit a REOBSERVE_REQUESTED event for a resource. The observation worker
+ * processes this asynchronously, probing the resource and ingesting a fresh
+ * measurement.
+ *
+ * This replaces the Phase 8.6.5 inline `triggerReobservation` which called
+ * `probeAndIngest()` synchronously inside the action executor. That coupled
+ * the command path (action completion) to the telemetry path (observation),
+ * making action completion depend on a potentially slow provider probe.
+ *
+ * The event is idempotent (deduped by idempotencyKey) so multiple emissions
+ * for the same resource/session collapse to one observation.
+ *
+ * Failures are non-fatal — the observation worker will also probe on its
+ * regular cycle. A re-observation failure must NEVER corrupt the session or
+ * the action that just succeeded.
+ */
+async function emitReobserveRequest(resourceId: string, sessionId: string): Promise<void> {
+  try {
+    // Idempotent key: one reobservation per (resource, session, action-completion).
+    // If the same resource is reobserved within the dedup window, the event
+    // collapses to one.
+    const idempotencyKey = `reobserve-${resourceId}-${sessionId}-${Date.now().toString(36)}`;
+    await db.reevaluationEvent.create({
+      data: {
+        type: "MEASUREMENT_RECEIVED", // reuse the measurement event type — the observation worker drains it
+        resourceId,
+        sessionId,
+        subjectId: null,
+        payload: JSON.stringify({ reobserve: true, resourceId, sessionId, reason: "post-action-reobservation" }),
+        idempotencyKey,
+        state: "PENDING",
+      },
+    }).catch(() => {
+      // Idempotent — if the key already exists, that's fine.
+    });
+    logger.info("action.reobserve_requested", { resourceId, sessionId });
+  } catch (err) {
+    // Non-fatal — the observation worker will probe the resource on its cycle.
+    logger.warn("action.reobserve_request_failed", {
+      resourceId, sessionId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }

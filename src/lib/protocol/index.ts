@@ -291,6 +291,55 @@ export const ReevaluationEventTypeSchema = z.enum([
 ]);
 export type ReevaluationEventType = z.infer<typeof ReevaluationEventTypeSchema>;
 
+/**
+ * Phase 8.6.5: ReevaluationEvent lifecycle — the same fencing pattern as
+ * ConnectivityAction recovery. The observation loop is a distributed worker
+ * system; its events need durable claims, lease expiry, and a dead-letter
+ * path so a crashed worker cannot block an event forever and a poison event
+ * cannot loop infinitely.
+ *
+ *   PENDING → CLAIMED → (PROCESSING) → COMPLETED
+ *                                  → FAILED (retryable)
+ *                                  → DEAD_LETTER (terminal, after N attempts)
+ *
+ * A CLAIMED event whose claimExpiresAt < now is reclaimable by another worker.
+ */
+export const ReevaluationEventStateSchema = z.enum([
+  "PENDING",
+  "CLAIMED",
+  "PROCESSING",
+  "COMPLETED",
+  "FAILED",
+  "DEAD_LETTER",
+]);
+export type ReevaluationEventState = z.infer<typeof ReevaluationEventStateSchema>;
+
+/**
+ * Phase 8.6.5: ConnectivityDecision execution state. Decouples decision
+ * triggering (reevaluation worker) from decision execution (decision-executor).
+ *
+ * Phase 8.6.6: Fenced execution + reconciliation propagation.
+ *   PENDING               — decision produced by reevaluation, not yet executed
+ *   EXECUTION_CLAIMED     — a worker has claimed the decision for execution
+ *                           (fenced — only the claim holder may execute)
+ *   EXECUTING             — the action is being executed
+ *   EXECUTED              — action SUCCEEDED, decision complete
+ *   FAILED                — action FAILED
+ *   RECONCILIATION_REQUIRED — action completed but needs cleanup (e.g. old
+ *                           resource leaked). NOT the same as EXECUTED.
+ *   SKIPPED               — KEEP/WAIT/ASK_USER decision (no action needed)
+ */
+export const DecisionExecutionStateSchema = z.enum([
+  "PENDING",
+  "EXECUTION_CLAIMED",
+  "EXECUTING",
+  "EXECUTED",
+  "FAILED",
+  "RECONCILIATION_REQUIRED",
+  "SKIPPED",
+]);
+export type DecisionExecutionState = z.infer<typeof DecisionExecutionStateSchema>;
+
 // ---------------------------------------------------------------------------
 // ConnectivityPolicy — deterministic rules for autonomous decisions
 // ---------------------------------------------------------------------------

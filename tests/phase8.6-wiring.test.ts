@@ -100,13 +100,36 @@ describe("Phase 8.6 — Continuous Connectivity Observation (wiring)", () => {
 
     const source = fs.readFileSync("src/lib/control-plane/reevaluation.ts", "utf-8");
     expect(source).toContain("export async function isReevaluationNecessary");
-    expect(source).toContain("export async function triggerReevaluation");
+    // Phase 8.6.5: reevaluation worker EVALUATES only (no execution)
+    expect(source).toContain("export async function evaluateEvent");
     expect(source).toContain("export async function processPendingEvents");
     expect(source).toContain("makeDecision");
-    expect(source).toContain("createAction");
-    expect(source).toContain("executeAction");
+    // Phase 8.6.5: fenced lifecycle (same pattern as action recovery)
+    expect(source).toContain("claimReevaluationEvent");
+    expect(source).toContain("claimId");
+    expect(source).toContain("claimExpiresAt");
+    expect(source).toContain("EVENT_LEASE_MS");
+    expect(source).toContain("EVENT_MAX_ATTEMPTS");
+    expect(source).toContain("DEAD_LETTER");
+    expect(source).toContain("reclaimExpiredClaims");
+    // Phase 8.6.5: reevaluation does NOT create/execute actions (separation)
+    expect(source).not.toContain("export async function triggerReevaluation");
+    expect(source).not.toContain("createAction");
+    expect(source).not.toContain("executeAction");
     // Persists events
     expect(source).toContain("db.reevaluationEvent");
+  });
+
+  it("8.6.5c: decision-executor separates triggering from execution", async () => {
+    const fs = await import("fs");
+    const source = fs.readFileSync("src/lib/control-plane/decision-executor.ts", "utf-8");
+    expect(source).toContain("export async function executeDecision");
+    expect(source).toContain("export async function executePendingDecisions");
+    expect(source).toContain("createAction");
+    expect(source).toContain("executeAction");
+    expect(source).toContain("executionState");
+    expect(source).toContain("SKIPPED");
+    expect(source).toContain("EXECUTED");
   });
 
   it("8.6.5b: measurement-store emits MEASUREMENT_RECEIVED + transition events", async () => {
