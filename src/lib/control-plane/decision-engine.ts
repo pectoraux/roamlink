@@ -342,24 +342,41 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
   }
 
   // Step 5: Budget check
-  // Phase 9.5.2: Budget is an attribute of a candidate/resource outcome,
+  // Phase 9.5.3: Budget is an attribute of a candidate/resource outcome,
   // not a prerequisite for the connectivity control plane to function.
   // Price applies ONLY when a commerce offer has an authoritative price.
   // A resource with no applicable price (WiFi, enterprise network, already-
   // entitled cellular) has budget applicability UNKNOWN — it is NOT silently
   // treated as "budget satisfied" or "budget violated."
-  if (input.maxPriceMinor) {
+  //
+  // Phase 9.5.3 fix: use `!= null` instead of truthiness. A budget of 0
+  // (free connectivity) is a valid, meaningful monetary constraint — it must
+  // not be treated as "no budget specified."
+  if (input.maxPriceMinor != null) {
     if (ranking.ranked.length > 0) {
-      const topOffer = ranking.ranked[0];
-      if (topOffer.customerPriceMinor <= input.maxPriceMinor) {
+      // Evaluate ALL ranked offers against the budget — not just the top one.
+      // This ensures over-budget candidates are explicitly identified as
+      // violations, not silently filtered by the ranking engine.
+      const overBudgetOffers = ranking.ranked.filter(
+        (r) => r.customerPriceMinor > (input.maxPriceMinor as number),
+      );
+      const withinBudgetOffers = ranking.ranked.filter(
+        (r) => r.customerPriceMinor <= (input.maxPriceMinor as number),
+      );
+
+      if (withinBudgetOffers.length > 0) {
         constraintsSatisfied.push("WITHIN_BUDGET");
         reasonCodes.push("BUDGET_CONSTRAINT");
-      } else {
+      }
+      if (overBudgetOffers.length > 0) {
         constraintsViolated.push("OVER_BUDGET");
         reasonCodes.push("BUDGET_CONSTRAINT");
-        if (action === "ACTIVATE") {
+        reasons.push(`${overBudgetOffers.length} offer(s) exceed budget ${input.maxPriceMinor}`);
+        // If the top-ranked offer is over budget and this is an ACTIVATE,
+        // require user approval (don't silently pick a cheaper alternative)
+        if (ranking.ranked[0].customerPriceMinor > (input.maxPriceMinor as number) && action === "ACTIVATE") {
           action = "ASK_USER";
-          reasons.push("Top offer exceeds budget — user approval required");
+          reasons.push("Top-ranked offer exceeds budget — user approval required");
         }
       }
     } else {

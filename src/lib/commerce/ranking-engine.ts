@@ -150,10 +150,11 @@ export async function rankOffers(
       continue;
     }
 
-    // Filter: budget constraint (if specified)
-    if (intent.maxPriceMinor && offer.customerPriceMinor > intent.maxPriceMinor) {
-      continue;
-    }
+    // Phase 9.5.3: Do NOT filter by budget here. The ranking engine should
+    // return ALL offers ranked by score. The decision engine evaluates budget
+    // as a policy constraint (BUDGET_CONSTRAINT / OVER_BUDGET) — the ranking
+    // engine must not silently exclude over-budget candidates.
+    // This preserves: Commerce ranking ≠ Connectivity Control Plane policy.
 
     // Score each dimension
     const intentMatchScore = scoreIntentMatch(intent.desiredSpec, spec);

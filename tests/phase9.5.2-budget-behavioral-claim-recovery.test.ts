@@ -311,4 +311,104 @@ describe("Phase 9.5.2 — Budget Behavioral Proof + Orphaned Claim Recovery (DB-
     expect(decision).not.toBeNull();
     expect(decision?.reasonCodes).not.toBeNull();
   }, 60_000);
+
+  // A4: Zero budget (maxPriceMinor=0) — valid constraint, not "no budget"
+  it("A4: budget=0 with priced offer → budget evaluated (not skipped)", async () => {
+    // Directly call makeDecision with budget=0 and the existing priced offers
+    // (A=450, B=700) — both should be over budget since 0 < 450
+    const intent = await createIntent({
+      subjectId: fx.userId,
+      rawText: "free connectivity only",
+      mode: "MANUAL",
+      maxPriceMinor: 0,
+    });
+
+    const decision = await makeDecision({
+      tenantId: fx.tenantId,
+      subjectId: fx.userId,
+      intentId: intent.intentId,
+      intentVersion: intent.version,
+      sessionId: fx.sessionId,
+      maxPriceMinor: 0, // zero budget — must be evaluated, NOT treated as absent
+    });
+
+    const persisted = await db.connectivityDecision.findUnique({
+      where: { id: decision.decisionId },
+      select: { constraintsSatisfied: true, constraintsViolated: true, reasonCodes: true },
+    });
+    const satisfied = JSON.parse(persisted?.constraintsSatisfied || "[]");
+    const violated = JSON.parse(persisted?.constraintsViolated || "[]");
+    const codes = JSON.parse(persisted?.reasonCodes || "[]");
+
+    // Budget=0 was evaluated — both offers (450, 700) are over budget
+    expect(violated).toContain("OVER_BUDGET");
+    expect(codes).toContain("BUDGET_CONSTRAINT");
+    // NOT skipped (the old truthiness bug would have skipped this entirely)
+    expect(satisfied).not.toContain("BUDGET_APPLICABILITY_UNKNOWN");
+  }, 30_000);
+
+  // A5: Over-budget-only candidate → ACTIVATE becomes ASK_USER
+  it("A5: only candidate over budget → action ASK_USER (not ACTIVATE)", async () => {
+    // Create a fresh tenant with only one offer priced at 700 (over a 500 budget)
+    const { hashPassword } = await import("@/lib/security");
+    const overBudgetUser = await db.user.create({
+      data: { email: `p955-${Date.now()}@test`, name: "Over Budget", passwordHash: await hashPassword("x"), role: "customer", emailVerified: new Date() },
+    });
+    const obTenant = await db.tenant.create({ data: { name: `P955 ${Date.now()}`, slug: `p955-${Date.now().toString(36)}`, status: "active" } });
+    const obPlan = await db.saaasPlan.findFirst({ where: { name: "starter" } });
+    const obSub = await db.tenantSubscription.create({ data: { tenantId: obTenant.id, saaasPlanId: obPlan!.id, status: "active", billingCycle: "monthly", currentPeriodEnd: new Date(Date.now() + 30 * 86400000) } });
+    const obCap = await db.connectivityCapability.findUnique({ where: { type: "INTERNET" } });
+    const obEnt = await db.connectivityEntitlement.create({ data: { tenantId: obTenant.id, subscriptionId: obSub.id, capabilityId: obCap!.id, status: "ACTIVE", capabilitySet: JSON.stringify({ downloadMbps: 300 }), validFrom: new Date(), userId: overBudgetUser.id } });
+    const obPi = await db.connectivityProviderInstance.create({ data: { tenantId: obTenant.id, providerType: "mock", name: `P955 PI`, status: "active", configuration: JSON.stringify({}) } });
+    const obCapA = await db.protocolCapability.create({ data: { tenantId: obTenant.id, providerInstanceId: obPi.id, type: "INTERNET", providerType: "mock", technicalSpec: JSON.stringify({ downloadMbps: 300 }), coverage: JSON.stringify({ countries: ["GH"] }), reliability: 0.9, status: "active" } });
+    const obResA = await db.protocolResource.create({ data: { capabilityId: obCapA.id, providerInstanceId: obPi.id, identifiers: JSON.stringify({ id: "OB-A" }), state: "AVAILABLE" } });
+    const obOffer = await db.connectivityOffer2.create({
+      data: {
+        tenantId: obTenant.id, capabilityId: obCapA.id,
+        capabilityType: "INTERNET", providerType: "mock",
+        spec: JSON.stringify({ downloadMbps: 300 }), coverage: JSON.stringify({ countries: ["GH"] }),
+        wholesalePriceMinor: 500, customerPriceMinor: 700, currency: "USD", status: "active",
+      },
+    });
+    await createOrUpdatePolicy({ subjectId: overBudgetUser.id, preset: "RELIABLE", mode: "automatic", maxAutoSpendMinor: 10000, requireUserApprovalForPurchase: false });
+
+    try {
+      const intent = await createIntent({
+        subjectId: overBudgetUser.id,
+        rawText: "connectivity under $5",
+        mode: "AUTOMATIC",
+        maxPriceMinor: 500,
+      });
+
+      await processPendingEvents(10, "p955-a5-worker");
+
+      const decision = await db.connectivityDecision.findFirst({
+        where: { intentId: intent.intentId },
+        orderBy: { createdAt: "desc" },
+        select: { action: true, constraintsViolated: true, reasonCodes: true },
+      });
+      expect(decision).not.toBeNull();
+      const violated = JSON.parse(decision?.constraintsViolated || "[]");
+      const codes = JSON.parse(decision?.reasonCodes || "[]");
+
+      // The only candidate (700) is over budget (500)
+      expect(violated).toContain("OVER_BUDGET");
+      expect(codes).toContain("BUDGET_CONSTRAINT");
+      // ACTIVATE should have been downgraded to ASK_USER
+      expect(decision?.action).toBe("ASK_USER");
+    } finally {
+      await db.connectivityIntentRecord.deleteMany({ where: { subjectId: overBudgetUser.id } }).catch(() => {});
+      await db.reevaluationEvent.deleteMany({ where: { subjectId: overBudgetUser.id } }).catch(() => {});
+      await db.connectivityDecision.deleteMany({ where: { intentId: { contains: "intent-" } } }).catch(() => {});
+      await db.connectivityOffer2.deleteMany({ where: { id: obOffer.id } }).catch(() => {});
+      await db.protocolResource.deleteMany({ where: { id: obResA.id } }).catch(() => {});
+      await db.protocolCapability.deleteMany({ where: { id: obCapA.id } }).catch(() => {});
+      await db.connectivityProviderInstance.deleteMany({ where: { id: obPi.id } }).catch(() => {});
+      await db.connectivityEntitlement.deleteMany({ where: { id: obEnt.id } }).catch(() => {});
+      await db.tenantSubscription.deleteMany({ where: { id: obSub.id } }).catch(() => {});
+      await db.connectivityPolicy.deleteMany({ where: { subjectId: overBudgetUser.id } }).catch(() => {});
+      await db.tenant.deleteMany({ where: { id: obTenant.id } }).catch(() => {});
+      await db.user.deleteMany({ where: { id: overBudgetUser.id } }).catch(() => {});
+    }
+  }, 120_000);
 });
