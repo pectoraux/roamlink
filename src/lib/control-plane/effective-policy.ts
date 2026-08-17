@@ -9,9 +9,10 @@
  *   - Policy identity is first-class: uses the stored `preset` field, not
  *     reverse-engineered via detectBasePreset(). A policy created from RELIABLE
  *     carries preset="RELIABLE" even if the user later customizes parameters.
- *   - batterySaver is a server-defined rule, not a hard-coded physical law.
- *     The BATTERY_RULE controls whether batterySaver context overrides the
- *     base preset. A future policy could disable this rule for critical calls.
+ *   - batterySaver is controlled by BATTERY_SAVER_RULE, which is global server
+ *     configuration (not policy state). It cannot be disabled per-policy. If
+ *     per-policy batterySaver behavior is needed, it must be added as a
+ *     first-class policy field, not by mutating the server constant.
  *   - Returns provenance fields (basePolicyId, basePolicyVersion, contextVersion,
  *     contextObservedAt) so the decision engine can persist them.
  *
