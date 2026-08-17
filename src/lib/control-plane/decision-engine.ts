@@ -342,10 +342,12 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
   }
 
   // Step 5: Budget check
-  // Phase 9.5.1: Evaluate budget even when there are no ranked offers —
-  // the intent's budget constraint is authoritative regardless of whether
-  // commerce offers exist. If no offers exist, we record that a budget was
-  // specified but no offers to check against.
+  // Phase 9.5.2: Budget is an attribute of a candidate/resource outcome,
+  // not a prerequisite for the connectivity control plane to function.
+  // Price applies ONLY when a commerce offer has an authoritative price.
+  // A resource with no applicable price (WiFi, enterprise network, already-
+  // entitled cellular) has budget applicability UNKNOWN — it is NOT silently
+  // treated as "budget satisfied" or "budget violated."
   if (input.maxPriceMinor) {
     if (ranking.ranked.length > 0) {
       const topOffer = ranking.ranked[0];
@@ -361,10 +363,11 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
         }
       }
     } else {
-      // No ranked offers — budget was specified but no offers to check against.
-      // Record that the budget constraint was evaluated.
-      constraintsSatisfied.push("WITHIN_BUDGET");
-      reasonCodes.push("BUDGET_CONSTRAINT");
+      // No ranked offers — budget was specified but no candidate has an
+      // authoritative price. Budget applicability is UNKNOWN, not satisfied.
+      // This preserves: Commerce ≠ Connectivity Control Plane.
+      constraintsSatisfied.push("BUDGET_APPLICABILITY_UNKNOWN");
+      // Do NOT push BUDGET_CONSTRAINT — no price was actually evaluated.
     }
   }
 

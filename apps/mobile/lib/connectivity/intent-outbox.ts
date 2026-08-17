@@ -52,10 +52,18 @@ export type IntentOutboxEntry = {
   attemptCount: number;
   lastAttemptAt: string | null;
   status: "PENDING" | "CLAIMED" | "ACKNOWLEDGED" | "FAILED";
+  // Phase 9.5.2: Lease timestamp for CLAIMED state. If the process dies
+  // while CLAIMED, a boot-time reconciliation resets entries whose
+  // claimedAt is older than CLAIM_LEASE_MS back to PENDING.
+  claimedAt: string | null;
   // Server response (set after successful sync)
   serverIntentId?: string;
   serverVersion?: number;
 };
+
+// Phase 9.5.2: CLAIMED lease duration. If an entry has been CLAIMED for
+// longer than this, it is considered orphaned (process died mid-sync).
+const CLAIM_LEASE_MS = 5 * 60 * 1000; // 5 minutes
 
 // ---------------------------------------------------------------------------
 // Serialized mutations (same pattern as observation outbox)
@@ -99,6 +107,7 @@ export async function enqueueIntentOperation(operation: IntentOperation): Promis
     attemptCount: 0,
     lastAttemptAt: null,
     status: "PENDING",
+    claimedAt: null,
   };
 
   return serialized(async () => {
@@ -112,26 +121,65 @@ export async function enqueueIntentOperation(operation: IntentOperation): Promis
 /**
  * Load all entries that need processing (PENDING or FAILED).
  * Does NOT return CLAIMED entries (they are being transmitted).
+ * Phase 9.5.2: Also reclaims orphaned CLAIMED entries whose lease has expired.
  */
 export async function loadPendingIntentOperations(): Promise<IntentOutboxEntry[]> {
   return serialized(async () => {
     const outbox = await loadOutboxUnsafe();
-    return outbox.filter((e) => e.status === "PENDING" || e.status === "FAILED");
+    const now = Date.now();
+    let mutated = false;
+
+    const result = outbox.filter((e) => {
+      if (e.status === "PENDING" || e.status === "FAILED") {
+        return true;
+      }
+      if (e.status === "CLAIMED" && e.claimedAt) {
+        const claimedMs = new Date(e.claimedAt).getTime();
+        if (now - claimedMs > CLAIM_LEASE_MS) {
+          // Orphaned claim — reset to PENDING for retry
+          e.status = "PENDING";
+          e.claimedAt = null;
+          mutated = true;
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (mutated) {
+      await saveOutboxUnsafe(outbox);
+    }
+
+    return result;
   });
 }
 
 /**
  * Claim an entry for transmission (PENDING/FAILED → CLAIMED).
- * This prevents two concurrent flush invocations from working on the same entry.
- * Returns the claimed entry, or null if already claimed.
+ * Sets claimedAt for lease expiry tracking.
+ * Returns true if the claim succeeded, false if already claimed.
  */
 export async function claimIntentOperation(entryId: string): Promise<boolean> {
   return serialized(async () => {
     const outbox = await loadOutboxUnsafe();
     const entry = outbox.find((e) => e.id === entryId);
     if (!entry) return false;
-    if (entry.status === "CLAIMED") return false; // already claimed
+    if (entry.status === "CLAIMED") {
+      // Check lease expiry — if the lease has expired, reclaim
+      if (entry.claimedAt) {
+        const claimedMs = new Date(entry.claimedAt).getTime();
+        if (Date.now() - claimedMs > CLAIM_LEASE_MS) {
+          entry.claimedAt = new Date().toISOString();
+          entry.attemptCount++;
+          entry.lastAttemptAt = new Date().toISOString();
+          await saveOutboxUnsafe(outbox);
+          return true;
+        }
+      }
+      return false; // still within lease
+    }
     entry.status = "CLAIMED";
+    entry.claimedAt = new Date().toISOString();
     entry.attemptCount++;
     entry.lastAttemptAt = new Date().toISOString();
     await saveOutboxUnsafe(outbox);
