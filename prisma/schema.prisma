@@ -2410,6 +2410,11 @@ model ConnectivityIntentRecord {
   priority            String   @default("NORMAL") // LOW | NORMAL | HIGH | CRITICAL
   source              String   @default("USER") // USER | AI_PROPOSAL | COMMERCIAL | SYSTEM
 
+  // Phase 9.4.1: Idempotency key for offline-safe intent creation.
+  // A mobile retry with the same idempotencyKey returns the existing intent
+  // rather than creating a duplicate.
+  idempotencyKey      String?  @unique
+
   // Declarative content (JSON — matches ConnectivityIntentSchema)
   payload             String   // JSON of the intent specification
 

@@ -18,7 +18,7 @@ export async function POST(req: NextRequest) {
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const body = await req.json();
-  const { rawText, capabilityType, desiredSpec, location, maxPriceMinor, mode, priority, expiresAt, deviceId, supersedesIntentId, expectedVersion, source } = body;
+  const { rawText, capabilityType, desiredSpec, location, maxPriceMinor, mode, priority, expiresAt, deviceId, supersedesIntentId, expectedVersion, source, idempotencyKey } = body;
 
   if (!rawText && !capabilityType && !desiredSpec && !location) {
     return NextResponse.json({ error: "At least one of rawText, capabilityType, desiredSpec, or location is required" }, { status: 400 });
@@ -38,6 +38,7 @@ export async function POST(req: NextRequest) {
     source: source ?? "USER",
     supersedesIntentId,
     expectedVersion,
+    idempotencyKey,
   });
 
   if (result.rejected) {

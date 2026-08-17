@@ -70,6 +70,50 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
   const constraintsViolated: string[] = [];
   const reasons: string[] = [];
 
+  // P0-2: Intent expiry enforcement. If an intentId is provided, verify the
+  // intent is ACTIVE and not expired BEFORE producing any actionable decision.
+  // This is an inline check — correctness does not depend on a cron job.
+  if (input.intentId && input.intentVersion) {
+    const { isIntentExpired } = await import("./intent-service");
+    const expired = await isIntentExpired(input.intentId, input.intentVersion);
+    if (expired) {
+      reasons.push("Intent is expired/superseded — no actionable decision");
+      constraintsViolated.push("INTENT_EXPIRED");
+
+      // Persist a WAIT decision with provenance (no action)
+      const decision = await db.connectivityDecision.create({
+        data: {
+          intentId: input.intentId,
+          intentVersion: input.intentVersion,
+          sessionId: input.sessionId ?? null,
+          action: "WAIT",
+          targetResourceId: null,
+          targetOfferId: null,
+          score: 0,
+          constraintsSatisfied: JSON.stringify(constraintsSatisfied),
+          constraintsViolated: JSON.stringify(constraintsViolated),
+          reasons: JSON.stringify(reasons),
+          policyVersion: "default",
+          executionState: "SKIPPED",
+        },
+      });
+
+      logger.info("decision.intent_expired", {
+        decisionId: decision.id, intentId: input.intentId, intentVersion: input.intentVersion,
+      });
+
+      return {
+        decisionId: decision.id,
+        action: "WAIT",
+        score: 0,
+        constraintsSatisfied,
+        constraintsViolated,
+        reasons,
+        rankedOffers: [],
+      };
+    }
+  }
+
   // Phase 9.3.2: Resolve the effective policy FIRST (before anything else).
   // Policy resolution is INTERNAL — no caller-supplied escape hatch.
   const { deriveEffectivePolicy } = await import("./effective-policy");

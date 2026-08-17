@@ -1,15 +1,16 @@
 /**
- * Control Plane — Intent Lifecycle Service (Phase 9.4)
+ * Control Plane — Intent Lifecycle Service (Phase 9.4 + 9.4.1 Control-Loop Closure)
  *
- * Manages the durable ConnectivityIntent lifecycle: creation, versioning,
- * supersession, expiry, cancellation. Enforces optimistic concurrency fencing
- * so an offline replay of an older intent version cannot overwrite a newer one.
+ * Manages the durable ConnectivityIntent lifecycle with:
+ *   - Atomic supersession via db.$transaction (P0-3)
+ *   - Idempotency key for offline-safe creation (P1-4)
+ *   - Strict expectedVersion equality (P1-5)
+ *   - Durable event handoff — no .catch swallow (P1-2)
+ *   - INTENT_CHANGED event type (P1-1)
  *
- *   Intent → ReevaluationEvent → Decision Engine → Decision → Action
+ *   Intent → INTENT_CHANGED event → Reevaluation Worker → makeDecision(intentId, intentVersion, deviceId)
  *
  * NOT: Intent → Action
- *
- * The intent is a REQUEST FOR AN OUTCOME. The decision engine translates it.
  */
 
 import { db } from "@/lib/db";
@@ -33,9 +34,10 @@ export type CreateIntentInput = {
   priority?: "LOW" | "NORMAL" | "HIGH" | "CRITICAL";
   expiresAt?: Date;
   source?: "USER" | "AI_PROPOSAL" | "COMMERCIAL" | "SYSTEM";
-  // For supersession: the intent this one replaces
   supersedesIntentId?: string;
-  expectedVersion?: number; // optimistic fencing — the version the caller expects to supersede
+  expectedVersion?: number;
+  // Phase 9.4.1: Idempotency key for offline-safe creation
+  idempotencyKey?: string;
 };
 
 export type IntentResult = {
@@ -43,20 +45,31 @@ export type IntentResult = {
   version: number;
   status: IntentState;
   rejected?: string;
+  duplicate?: boolean;
 };
 
 /**
  * Create a new intent or a new version of an existing intent.
  *
- * If `supersedesIntentId` is provided, this creates a new version that
- * supersedes the previous one. The previous version is atomically marked
- * SUPERSEDED.
- *
- * If `expectedVersion` is provided, the server validates that the caller's
- * expected version matches the current version before superseding. A stale
- * request (expectedVersion < currentVersion) is rejected.
+ * P1-4: If idempotencyKey is provided, check for an existing intent with
+ * that key and return it (idempotent — mobile retries don't create duplicates).
  */
 export async function createIntent(input: CreateIntentInput): Promise<IntentResult> {
+  // P1-4: Idempotency check
+  if (input.idempotencyKey) {
+    const existing = await db.connectivityIntentRecord.findUnique({
+      where: { idempotencyKey: input.idempotencyKey },
+    });
+    if (existing) {
+      return {
+        intentId: existing.intentId,
+        version: existing.version,
+        status: existing.status as IntentState,
+        duplicate: true,
+      };
+    }
+  }
+
   const payload: ConnectivityIntent = {
     subjectId: input.subjectId,
     deviceId: input.deviceId,
@@ -93,15 +106,19 @@ export async function createIntent(input: CreateIntentInput): Promise<IntentResu
         expiresAt: input.expiresAt ?? null,
         priority: input.priority ?? "NORMAL",
         source: input.source ?? "USER",
+        idempotencyKey: input.idempotencyKey ?? null,
       },
     });
 
     logger.info("intent.created", { intentId, version: 1, subjectId: input.subjectId });
 
+    // P1-2: Durable event handoff — emit INTENT_CHANGED (no .catch swallow)
+    await emitIntentReevaluationEvent(intentId, 1, input.subjectId, input.deviceId);
+
     return { intentId, version: 1, status: "ACTIVE" };
   }
 
-  // Supersession: create a new version, atomically supersede the old one
+  // Supersession: atomic transaction (P0-3)
   return supersedeIntent({
     subjectId: input.subjectId,
     intentId: input.supersedesIntentId,
@@ -111,11 +128,12 @@ export async function createIntent(input: CreateIntentInput): Promise<IntentResu
     priority: input.priority,
     source: input.source,
     deviceId: input.deviceId,
+    idempotencyKey: input.idempotencyKey,
   });
 }
 
 // ---------------------------------------------------------------------------
-// Supersede an intent (atomic version fencing)
+// Supersede an intent — ATOMIC via db.$transaction (P0-3)
 // ---------------------------------------------------------------------------
 
 async function supersedeIntent(input: {
@@ -127,102 +145,127 @@ async function supersedeIntent(input: {
   priority?: string;
   source?: string;
   deviceId?: string;
+  idempotencyKey?: string;
 }): Promise<IntentResult> {
-  // Find the current ACTIVE version of this intent
-  const current = await db.connectivityIntentRecord.findFirst({
-    where: { intentId: input.intentId, status: "ACTIVE" },
-    orderBy: { version: "desc" },
-  });
-
-  if (!current) {
-    return { intentId: input.intentId, version: 0, status: "ACTIVE", rejected: "no-active-intent" };
-  }
-
-  // Validate ownership
-  if (current.subjectId !== input.subjectId) {
-    return { intentId: input.intentId, version: current.version, status: "ACTIVE" as IntentState, rejected: "ownership-violation" };
-  }
-
-  // Phase 9.4: Optimistic fencing — reject stale supersession
-  if (input.expectedVersion !== undefined && input.expectedVersion < current.version) {
-    logger.warn("intent.stale_supersession_rejected", {
-      intentId: input.intentId,
-      expectedVersion: input.expectedVersion,
-      currentVersion: current.version,
+  // P1-4: Idempotency check
+  if (input.idempotencyKey) {
+    const existing = await db.connectivityIntentRecord.findUnique({
+      where: { idempotencyKey: input.idempotencyKey },
     });
-    return {
-      intentId: input.intentId,
-      version: current.version,
-      status: "ACTIVE",
-      rejected: "stale-version",
-    };
+    if (existing) {
+      return {
+        intentId: existing.intentId,
+        version: existing.version,
+        status: existing.status as IntentState,
+        duplicate: true,
+      };
+    }
   }
 
-  // Also check if the intent is already superseded/expired/cancelled
-  if (current.status !== "ACTIVE") {
-    return {
-      intentId: input.intentId,
-      version: current.version,
-      status: current.status as IntentState,
-      rejected: "not-active",
-    };
-  }
+  try {
+    // P0-3: Atomic transaction — supersede old + create new in one transaction
+    const result = await db.$transaction(async (tx) => {
+      // Find current ACTIVE version within the transaction
+      const current = await tx.connectivityIntentRecord.findFirst({
+        where: { intentId: input.intentId, status: "ACTIVE" },
+        orderBy: { version: "desc" },
+      });
 
-  const newVersion = current.version + 1;
+      if (!current) {
+        return { intentId: input.intentId, version: 0, status: "ACTIVE" as IntentState, rejected: "no-active-intent" };
+      }
 
-  // Atomically supersede the old version AND create the new one.
-  // The updateMany with WHERE guard ensures only one writer can supersede.
-  const supersedeResult = await db.connectivityIntentRecord.updateMany({
-    where: {
-      intentId: input.intentId,
-      version: current.version,
-      status: "ACTIVE", // only supersede if still ACTIVE
-    },
-    data: {
-      status: "SUPERSEDED",
-      supersededAt: new Date(),
-    },
-  });
+      // Validate ownership
+      if (current.subjectId !== input.subjectId) {
+        return { intentId: input.intentId, version: current.version, status: "ACTIVE" as IntentState, rejected: "ownership-violation" };
+      }
 
-  if (supersedeResult.count === 0) {
-    // Another writer beat us — re-read and return current state
-    const latest = await db.connectivityIntentRecord.findFirst({
-      where: { intentId: input.intentId },
-      orderBy: { version: "desc" },
+      // P1-5: Strict expectedVersion equality (not just <)
+      if (input.expectedVersion !== undefined && input.expectedVersion !== current.version) {
+        if (input.expectedVersion < current.version) {
+          return { intentId: input.intentId, version: current.version, status: "ACTIVE" as IntentState, rejected: "stale-version" };
+        } else {
+          // expectedVersion > current.version is also wrong
+          return { intentId: input.intentId, version: current.version, status: "ACTIVE" as IntentState, rejected: "version-mismatch" };
+        }
+      }
+
+      if (current.status !== "ACTIVE") {
+        return { intentId: input.intentId, version: current.version, status: current.status as IntentState, rejected: "not-active" };
+      }
+
+      const newVersion = current.version + 1;
+
+      // Atomically supersede the old version
+      const supersedeResult = await tx.connectivityIntentRecord.updateMany({
+        where: {
+          intentId: input.intentId,
+          version: current.version,
+          status: "ACTIVE",
+        },
+        data: {
+          status: "SUPERSEDED",
+          supersededAt: new Date(),
+        },
+      });
+
+      if (supersedeResult.count === 0) {
+        return { intentId: input.intentId, version: current.version, status: "ACTIVE" as IntentState, rejected: "concurrent-supersession" };
+      }
+
+      // Create the new version within the same transaction
+      const newRecord = await tx.connectivityIntentRecord.create({
+        data: {
+          intentId: input.intentId,
+          subjectId: input.subjectId,
+          deviceId: input.deviceId ?? null,
+          version: newVersion,
+          status: "ACTIVE",
+          supersedesIntentId: input.intentId,
+          supersedesVersion: current.version,
+          payload: JSON.stringify(input.payload),
+          expiresAt: input.expiresAt ?? null,
+          priority: input.priority ?? "NORMAL",
+          source: input.source ?? "USER",
+          idempotencyKey: input.idempotencyKey ?? null,
+        },
+      });
+
+      return { intentId: input.intentId, version: newVersion, status: "ACTIVE" as IntentState };
     });
-    return {
-      intentId: input.intentId,
-      version: latest?.version ?? 0,
-      status: (latest?.status ?? "ACTIVE") as IntentState,
-      rejected: "concurrent-supersession",
-    };
-  }
 
-  // Create the new version
-  const newRecord = await db.connectivityIntentRecord.create({
-    data: {
+    // Emit reevaluation OUTSIDE the transaction (event emission is non-fatal
+    // to the intent state, but we DON'T swallow errors — we log them)
+    if (!result.rejected) {
+      try {
+        await emitIntentReevaluationEvent(result.intentId, result.version, input.subjectId, input.deviceId);
+      } catch (err) {
+        // P1-2: Log the error — don't silently swallow. The observation worker
+        // will also process on its cycle, but this is a real failure that should
+        // be visible.
+        logger.error("intent.reevaluation_emission_failed", {
+          intentId: result.intentId,
+          version: result.version,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    logger.info("intent.superseded", {
       intentId: input.intentId,
+      newVersion: result.version,
       subjectId: input.subjectId,
-      deviceId: input.deviceId ?? null,
-      version: newVersion,
-      status: "ACTIVE",
-      supersedesIntentId: input.intentId,
-      supersedesVersion: current.version,
-      payload: JSON.stringify(input.payload),
-      expiresAt: input.expiresAt ?? null,
-      priority: input.priority ?? "NORMAL",
-      source: input.source ?? "USER",
-    },
-  });
+    });
 
-  logger.info("intent.superseded", {
-    intentId: input.intentId,
-    oldVersion: current.version,
-    newVersion,
-    subjectId: input.subjectId,
-  });
-
-  return { intentId: input.intentId, version: newVersion, status: "ACTIVE" };
+    return result;
+  } catch (err) {
+    // Transaction failed — no state was mutated
+    logger.error("intent.supersede_transaction_failed", {
+      intentId: input.intentId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { intentId: input.intentId, version: 0, status: "ACTIVE" as IntentState, rejected: "transaction-failed" };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +279,7 @@ export async function getActiveIntent(subjectId: string): Promise<{
   payload: ConnectivityIntent;
   expiresAt: Date | null;
   createdAt: Date;
+  deviceId: string | null;
 } | null> {
   const record = await db.connectivityIntentRecord.findFirst({
     where: { subjectId, status: "ACTIVE" },
@@ -251,6 +295,7 @@ export async function getActiveIntent(subjectId: string): Promise<{
     payload: JSON.parse(record.payload) as ConnectivityIntent,
     expiresAt: record.expiresAt,
     createdAt: record.createdAt,
+    deviceId: record.deviceId,
   };
 }
 
@@ -303,31 +348,41 @@ export async function cancelIntent(
   intentId: string,
   expectedVersion?: number,
 ): Promise<IntentResult> {
-  const current = await db.connectivityIntentRecord.findFirst({
-    where: { intentId, subjectId, status: "ACTIVE" },
+  // P1-6: Check ownership first — return 403 not 404
+  const anyRecord = await db.connectivityIntentRecord.findFirst({
+    where: { intentId },
+    select: { subjectId: true, version: true, status: true },
     orderBy: { version: "desc" },
   });
 
-  if (!current) {
-    return { intentId, version: 0, status: "ACTIVE", rejected: "no-active-intent" };
+  if (!anyRecord) {
+    return { intentId, version: 0, status: "ACTIVE", rejected: "not-found" };
   }
 
-  // Fencing
-  if (expectedVersion !== undefined && expectedVersion < current.version) {
-    return { intentId, version: current.version, status: "ACTIVE", rejected: "stale-version" };
+  if (anyRecord.subjectId !== subjectId) {
+    return { intentId, version: anyRecord.version, status: "ACTIVE" as IntentState, rejected: "ownership-violation" };
+  }
+
+  if (anyRecord.status !== "ACTIVE") {
+    return { intentId, version: anyRecord.version, status: anyRecord.status as IntentState, rejected: "not-active" };
+  }
+
+  // P1-5: Strict expectedVersion equality
+  if (expectedVersion !== undefined && expectedVersion !== anyRecord.version) {
+    return { intentId, version: anyRecord.version, status: "ACTIVE", rejected: expectedVersion < anyRecord.version ? "stale-version" : "version-mismatch" };
   }
 
   const result = await db.connectivityIntentRecord.updateMany({
-    where: { id: current.id, version: current.version, status: "ACTIVE" },
+    where: { intentId, version: anyRecord.version, status: "ACTIVE" },
     data: { status: "CANCELLED", supersededAt: new Date() },
   });
 
   if (result.count === 0) {
-    return { intentId, version: current.version, status: "ACTIVE", rejected: "concurrent-modification" };
+    return { intentId, version: anyRecord.version, status: "ACTIVE", rejected: "concurrent-modification" };
   }
 
-  logger.info("intent.cancelled", { intentId, version: current.version, subjectId });
-  return { intentId, version: current.version, status: "CANCELLED" };
+  logger.info("intent.cancelled", { intentId, version: anyRecord.version, subjectId });
+  return { intentId, version: anyRecord.version, status: "CANCELLED" };
 }
 
 // ---------------------------------------------------------------------------
@@ -366,25 +421,32 @@ export async function expireStaleIntents(): Promise<{ expired: number }> {
 }
 
 // ---------------------------------------------------------------------------
-// Emit reevaluation signal when intent changes
+// Emit INTENT_CHANGED reevaluation signal (P1-1: first-class event type)
 // ---------------------------------------------------------------------------
 
-export async function emitIntentReevaluationEvent(intentId: string, version: number, subjectId: string): Promise<void> {
+export async function emitIntentReevaluationEvent(
+  intentId: string,
+  version: number,
+  subjectId: string,
+  deviceId?: string,
+): Promise<void> {
+  // P1-1: Use INTENT_CHANGED event type (not MEASUREMENT_RECEIVED)
   await db.reevaluationEvent.create({
     data: {
-      type: "MEASUREMENT_RECEIVED", // reuse existing event type — the worker drains it
+      type: "INTENT_CHANGED",
       subjectId,
+      resourceId: null,
+      sessionId: null,
       payload: JSON.stringify({
-        intentChanged: true,
         intentId,
         intentVersion: version,
+        subjectId,
+        deviceId: deviceId ?? null,
         reason: "intent-update",
       }),
       state: "PENDING",
     },
-  }).catch(() => {
-    // Non-fatal — the observation worker will also process on its cycle
   });
 
-  logger.info("intent.reevaluation_emitted", { intentId, version, subjectId });
+  logger.info("intent.reevaluation_emitted", { intentId, version, subjectId, deviceId });
 }

@@ -252,6 +252,29 @@ export async function evaluateEvent(event: ReevaluationEventRow): Promise<Evalua
   }
 
   const sessionId = necessity.sessionId!;
+
+  // Phase 9.4.1 (P0-1): If this is an INTENT_CHANGED event, resolve the
+  // authoritative intent from the event payload — NOT from session.intentId.
+  // The event carries intentId, intentVersion, subjectId, deviceId.
+  let intentId: string | undefined;
+  let intentVersion: number | undefined;
+  let deviceId: string | undefined;
+  let subjectId: string | undefined;
+
+  if (event.type === "INTENT_CHANGED") {
+    const payload = JSON.parse(event.payload) as {
+      intentId: string;
+      intentVersion: number;
+      subjectId: string;
+      deviceId?: string;
+    };
+    intentId = payload.intentId;
+    intentVersion = payload.intentVersion;
+    deviceId = payload.deviceId;
+    subjectId = payload.subjectId;
+  }
+
+  // If not an INTENT_CHANGED event, resolve from session (legacy path)
   const session = await db.connectivitySession.findUnique({
     where: { id: sessionId },
     select: { id: true, subjectId: true, state: true, intentId: true, activeResourceId: true },
@@ -260,6 +283,11 @@ export async function evaluateEvent(event: ReevaluationEventRow): Promise<Evalua
   if (!session) {
     return { eventId: event.id, decisionAction: "NONE", result: "skipped:session-not-found" };
   }
+
+  // Use intent from event if available, otherwise fall back to session.intentId
+  const effectiveIntentId = intentId ?? session.intentId ?? undefined;
+  const effectiveSubjectId = subjectId ?? session.subjectId;
+  const effectiveDeviceId = deviceId;
 
   const tenantId = await resolveTenantForSession(sessionId);
   if (!tenantId) {
@@ -275,12 +303,16 @@ export async function evaluateEvent(event: ReevaluationEventRow): Promise<Evalua
     capabilityType = resource?.capability?.type ?? undefined;
   }
 
+  // P0-1: Pass intentId, intentVersion, and deviceId from the INTENT_CHANGED
+  // event into makeDecision — not from session.intentId.
   const decision = await makeDecision({
     tenantId,
-    subjectId: session.subjectId,
-    intentId: session.intentId ?? undefined,
+    subjectId: effectiveSubjectId,
+    intentId: effectiveIntentId,
+    intentVersion,
     sessionId: session.id,
     capabilityType,
+    deviceId: effectiveDeviceId,
   });
 
   // Mark KEEP/WAIT/ASK_USER as SKIPPED (no action needed). Non-KEEP stays

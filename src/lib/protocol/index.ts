@@ -370,6 +370,7 @@ export const ReevaluationEventTypeSchema = z.enum([
   "PROVIDER_UNAVAILABLE",
   "LOCATION_CHANGED",
   "POLICY_CHANGED",
+  "INTENT_CHANGED", // Phase 9.4: first-class intent change event (not smuggled through MEASUREMENT_RECEIVED)
 ]);
 export type ReevaluationEventType = z.infer<typeof ReevaluationEventTypeSchema>;
 

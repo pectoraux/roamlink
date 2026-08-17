@@ -33,7 +33,7 @@ export async function POST(
 
   const { intentId } = await params;
   const body = await req.json();
-  const { action, expectedVersion, rawText, capabilityType, desiredSpec, location, maxPriceMinor, mode, priority, expiresAt, deviceId } = body;
+  const { action, expectedVersion, rawText, capabilityType, desiredSpec, location, maxPriceMinor, mode, priority, expiresAt, deviceId, idempotencyKey } = body;
 
   if (action === "cancel") {
     const result = await cancelIntent(user.id, intentId, expectedVersion);
@@ -57,6 +57,7 @@ export async function POST(
       expiresAt: expiresAt ? new Date(expiresAt) : undefined,
       supersedesIntentId: intentId,
       expectedVersion,
+      idempotencyKey,
     });
 
     if (result.rejected) {
