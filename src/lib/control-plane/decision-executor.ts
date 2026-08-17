@@ -114,20 +114,39 @@ export async function claimDecisionForExecution(
   // PENDING), dead-letter it instead of claiming. This is a defensive check —
   // reclaimExpiredDecisionClaims is the primary dead-letter checkpoint, but
   // this catches any decision that somehow reached PENDING with attemptCount >= MAX.
+  //
+  // Phase 11.1.1 (fenced): The dead-letter transition MUST be DB-authoritative.
+  // The read above and this write are separate operations, so an unfenced
+  // update would race with another worker's claim:
+  //   Worker A reads: PENDING, attempts=3
+  //   Worker B claims: PENDING → EXECUTION_CLAIMED (fenced, increments to 4)
+  //   Worker A dead-letters: overwrites EXECUTION_CLAIMED → DEAD_LETTER
+  // This destroys Worker B's claim mid-execution. The fix: make the dead-letter
+  // itself a fenced updateMany with WHERE guards on state + attemptCount.
+  // If count=0, another worker already changed the state (claimed it or already
+  // dead-lettered it) — do NOT overwrite; recurse to the next decision.
   if (claimable.executionAttemptCount >= DECISION_MAX_ATTEMPTS) {
-    await db.connectivityDecision.update({
-      where: { id: claimable.id },
+    const deadLetterResult = await db.connectivityDecision.updateMany({
+      where: {
+        id: claimable.id,
+        executionState: DECISION_PENDING, // still PENDING (not claimed by someone else)
+        executionAttemptCount: { gte: DECISION_MAX_ATTEMPTS }, // still at/over MAX
+      },
       data: {
         executionState: DECISION_DEAD_LETTER,
         executedAt: new Date(),
       },
-    }).catch(() => {});
-    logger.error("decision.dead_lettered_at_claim", {
-      decisionId: claimable.id,
-      attemptCount: claimable.executionAttemptCount,
-      maxAttempts: DECISION_MAX_ATTEMPTS,
     });
-    // Recurse to try the next claimable decision.
+
+    if (deadLetterResult.count > 0) {
+      logger.error("decision.dead_lettered_at_claim", {
+        decisionId: claimable.id,
+        attemptCount: claimable.executionAttemptCount,
+        maxAttempts: DECISION_MAX_ATTEMPTS,
+      });
+    }
+    // Whether we dead-lettered it or another worker beat us to it, this
+    // decision is no longer claimable by us. Recurse to try the next one.
     return claimDecisionForExecution(workerId, filter);
   }
 
@@ -247,23 +266,49 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
 
   // Phase 11.1: Poison-decision check — don't claim a decision that has
   // already exceeded MAX_ATTEMPTS. Dead-letter it instead.
+  //
+  // Phase 11.1.1 (fenced): The dead-letter transition MUST be DB-authoritative.
+  // The read above (findUnique) and this write are separate operations, so an
+  // unfenced update would race with another worker's claim (same TOCTOU as
+  // claimDecisionForExecution). The fix: fenced updateMany with WHERE guards
+  // on state + attemptCount. If count=0, another worker already changed the
+  // state — return the current state, do NOT overwrite it.
   if (decision.executionAttemptCount >= DECISION_MAX_ATTEMPTS) {
-    await db.connectivityDecision.update({
-      where: { id: decisionId },
+    const deadLetterResult = await db.connectivityDecision.updateMany({
+      where: {
+        id: decisionId,
+        executionState: { in: [DECISION_PENDING, DECISION_EXECUTION_CLAIMED] }, // still claimable (not already terminal)
+        executionAttemptCount: { gte: DECISION_MAX_ATTEMPTS }, // still at/over MAX
+      },
       data: {
         executionState: DECISION_DEAD_LETTER,
         executedAt: new Date(),
       },
-    }).catch(() => {});
-    logger.error("decision.dead_lettered_at_execute", {
-      decisionId,
-      attemptCount: decision.executionAttemptCount,
-      maxAttempts: DECISION_MAX_ATTEMPTS,
+    });
+
+    if (deadLetterResult.count > 0) {
+      logger.error("decision.dead_lettered_at_execute", {
+        decisionId,
+        attemptCount: decision.executionAttemptCount,
+        maxAttempts: DECISION_MAX_ATTEMPTS,
+      });
+      return {
+        decisionId,
+        executionState: "FAILED",
+        error: `dead-lettered:max-attempts (${decision.executionAttemptCount} >= ${DECISION_MAX_ATTEMPTS})`,
+      };
+    }
+    // count=0: another worker already changed the state (claimed it, executed
+    // it, or already dead-lettered it). Re-read and return the current state
+    // rather than overwriting it.
+    const current = await db.connectivityDecision.findUnique({
+      where: { id: decisionId },
+      select: { executionState: true },
     });
     return {
       decisionId,
-      executionState: "FAILED",
-      error: `dead-lettered:max-attempts (${decision.executionAttemptCount} >= ${DECISION_MAX_ATTEMPTS})`,
+      executionState: (current?.executionState as "EXECUTED" | "FAILED" | "RECONCILIATION_REQUIRED" | "SKIPPED") ?? "FAILED",
+      error: "decision-state-changed-concurrently",
     };
   }
 
@@ -376,6 +421,17 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
  * instead of being returned to PENDING. Parallel to ReevaluationEvent
  * dead-lettering in reclaimExpiredClaims().
  *
+ * Phase 11.1.1 (fenced): Both transitions (→ DEAD_LETTER and → PENDING) use
+ * fenced updateMany with WHERE guards on state + claim-expiry. The findMany
+ * read and each per-decision write are separate operations, so an unfenced
+ * update would race with a concurrent worker's claim:
+ *   reclaim reads: EXECUTION_CLAIMED, expired, attempts=2
+ *   worker claims it: EXECUTION_CLAIMED → re-claims + increments to 3
+ *   reclaim overwrites: → PENDING (destroying the new claim)
+ * The fix: each update includes `executionState: EXECUTION_CLAIMED` and
+ * `executionClaimExpiresAt: { lt: now }` in the WHERE guard. If count=0,
+ * another worker already changed the state — skip it (don't overwrite).
+ *
  * Returns { reclaimed, deadLettered } so callers can observe both outcomes.
  */
 export async function reclaimExpiredDecisionClaims(): Promise<{ reclaimed: number; deadLettered: number }> {
@@ -395,32 +451,52 @@ export async function reclaimExpiredDecisionClaims(): Promise<{ reclaimed: numbe
   let deadLettered = 0;
 
   for (const decision of expired) {
+    // Phase 11.1.1: Fenced transition — only update if still EXECUTION_CLAIMED
+    // with an expired lease. A concurrent worker may have already claimed it
+    // (incrementing attemptCount) or transitioned it to a terminal state.
+    // We must NOT overwrite that.
     if (decision.executionAttemptCount >= DECISION_MAX_ATTEMPTS) {
       // Phase 11.1: Poison decision — dead-letter, don't retry.
-      await db.connectivityDecision.update({
-        where: { id: decision.id },
+      const result = await db.connectivityDecision.updateMany({
+        where: {
+          id: decision.id,
+          executionState: DECISION_EXECUTION_CLAIMED, // still claimed (not changed since read)
+          executionClaimExpiresAt: { lt: now }, // still expired
+          executionAttemptCount: { gte: DECISION_MAX_ATTEMPTS }, // still at/over MAX
+        },
         data: {
           executionState: DECISION_DEAD_LETTER,
           executedAt: now,
         },
-      }).catch(() => {});
-      deadLettered++;
-      logger.error("decision.dead_lettered_at_reclaim", {
-        decisionId: decision.id,
-        attemptCount: decision.executionAttemptCount,
-        maxAttempts: DECISION_MAX_ATTEMPTS,
       });
+      if (result.count > 0) {
+        deadLettered++;
+        logger.error("decision.dead_lettered_at_reclaim", {
+          decisionId: decision.id,
+          attemptCount: decision.executionAttemptCount,
+          maxAttempts: DECISION_MAX_ATTEMPTS,
+        });
+      }
+      // If count=0: another worker changed the state. Skip — don't overwrite.
     } else {
       // Return to PENDING for retry.
-      await db.connectivityDecision.update({
-        where: { id: decision.id },
+      const result = await db.connectivityDecision.updateMany({
+        where: {
+          id: decision.id,
+          executionState: DECISION_EXECUTION_CLAIMED, // still claimed
+          executionClaimExpiresAt: { lt: now }, // still expired
+          executionAttemptCount: { lt: DECISION_MAX_ATTEMPTS }, // still under MAX
+        },
         data: {
           executionState: DECISION_PENDING,
           executionClaimId: null,
           executionClaimedAt: null,
         },
-      }).catch(() => {});
-      reclaimed++;
+      });
+      if (result.count > 0) {
+        reclaimed++;
+      }
+      // If count=0: another worker changed the state. Skip — don't overwrite.
     }
   }
 

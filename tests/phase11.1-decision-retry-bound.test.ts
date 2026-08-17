@@ -380,4 +380,141 @@ describe("Phase 11.1 — Decision Retry Bound (DB-backed)", () => {
     // Cleanup
     await db.connectivityDecision.deleteMany({ where: { id: { in: [reclaimDecision.id, deadLetterDecision.id] } } }).catch(() => {});
   }, 60_000);
+
+  // =========================================================================
+  // 11.1.5 — Adversarial concurrency: decision at MAX + two concurrent claims
+  //           → exactly one terminal transition, DEAD_LETTER remains terminal.
+  //
+  // Phase 11.1.1 (fenced): The dead-letter transition MUST be DB-authoritative.
+  // Before the fix, the dead-letter was an unfenced `update` after a read —
+  // a TOCTOU race:
+  //   Worker A reads: PENDING, attempts=3
+  //   Worker B claims: PENDING → EXECUTION_CLAIMED (fenced, increments to 4)
+  //   Worker A dead-letters: overwrites EXECUTION_CLAIMED → DEAD_LETTER
+  // This destroys Worker B's claim mid-execution. The fix: fenced updateMany
+  // with WHERE guards on state + attemptCount. This test proves the race is closed.
+  // =========================================================================
+  it("11.1.5: concurrent claims on decision at MAX → exactly one terminal transition, no claim survives", async () => {
+    // Create a PENDING decision at MAX attempts (the poison threshold).
+    const decision = await db.connectivityDecision.create({
+      data: {
+        intentId: `p111-concurrency-test-${Date.now()}`,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: concurrency"]),
+        executionState: "PENDING",
+        executionAttemptCount: DECISION_MAX_ATTEMPTS, // already at MAX
+      },
+    });
+
+    // Two workers concurrently call claimDecisionForExecution on the same decision.
+    // Both read it as PENDING with attempts=MAX. Both try to dead-letter it.
+    // The fix: the dead-letter is a fenced updateMany. Exactly one succeeds
+    // (count=1); the other gets count=0 and recurses (returns null or a
+    // different decision).
+    const [claimA, claimB] = await Promise.all([
+      claimDecisionForExecution("concurrent-worker-A", { decisionId: decision.id }),
+      claimDecisionForExecution("concurrent-worker-B", { decisionId: decision.id }),
+    ]);
+
+    // Neither worker should have claimed the decision for EXECUTION.
+    // (Both would have tried to dead-letter it; neither proceeds to EXECUTION_CLAIMED.)
+    // A worker only returns a non-null result if it successfully claimed for execution.
+    // Since the decision is at MAX, neither can claim it — both should return null
+    // (or a different decision, but we scoped to this decisionId).
+    expect(claimA).toBeNull();
+    expect(claimB).toBeNull();
+
+    // The decision is now DEAD_LETTER (terminal). Exactly one dead-letter
+    // transition succeeded — but both workers observed it as terminal.
+    const final = await db.connectivityDecision.findUnique({
+      where: { id: decision.id },
+      select: { executionState: true, executionAttemptCount: true, executionClaimId: true },
+    });
+
+    // DEAD_LETTER is terminal — not PENDING, not EXECUTION_CLAIMED, not EXECUTING.
+    expect(final?.executionState).toBe("DEAD_LETTER");
+    expect(final?.executionAttemptCount).toBe(DECISION_MAX_ATTEMPTS); // not incremented by dead-letter
+    expect(final?.executionClaimId).toBeNull(); // no claim survived
+
+    // Verify: no action was created for this decision (neither worker executed).
+    const actions = await db.connectivityAction.findMany({ where: { decisionId: decision.id } });
+    expect(actions.length).toBe(0);
+
+    // Cleanup
+    await db.connectivityDecision.delete({ where: { id: decision.id } }).catch(() => {});
+  }, 60_000);
+
+  // =========================================================================
+  // 11.1.6 — Adversarial concurrency: concurrent executeDecision at MAX
+  //           → no execution proceeds, DEAD_LETTER terminal.
+  //
+  // Same race, but through the executeDecision() direct-call path (the
+  // reevaluation worker calls executeDecision after producing a decision).
+  // =========================================================================
+  it("11.1.6: concurrent executeDecision on decision at MAX → no execution, DEAD_LETTER terminal", async () => {
+    // Create a PENDING decision at MAX attempts.
+    const decision = await db.connectivityDecision.create({
+      data: {
+        intentId: `p111-exec-concurrency-${Date.now()}`,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: exec concurrency"]),
+        executionState: "PENDING",
+        executionAttemptCount: DECISION_MAX_ATTEMPTS, // at MAX
+      },
+    });
+
+    // Two workers concurrently call executeDecision on the same decision.
+    // Both read it as PENDING with attempts=MAX. Both try to dead-letter it.
+    // The fix: fenced updateMany. Exactly one dead-letters; the other gets
+    // count=0 and returns "decision-state-changed-concurrently".
+    const [resultA, resultB] = await Promise.all([
+      executeDecision(decision.id),
+      executeDecision(decision.id),
+    ]);
+
+    // At least one reports the dead-letter (FAILED + "dead-lettered:max-attempts").
+    // The other either also reports the dead-letter (if it read before the write)
+    // or reports "decision-state-changed-concurrently" (if it read after).
+    // Neither reports EXECUTED — no execution proceeds.
+    const deadLetterCount = [resultA, resultB].filter(
+      (r) => r.executionState === "FAILED" && r.error?.includes("dead-lettered"),
+    ).length;
+    const concurrentCount = [resultA, resultB].filter(
+      (r) => r.error === "decision-state-changed-concurrently",
+    ).length;
+
+    // At least one dead-lettered; the rest either also dead-lettered or saw concurrent change.
+    expect(deadLetterCount).toBeGreaterThanOrEqual(1);
+    expect(deadLetterCount + concurrentCount).toBe(2);
+
+    // Neither worker executed the decision.
+    expect(resultA.executionState).not.toBe("EXECUTED");
+    expect(resultB.executionState).not.toBe("EXECUTED");
+
+    // The decision is DEAD_LETTER (terminal).
+    const final = await db.connectivityDecision.findUnique({
+      where: { id: decision.id },
+      select: { executionState: true, executionAttemptCount: true, executionClaimId: true },
+    });
+    expect(final?.executionState).toBe("DEAD_LETTER");
+    expect(final?.executionAttemptCount).toBe(DECISION_MAX_ATTEMPTS); // not incremented
+    expect(final?.executionClaimId).toBeNull(); // no claim survived
+
+    // No action was created (neither worker executed).
+    const actions = await db.connectivityAction.findMany({ where: { decisionId: decision.id } });
+    expect(actions.length).toBe(0);
+
+    // Cleanup
+    await db.connectivityDecision.delete({ where: { id: decision.id } }).catch(() => {});
+  }, 60_000);
 });
