@@ -226,9 +226,11 @@ describe("Phase 10.1.1 — Observation Validation Integrity Fixes (DB-backed)", 
     const devA = await freshDevice(fx.userId);
     const devB = await freshDevice(fx.userId);
 
-    // Flood device A with 60 observations (the rate limit threshold). Insert
-    // them directly to avoid the slow synchronous reevaluation path — we only
-    // need the EdgeObservationRecord rows to exist for the rate-limit count.
+    // Pre-insert 60 EdgeObservationRecord rows for device A (raw DB inserts,
+    // within the 60s rate-limit window). After this, device A has 60 records.
+    // The 61st observation (submitted next) will make the count 61 — the first
+    // to exceed the limit. (The exact 60th/61st boundary is proven separately
+    // in test 10.1.1.5.)
     const now = Date.now();
     await db.edgeObservationRecord.createMany({
       data: Array.from({ length: 60 }, (_, i) => ({
@@ -370,4 +372,79 @@ describe("Phase 10.1.1 — Observation Validation Integrity Fixes (DB-backed)", 
     expect(measurement?.integrity).toBe("VALID");
     expect(measurement?.trust).toBe("LIMITED");
   }, 60_000);
+
+  // =========================================================================
+  // 10.1.1.5 — Exact rate-limit boundary: 60th = VALID, 61st = RATE_LIMITED
+  // =========================================================================
+  it("10.1.1.5: exact rate-limit boundary — 60th observation is VALID, 61st is the first RATE_LIMITED", async () => {
+    const dev = await freshDevice(fx.userId);
+
+    // Pre-insert 59 EdgeObservationRecord rows for this device (raw DB inserts,
+    // within the 60s rate-limit window, high sequence numbers to avoid collision).
+    // After this, the device has 59 records. The 60th observation (submitted next)
+    // will make the count 60 — which must be VALID (within the limit).
+    const now = Date.now();
+    await db.edgeObservationRecord.createMany({
+      data: Array.from({ length: 59 }, (_, i) => ({
+        observationId: `boundary-${dev}-${i}-${now}`,
+        deviceId: dev,
+        userId: fx.userId,
+        sessionId: fx.sessionId,
+        resourceId: fx.resourceAId,
+        sequence: 5000 + i,
+        source: "DEVICE",
+        observedAt: new Date(now),
+        payload: JSON.stringify({ boundary: true }),
+      })),
+    });
+
+    // --- The 60th observation (through the real ingestion path) ---
+    // The pipeline creates the record (count becomes 60), then calls
+    // validateObservation which counts 60. With the off-by-one fix (strictly >),
+    // 60 > 60 = false → VALID. The 60th is the LAST observation within the limit.
+    const obs60 = makeObs(dev, 6000, { sessionId: fx.sessionId, resourceId: fx.resourceAId });
+    const ack60 = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs60] });
+    expect(ack60.rejected.length).toBe(0); // accepted
+
+    const record60 = await db.edgeObservationRecord.findUnique({
+      where: { observationId: obs60.observationId },
+      select: { derivedMeasurementId: true },
+    });
+    expect(record60?.derivedMeasurementId).not.toBeNull();
+    const measurement60 = await db.connectivityMeasurement.findUnique({
+      where: { id: record60!.derivedMeasurementId! },
+      select: { integrity: true, trust: true },
+    });
+    // The 60th is VALID — within the limit. NOT RATE_LIMITED.
+    expect(measurement60?.integrity).toBe("VALID");
+    expect(measurement60?.trust).toBe("LIMITED");
+
+    // --- The 61st observation (through the real ingestion path) ---
+    // The pipeline creates the record (count becomes 61), then calls
+    // validateObservation which counts 61. 61 > 60 = true → RATE_LIMITED.
+    // The 61st is the FIRST observation to exceed the limit.
+    const obs61 = makeObs(dev, 6001, { sessionId: fx.sessionId, resourceId: fx.resourceAId });
+    const ack61 = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs61] });
+    expect(ack61.rejected.length).toBe(0); // accepted (persisted for audit)
+
+    const record61 = await db.edgeObservationRecord.findUnique({
+      where: { observationId: obs61.observationId },
+      select: { derivedMeasurementId: true },
+    });
+    expect(record61?.derivedMeasurementId).not.toBeNull();
+    const measurement61 = await db.connectivityMeasurement.findUnique({
+      where: { id: record61!.derivedMeasurementId! },
+      select: { integrity: true, trust: true },
+    });
+    // The 61st is the first RATE_LIMITED — exceeds the limit.
+    expect(measurement61?.integrity).toBe("RATE_LIMITED");
+    expect(measurement61?.trust).toBe("UNTRUSTED");
+
+    // Cleanup so the flood records don't affect other tests.
+    await db.edgeObservationRecord.deleteMany({ where: { deviceId: dev } }).catch(() => {});
+    await db.connectivityMeasurement.deleteMany({
+      where: { resourceId: fx.resourceAId, source: "DEVICE", trust: "UNTRUSTED" },
+    }).catch(() => {});
+    await db.resourceHealth.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
+  }, 90_000);
 });

@@ -135,17 +135,34 @@ export async function validateObservation(input: {
   // context. Counting observation RECORDS (not measurements) is correct
   // because suspicious observations that never project to a measurement
   // (e.g., resource mismatch) still count toward the device's rate limit.
+  //
+  // Phase 10.1.1 (off-by-one fix): The count is performed AFTER the
+  // EdgeObservationRecord has been persisted in ingestOneObservation (step 5
+  // creates the record, step 6 calls validateObservation). So the count
+  // INCLUDES the current observation's own record.
+  //
+  //   Nth observation → count = N (includes itself)
+  //
+  // "max 60 per minute" means observations 1..60 are allowed (VALID), and the
+  // 61st is the first to be classified RATE_LIMITED. Therefore the condition
+  // is strictly-greater-than (>), NOT >=:
+  //
+  //   count = 60 → 60 > 60 = false → VALID    (60th observation, within limit)
+  //   count = 61 → 61 > 60 = true  → RATE_LIMITED (61st, first to exceed)
+  //
+  // The previous `>=` condition fired at count=60, making the 60th observation
+  // (which is within the limit) RATE_LIMITED — an off-by-one.
   const recentCount = await db.edgeObservationRecord.count({
     where: {
       deviceId: input.deviceId,
       observedAt: { gte: new Date(now - OBSERVATION_VALIDATION.rateLimitWindowMs) },
     },
   });
-  if (recentCount >= OBSERVATION_VALIDATION.maxObservationsPerMinute) {
+  if (recentCount > OBSERVATION_VALIDATION.maxObservationsPerMinute) {
     return {
       integrity: "RATE_LIMITED",
       trust: "UNTRUSTED",
-      reason: `${recentCount} observations from device ${input.deviceId} in the last ${OBSERVATION_VALIDATION.rateLimitWindowMs / 1000}s (max ${OBSERVATION_VALIDATION.maxObservationsPerMinute})`,
+      reason: `${recentCount} observations from device ${input.deviceId} in the last ${OBSERVATION_VALIDATION.rateLimitWindowMs / 1000}s (max ${OBSERVATION_VALIDATION.maxObservationsPerMinute}; the 61st in a 60s window is the first to be rate-limited)`,
     };
   }
 

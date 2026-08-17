@@ -122,9 +122,17 @@ export const OBSERVATION_VALIDATION = {
   // ConnectivityMeasurement by resource. This makes the limit genuinely
   // per-device: two devices reporting on the same resource get separate
   // buckets, and a device cannot evade the limit by switching resource context.
+  //
+  // Off-by-one note: the count is performed AFTER the record is persisted (the
+  // pipeline creates the record, then calls validateObservation which counts).
+  // So the count INCLUDES the current observation. The condition in
+  // validateObservation is strictly-greater-than (>): the Nth observation has
+  // count=N, so count>60 fires at N=61 (the 61st), not at N=60 (the 60th,
+  // which is within the limit). This means observations 1..60 are VALID and
+  // the 61st is the first to be RATE_LIMITED.
   // ---------------------------------------------------------------------------
   rateLimitWindowMs: 60_000,      // 1 minute rolling window
-  maxObservationsPerMinute: 60,   // 1 per second max per device
+  maxObservationsPerMinute: 60,   // 1 per second max per device; 61st is rate-limited
 } as const;
 
 // ---------------------------------------------------------------------------
