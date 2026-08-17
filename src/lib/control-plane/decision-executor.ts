@@ -264,8 +264,8 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
   const claimId = `decexec-${decisionId}-${now.getTime()}`;
   const claimExpiresAt = new Date(now.getTime() + DECISION_EXECUTION_LEASE_MS);
 
-  // Phase 11.1: Poison-decision check — don't claim a decision that has
-  // already exceeded MAX_ATTEMPTS. Dead-letter it instead.
+  // Phase 11.1: Poison-decision check — don't claim a PENDING decision that
+  // has already exceeded MAX_ATTEMPTS. Dead-letter it instead.
   //
   // Phase 11.1.1 (fenced): The dead-letter transition MUST be DB-authoritative.
   // The read above (findUnique) and this write are separate operations, so an
@@ -273,11 +273,29 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
   // claimDecisionForExecution). The fix: fenced updateMany with WHERE guards
   // on state + attemptCount. If count=0, another worker already changed the
   // state — return the current state, do NOT overwrite it.
-  if (decision.executionAttemptCount >= DECISION_MAX_ATTEMPTS) {
+  //
+  // Phase 11.1.2 (active-claim protection): The poison check must ONLY
+  // dead-letter a PENDING decision. An EXECUTION_CLAIMED decision belongs to
+  // the claim owner until its lease expires — even if attemptCount >= MAX
+  // (which can legitimately happen: a worker claims at attempts=MAX-1,
+  // increments to MAX, and is mid-execution). A second caller dead-lettering
+  // an EXECUTION_CLAIMED decision would destroy the active claim. The
+  // authoritative path for dead-lettering an expired EXECUTION_CLAIMED claim
+  // is reclaimExpiredDecisionClaims() (which checks claim-expiry).
+  //
+  // Lifecycle:
+  //   PENDING, attempts=MAX
+  //       → executeDecision() → DEAD_LETTER (poison check, PENDING only)
+  //   EXECUTION_CLAIMED, attempts=MAX (active claim, lease not expired)
+  //       → another executeDecision() → claim fails (already-claimed)
+  //       → existing worker remains authoritative
+  //   EXECUTION_CLAIMED + expired lease, attempts=MAX
+  //       → reclaimExpiredDecisionClaims() → DEAD_LETTER (claim-expiry guarded)
+  if (decision.executionAttemptCount >= DECISION_MAX_ATTEMPTS && decision.executionState === DECISION_PENDING) {
     const deadLetterResult = await db.connectivityDecision.updateMany({
       where: {
         id: decisionId,
-        executionState: { in: [DECISION_PENDING, DECISION_EXECUTION_CLAIMED] }, // still claimable (not already terminal)
+        executionState: DECISION_PENDING, // ONLY PENDING — never an active EXECUTION_CLAIMED claim
         executionAttemptCount: { gte: DECISION_MAX_ATTEMPTS }, // still at/over MAX
       },
       data: {
@@ -298,9 +316,9 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
         error: `dead-lettered:max-attempts (${decision.executionAttemptCount} >= ${DECISION_MAX_ATTEMPTS})`,
       };
     }
-    // count=0: another worker already changed the state (claimed it, executed
-    // it, or already dead-lettered it). Re-read and return the current state
-    // rather than overwriting it.
+    // count=0: another worker changed the state (claimed it, executed it, or
+    // already dead-lettered it). Re-read and return the current state rather
+    // than overwriting it.
     const current = await db.connectivityDecision.findUnique({
       where: { id: decisionId },
       select: { executionState: true },

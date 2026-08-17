@@ -517,4 +517,105 @@ describe("Phase 11.1 — Decision Retry Bound (DB-backed)", () => {
     // Cleanup
     await db.connectivityDecision.delete({ where: { id: decision.id } }).catch(() => {});
   }, 60_000);
+
+  // =========================================================================
+  // 11.1.7 — Active MAX-attempt claim cannot be dead-lettered by a second caller.
+  //
+  // Phase 11.1.2 (active-claim protection): A legitimate worker can be
+  // mid-execution with attemptCount = MAX (incremented from MAX-1 to MAX
+  // during its own claim). A second caller invoking executeDecision() must NOT
+  // dead-letter the active claim — the EXECUTION_CLAIMED decision belongs to
+  // the claim owner until its lease expires. The authoritative dead-letter
+  // path for an expired EXECUTION_CLAIMED claim is reclaimExpiredDecisionClaims().
+  //
+  // Before the fix, executeDecision's poison check had `executionState IN
+  // [PENDING, EXECUTION_CLAIMED]` in its WHERE guard — a second caller could
+  // dead-letter an active claim, destroying it mid-execution.
+  //
+  // Lifecycle proven by this test:
+  //   1. PENDING, attempts=MAX-1 → worker A claims → EXECUTION_CLAIMED, attempts=MAX
+  //   2. Worker B calls executeDecision() → must NOT dead-letter (claim is active)
+  //   3. A's claim remains intact; decision stays EXECUTION_CLAIMED; no second action
+  //   4. Expire A's lease → reclaim → DEAD_LETTER (the authoritative path)
+  // =========================================================================
+  it("11.1.7: active MAX-attempt claim cannot be dead-lettered by a second caller; reclaim dead-letters after lease expiry", async () => {
+    // 1. Create a PENDING decision at MAX-1 attempts.
+    const decision = await db.connectivityDecision.create({
+      data: {
+        intentId: `p111-active-claim-${Date.now()}`,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: active claim protection"]),
+        executionState: "PENDING",
+        executionAttemptCount: DECISION_MAX_ATTEMPTS - 1, // MAX-1 (e.g. 2 if MAX=3)
+      },
+    });
+
+    // 2. Worker A claims it via claimDecisionForExecution → EXECUTION_CLAIMED, attempts=MAX.
+    const claimedByA = await claimDecisionForExecution("worker-A", { decisionId: decision.id });
+    expect(claimedByA).not.toBeNull();
+    expect(claimedByA!.attemptCount).toBe(DECISION_MAX_ATTEMPTS); // incremented to MAX
+
+    const afterClaim = await db.connectivityDecision.findUnique({
+      where: { id: decision.id },
+      select: { executionState: true, executionAttemptCount: true, executionClaimId: true, executionClaimExpiresAt: true },
+    });
+    expect(afterClaim?.executionState).toBe("EXECUTION_CLAIMED");
+    expect(afterClaim?.executionAttemptCount).toBe(DECISION_MAX_ATTEMPTS);
+    expect(afterClaim?.executionClaimId).not.toBeNull();
+    const workerAClaimId = afterClaim?.executionClaimId;
+    const workerAClaimExpiresAt = afterClaim?.executionClaimExpiresAt;
+
+    // 3. Before lease expiry, Worker B calls executeDecision() on the same decision.
+    //    Worker B sees EXECUTION_CLAIMED + attempts=MAX. The poison check must NOT
+    //    fire (the decision is EXECUTION_CLAIMED, not PENDING). The claim attempt
+    //    must fail (already-claimed). Worker A's claim must remain intact.
+    const resultB = await executeDecision(decision.id);
+
+    // Worker B does NOT execute — it gets either "decision-already-claimed" or
+    // the current state (EXECUTION_CLAIMED). Crucially, NOT EXECUTED, and NOT
+    // a dead-letter transition.
+    expect(resultB.executionState).not.toBe("EXECUTED");
+    expect(resultB.error).not.toContain("dead-lettered"); // no dead-letter of an active claim
+
+    // 4. Assert Worker A's claim remains intact.
+    const afterB = await db.connectivityDecision.findUnique({
+      where: { id: decision.id },
+      select: { executionState: true, executionAttemptCount: true, executionClaimId: true, executionClaimExpiresAt: true },
+    });
+    expect(afterB?.executionState).toBe("EXECUTION_CLAIMED"); // still claimed, NOT DEAD_LETTER
+    expect(afterB?.executionAttemptCount).toBe(DECISION_MAX_ATTEMPTS); // unchanged
+    expect(afterB?.executionClaimId).toBe(workerAClaimId); // A's claim is intact
+    expect(afterB?.executionClaimExpiresAt?.getTime()).toBe(workerAClaimExpiresAt?.getTime());
+
+    // 5. No second action was created (Worker B did not execute).
+    const actions = await db.connectivityAction.findMany({ where: { decisionId: decision.id } });
+    expect(actions.length).toBe(0);
+
+    // 6. Now expire A's lease and run reclaim. The authoritative dead-letter path
+    //    for an expired EXECUTION_CLAIMED claim with attempts>=MAX is
+    //    reclaimExpiredDecisionClaims().
+    await db.connectivityDecision.update({
+      where: { id: decision.id },
+      data: { executionClaimExpiresAt: new Date(Date.now() - 1000) }, // expire the lease
+    });
+
+    const reclaimResult = await reclaimExpiredDecisionClaims();
+    expect(reclaimResult.deadLettered).toBeGreaterThanOrEqual(1);
+
+    // 7. Assert transition to DEAD_LETTER.
+    const final = await db.connectivityDecision.findUnique({
+      where: { id: decision.id },
+      select: { executionState: true, executionAttemptCount: true },
+    });
+    expect(final?.executionState).toBe("DEAD_LETTER");
+    expect(final?.executionAttemptCount).toBe(DECISION_MAX_ATTEMPTS); // unchanged
+
+    // Cleanup
+    await db.connectivityDecision.delete({ where: { id: decision.id } }).catch(() => {});
+  }, 60_000);
 });
