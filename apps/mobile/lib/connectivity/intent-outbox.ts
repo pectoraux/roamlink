@@ -4,17 +4,20 @@
  * A durable local outbox for intent mutations, mirroring the Phase 9.1
  * observation outbox reliability model.
  *
- *   local intent mutation
- *       ↓
- *   durable outbox (AsyncStorage)
- *       ↓
- *   idempotency key
- *       ↓
- *   server ACK / current version
- *       ↓
- *   safe removal
+ * State machine (accurate as of 9.5.1):
  *
- * The mobile becomes an intent CLIENT, not a decision client.
+ *   PENDING
+ *     ↓
+ *   CLAIMED (SYNCING) — entry is being transmitted, prevents concurrent flush
+ *     ├── success → ACKNOWLEDGED (retained briefly for dedup, then removed)
+ *     └── failure → FAILED (retryable on next cycle)
+ *
+ *   FAILED
+ *     ↓ (retry)
+ *   CLAIMED
+ *
+ * The CLAIMED state prevents two concurrent flush invocations from working
+ * on the same logical entry.
  */
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -48,7 +51,7 @@ export type IntentOutboxEntry = {
   createdAt: string;
   attemptCount: number;
   lastAttemptAt: string | null;
-  status: "PENDING" | "SYNCING" | "ACKNOWLEDGED" | "FAILED";
+  status: "PENDING" | "CLAIMED" | "ACKNOWLEDGED" | "FAILED";
   // Server response (set after successful sync)
   serverIntentId?: string;
   serverVersion?: number;
@@ -107,7 +110,8 @@ export async function enqueueIntentOperation(operation: IntentOperation): Promis
 }
 
 /**
- * Load all pending (non-acknowledged) intent operations.
+ * Load all entries that need processing (PENDING or FAILED).
+ * Does NOT return CLAIMED entries (they are being transmitted).
  */
 export async function loadPendingIntentOperations(): Promise<IntentOutboxEntry[]> {
   return serialized(async () => {
@@ -117,7 +121,26 @@ export async function loadPendingIntentOperations(): Promise<IntentOutboxEntry[]
 }
 
 /**
- * Mark an outbox entry as acknowledged (server accepted it).
+ * Claim an entry for transmission (PENDING/FAILED → CLAIMED).
+ * This prevents two concurrent flush invocations from working on the same entry.
+ * Returns the claimed entry, or null if already claimed.
+ */
+export async function claimIntentOperation(entryId: string): Promise<boolean> {
+  return serialized(async () => {
+    const outbox = await loadOutboxUnsafe();
+    const entry = outbox.find((e) => e.id === entryId);
+    if (!entry) return false;
+    if (entry.status === "CLAIMED") return false; // already claimed
+    entry.status = "CLAIMED";
+    entry.attemptCount++;
+    entry.lastAttemptAt = new Date().toISOString();
+    await saveOutboxUnsafe(outbox);
+    return true;
+  });
+}
+
+/**
+ * Acknowledge an entry (CLAIMED → ACKNOWLEDGED, then removed).
  * The entry is removed after acknowledgment.
  */
 export async function acknowledgeIntentOperation(entryId: string, serverIntentId: string, serverVersion: number): Promise<void> {
@@ -129,7 +152,7 @@ export async function acknowledgeIntentOperation(entryId: string, serverIntentId
 }
 
 /**
- * Mark an outbox entry as failed (will retry on next sync cycle).
+ * Fail an entry (CLAIMED → FAILED, retryable on next cycle).
  */
 export async function failIntentOperation(entryId: string): Promise<void> {
   return serialized(async () => {
@@ -137,8 +160,6 @@ export async function failIntentOperation(entryId: string): Promise<void> {
     const entry = outbox.find((e) => e.id === entryId);
     if (entry) {
       entry.status = "FAILED";
-      entry.attemptCount++;
-      entry.lastAttemptAt = new Date().toISOString();
       await saveOutboxUnsafe(outbox);
     }
   });
@@ -148,8 +169,10 @@ export async function failIntentOperation(entryId: string): Promise<void> {
  * Get the current outbox size (for UI/debug).
  */
 export async function getIntentOutboxSize(): Promise<number> {
-  const outbox = await loadPendingIntentOperations();
-  return outbox.length;
+  return serialized(async () => {
+    const outbox = await loadOutboxUnsafe();
+    return outbox.filter((e) => e.status === "PENDING" || e.status === "FAILED").length;
+  });
 }
 
 /**

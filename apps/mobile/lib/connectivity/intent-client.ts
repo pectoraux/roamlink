@@ -14,6 +14,7 @@ import { getDeviceId } from "./device-context";
 import {
   enqueueIntentOperation,
   loadPendingIntentOperations,
+  claimIntentOperation,
   acknowledgeIntentOperation,
   failIntentOperation,
   type CreateIntentPayload,
@@ -127,6 +128,11 @@ export async function flushIntentOutbox(): Promise<{ synced: number; failed: num
   let failed = 0;
 
   for (const entry of pending) {
+    // Phase 9.5.1: Claim the entry before transmission (PENDING/FAILED → CLAIMED).
+    // This prevents two concurrent flush invocations from working on the same entry.
+    const claimed = await claimIntentOperation(entry.id);
+    if (!claimed) continue; // already claimed by another flush
+
     try {
       const result = await syncOneOperation(token, entry);
       if (result) {

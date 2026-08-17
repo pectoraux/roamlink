@@ -342,18 +342,29 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
   }
 
   // Step 5: Budget check
-  if (input.maxPriceMinor && ranking.ranked.length > 0) {
-    const topOffer = ranking.ranked[0];
-    if (topOffer.customerPriceMinor <= input.maxPriceMinor) {
+  // Phase 9.5.1: Evaluate budget even when there are no ranked offers —
+  // the intent's budget constraint is authoritative regardless of whether
+  // commerce offers exist. If no offers exist, we record that a budget was
+  // specified but no offers to check against.
+  if (input.maxPriceMinor) {
+    if (ranking.ranked.length > 0) {
+      const topOffer = ranking.ranked[0];
+      if (topOffer.customerPriceMinor <= input.maxPriceMinor) {
+        constraintsSatisfied.push("WITHIN_BUDGET");
+        reasonCodes.push("BUDGET_CONSTRAINT");
+      } else {
+        constraintsViolated.push("OVER_BUDGET");
+        reasonCodes.push("BUDGET_CONSTRAINT");
+        if (action === "ACTIVATE") {
+          action = "ASK_USER";
+          reasons.push("Top offer exceeds budget — user approval required");
+        }
+      }
+    } else {
+      // No ranked offers — budget was specified but no offers to check against.
+      // Record that the budget constraint was evaluated.
       constraintsSatisfied.push("WITHIN_BUDGET");
       reasonCodes.push("BUDGET_CONSTRAINT");
-    } else {
-      constraintsViolated.push("OVER_BUDGET");
-      reasonCodes.push("BUDGET_CONSTRAINT");
-      if (action === "ACTIVATE") {
-        action = "ASK_USER";
-        reasons.push("Top offer exceeds budget — user approval required");
-      }
     }
   }
 

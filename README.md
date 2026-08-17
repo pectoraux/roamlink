@@ -1,25 +1,59 @@
-# RoamLink — eSIM Reseller Marketplace (MVP)
+# RoamLink — Connectivity Operating System
 
-RoamLink is a **Level 1 eSIM reseller marketplace**: a storefront that lets
-travelers browse, buy, install, and top up travel eSIM data plans. It is built
-as a provider-independent platform — the storefront never talks to a specific
-eSIM or payment provider directly. Everything goes through adapter interfaces,
-so swapping in a real telecom provider (Airalo, Soracom, eSIMX, …) or a real
-payment provider (Stripe, Paystack, …) only requires implementing one adapter
-per side.
+RoamLink is a **connectivity control plane** that autonomously orchestrates
+connectivity across heterogeneous resources (WiFi, cellular, eSIM). It is
+not merely an eSIM marketplace — the marketplace is one of several product
+surfaces that sit on top of the frozen connectivity control plane.
 
-This repository is the **MVP**: a fully-functional end-to-end flow backed by a
-mock eSIM provider and a mock payment provider that exercise the exact same
-server-side code paths a real integration would. The mock provider generates
-clearly-marked **development** values (fake ICCIDs, fake SM-DP+ addresses, fake
-activation codes) so you can demo the entire purchase → install → usage → top-up
-journey locally.
+## Architecture
 
-> ⚠️ **No real telecom or payment credentials are shipped.** Real provider
-> integrations are *documented boundaries* — see
-> [`docs/esim-provider.md`](docs/esim-provider.md) and
-> [`docs/payments.md`](docs/payments.md). Never fabricate a provider API;
-> implement only against the provider's real, documented HTTP API.
+```
+User / Edge (mobile)
+  ├── Observation (Phase 9.1)
+  ├── Device Context (Phase 9.3)
+  └── Connectivity Intent (Phase 9.4 — declarative, versioned, fenced)
+          ↓
+  Server Control Plane
+  ├── Policy Resolution (base policy + device context → effective policy)
+  ├── Decision Engine (deterministic, with intent + policy + observation provenance)
+  ├── Fenced Execution (Phase 8 — atomic, recoverable)
+  └── Verification (invariant: provider truth + session + resource + binding converge)
+          ↓
+  Frozen Connectivity Kernel (entitlement, binding, lease, convergence)
+          ↓
+  Provider Adapters (MikroTik, eSIM, mock — FROZEN contract)
+          ↓
+  Provider Infrastructure
+```
+
+### Key invariants
+
+- **Intent ≠ Decision ≠ Action** — three separate protocol concepts
+- **AI never has authority** — AI proposes structured intent; the deterministic control plane decides
+- **Mobile ≠ Control Plane** — the edge is an observer + intent client, never a decision authority
+- **Commerce ≠ Connectivity Control** — the marketplace is a product surface, not a control-plane bypass
+
+### Frozen layers
+
+| Layer | Status |
+|---|---|
+| Connectivity kernel (`entitlement.ts`) | FROZEN |
+| Adapter contract | FROZEN |
+| Ranking engine | FROZEN |
+| Double-entry ledger | FROZEN |
+| Phase 8 execution fencing | FROZEN |
+| Phase 9.1 observation protocol | FROZEN |
+| Phase 9.2 current-connectivity projection | FROZEN |
+| Phase 9.3 context semantics | FROZEN |
+| Phase 9.3.2 policy authority/provenance | FROZEN |
+| Phase 9.4 intent lifecycle | FROZEN |
+
+### Product surfaces
+
+1. **eSIM Marketplace** — browse, buy, install, top up travel eSIM data plans
+2. **Connectivity Control Plane** — autonomous connectivity switching with observation, policy, intent
+3. **Mobile Agent** — edge observation, intent submission, current-connectivity display
+4. **Reseller Portal** — reseller economics, analytics, infrastructure management
 
 ---
 
