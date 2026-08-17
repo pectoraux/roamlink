@@ -2127,12 +2127,18 @@ model ConnectivityDecision {
   // Phase 8.6.6: Fenced execution — PENDING → EXECUTION_CLAIMED → EXECUTING
   //   → EXECUTED | FAILED | RECONCILIATION_REQUIRED | SKIPPED.
   //   Two workers cannot execute the same decision concurrently.
-  executionState  String   @default("PENDING") // PENDING | EXECUTION_CLAIMED | EXECUTING | EXECUTED | FAILED | RECONCILIATION_REQUIRED | SKIPPED
+  // Phase 11.1: DEAD_LETTER state for poison decisions (exceeded MAX_ATTEMPTS).
+  executionState  String   @default("PENDING") // PENDING | EXECUTION_CLAIMED | EXECUTING | EXECUTED | FAILED | RECONCILIATION_REQUIRED | SKIPPED | DEAD_LETTER
   // Phase 8.6.6: Execution fencing — only the worker holding executionClaimId
   // may execute the decision. Expired claims are reclaimable.
   executionClaimId String?
   executionClaimedAt DateTime?
   executionClaimExpiresAt DateTime?
+  // Phase 11.1: Attempt count — incremented each time the decision is claimed
+  // for execution. Bounds the crash-retry loop: a decision that crashes the
+  // worker more than DECISION_MAX_ATTEMPTS times is dead-lettered (poison-
+  // decision protection, parallel to ReevaluationEvent dead-lettering).
+  executionAttemptCount Int @default(0)
   executedAt      DateTime?
   // Phase 8.6.6: The action id produced by execution (audit link).
   executedActionId String?

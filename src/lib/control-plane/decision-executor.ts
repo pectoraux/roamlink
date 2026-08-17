@@ -41,6 +41,7 @@ export const DECISION_EXECUTED = "EXECUTED" as const;
 export const DECISION_FAILED = "FAILED" as const;
 export const DECISION_RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED" as const;
 export const DECISION_SKIPPED = "SKIPPED" as const;
+export const DECISION_DEAD_LETTER = "DEAD_LETTER" as const;
 
 /** Lease duration for a claimed decision. A crashed worker's claim expires after this. */
 export const DECISION_EXECUTION_LEASE_MS = 5 * 60_000; // 5 minutes — action execution can be slow
@@ -74,7 +75,10 @@ export type DecisionExecutionResult = {
  * The claim is atomic (updateMany with a WHERE guard) so two concurrent
  * workers cannot both claim the same decision.
  */
-export async function claimDecisionForExecution(workerId: string): Promise<{
+export async function claimDecisionForExecution(
+  workerId: string,
+  filter?: { decisionId?: string; sessionId?: string },
+): Promise<{
   id: string;
   action: string;
   sessionId: string | null;
@@ -86,7 +90,8 @@ export async function claimDecisionForExecution(workerId: string): Promise<{
   const claimId = `decexec-claim-${workerId}-${now.getTime()}-${Math.random().toString(36).slice(2, 8)}`;
   const claimExpiresAt = new Date(now.getTime() + DECISION_EXECUTION_LEASE_MS);
 
-  // Find the oldest claimable non-KEEP decision.
+  // Find the oldest claimable non-KEEP decision. An optional filter scopes the
+  // claim to a specific decision or session (parallel to claimReevaluationEvent).
   const claimable = await db.connectivityDecision.findFirst({
     where: {
       OR: [
@@ -94,6 +99,8 @@ export async function claimDecisionForExecution(workerId: string): Promise<{
         { executionState: DECISION_EXECUTION_CLAIMED, executionClaimExpiresAt: { lt: now } },
       ],
       action: { notIn: ["KEEP", "WAIT", "ASK_USER"] },
+      ...(filter?.decisionId ? { id: filter.decisionId } : {}),
+      ...(filter?.sessionId ? { sessionId: filter.sessionId } : {}),
     },
     orderBy: { createdAt: "asc" },
     take: 1,
@@ -101,7 +108,30 @@ export async function claimDecisionForExecution(workerId: string): Promise<{
 
   if (!claimable) return null;
 
-  // Fenced update: only transition if still claimable.
+  // Phase 11.1: Poison-decision protection. If this decision has already been
+  // claimed DECISION_MAX_ATTEMPTS times (the worker crashed mid-execution each
+  // time, the lease expired, and reclaimExpiredDecisionClaims returned it to
+  // PENDING), dead-letter it instead of claiming. This is a defensive check —
+  // reclaimExpiredDecisionClaims is the primary dead-letter checkpoint, but
+  // this catches any decision that somehow reached PENDING with attemptCount >= MAX.
+  if (claimable.executionAttemptCount >= DECISION_MAX_ATTEMPTS) {
+    await db.connectivityDecision.update({
+      where: { id: claimable.id },
+      data: {
+        executionState: DECISION_DEAD_LETTER,
+        executedAt: new Date(),
+      },
+    }).catch(() => {});
+    logger.error("decision.dead_lettered_at_claim", {
+      decisionId: claimable.id,
+      attemptCount: claimable.executionAttemptCount,
+      maxAttempts: DECISION_MAX_ATTEMPTS,
+    });
+    // Recurse to try the next claimable decision.
+    return claimDecisionForExecution(workerId, filter);
+  }
+
+  // Fenced update: only transition if still claimable. Increment attemptCount.
   const result = await db.connectivityDecision.updateMany({
     where: {
       id: claimable.id,
@@ -115,15 +145,19 @@ export async function claimDecisionForExecution(workerId: string): Promise<{
       executionClaimId: claimId,
       executionClaimedAt: now,
       executionClaimExpiresAt: claimExpiresAt,
+      executionAttemptCount: { increment: 1 },
     },
   });
 
   if (result.count === 0) {
     // Another worker beat us — try the next one.
-    return claimDecisionForExecution(workerId);
+    return claimDecisionForExecution(workerId, filter);
   }
 
-  logger.info("decision.claimed", { decisionId: claimable.id, claimId });
+  const newAttemptCount = claimable.executionAttemptCount + 1;
+  logger.info("decision.claimed", {
+    decisionId: claimable.id, claimId, attemptCount: newAttemptCount,
+  });
 
   return {
     id: claimable.id,
@@ -131,7 +165,7 @@ export async function claimDecisionForExecution(workerId: string): Promise<{
     sessionId: claimable.sessionId,
     targetResourceId: claimable.targetResourceId,
     reasons: claimable.reasons,
-    attemptCount: 0, // not tracked on the row yet; could add a column if needed
+    attemptCount: newAttemptCount,
   };
 }
 
@@ -154,7 +188,7 @@ export async function claimDecisionForExecution(workerId: string): Promise<{
 export async function executeDecision(decisionId: string): Promise<DecisionExecutionResult> {
   const decision = await db.connectivityDecision.findUnique({
     where: { id: decisionId },
-    select: { id: true, sessionId: true, action: true, targetResourceId: true, reasons: true, executionState: true, intentId: true, intentVersion: true },
+    select: { id: true, sessionId: true, action: true, targetResourceId: true, reasons: true, executionState: true, intentId: true, intentVersion: true, executionAttemptCount: true },
   });
 
   if (!decision) {
@@ -204,9 +238,34 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
   }
 
   // Phase 8.6.6: Fenced claim — only one worker may proceed.
+  // Phase 11.1: Increment executionAttemptCount at claim time (same as
+  // claimDecisionForExecution). This is the direct-call path (reevaluation
+  // worker calls executeDecision after producing a decision).
   const now = new Date();
   const claimId = `decexec-${decisionId}-${now.getTime()}`;
   const claimExpiresAt = new Date(now.getTime() + DECISION_EXECUTION_LEASE_MS);
+
+  // Phase 11.1: Poison-decision check — don't claim a decision that has
+  // already exceeded MAX_ATTEMPTS. Dead-letter it instead.
+  if (decision.executionAttemptCount >= DECISION_MAX_ATTEMPTS) {
+    await db.connectivityDecision.update({
+      where: { id: decisionId },
+      data: {
+        executionState: DECISION_DEAD_LETTER,
+        executedAt: new Date(),
+      },
+    }).catch(() => {});
+    logger.error("decision.dead_lettered_at_execute", {
+      decisionId,
+      attemptCount: decision.executionAttemptCount,
+      maxAttempts: DECISION_MAX_ATTEMPTS,
+    });
+    return {
+      decisionId,
+      executionState: "FAILED",
+      error: `dead-lettered:max-attempts (${decision.executionAttemptCount} >= ${DECISION_MAX_ATTEMPTS})`,
+    };
+  }
 
   const claimResult = await db.connectivityDecision.updateMany({
     where: {
@@ -222,6 +281,7 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
       executionClaimId: claimId,
       executionClaimedAt: now,
       executionClaimExpiresAt: claimExpiresAt,
+      executionAttemptCount: { increment: 1 },
     },
   });
 
@@ -308,25 +368,66 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
 /**
  * Reclaim decisions whose execution claims have expired (the worker died
  * mid-execution). Returns them to PENDING so another worker can retry.
+ *
+ * Phase 11.1: Dead-letter decisions that have exceeded DECISION_MAX_ATTEMPTS.
+ * This is the primary poison-decision checkpoint — the crash-retry loop
+ * (EXECUTION_CLAIMED → lease expires → PENDING → claim → crash → ...) is
+ * bounded: after DECISION_MAX_ATTEMPTS claims, the decision is dead-lettered
+ * instead of being returned to PENDING. Parallel to ReevaluationEvent
+ * dead-lettering in reclaimExpiredClaims().
+ *
+ * Returns { reclaimed, deadLettered } so callers can observe both outcomes.
  */
-export async function reclaimExpiredDecisionClaims(): Promise<{ reclaimed: number }> {
+export async function reclaimExpiredDecisionClaims(): Promise<{ reclaimed: number; deadLettered: number }> {
   const now = new Date();
-  const result = await db.connectivityDecision.updateMany({
+
+  // Find expired-claim decisions.
+  const expired = await db.connectivityDecision.findMany({
     where: {
       executionState: DECISION_EXECUTION_CLAIMED,
       executionClaimExpiresAt: { lt: now },
     },
-    data: {
-      executionState: DECISION_PENDING,
-      executionClaimId: null,
-      executionClaimedAt: null,
-    },
+    select: { id: true, executionAttemptCount: true },
+    take: 100,
   });
 
-  if (result.count > 0) {
-    logger.info("decision.claims_reclaimed", { reclaimed: result.count });
+  let reclaimed = 0;
+  let deadLettered = 0;
+
+  for (const decision of expired) {
+    if (decision.executionAttemptCount >= DECISION_MAX_ATTEMPTS) {
+      // Phase 11.1: Poison decision — dead-letter, don't retry.
+      await db.connectivityDecision.update({
+        where: { id: decision.id },
+        data: {
+          executionState: DECISION_DEAD_LETTER,
+          executedAt: now,
+        },
+      }).catch(() => {});
+      deadLettered++;
+      logger.error("decision.dead_lettered_at_reclaim", {
+        decisionId: decision.id,
+        attemptCount: decision.executionAttemptCount,
+        maxAttempts: DECISION_MAX_ATTEMPTS,
+      });
+    } else {
+      // Return to PENDING for retry.
+      await db.connectivityDecision.update({
+        where: { id: decision.id },
+        data: {
+          executionState: DECISION_PENDING,
+          executionClaimId: null,
+          executionClaimedAt: null,
+        },
+      }).catch(() => {});
+      reclaimed++;
+    }
   }
-  return { reclaimed: result.count };
+
+  if (reclaimed > 0 || deadLettered > 0) {
+    logger.info("decision.claims_reclaimed", { reclaimed, deadLettered });
+  }
+  return { reclaimed, deadLettered };
 }
 
 // ---------------------------------------------------------------------------
