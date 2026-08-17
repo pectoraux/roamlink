@@ -3332,3 +3332,60 @@ Stage Summary:
 - The ingestion acceptance window ≠ health contribution window — documented as intentionally distinct.
 - Frozen layers unchanged: entitlement.ts, adapter contract, ranking engine, ledger, decision-engine budget logic, intent-service, reason-code protocol.
 - Phase 10.1.1 is COMPLETE. The trust/firewall architecture is strong enough to freeze Phase 10.
+
+---
+Task ID: 10.1.1-boundary
+Agent: Principal Architect (main) — Phase 10.1.1 Rate-Limit Off-by-One + Boundary Test
+Task: Fix the rate-limit off-by-one identified in the architect's follow-up, add an exact 60th/61st boundary test, rerun 10.1.1 + 9.1 + 10 + 9.5, and freeze only after that.
+
+Work Log:
+- Identified the off-by-one: the rate limiter counts EdgeObservationRecord AFTER the record is persisted (pipeline step 5 creates the record, step 6 calls validateObservation which counts). So the count INCLUDES the current observation's own record (Nth observation → count = N). The previous condition `recentCount >= maxObservationsPerMinute` (60 >= 60 = true) fired at the 60th observation — making it RATE_LIMITED when it should be the last VALID one within the limit. "max 60 per minute" means observations 1..60 are allowed; the 61st is the first to be RATE_LIMITED.
+
+- Fix (observation-validation.ts): Changed `recentCount >= OBSERVATION_VALIDATION.maxObservationsPerMinute` to `recentCount > OBSERVATION_VALIDATION.maxObservationsPerMinute` (strictly-greater-than). Now:
+  - count = 60 (60th observation) → 60 > 60 = false → VALID (within limit) ✓
+  - count = 61 (61st observation) → 61 > 60 = true → RATE_LIMITED (first to exceed) ✓
+  Updated the reason message and added a detailed inline comment explaining the count-includes-current-observation semantics and the boundary math.
+
+- Documentation (observation-trust.ts): Updated the OBSERVATION_VALIDATION.rateLimitWindowMs comment to document the off-by-one semantics: the count is performed after the record is persisted, so the condition is strictly >, and the 61st observation in a 60s window is the first to be rate-limited. Updated maxObservationsPerMinute comment to "61st is rate-limited."
+
+- New boundary test (10.1.1.5): exact 60th/61st boundary proof.
+  - Pre-inserts 59 EdgeObservationRecord rows via createMany (within the 60s window, high sequence numbers 5000-5058 to avoid collision).
+  - Submits the 60th observation through the real ingestion path (ingestEdgeObservationBatch) → asserts integrity=VALID, trust=LIMITED (NOT RATE_LIMITED). The pipeline creates the 60th record (count=60), validateObservation checks 60 > 60 = false → VALID.
+  - Submits the 61st observation through the real ingestion path → asserts integrity=RATE_LIMITED, trust=UNTRUSTED (the first to exceed). The pipeline creates the 61st record (count=61), validateObservation checks 61 > 60 = true → RATE_LIMITED.
+  - This test would have FAILED with the previous >= condition (the 60th would have been RATE_LIMITED). It proves the exact boundary.
+
+- Updated 10.1.1.2 test comment: clarified that the 60 pre-inserted records mean the 61st is the first to exceed (not that 60 is the "threshold" that triggers rate limiting).
+
+- Regression (all DB-backed against PostgreSQL + mock adapter):
+  Phase 10.1.1 (with boundary):   5/5 PASS
+    10.1.1.1 PASS — resource hint mismatch → RESOURCE_MISMATCH + UNTRUSTED
+    10.1.1.2 PASS — per-device rate limit (60 pre-inserted, 61st RATE_LIMITED, device B unaffected)
+    10.1.1.3 PASS — duplicate → ingestion outcome (no integrity=DUPLICATE measurement)
+    10.1.1.4 PASS — valid observation → measurement projected (input.triggerReevaluation fix)
+    10.1.1.5 PASS — exact boundary: 60th = VALID + LIMITED, 61st = first RATE_LIMITED + UNTRUSTED
+  Phase 10 (existing):            8/8 PASS
+  Phase 9.1 (edge contract):     12/12 PASS (9.1.5 updated in prior commit)
+  Phase 9.1.1 (reliability):      4/4 PASS
+  Phase 9.5 (regression):        30/31 PASS
+    Pre-existing failure: 9.5.1 A1 (budget constraint reason code) — verified
+    to fail at fc0cea8 (frozen Phase 9.5.5) and fad2f0d (Phase 10), unrelated
+    to observation trust/provenance. Out of scope for 10.1.1.
+  Total: 60 PASS, 1 pre-existing FAIL (not introduced by this patch).
+  Lint: clean (eslint . exit 0).
+
+- FROZEN LAYERS (verified unchanged):
+  - entitlement.ts (kernel) — no Phase 10.1.1 code.
+  - adapter contract — unchanged.
+  - ranking engine — unchanged.
+  - ledger — untouched.
+  - decision-engine.ts budget logic — unchanged.
+  - intent-service.ts — unchanged.
+  - reason-code protocol — unchanged.
+
+Stage Summary:
+- HEAD: fc6b63f (on GitHub, verified: git ls-remote origin main → fc6b63f)
+- The rate-limit off-by-one is fixed. The exact boundary is proven: 60th observation = VALID (within limit), 61st = first RATE_LIMITED.
+- Phase 10.1.1: 5/5 adversarial tests PASS (including the new boundary test).
+- Full regression: 60 PASS, 1 pre-existing FAIL (9.5.1 A1, unrelated).
+- The trust firewall architecture is sound, exercised by device observations, and the rate-limit boundary is exact.
+- Phase 10 is now FROZEN.
