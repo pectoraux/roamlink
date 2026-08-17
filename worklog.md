@@ -3516,3 +3516,50 @@ Stage Summary:
   + "A worker's claim cannot be destroyed by a concurrent dead-letter."
 - Phase 11.1 is now legitimately closed. The decision state machine is clean enough for Phase 11.2 to build its session-level serialization primitive on top.
 - Next: Phase 11.2 — Session-level execution serialization (DB-authoritative primitive, highest-risk area).
+
+---
+Task ID: 11.1.2
+Agent: Principal Architect (main) — Phase 11.1.2 Active-Claim Protection
+Task: Close the remaining concurrency hole in 11.1.1. executeDecision()'s poison check included EXECUTION_CLAIMED in its WHERE guard, allowing a second caller to dead-letter a legitimate worker's active claim while it was mid-execution. The architect's audit of 6fdb8c4 identified this precisely.
+
+Work Log:
+- Audited 6fdb8c4 directly. Confirmed the race:
+  - executeDecision() poison check WHERE: `executionState IN [PENDING, EXECUTION_CLAIMED] AND executionAttemptCount >= MAX`.
+  - The EXECUTION_CLAIMED branch is unsafe. A legitimate worker A claims at attempts=MAX-1, increments to MAX during the claim, and is mid-execution. A second caller B sees EXECUTION_CLAIMED + attempts=MAX and dead-letters it. The WHERE guard does NOT check: whether the existing claim is expired, whether the caller owns the claim, or the lease expiry.
+  - This is precisely the claim-destruction race that 6fdb8c4 was supposed to eliminate.
+
+- Fix — executeDecision() poison check (decision-executor.ts):
+  - Changed the condition from `if (decision.executionAttemptCount >= DECISION_MAX_ATTEMPTS)` to `if (decision.executionAttemptCount >= DECISION_MAX_ATTEMPTS && decision.executionState === DECISION_PENDING)`.
+  - Changed the fenced updateMany WHERE from `executionState: { in: [DECISION_PENDING, DECISION_EXECUTION_CLAIMED] }` to `executionState: DECISION_PENDING` (ONLY PENDING — never an active claim).
+  - An EXECUTION_CLAIMED decision now flows through to the normal claim path, which returns "decision-already-claimed" (the existing behavior for a concurrent caller). The active claim is not destroyed.
+  - Added a detailed lifecycle comment documenting the clean separation of responsibilities:
+    - PENDING, attempts=MAX → executeDecision() → DEAD_LETTER (poison check, PENDING only)
+    - EXECUTION_CLAIMED, attempts=MAX (active, lease not expired) → another executeDecision() → claim fails (already-claimed) → existing worker remains authoritative
+    - EXECUTION_CLAIMED + expired lease, attempts=MAX → reclaimExpiredDecisionClaims() → DEAD_LETTER (claim-expiry guarded)
+
+- Adversarial test (11.1.7, DB-backed runtime, PASS):
+  - Step 1: Create decision PENDING, executionAttemptCount = MAX-1.
+  - Step 2: Worker A claims it via claimDecisionForExecution → EXECUTION_CLAIMED, attempts=MAX.
+  - Step 3: Before lease expiry, Worker B calls executeDecision() on the same decision. Assert: B does NOT execute; B's error does NOT contain "dead-lettered".
+  - Step 4: Worker A's claim remains intact (EXECUTION_CLAIMED, same claimId, same expiry, attempts=MAX). No second action created.
+  - Step 5: Expire A's lease → reclaim → DEAD_LETTER (the authoritative path). Assert: deadLettered >= 1, final state = DEAD_LETTER, attempts unchanged.
+  - VERIFIED: this test FAILS at the pre-fix state (6fdb8c4). Worker B dead-letters A's active claim with error "dead-lettered:max-attempts (3 >= 3)". The test correctly proves the race is closed.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7 tests):   7/7 PASS
+  Phase 8.6.6 (execution):     5/5 PASS
+  Phase 10/10.1.1:            13/13 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 25 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 564bf06 (on GitHub, verified: git ls-remote origin main → 564bf06)
+- The active-claim protection hole is closed. executeDecision()'s poison check now only dead-letters PENDING decisions — never an active EXECUTION_CLAIMED claim.
+- Claim ownership semantics are now sound: an active claim (EXECUTION_CLAIMED with a non-expired lease) belongs to the claim owner and cannot be destroyed by a concurrent caller.
+- The authoritative dead-letter path for an expired claim is reclaimExpiredDecisionClaims() (which checks claim-expiry + attemptCount in its fenced WHERE guard).
+- Acceptance invariant #1 now fully proven with clean claim ownership:
+  "A decision cannot execute more than DECISION_MAX_ATTEMPTS times."
+  + "A worker's active claim cannot be destroyed by a concurrent caller."
+  + "An expired claim is dead-lettered only by the reclaim path (claim-expiry guarded)."
+- Phase 11.1 is now legitimately closed. The decision executor's claim ownership semantics are sound enough for Phase 11.2 to build the session-level DB serialization layer on top.
+- Next: Phase 11.2 — Session-level execution serialization (DB-authoritative primitive, highest-risk area).
