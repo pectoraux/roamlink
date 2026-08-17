@@ -21,12 +21,21 @@ import { getPolicy, evaluatePolicy } from "@/lib/control-plane/policy-engine";
 import { discoverCapabilities, discoverResources } from "@/lib/control-plane/capability-registry";
 import { getResourceHealth } from "@/lib/control-plane/health-derivation";
 import { mayTriggerAutomaticSwitch } from "@/lib/control-plane/freshness";
-import type { ConnectivityPolicy } from "@/lib/protocol";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+// Phase 9.3.2: The policy escape hatch is REMOVED. Policy resolution is now
+// an internal control-plane operation — the decision engine ALWAYS derives
+// the effective policy from base policy + device context (if deviceId is
+// provided) or base policy alone.
+//
+// This prevents a future caller from accidentally bypassing the
+// effective-policy boundary by passing a pre-resolved policy object.
+//
+// If a legitimate internal/test case needs a pre-resolved policy, use the
+// explicitly named internal API: makeDecisionWithResolvedPolicy().
 export type DecisionInput = {
   tenantId: string;
   subjectId: string;
@@ -37,11 +46,6 @@ export type DecisionInput = {
   desiredSpec?: Record<string, unknown>;
   location?: Record<string, unknown>;
   maxPriceMinor?: number;
-  policy?: ConnectivityPolicy;
-  // Phase 9.3.1: Optional device ID for effective-policy derivation.
-  // When provided, the decision engine derives the effective policy from
-  // base policy + device context (batterySaver, workMode, etc.) instead of
-  // using the base policy directly.
   deviceId?: string;
 };
 
@@ -170,13 +174,23 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
       ? await db.connectivitySession.findUnique({ where: { id: input.sessionId } })
       : null;
 
+    // Phase 9.3.2: Resolve the effective policy EARLY (before the active-session
+    // check) so the switchThreshold uses the correct effective policy.
+    // Policy resolution is INTERNAL — no caller-supplied escape hatch.
+    const { deriveEffectivePolicy } = await import("./effective-policy");
+    const effectivePolicy = input.deviceId
+      ? await deriveEffectivePolicy(input.subjectId, input.deviceId)
+      : await deriveEffectivePolicy(input.subjectId);
+
     if (activeSession && activeSession.state === "ACTIVE") {
       // Active session — evaluate KEEP vs SWITCH using the PERSISTED health
       // snapshot (Phase 8.6). Health is derived from the measurement stream
       // by deriveResourceHealth() at ingestion time — not recomputed here.
       // This makes hysteresis a genuine control-system property.
-      const policy = input.policy;
-      const switchThreshold = policy?.switchHysteresis ?? 0.15;
+      //
+      // Phase 9.3.2: The switchThreshold uses the EFFECTIVE policy, not a
+      // caller-supplied policy. The escape hatch is removed.
+      const switchThreshold = effectivePolicy.switchHysteresis;
 
       // Control-system gates: dwell + cooldown (unchanged)
       const MIN_DWELL_MS = 60_000;
@@ -270,31 +284,20 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
     }
   }
 
-  // Step 6: Reliability check
-  if (input.policy?.minReliability && bestCapability) {
-    if (bestCapability.reliability >= input.policy.minReliability) {
+  // Step 6: Reliability check (uses effective policy)
+  if (effectivePolicy.minReliability && bestCapability) {
+    if (bestCapability.reliability >= effectivePolicy.minReliability) {
       constraintsSatisfied.push("MEETS_RELIABILITY");
     } else {
       constraintsViolated.push("BELOW_MIN_RELIABILITY");
     }
   }
 
-  // Step 7: Policy evaluation
-  // Phase 9.3.1: Derive effective policy from base + device context.
-  // If input.policy is explicitly provided, use it (caller override).
-  // If deviceId is provided, derive effective policy (base + device context).
-  // Otherwise, fall back to the base policy.
-  let policy = input.policy;
-  if (!policy && input.deviceId) {
-    const { deriveEffectivePolicy } = await import("./effective-policy");
-    const effective = await deriveEffectivePolicy(input.subjectId, input.deviceId);
-    policy = effective as ConnectivityPolicy;
-  }
-  if (!policy) {
-    policy = await getPolicy(input.subjectId);
-  }
+  // Step 7: Policy evaluation (effective policy already resolved in Step 4)
+  // Phase 9.3.2: No caller-supplied escape hatch. The effectivePolicy was
+  // derived from base policy + device context in Step 4.
   const policyResult = evaluatePolicy({
-    policy,
+    policy: effectivePolicy,
     action: action === "ACTIVATE" ? "ACTIVATE" : action === "SWITCH" ? "SWITCH" : "KEEP",
     estimatedCostMinor: ranking.ranked[0]?.customerPriceMinor,
   });
@@ -307,7 +310,7 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
     constraintsSatisfied.push("POLICY_ALLOWED");
   }
 
-  // Step 8: Persist
+  // Step 8: Persist with provenance (Phase 9.3.2)
   const decision = await db.connectivityDecision.create({
     data: {
       intentId: input.intentId ?? "unknown",
@@ -319,7 +322,16 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
       constraintsSatisfied: JSON.stringify(constraintsSatisfied),
       constraintsViolated: JSON.stringify(constraintsViolated),
       reasons: JSON.stringify(reasons),
-      policyVersion: input.policy?.id ?? "default",
+      policyVersion: effectivePolicy.basePolicyId ?? "default",
+      // Phase 9.3.2: Durable provenance
+      basePolicyId: effectivePolicy.basePolicyId,
+      basePolicyVersion: effectivePolicy.basePolicyVersion,
+      basePreset: effectivePolicy.basePreset,
+      contextDeviceId: effectivePolicy.contextDeviceId,
+      contextVersion: effectivePolicy.contextVersion,
+      contextObservedAt: effectivePolicy.contextObservedAt,
+      effectivePreset: effectivePolicy.effectivePreset,
+      derivationReasons: effectivePolicy.derivationReason ?? null,
     },
   });
 

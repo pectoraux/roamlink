@@ -114,8 +114,17 @@ export async function createOrUpdatePolicy(input: {
     switchHysteresis: existing.switchHysteresis,
     requireUserApprovalForPurchase: existing.requireUserApprovalForPurchase,
     neverInterruptActiveCall: existing.neverInterruptActiveCall,
+    preset: existing.preset,
   } : null;
   const base = preset ?? existingParsed ?? POLICY_PRESETS.MANUAL;
+
+  // Phase 9.3.2: Store the preset explicitly. If a preset is provided,
+  // use it. If not, preserve the existing preset. Only fall back to null
+  // (custom) if there's no existing preset and no input preset.
+  const storedPreset = input.preset ?? existingParsed?.preset ?? null;
+
+  // Phase 9.3.2: Increment version on update for provenance tracking
+  const newVersion = existing ? (existing.version ?? 1) + 1 : 1;
 
   const data = {
     subjectId: input.subjectId,
@@ -126,6 +135,8 @@ export async function createOrUpdatePolicy(input: {
     switchHysteresis: input.switchHysteresis ?? base.switchHysteresis,
     requireUserApprovalForPurchase: input.requireUserApprovalForPurchase ?? base.requireUserApprovalForPurchase,
     neverInterruptActiveCall: input.neverInterruptActiveCall ?? base.neverInterruptActiveCall,
+    preset: storedPreset,
+    version: newVersion,
   };
 
   let policy;
@@ -169,6 +180,8 @@ export async function getPolicy(subjectId: string) {
       switchHysteresis: 0.15,
       requireUserApprovalForPurchase: true,
       neverInterruptActiveCall: true,
+      preset: null,
+      version: 0,
       isDefault: true,
     };
   }
@@ -183,6 +196,8 @@ export async function getPolicy(subjectId: string) {
     switchHysteresis: policy.switchHysteresis,
     requireUserApprovalForPurchase: policy.requireUserApprovalForPurchase,
     neverInterruptActiveCall: policy.neverInterruptActiveCall,
+    preset: policy.preset,
+    version: policy.version ?? 1,
     isDefault: false,
   };
 }

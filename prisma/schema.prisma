@@ -2069,6 +2069,14 @@ model ConnectivityPolicy {
   switchHysteresis Float   @default(0.15)
   requireUserApprovalForPurchase Boolean @default(true)
   neverInterruptActiveCall Boolean @default(true)
+  // Phase 9.3.2: Policy identity is first-class. The preset is stored
+  // explicitly rather than reverse-engineered from parameters. A policy
+  // created from RELIABLE carries preset="RELIABLE" even if the user later
+  // customizes individual parameters (e.g. custom hysteresis).
+  preset          String?
+  // Phase 9.3.2: Policy version for provenance tracking. Incremented on
+  // each update so decisions can reference the exact policy version used.
+  version         Int      @default(1)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -2089,6 +2097,16 @@ model ConnectivityDecision {
   constraintsViolated String?
   reasons         String?
   policyVersion   String?
+  // Phase 9.3.2: Durable decision provenance. A persisted decision can answer:
+  //   What policy caused this? What device context? What derivation?
+  basePolicyId    String?
+  basePolicyVersion Int?
+  basePreset      String?
+  contextDeviceId String?
+  contextVersion  Int?
+  contextObservedAt DateTime?
+  effectivePreset String?
+  derivationReasons String?
   // Phase 8.6.5: Separation of decision triggering from decision execution.
   // The reevaluation worker produces a Decision (PENDING); a separate
   // decision-executor turns non-KEEP decisions into Actions (EXECUTED/FAILED).
@@ -2114,6 +2132,7 @@ model ConnectivityDecision {
   @@index([sessionId])
   @@index([executionState])
   @@index([executionClaimExpiresAt])
+  @@index([basePolicyId])
 }
 
 model ConnectivityAction {
