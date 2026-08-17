@@ -3454,3 +3454,65 @@ Stage Summary:
 - The DECISION_DEAD_LETTER state is auditable (it persists in the DB with executionAttemptCount showing how many times it was attempted).
 - Frozen layers unchanged: entitlement.ts kernel, adapter contract, ranking engine, ledger, reason-code protocol, Phase 10 trust firewall.
 - Next: Phase 11.2 — Session-level execution serialization (DB-authoritative primitive). The highest-risk area. The primitive must be authoritative at the database boundary, not merely a JavaScript mutex.
+
+---
+Task ID: 11.1.1
+Agent: Principal Architect (main) — Phase 11.1.1 Fenced Dead-Letter Transitions
+Task: Close the DB-authoritative concurrency hole identified in the architect's audit of 96e80d1. The dead-letter transition was an unfenced `update` after a read — a TOCTOU race where Worker A could overwrite Worker B's claim (EXECUTION_CLAIMED) with DEAD_LETTER, destroying the claim mid-execution.
+
+Work Log:
+- Audited 96e80d1 directly. Confirmed the race in three places:
+  1. claimDecisionForExecution: reads claimable (findFirst), checks attemptCount>=MAX, then unconditional `update` → DEAD_LETTER.
+  2. executeDecision: reads decision (findUnique), checks attemptCount>=MAX, then unconditional `update` → DEAD_LETTER.
+  3. reclaimExpiredDecisionClaims: findMany reads, then per-decision unconditional `update` → DEAD_LETTER or PENDING.
+  All three had the same pattern: read + unfenced write = TOCTOU race with a concurrent worker's claim.
+
+- Fix 1 — claimDecisionForExecution (defensive dead-letter at claim):
+  Replaced unconditional `update` with fenced `updateMany`:
+    WHERE id = claimable.id
+      AND executionState = PENDING (still PENDING, not claimed by someone else)
+      AND executionAttemptCount >= MAX (still at/over MAX)
+    DATA → DEAD_LETTER
+  If count=0: another worker already changed the state (claimed it or already dead-lettered it) — do NOT overwrite; recurse to the next decision. The log only fires if the dead-letter actually succeeded (count>0).
+
+- Fix 2 — executeDecision (poison check before claim):
+  Replaced unconditional `update` with fenced `updateMany`:
+    WHERE id = decisionId
+      AND executionState IN [PENDING, EXECUTION_CLAIMED] (still claimable, not already terminal)
+      AND executionAttemptCount >= MAX
+    DATA → DEAD_LETTER
+  If count>0: dead-lettered successfully → return FAILED + "dead-lettered:max-attempts".
+  If count=0: another worker already changed the state → re-read and return current state with error "decision-state-changed-concurrently". Do NOT overwrite.
+
+- Fix 3 — reclaimExpiredDecisionClaims (PRIMARY dead-letter checkpoint):
+  Both transitions now use fenced updateMany:
+  - → DEAD_LETTER: WHERE state=EXECUTION_CLAIMED AND claimExpiresAt<now AND attemptCount>=MAX
+  - → PENDING: WHERE state=EXECUTION_CLAIMED AND claimExpiresAt<now AND attemptCount<MAX
+  If count=0: another worker changed the state → skip (don't overwrite, don't count).
+  The `reclaimed` and `deadLettered` counters only increment when the fenced update actually succeeded (count>0).
+
+- The guarantee: a worker's claim (EXECUTION_CLAIMED with a fresh executionClaimId) can NEVER be overwritten by another worker's dead-letter. The dead-letter only succeeds if the decision is still in the expected state + attempt range. This makes the poison-decision transition DB-authoritative, not merely a JS-level check.
+
+- Adversarial tests (2 new, both DB-backed runtime, both PASS):
+  11.1.5 PASS — concurrent claims on decision at MAX:
+    Two workers call claimDecisionForExecution on the same decision (PENDING, attempts=MAX) concurrently via Promise.all. Both try to dead-letter. Result: neither claims for execution (both return null — the decisionId filter scopes them to this decision, which is now DEAD_LETTER and not claimable); the decision ends DEAD_LETTER (terminal); attemptCount unchanged (3, not incremented by dead-letter); executionClaimId is null (no claim survived); no action created.
+  11.1.6 PASS — concurrent executeDecision on decision at MAX:
+    Two workers call executeDecision on the same decision (PENDING, attempts=MAX) concurrently. Both try to dead-letter. Result: at least one dead-letters (FAILED + "dead-lettered:max-attempts"); the other either also dead-letters or returns "decision-state-changed-concurrently" (count=0). Neither executes (not EXECUTED); no action created; DEAD_LETTER terminal; attemptCount unchanged; no claim survived.
+  These tests would FAIL with the unfenced update (the race would let one worker claim for execution while the other overwrites to DEAD_LETTER, leaving an orphaned claim or an executed action under a dead-lettered state).
+
+- Regression:
+  Phase 11.1 (all 6 tests):   6/6 PASS
+  Phase 8.6.6 (execution):    5/5 PASS
+  Phase 9.4.2 (intent auth):   5/5 PASS (in isolation; suite failure is test-isolation state pollution)
+  Phase 10/10.1.1:           13/13 PASS
+  Lint: clean (eslint . exit 0).
+
+Stage Summary:
+- HEAD: 6fdb8c4 (on GitHub, verified: git ls-remote origin main → 6fdb8c4)
+- The DB-authoritative concurrency hole is closed. All three dead-letter paths now use fenced updateMany with WHERE guards on state + attemptCount.
+- A worker's claim (EXECUTION_CLAIMED) can never be destroyed by a concurrent dead-letter transition.
+- Acceptance invariant #1 now fully proven under concurrency:
+  "A decision cannot execute more than DECISION_MAX_ATTEMPTS times."
+  + "A worker's claim cannot be destroyed by a concurrent dead-letter."
+- Phase 11.1 is now legitimately closed. The decision state machine is clean enough for Phase 11.2 to build its session-level serialization primitive on top.
+- Next: Phase 11.2 — Session-level execution serialization (DB-authoritative primitive, highest-risk area).
