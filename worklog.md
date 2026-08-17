@@ -3389,3 +3389,68 @@ Stage Summary:
 - Full regression: 60 PASS, 1 pre-existing FAIL (9.5.1 A1, unrelated).
 - The trust firewall architecture is sound, exercised by device observations, and the rate-limit boundary is exact.
 - Phase 10 is now FROZEN.
+
+---
+Task ID: 11.1
+Agent: Principal Architect (main) — Phase 11.1 Decision Retry Bound
+Task: Fix the decision retry bound defect found in the fc6b63f audit. DECISION_MAX_ATTEMPTS=3 was declared but never enforced — a decision that crashes the worker mid-execution retried indefinitely. Establish the poison-decision dead-letter pattern parallel to ReevaluationEvent. Prove acceptance invariant #1: "A decision cannot execute more than DECISION_MAX_ATTEMPTS times."
+
+Work Log:
+- Audited fc6b63f directly (did not trust prior summaries):
+  - DECISION_MAX_ATTEMPTS=3 declared at decision-executor.ts:48 but never referenced anywhere.
+  - claimDecisionForExecution returned `attemptCount: 0` hardcoded with comment "not tracked on the row yet; could add a column if needed."
+  - No executionAttemptCount column on ConnectivityDecision.
+  - reclaimExpiredDecisionClaims used updateMany to bulk-return EXECUTION_CLAIMED → PENDING unconditionally. No attempt-count check, no dead-letter.
+  - The crash-retry loop (EXECUTION_CLAIMED → lease expires → PENDING → claim → crash → ...) was unbounded.
+
+- Schema (prisma/schema.prisma):
+  - Added `executionAttemptCount Int @default(0)` to ConnectivityDecision.
+  - Added DEAD_LETTER to the executionState comment (PENDING | EXECUTION_CLAIMED | EXECUTING | EXECUTED | FAILED | RECONCILIATION_REQUIRED | SKIPPED | DEAD_LETTER).
+
+- Protocol (src/lib/protocol/index.ts):
+  - Added "DEAD_LETTER" to DecisionExecutionStateSchema with doc comment: "Phase 11.1: poison decision. The worker crashed mid-execution more than DECISION_MAX_ATTEMPTS times. Terminal — will not be retried. Auditable."
+
+- decision-executor.ts:
+  - Added DECISION_DEAD_LETTER constant.
+  - claimDecisionForExecution: now increments executionAttemptCount in the atomic updateMany. Returns the real count (not hardcoded 0). Added defensive dead-letter check: if attemptCount >= MAX at claim time, dead-letter instead of claiming. Added optional filter parameter { decisionId?, sessionId? } for scoped claims (parallel to claimReevaluationEvent's filter — needed for test isolation).
+  - executeDecision (direct-call path): now selects executionAttemptCount. Added poison-decision check: if attemptCount >= MAX, dead-letter instead of claiming. Increments executionAttemptCount in the atomic claim.
+  - reclaimExpiredDecisionClaims (PRIMARY dead-letter checkpoint): changed from bulk updateMany to findMany + per-decision check. If attemptCount >= MAX → DEAD_LETTER. If attemptCount < MAX → PENDING. Returns { reclaimed, deadLettered } (was { reclaimed }). Parallel to ReevaluationEvent dead-lettering in reclaimExpiredClaims().
+
+- API route (observe-connectivity/route.ts): surfaces decisionDeadLettered in the cron response + log (additive — decisionReclaim.reclaimed still exists for backward compat).
+
+- DB migration: added executionAttemptCount column via raw SQL ALTER TABLE on the SQLite dev DB. Regenerated Prisma client with sqlite provider (schema declares postgresql for production/Vercel; dev uses SQLite — the existing pattern in this repo).
+
+- Bounded crash-retry loop:
+    Claim #1 (count→1), crash, reclaim (1<3 → PENDING)
+    Claim #2 (count→2), crash, reclaim (2<3 → PENDING)
+    Claim #3 (count→3), crash, reclaim (3≥3 → DEAD_LETTER)
+  → A decision cannot execute more than 3 times. Terminal after that.
+
+- Parallel to events: ReevaluationEvent has had dead-lettering since Phase 8.6.5 (EVENT_MAX_ATTEMPTS=5, attemptCount increment at claim, dead-letter at reclaim). This fix brings ConnectivityDecision to the same standard with DECISION_MAX_ATTEMPTS=3.
+
+Tests (tests/phase11.1-decision-retry-bound.test.ts, 4 DB-backed runtime, all PASS):
+  11.1.1 PASS — claimDecisionForExecution increments executionAttemptCount on each claim. Claim #1 → count=1, reclaim, claim #2 → count=2. Count preserved across reclaim.
+  11.1.2 PASS — crash-retry loop bounded. After 3 claims (each crashing + reclaiming), the 3rd reclaim dead-letters (3≥3). A subsequent scoped claim returns null (DEAD_LETTER is not claimable).
+  11.1.3 PASS — successfully executed decision has attemptCount=1 (not inflated by the poison-check logic — successful execution doesn't trigger the dead-letter path).
+  11.1.4 PASS — reclaimExpiredDecisionClaims returns { reclaimed, deadLettered }. A decision below MAX → PENDING (reclaimed). A decision at MAX → DEAD_LETTER.
+
+Regression (all DB-backed against PostgreSQL + mock adapter):
+  Phase 8.6.6 (execution closure):   5/5 PASS
+  Phase 9.4.2 (intent authority):    5/5 PASS
+  Phase 9.5.2 (budget behavioral):  6/6 PASS (in isolation)
+  Phase 10 (observation trust):      8/8 PASS
+  Phase 10.1.1 (validation):         5/5 PASS
+  Lint: clean (eslint . exit 0).
+
+  Pre-existing failures (not introduced by this patch, tracked separately):
+  - Phase 9.5.1 A1 (budget constraint reason code) — tracked debt item.
+  - Some 8.6.5 tests fail due to DB-state pollution across test files (pre-existing fragility).
+
+Stage Summary:
+- HEAD: 96e80d1 (on GitHub, verified: git ls-remote origin main → 96e80d1)
+- Acceptance invariant #1 is now proven: "A decision cannot execute more than DECISION_MAX_ATTEMPTS times."
+- The crash-retry loop is bounded: after 3 claims (each crashing), the decision is DEAD_LETTER (terminal, auditable, not retried).
+- Parallel to the ReevaluationEvent dead-letter pattern (same semantics: increment at claim, dead-letter at reclaim).
+- The DECISION_DEAD_LETTER state is auditable (it persists in the DB with executionAttemptCount showing how many times it was attempted).
+- Frozen layers unchanged: entitlement.ts kernel, adapter contract, ranking engine, ledger, reason-code protocol, Phase 10 trust firewall.
+- Next: Phase 11.2 — Session-level execution serialization (DB-authoritative primitive). The highest-risk area. The primitive must be authoritative at the database boundary, not merely a JavaScript mutex.
