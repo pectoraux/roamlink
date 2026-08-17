@@ -2017,6 +2017,17 @@ model ConnectivitySession {
   endedAt         DateTime?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
+  // Phase 11.2: Session-level execution serialization primitive.
+  // A session may have at most one connectivity mutation executing at a time.
+  // The slot is acquired (DB-authoritative fenced updateMany) before a decision
+  // creates/executes an action, and released after the action completes (success/
+  // failure/reconciliation). A crashed worker's slot is reclaimable after lease
+  // expiry (reclaimExpiredSessionSlots). This prevents two concurrent SWITCH
+  // decisions for the same session from racing on session.activeResourceId and
+  // leaving an orphaned target IN_USE.
+  executionSlotClaimId      String?
+  executionSlotClaimedAt    DateTime?
+  executionSlotClaimExpiresAt DateTime?
 
   measurements    ConnectivityMeasurement[]
   decisions       ConnectivityDecision[]
@@ -2026,6 +2037,7 @@ model ConnectivitySession {
   @@index([subjectId])
   @@index([state])
   @@index([entitlementId])
+  @@index([executionSlotClaimExpiresAt])
 }
 
 model ConnectivityMeasurement {

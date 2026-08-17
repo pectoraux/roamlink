@@ -29,6 +29,10 @@
 import { db } from "@/lib/db";
 import { logger } from "@/lib/logger";
 import { createAction, executeAction } from "./action-executor";
+import {
+  acquireSessionExecutionSlot,
+  releaseSessionExecutionSlot,
+} from "./session-execution-slot";
 
 // ---------------------------------------------------------------------------
 // Lifecycle constants (Phase 8.6.6)
@@ -43,6 +47,15 @@ export const DECISION_RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED" as con
 export const DECISION_SKIPPED = "SKIPPED" as const;
 export const DECISION_DEAD_LETTER = "DEAD_LETTER" as const;
 
+/**
+ * Phase 11.2: A special result for "session-busy-requeued." This is NOT a
+ * persisted executionState — the decision is returned to PENDING. It's a
+ * return-value-only state so the caller (executePendingDecisions) can track
+ * it in results. The decision stays PENDING and will be retried on a future
+ * worker iteration when the session slot is free.
+ */
+export const DECISION_SESSION_BUSY = "SESSION_BUSY" as const;
+
 /** Lease duration for a claimed decision. A crashed worker's claim expires after this. */
 export const DECISION_EXECUTION_LEASE_MS = 5 * 60_000; // 5 minutes — action execution can be slow
 /** Max attempts before a decision is dead-lettered (poison-decision protection). */
@@ -54,7 +67,10 @@ export const DECISION_MAX_ATTEMPTS = 3;
 
 export type DecisionExecutionResult = {
   decisionId: string;
-  executionState: "EXECUTED" | "FAILED" | "RECONCILIATION_REQUIRED" | "SKIPPED";
+  // EXECUTED | FAILED | RECONCILIATION_REQUIRED | SKIPPED are persisted on the decision row.
+  // SESSION_BUSY is a return-value-only state (Phase 11.2): the decision was
+  // returned to PENDING because the session slot was held by another worker.
+  executionState: "EXECUTED" | "FAILED" | "RECONCILIATION_REQUIRED" | "SKIPPED" | "SESSION_BUSY";
   actionId?: string;
   actionStatus?: string;
   error?: string;
@@ -367,7 +383,46 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
     data: { executionState: DECISION_EXECUTING },
   });
 
-  // Create + execute the action.
+  // Phase 11.2: Session-level execution serialization.
+  // Acquire the session execution slot BEFORE creating/executing the action.
+  // The slot owns the ENTIRE mutation window (create action → execute → verify).
+  // If the slot is busy (another decision is mutating this session), requeue
+  // the decision (return to PENDING) — do NOT fail or dead-letter it.
+  // "Session busy" is a legitimate "try later" condition.
+  //
+  // This prevents two concurrent SWITCH decisions (A→B and A→C) for the same
+  // session from both executing and racing on session.activeResourceId.
+  let sessionSlotClaimId: string | null = null;
+  if (decision.sessionId) {
+    sessionSlotClaimId = `slot-${decisionId}-${Date.now()}`;
+    const slotResult = await acquireSessionExecutionSlot(decision.sessionId, sessionSlotClaimId);
+    if (!slotResult.acquired) {
+      // Session is being mutated by another worker. Requeue the decision:
+      // return it to PENDING (release the execution claim) so it can be
+      // retried on a future worker iteration when the slot is free.
+      // The attemptCount stays incremented (the claim did happen).
+      await db.connectivityDecision.update({
+        where: { id: decisionId },
+        data: {
+          executionState: DECISION_PENDING,
+          executionClaimId: null,
+          executionClaimedAt: null,
+        },
+      });
+      logger.info("decision.session_busy_requeued", {
+        decisionId, sessionId: decision.sessionId,
+      });
+      return {
+        decisionId,
+        executionState: "SESSION_BUSY",
+        error: "session-execution-slot-held-by-another-worker",
+      };
+    }
+  }
+
+  // Create + execute the action. The session slot is released in a finally
+  // block — regardless of success/failure/reconciliation, the slot MUST be
+  // released so the next decision for the session can execute.
   try {
     const reasons = decision.reasons ? JSON.parse(decision.reasons) as string[] : [];
     const action = await createAction({
@@ -421,6 +476,13 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
     });
     logger.error("decision.execution_error", { decisionId, error: errorMsg });
     return { decisionId, executionState: "FAILED", error: errorMsg };
+  } finally {
+    // Phase 11.2: Release the session execution slot. Fenced by claimId —
+    // only the claim owner releases. If the slot was reclaimed after lease
+    // expiry (crashed worker), this is a no-op (count=0, safe).
+    if (sessionSlotClaimId && decision.sessionId) {
+      await releaseSessionExecutionSlot(decision.sessionId, sessionSlotClaimId);
+    }
   }
 }
 

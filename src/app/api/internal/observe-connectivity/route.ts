@@ -22,6 +22,7 @@ import { logger } from "@/lib/logger";
 import { probeAllActiveSessions, probeStaleActiveResources } from "@/lib/control-plane/observation";
 import { processPendingEvents, reclaimExpiredClaims } from "@/lib/control-plane/reevaluation";
 import { executePendingDecisions, reclaimExpiredDecisionClaims } from "@/lib/control-plane/decision-executor";
+import { reclaimExpiredSessionSlots } from "@/lib/control-plane/session-execution-slot";
 
 export async function POST(req: NextRequest) {
   const authHeader = req.headers.get("authorization");
@@ -31,9 +32,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  // 1. Reclaim expired claims (crashed workers) for both events and decisions.
+  // 1. Reclaim expired claims (crashed workers) for events, decisions, and session slots.
   const eventReclaim = await reclaimExpiredClaims();
   const decisionReclaim = await reclaimExpiredDecisionClaims();
+  const sessionSlotReclaim = await reclaimExpiredSessionSlots();
 
   // 2. Re-observe resources with expired/unknown current measurements first
   //    (freshness clock policy — never go blind when connectivity is failing).
@@ -55,6 +57,7 @@ export async function POST(req: NextRequest) {
     eventClaimsReclaimed: eventReclaim.reclaimed,
     deadLettered: eventReclaim.deadLettered,
     decisionClaimsReclaimed: decisionReclaim.reclaimed,
+    sessionSlotsReclaimed: sessionSlotReclaim.reclaimed,
     staleProbed: staleProbe.probed,
     probed: probeResult.probed,
     eventsProcessed: eventResult.processed,
@@ -65,6 +68,7 @@ export async function POST(req: NextRequest) {
     eventClaimsReclaimed: eventReclaim.reclaimed,
     deadLettered: eventReclaim.deadLettered,
     decisionClaimsReclaimed: decisionReclaim.reclaimed,
+    sessionSlotsReclaimed: sessionSlotReclaim.reclaimed,
     staleProbed: staleProbe.probed,
     probed: probeResult.probed,
     eventsProcessed: eventResult.processed,
