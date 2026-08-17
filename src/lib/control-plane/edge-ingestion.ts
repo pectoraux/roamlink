@@ -292,23 +292,50 @@ async function ingestOneObservation(
     throw err;
   }
 
-  // 6. Project to ConnectivityMeasurement (source=DEVICE) via the existing
-  //    ingestion pipeline. This derives health + emits MEASUREMENT_RECEIVED.
-  //    Only project if we have a validated resourceId — otherwise the
-  //    observation is stored but doesn't feed the control plane (no resource
-  //    to associate health with).
+  // 6. Phase 10: Validate the observation and derive trust/integrity.
+  //    The server alone derives trust — the mobile client never submits trust.
+  //    Validation checks: capturedAt sanity, metric plausibility, resource
+  //    consistency, rate limiting.
   let measurementId: string | undefined;
   if (validatedResourceId) {
     try {
+      const { validateObservation } = await import("./observation-validation");
+      const validationResult = await validateObservation({
+        deviceId: obs.deviceId,
+        resourceId: validatedResourceId,
+        sessionId: validatedSessionId,
+        userId,
+        observedAt: new Date(obs.observedAt),
+        source: obs.source as any,
+        metrics: projectToMetrics(obs.connectivity, obs.device),
+      });
+
+      // Log suspicious observations for auditability (they're still persisted)
+      if (validationResult.integrity !== "VALID") {
+        logger.warn("edge.observation_validation_failed", {
+          observationId: obs.observationId,
+          deviceId: obs.deviceId,
+          integrity: validationResult.integrity,
+          trust: validationResult.trust,
+          reason: validationResult.reason,
+        });
+      }
+
+      // 7. Project to ConnectivityMeasurement with trust/integrity classification.
+      //    UNTRUSTED measurements are stored but excluded from health derivation
+      //    by the health firewall (isEligibleForHealth).
       const result = await ingestMeasurement({
         resourceId: validatedResourceId,
         sessionId: validatedSessionId ?? undefined,
         type: "QUALITY",
         metrics: projectToMetrics(obs.connectivity, obs.device),
-        source: "DEVICE", // provenance: device-reported
-        confidence: 0.7, // device-reported is less trustworthy than adapter
+        source: "DEVICE",
+        confidence: 0.7,
         capturedAt: new Date(obs.observedAt),
-        triggerReevaluation: true,
+        triggerReevaluation: input.triggerReevaluation !== false,
+        // Phase 10: Pass server-derived trust + integrity
+        trust: validationResult.trust,
+        integrity: validationResult.integrity,
       });
       measurementId = result.measurementId;
 

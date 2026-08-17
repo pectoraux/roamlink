@@ -69,6 +69,10 @@ export type IngestMeasurementInput = {
   // Whether to trigger synchronous re-evaluation (default true). Set false in
   // batch/worker contexts that process events separately.
   triggerReevaluation?: boolean;
+  // Phase 10: Server-derived trust + integrity (optional — defaults to
+  // TRUSTED/VALID for backward compatibility with adapter-sourced measurements).
+  trust?: string;
+  integrity?: string;
 };
 
 export type IngestResult = {
@@ -173,6 +177,9 @@ export async function ingestMeasurement(input: IngestMeasurementInput): Promise<
           confidence: input.confidence ?? 0.5,
           capturedAt,
           deduplicationKey,
+          // Phase 10: Persist trust + integrity classification
+          trust: input.trust ?? "TRUSTED",
+          integrity: input.integrity ?? "VALID",
         },
       });
     } catch (err: any) {

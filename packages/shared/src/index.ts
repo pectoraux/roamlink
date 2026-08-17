@@ -288,3 +288,4 @@ export * from "./api-client";
 export * from "./edge-observation";
 export * from "./current-connectivity";
 export * from "./reason-codes";
+export * from "./observation-trust";

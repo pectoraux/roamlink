@@ -120,6 +120,7 @@ export async function getCurrentConnectivityForUser(userId: string): Promise<Cur
           observedAt: latestMeasurement?.capturedAt?.toISOString() ?? null,
           freshness: healthRow.freshness as "FRESH" | "STALE" | "EXPIRED" | "UNKNOWN",
           explanation: mapHealthExplanation(healthRow.status, healthRow.freshness, metrics),
+          trust: (healthRow.trust ?? "UNTRUSTED") as "TRUSTED" | "LIMITED" | "UNTRUSTED",
         };
       } else {
         health = {
@@ -129,6 +130,7 @@ export async function getCurrentConnectivityForUser(userId: string): Promise<Cur
           observedAt: null,
           freshness: "UNKNOWN",
           explanation: "No health data available yet — awaiting observation.",
+          trust: "UNTRUSTED",
         };
       }
     }

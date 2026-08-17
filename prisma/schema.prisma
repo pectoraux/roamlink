@@ -2039,16 +2039,18 @@ model ConnectivityMeasurement {
   // FRESH (age<30s) | STALE (30s–120s) | EXPIRED (>120s) | UNKNOWN
   freshness       String   @default("UNKNOWN")
   // Phase 8.6: provenance — MUST be one of ADAPTER|DEVICE|PROBE|PROVIDER|DERIVED.
-  // Provider-reported and client-observed metrics are never mixed without
-  // preserving which is which. Validated at ingestion time (measurement-store).
   source          String   @default("PROVIDER")
   confidence      Float    @default(0.5)
   capturedAt      DateTime @default(now())
-  // Phase 8.6.5: Idempotent observation identity. Two probes of the same
-  // (resourceId, observedAt, source, metrics-hash) MUST NOT create two
-  // measurements. Computed by ingestMeasurement() or caller-supplied.
-  // Nullable so pre-8.6.5 rows survive; new rows always set it.
+  // Phase 8.6.5: Idempotent observation identity.
   deduplicationKey String? @unique
+  // Phase 10: Server-derived trust classification.
+  // TRUSTED | LIMITED | UNTRUSTED. The server alone derives trust.
+  // UNTRUSTED measurements are stored but excluded from health derivation.
+  trust           String   @default("TRUSTED")
+  // Phase 10: Observation integrity state at ingestion.
+  // VALID | STALE | FUTURE_TIMESTAMP | INVALID_METRIC | RESOURCE_MISMATCH | RATE_LIMITED | DUPLICATE
+  integrity       String   @default("VALID")
 
   session         ConnectivitySession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
 
@@ -2057,6 +2059,8 @@ model ConnectivityMeasurement {
   @@index([capturedAt])
   @@index([source])
   @@index([freshness])
+  @@index([trust])
+  @@index([integrity])
 }
 
 model ConnectivityPolicy {
@@ -2262,10 +2266,17 @@ model ResourceHealth {
   derivedFromSources String?
   // The measurement id of the most recent sample (audit link).
   latestMeasurementId String?
+  // Phase 10: Trust level of the evidence that fed this snapshot.
+  // TRUSTED | LIMITED | UNTRUSTED. Orthogonal to health status.
+  // TRUSTED = at least one trusted (provider/server) measurement contributed.
+  // LIMITED = only device (LIMITED-trust) measurements contributed.
+  // UNTRUSTED = no eligible measurements (only UNTRUSTED or none).
+  trust           String   @default("UNTRUSTED")
   updatedAt       DateTime @updatedAt
 
   @@index([status])
   @@index([sessionId])
+  @@index([trust])
 }
 
 // ---------------------------------------------------------------------------

@@ -60,6 +60,10 @@ export type CurrentConnectivityHealth = {
   freshness: "FRESH" | "STALE" | "EXPIRED" | "UNKNOWN";
   /** Human-readable explanation of the health status. */
   explanation: string;
+  /** Phase 10: Trust level of the evidence behind this health snapshot.
+   * Orthogonal to status/freshness. TRUSTED = provider/server evidence.
+   * LIMITED = device evidence only. UNTRUSTED = no eligible evidence. */
+  trust: "TRUSTED" | "LIMITED" | "UNTRUSTED";
 };
 
 import type { ReasonCode } from "./reason-codes";

@@ -113,6 +113,8 @@ export type DerivedHealth = {
   freshness: MeasurementFreshness;
   derivedFromSources: string;
   latestMeasurementId: string | null;
+  // Phase 10: Trust level of the evidence that fed this snapshot.
+  trust: "TRUSTED" | "LIMITED" | "UNTRUSTED";
 };
 
 /**
@@ -159,14 +161,17 @@ export async function deriveResourceHealth(
       freshness: "UNKNOWN",
       derivedFromSources: "",
       latestMeasurementId: null,
+      trust: "UNTRUSTED",
     });
     return snapshot;
   }
 
-  // Filter out EXPIRED / UNKNOWN-freshness samples (recompute freshness at
-  // derivation time so a measurement that has aged past STALE since ingest is
-  // correctly excluded).
+  // Phase 10: Trust firewall. Filter out UNTRUSTED measurements — they are
+  // stored for audit but must NOT influence health derivation.
+  // Also filter EXPIRED / UNKNOWN-freshness samples.
   const contributing = measurements.filter((m) => {
+    // Phase 10: Trust firewall — UNTRUSTED measurements excluded
+    if (m.trust === "UNTRUSTED") return false;
     const f = classifyFreshness(m.capturedAt, now, thresholds);
     return contributesToHealth(f);
   });
@@ -181,6 +186,7 @@ export async function deriveResourceHealth(
       freshness: "EXPIRED",
       derivedFromSources: "",
       latestMeasurementId: measurements[0]?.id ?? null,
+      trust: "UNTRUSTED",
     });
     return snapshot;
   }
@@ -206,6 +212,14 @@ export async function deriveResourceHealth(
   const sourceSet = new Set(samples.map((s) => s.source).filter(Boolean));
   const derivedFromSources = Array.from(sourceSet).sort().join("+");
 
+  // Phase 10: Derive trust from the contributing samples.
+  // TRUSTED = at least one TRUSTED (provider/server) measurement contributed.
+  // LIMITED = only LIMITED-trust (device) measurements contributed.
+  // UNTRUSTED = no eligible measurements (shouldn't happen here, but defensive).
+  const hasTrusted = contributing.some((m) => m.trust === "TRUSTED");
+  const hasLimited = contributing.some((m) => m.trust === "LIMITED");
+  const trustLevel: "TRUSTED" | "LIMITED" | "UNTRUSTED" = hasTrusted ? "TRUSTED" : hasLimited ? "LIMITED" : "UNTRUSTED";
+
   const snapshot = await persistHealth({
     resourceId,
     status,
@@ -215,6 +229,7 @@ export async function deriveResourceHealth(
     freshness,
     derivedFromSources,
     latestMeasurementId: samples[0]?.id ?? null,
+    trust: trustLevel,
   });
 
   logger.info("health.derived", {
@@ -243,6 +258,7 @@ async function persistHealth(input: {
   freshness: MeasurementFreshness;
   derivedFromSources: string;
   latestMeasurementId: string | null;
+  trust: "TRUSTED" | "LIMITED" | "UNTRUSTED";
 }): Promise<DerivedHealth> {
   await db.resourceHealth.upsert({
     where: { resourceId: input.resourceId },
@@ -255,6 +271,7 @@ async function persistHealth(input: {
       freshness: input.freshness,
       derivedFromSources: input.derivedFromSources || null,
       latestMeasurementId: input.latestMeasurementId,
+      trust: input.trust,
     },
     update: {
       status: input.status,
@@ -264,6 +281,7 @@ async function persistHealth(input: {
       freshness: input.freshness,
       derivedFromSources: input.derivedFromSources || null,
       latestMeasurementId: input.latestMeasurementId,
+      trust: input.trust,
     },
   });
 
@@ -276,6 +294,7 @@ async function persistHealth(input: {
     freshness: input.freshness,
     derivedFromSources: input.derivedFromSources,
     latestMeasurementId: input.latestMeasurementId,
+    trust: input.trust,
   };
 }
 
@@ -295,6 +314,7 @@ export async function getResourceHealth(resourceId: string): Promise<DerivedHeal
     freshness: row.freshness as MeasurementFreshness,
     derivedFromSources: row.derivedFromSources ?? "",
     latestMeasurementId: row.latestMeasurementId,
+    trust: (row.trust ?? "UNTRUSTED") as "TRUSTED" | "LIMITED" | "UNTRUSTED",
   };
 }
 
