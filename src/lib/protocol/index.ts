@@ -22,7 +22,7 @@ import { z } from "zod";
 export const PROTOCOL_VERSION = "v1" as const;
 
 // ---------------------------------------------------------------------------
-// ConnectivityIntent — what the user wants
+// ConnectivityIntent — what the user wants (Phase 9.4: durable, versioned)
 // ---------------------------------------------------------------------------
 
 export const LocationConstraintSchema = z.object({
@@ -55,9 +55,51 @@ export const BudgetConstraintSchema = z.object({
   maxMinor: z.number().optional(),
 });
 
+/**
+ * Phase 9.4: Intent state machine.
+ *
+ *   ACTIVE     — the intent is the current authoritative user desire
+ *   SUPERSEDED — a newer intent version has replaced this one
+ *   EXPIRED    — the intent's expiresAt has passed
+ *   FULFILLED  — the intent's outcome has been achieved (session ACTIVE + healthy)
+ *   CANCELLED  — the user explicitly cancelled the intent
+ *
+ * Legal transitions:
+ *   ACTIVE → SUPERSEDED (when a newer version is accepted)
+ *   ACTIVE → EXPIRED (when expiresAt passes)
+ *   ACTIVE → FULFILLED (when outcome is achieved)
+ *   ACTIVE → CANCELLED (when user cancels)
+ *   SUPERSEDED/EXPIRED/FULFILLED/CANCELLED → terminal (no further transitions)
+ */
+export const IntentStateSchema = z.enum([
+  "ACTIVE",
+  "SUPERSEDED",
+  "EXPIRED",
+  "FULFILLED",
+  "CANCELLED",
+]);
+export type IntentState = z.infer<typeof IntentStateSchema>;
+
 export const ConnectivityIntentSchema = z.object({
   id: z.string().optional(),
   subjectId: z.string(),
+  // Phase 9.4: Device scope — the intent may be scoped to a specific device
+  deviceId: z.string().optional(),
+  // Phase 9.4: Durable version for optimistic concurrency fencing
+  version: z.number().int().default(1),
+  // Phase 9.4: Lifecycle state
+  status: IntentStateSchema.default("ACTIVE"),
+  // Phase 9.4: Supersession tracking — which intent/version this one replaces
+  supersedesIntentId: z.string().optional(),
+  supersedesVersion: z.number().int().optional(),
+  // Phase 9.4: Expiry — an expired intent must not generate new actions
+  expiresAt: z.string().datetime().optional(),
+  // Phase 9.4: Priority — higher priority intents may preempt lower ones
+  priority: z.enum(["LOW", "NORMAL", "HIGH", "CRITICAL"]).default("NORMAL"),
+  // Phase 9.4: Provenance — where did this intent come from?
+  source: z.enum(["USER", "AI_PROPOSAL", "COMMERCIAL", "SYSTEM"]).default("USER"),
+
+  // Existing declarative fields (unchanged):
   location: LocationConstraintSchema.optional(),
   timeWindow: TimeWindowSchema.optional(),
   capabilityRequirements: CapabilityRequirementsSchema.optional(),
@@ -66,10 +108,50 @@ export const ConnectivityIntentSchema = z.object({
   mode: z.enum(["AUTOMATIC", "MANUAL"]).default("MANUAL"),
   rawText: z.string().optional(),
   confidence: z.number().min(0).max(1).default(0),
+
+  // Phase 9.4: Timestamps for lifecycle management
   createdAt: z.string().datetime().optional(),
+  updatedAt: z.string().datetime().optional(),
 });
 
 export type ConnectivityIntent = z.infer<typeof ConnectivityIntentSchema>;
+
+/**
+ * Phase 9.4: Legal intent state transitions.
+ * Terminal states (SUPERSEDED, EXPIRED, FULFILLED, CANCELLED) cannot transition.
+ */
+export const INTENT_TRANSITIONS: Record<IntentState, IntentState[]> = {
+  ACTIVE: ["SUPERSEDED", "EXPIRED", "FULFILLED", "CANCELLED"],
+  SUPERSEDED: [],
+  EXPIRED: [],
+  FULFILLED: [],
+  CANCELLED: [],
+};
+
+/**
+ * Phase 9.4: Deterministic decision reason codes.
+ * Each code corresponds to actual decision logic — no free-form explanations.
+ * The decision explanation is a projection of these codes, not a narrative.
+ */
+export const DecisionReasonCodeSchema = z.enum([
+  "RELIABILITY_REQUIREMENT",   // minReliability gate
+  "BATTERY_SAVER_CONTEXT",     // effective policy derivation
+  "BUDGET_CONSTRAINT",         // budget gate
+  "FRESHNESS_GATE",            // stale health → no auto-switch
+  "RESOURCE_UNAVAILABLE",      // no available resources found
+  "PREFERRED_TRANSPORT",      // transport preference applied
+  "POLICY_CONSTRAINT",         // policy blocked or allowed
+  "ACTIVE_SESSION",           // session already active
+  "HYSTERESIS",               // M-of-N degraded + improvement margin
+  "NO_BETTER_RESOURCE",       // best candidate not better than current
+  "DWELL_TIME",               // session too young to switch
+  "COOLDOWN",                 // recent switch, cooling down
+  "INSUFFICIENT_SAMPLES",     // not enough measurements for confidence
+  "INTENT_EXPIRED",           // intent expired, no new action
+  "INTENT_SUPERSEDED",        // intent was superseded, no new action
+  "QUALITY_ACCEPTABLE",       // current resource is healthy enough
+]);
+export type DecisionReasonCode = z.infer<typeof DecisionReasonCodeSchema>;
 
 // ---------------------------------------------------------------------------
 // ConnectivityCapability — technical description of supply

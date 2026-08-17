@@ -135,12 +135,16 @@ describe("Phase 8 — Connectivity Control Plane", () => {
   // -------------------------------------------------------------------------
   // Protocol API Routes
   // -------------------------------------------------------------------------
-  it("8.14: intent API creates intent + session + decision", async () => {
+  it("8.14: intent API creates durable intent + emits reevaluation", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync("src/app/api/v1/connectivity/intents/route.ts", "utf-8");
-    expect(source).toContain("intentRequest.create");
-    expect(source).toContain("createSession");
-    expect(source).toContain("makeDecision");
+    // Phase 9.4: The intent API now creates a durable ConnectivityIntentRecord
+    // (not a commerce IntentRequest) and emits a reevaluation signal.
+    // It does NOT directly invoke the action executor.
+    expect(source).toContain("createIntent");
+    expect(source).toContain("emitIntentReevaluationEvent");
+    // Must NOT directly call action executor
+    expect(source).not.toContain("executeAction");
   });
 
   it("8.15: sessions API is auth-guarded", async () => {

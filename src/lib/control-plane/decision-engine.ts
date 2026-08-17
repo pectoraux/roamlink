@@ -37,6 +37,8 @@ export type DecisionInput = {
   tenantId: string;
   subjectId: string;
   intentId?: string;
+  // Phase 9.4: Intent version for provenance
+  intentVersion?: number;
   sessionId?: string;
   rawText?: string;
   capabilityType?: string;
@@ -309,15 +311,18 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
     constraintsSatisfied.push("POLICY_ALLOWED");
   }
 
-  // Step 8: Persist with provenance (Phase 9.3.2)
+  // Step 8: Persist with provenance (Phase 9.3.2 + 9.4)
   const decision = await db.connectivityDecision.create({
     data: {
       intentId: input.intentId ?? "unknown",
+      // Phase 9.4: Intent version provenance
+      intentVersion: input.intentVersion ?? null,
       sessionId: input.sessionId ?? null,
       action,
       targetResourceId: targetResourceId ?? null,
       targetOfferId: targetOfferId ?? null,
       score,
+      // Phase 9.4: Structured reason codes (deterministic, evidence-backed)
       constraintsSatisfied: JSON.stringify(constraintsSatisfied),
       constraintsViolated: JSON.stringify(constraintsViolated),
       reasons: JSON.stringify(reasons),

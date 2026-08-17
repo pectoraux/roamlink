@@ -2088,6 +2088,8 @@ model ConnectivityPolicy {
 model ConnectivityDecision {
   id              String   @id @default(cuid())
   intentId        String
+  // Phase 9.4: Intent version provenance — which version of the intent was active
+  intentVersion   Int?
   sessionId       String?
   action          String
   targetResourceId String?
@@ -2379,4 +2381,46 @@ model EdgeObservationRecord {
   @@index([sessionId])
   @@index([resourceId])
   @@index([observedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9.4 — Durable Connectivity Intent
+//
+// A declarative request for a connectivity outcome. It is NOT a command.
+// The decision engine translates intent → decision → action.
+//
+//   Intent → ReevaluationEvent → Decision Engine → Decision → Action
+//
+// NOT: Intent → Action
+//
+// Versioning: each update creates a new version. A newer version supersedes
+// the older one. An offline replay of an older version is rejected.
+// ---------------------------------------------------------------------------
+
+model ConnectivityIntentRecord {
+  id                  String   @id @default(cuid())
+  intentId            String   // stable identifier across versions
+  subjectId           String   // authenticated user who created this intent
+  deviceId            String?  // optional device scope
+  version             Int      @default(1) // monotonic per intentId
+  status              String   @default("ACTIVE") // ACTIVE | SUPERSEDED | EXPIRED | FULFILLED | CANCELLED
+  supersedesIntentId  String?
+  supersedesVersion   Int?
+  expiresAt           DateTime?
+  priority            String   @default("NORMAL") // LOW | NORMAL | HIGH | CRITICAL
+  source              String   @default("USER") // USER | AI_PROPOSAL | COMMERCIAL | SYSTEM
+
+  // Declarative content (JSON — matches ConnectivityIntentSchema)
+  payload             String   // JSON of the intent specification
+
+  // Timestamps
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  supersededAt        DateTime?
+
+  @@unique([intentId, version]) // version fencing
+  @@index([subjectId])
+  @@index([intentId])
+  @@index([status])
+  @@index([expiresAt])
 }
