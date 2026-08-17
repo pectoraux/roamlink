@@ -29,6 +29,16 @@ export function ConnectivityDecisionStatus({ decision }: { decision: CurrentConn
           {decision.reasons[0]}
         </Text>
       )}
+      {/* Phase 9.5: Display canonical reason codes (machine-readable, deterministic) */}
+      {decision.reasonCodes && decision.reasonCodes.length > 0 && (
+        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 4, marginTop: 4 }}>
+          {decision.reasonCodes.map((code) => (
+            <View key={code} style={{ backgroundColor: "#f1f5f9", paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 }}>
+              <Text style={{ fontSize: 10, color: "#64748b", fontFamily: "monospace" }}>{code}</Text>
+            </View>
+          ))}
+        </View>
+      )}
     </View>
   );
 }

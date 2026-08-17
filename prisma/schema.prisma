@@ -2098,6 +2098,9 @@ model ConnectivityDecision {
   constraintsSatisfied String?
   constraintsViolated String?
   reasons         String?
+  // Phase 9.5 (R1): Canonical machine-readable reason codes (JSON array).
+  // Deterministic, evidence-backed. AI never generates these.
+  reasonCodes     String?
   policyVersion   String?
   // Phase 9.3.2: Durable decision provenance. A persisted decision can answer:
   //   What policy caused this? What device context? What derivation?

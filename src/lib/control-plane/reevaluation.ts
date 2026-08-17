@@ -291,6 +291,31 @@ export async function evaluateEvent(event: ReevaluationEventRow): Promise<Evalua
     subjectId = payload.subjectId;
   }
 
+  // Phase 9.5 (R2): Resolve the intent payload to extract budget, capability
+  // type, and other declarative fields. The intent is the authoritative source
+  // of these constraints — the worker does NOT inject them from elsewhere.
+  let maxPriceMinor: number | undefined;
+  let capabilityType: string | undefined;
+  if (intentId && intentVersion) {
+    const intentRecord = await db.connectivityIntentRecord.findUnique({
+      where: { intentId_version: { intentId, version: intentVersion } },
+      select: { payload: true },
+    });
+    if (intentRecord) {
+      try {
+        const intentPayload = JSON.parse(intentRecord.payload) as {
+          budget?: { maxMinor?: number };
+          capabilityType?: string;
+        };
+        maxPriceMinor = intentPayload.budget?.maxMinor;
+        // capabilityType may be stored at top level or in capabilityRequirements
+        capabilityType = (intentPayload as Record<string, unknown>).capabilityType as string | undefined;
+      } catch {
+        // Corrupt payload — skip budget extraction
+      }
+    }
+  }
+
   const sessionId = necessity.sessionId;
 
   // P0-1: If there's no session (intent-changed-no-session), we still need
@@ -312,12 +337,15 @@ export async function evaluateEvent(event: ReevaluationEventRow): Promise<Evalua
     }
 
     // No session — makeDecision with no sessionId → ACTIVATE path
+    // Phase 9.5 (R2): Pass budget + capabilityType from the intent payload.
     const decision = await makeDecision({
       tenantId: entitlement.tenantId,
       subjectId,
       intentId,
       intentVersion,
       deviceId,
+      maxPriceMinor,
+      capabilityType,
     });
 
     const isTerminal = ["KEEP", "WAIT", "ASK_USER"].includes(decision.action);
@@ -357,25 +385,30 @@ export async function evaluateEvent(event: ReevaluationEventRow): Promise<Evalua
     return { eventId: event.id, decisionAction: "NONE", result: "skipped:no-tenant" };
   }
 
-  let capabilityType: string | undefined;
+  let sessionCapabilityType: string | undefined;
   if (session.activeResourceId) {
     const resource = await db.protocolResource.findUnique({
       where: { id: session.activeResourceId },
       select: { capability: { select: { type: true } } },
     });
-    capabilityType = resource?.capability?.type ?? undefined;
+    sessionCapabilityType = resource?.capability?.type ?? undefined;
   }
+  // Phase 9.5 (R2): Prefer the intent's capabilityType (from the intent payload)
+  // over the session's current resource capability type.
+  const effectiveCapabilityType = capabilityType ?? sessionCapabilityType;
 
   // P0-1: Pass intentId, intentVersion, and deviceId from the INTENT_CHANGED
   // event into makeDecision — not from session.intentId.
+  // Phase 9.5 (R2): Also pass maxPriceMinor from the intent payload.
   const decision = await makeDecision({
     tenantId,
     subjectId: effectiveSubjectId,
     intentId: effectiveIntentId,
     intentVersion,
     sessionId: session.id,
-    capabilityType,
+    capabilityType: effectiveCapabilityType,
     deviceId: effectiveDeviceId,
+    maxPriceMinor,
   });
 
   // Mark KEEP/WAIT/ASK_USER as SKIPPED (no action needed). Non-KEEP stays

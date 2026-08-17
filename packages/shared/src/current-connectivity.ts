@@ -67,8 +67,10 @@ export type CurrentConnectivityDecision = {
   action: string;
   /** Human-readable status: "Optimizing automatically", "Monitoring", etc. */
   statusLabel: string;
-  /** Why this decision was made. */
+  /** Human-readable explanation (projection of reason codes). */
   reasons: string[];
+  /** Phase 9.5: Canonical machine-readable reason codes (deterministic). */
+  reasonCodes: string[];
   createdAt: string | null;
 };
 

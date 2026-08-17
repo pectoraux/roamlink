@@ -141,6 +141,8 @@ export async function getCurrentConnectivityForUser(userId: string): Promise<Cur
       action: latestDecision.action,
       statusLabel: mapDecisionStatusLabel(latestDecision.action, session.state),
       reasons: latestDecision.reasons ? JSON.parse(latestDecision.reasons) : [],
+      // Phase 9.5 (R1): Expose canonical machine-readable reason codes.
+      reasonCodes: latestDecision.reasonCodes ? JSON.parse(latestDecision.reasonCodes) : [],
       createdAt: latestDecision.createdAt?.toISOString() ?? null,
     };
   }
