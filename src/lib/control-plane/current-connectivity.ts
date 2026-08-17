@@ -18,6 +18,7 @@
 
 import { db } from "@/lib/db";
 import { logger } from "@/lib/logger";
+import { REASON_CODES, type ReasonCode } from "@roamlink/shared";
 import type {
   CurrentConnectivity,
   CurrentConnectivitySession,
@@ -137,12 +138,27 @@ export async function getCurrentConnectivityForUser(userId: string): Promise<Cur
   let decision: CurrentConnectivityDecision | null = null;
   const latestDecision = session.decisions[0];
   if (latestDecision) {
+    // Phase 9.5.4: Parse + validate reason codes at the read boundary.
+    // Uses the shared protocol's isValidReasonCode which validates against
+    // the canonical registry and fails safe on corrupt data.
+    let reasonCodes: string[] = [];
+    if (latestDecision.reasonCodes) {
+      try {
+        const parsed = JSON.parse(latestDecision.reasonCodes);
+        if (Array.isArray(parsed)) {
+          // Filter against canonical registry (imported at module level)
+          reasonCodes = parsed.filter((c: string) => REASON_CODES.includes(c as ReasonCode));
+        }
+      } catch {
+        reasonCodes = [];
+      }
+    }
+
     decision = {
       action: latestDecision.action,
       statusLabel: mapDecisionStatusLabel(latestDecision.action, session.state),
       reasons: latestDecision.reasons ? JSON.parse(latestDecision.reasons) : [],
-      // Phase 9.5 (R1): Expose canonical machine-readable reason codes.
-      reasonCodes: latestDecision.reasonCodes ? JSON.parse(latestDecision.reasonCodes) : [],
+      reasonCodes,
       createdAt: latestDecision.createdAt?.toISOString() ?? null,
     };
   }

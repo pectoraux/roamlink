@@ -62,6 +62,8 @@ export type CurrentConnectivityHealth = {
   explanation: string;
 };
 
+import type { ReasonCode } from "./reason-codes";
+
 export type CurrentConnectivityDecision = {
   /** What RoamLink is doing: KEEP, SWITCH, ACTIVATE, WAIT, ASK_USER. */
   action: string;
@@ -69,8 +71,8 @@ export type CurrentConnectivityDecision = {
   statusLabel: string;
   /** Human-readable explanation (projection of reason codes). */
   reasons: string[];
-  /** Phase 9.5: Canonical machine-readable reason codes (deterministic). */
-  reasonCodes: string[];
+  /** Phase 9.5.4: Canonical machine-readable reason codes (protocol contract). */
+  reasonCodes: ReasonCode[];
   createdAt: string | null;
 };
 
