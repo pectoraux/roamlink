@@ -3263,3 +3263,72 @@ Stage Summary:
 - The edge observation contract is frozen. The mobile agent is an edge observer + policy/context source — it NEVER becomes a second control plane.
 - Architecture: Mobile → EdgeObservation → Server → Measurement (source=DEVICE) → ResourceHealth → ReevaluationEvent → Decision → Action → Phase 8 controller.
 - Frozen layers unchanged: entitlement.ts kernel, adapter contract, ranking engine, ledger, Phase 8.6.6 control plane.
+
+---
+Task ID: 10.1.1
+Agent: Principal Architect (main) — Phase 10.1.1 Observation Validation Integrity Fixes
+Task: Corrective patch on fad2f0d. The architect audited Phase 10 directly and identified four concrete gaps — including one compile-time defect that silently swallowed measurement projection for ALL device observations. Limited scope: fix the four gaps, add adversarial DB tests, re-run the Phase 9.5 regression suite. Do not redesign the trust firewall (it is sound).
+
+Work Log:
+- Audited fad2f0d directly (did not trust prior summaries):
+  - Confirmed undefined `input.triggerReevaluation` at edge-ingestion.ts:335 inside ingestOneObservation(userId, obs) which has no `input` parameter. The ReferenceError is caught by the surrounding try/catch and logged as `edge.measurement_projection_failed` — so measurements were NEVER projected for device observations through the actual ingestion path. The entire Phase 10 trust firewall was dead code for the device path. Pre-Phase-10 code (fc0cea8) had `triggerReevaluation: true`; Phase 10 introduced the regression.
+  - Confirmed RESOURCE_MISMATCH was effectively unreachable: validateResourceHint() returned null on hint mismatch, then validateObservation() was gated by `if (validatedResourceId)` and never saw the original hint. The mismatch was silently cleared — no measurement persisted with RESOURCE_MISMATCH + UNTRUSTED.
+  - Confirmed rate limiter was keyed by (resourceId, source, capturedAt) on ConnectivityMeasurement — NOT per-device. Two devices on the same resource shared a bucket; a device could evade by switching resource context.
+  - Confirmed DUPLICATE was in ObservationIntegrity type but duplicate observations returned early before validateObservation() — never received an integrity classification on a persisted measurement. Protocol/type mismatch.
+  - Confirmed the dual time-window issue (ingestion acceptance vs health contribution) was undocumented and could be "simplified" by future agents.
+
+- Fix 1 (edge-ingestion.ts): Replaced `triggerReevaluation: input.triggerReevaluation !== false` with `triggerReevaluation: true` (restoring pre-Phase-10 behavior). Added a comment explaining the regression and why the device path always triggers reevaluation.
+
+- Fix 2 (edge-ingestion.ts + observation-validation.ts): Refactored validateResourceHint() to return a structured result `{ validatedResourceId, mismatch, sessionActiveResourceId, hintResourceId, reason }`. On hint mismatch, validatedResourceId = session's actual active resource (not null), mismatch = true. The observation record's resourceId is set to the session's active resource (not the bogus hint). validateObservation() now accepts `hintResourceId` + `resourceMismatch` parameters and classifies RESOURCE_MISMATCH + UNTRUSTED when mismatch is true. The measurement is persisted with this classification and attached to the session's actual active resource. The health firewall excludes UNTRUSTED from derivation. The observation remains auditable with its classification. Removed the `if (validatedResourceId)` gate — validation always runs when there's a resource to attach to (including the mismatch case).
+
+- Fix 3 (observation-validation.ts): Changed the rate-limit count from `db.connectivityMeasurement.count({ where: { resourceId, capturedAt, source } })` to `db.edgeObservationRecord.count({ where: { deviceId, observedAt: { gte: now - rateLimitWindowMs } } })`. Genuinely per-device. Two devices on the same resource get separate buckets. A device cannot evade by switching resource context. Counting observation RECORDS (not measurements) is correct because suspicious observations that never project to a measurement (e.g., resource mismatch) still count toward the device's rate limit. Added `rateLimitWindowMs: 60_000` to OBSERVATION_VALIDATION.
+
+- Fix 4 (observation-trust.ts): Removed `DUPLICATE` from `ObservationIntegrity` type. Added `IngestionOutcome = "ACCEPTED" | "DUPLICATE" | "REJECTED"` to make explicit that DUPLICATE is an ingestion-time decision surfaced in EdgeObservationAck, not a measurement-integrity state. Updated the schema comment on ConnectivityMeasurement.integrity to reflect the removed value and explain the rationale.
+
+- Fix 5 (observation-trust.ts + health-derivation.ts): Added explicit doc comments distinguishing:
+  1. INGESTION ACCEPTANCE WINDOW (OBSERVATION_VALIDATION.maxAgeMs = 5min) — gate at the edge-ingestion boundary. An observation older than this is classified STALE + UNTRUSTED at ingestion and stored for audit, but the trust firewall excludes it from health derivation.
+  2. HEALTH CONTRIBUTION WINDOW (DEFAULT_WINDOW_MS = 5min in health-derivation.ts) — gate inside deriveResourceHealth(). Determines which ACCEPTED measurements contribute to the CURRENT health snapshot. Finer-grained: the freshness classification (FRESH/STALE/EXPIRED) is derived from capturedAt at read time and excludes EXPIRED samples.
+  Documented that these are different policies and MUST NOT be collapsed into one — the ingestion window is an acceptance/audit boundary; the health window is a control-plane authority boundary.
+
+- Adversarial tests (tests/phase10.1.1-validation-integrity.test.ts, 4 tests, all DB-backed, all PASS):
+  10.1.1.1 PASS — resource hint mismatch (device claims resourceB, session active on resourceA) → observation record's resourceId = resourceA (session's active resource, NOT null, NOT the bogus hint); projected measurement has integrity=RESOURCE_MISMATCH, trust=UNTRUSTED, resourceId=resourceA. Health firewall excludes UNTRUSTED from derivation.
+  10.1.1.2 PASS — per-device rate limit. Flooded device A with 60 EdgeObservationRecord rows directly. 61st observation through real ingestion path → classified RATE_LIMITED + UNTRUSTED. Device B's first observation → VALID + LIMITED (separate bucket, unaffected).
+  10.1.1.3 PASS — duplicate observation (same observationId re-uploaded) → ack.duplicateCount=1. No measurement with integrity=DUPLICATE exists in the DB (DUPLICATE is not a measurement-integrity state). Original measurement retains integrity=VALID, trust=LIMITED.
+  10.1.1.4 PASS — valid device observation through ingestEdgeObservationBatch → measurement IS projected (ConnectivityMeasurement count increased). The projected measurement has source=DEVICE, integrity=VALID, trust=LIMITED. Proves the input.triggerReevaluation fix — measurements are now actually projected for device observations.
+
+- Updated test (tests/phase9.1-edge-observation.test.ts 9.1.5):
+  Old expectation: record.resourceId = null (hint silently dropped on mismatch).
+  New expectation: record.resourceId = fx.resourceAId (session's actual active resource); projected measurement has integrity=RESOURCE_MISMATCH, trust=UNTRUSTED. This is the behavior the architect required: the mismatch is preserved as a classification, not silently cleared.
+
+- Regression (all DB-backed against PostgreSQL + mock adapter):
+  Phase 10 (existing):        8/8 PASS
+  Phase 10.1.1 (new):         4/4 PASS
+  Phase 9.1 (edge contract): 12/12 PASS (9.1.5 updated to reflect corrected behavior)
+  Phase 9.1.1 (reliability): 4/4 PASS
+  Phase 9.5 (regression):    30/31 PASS
+    Pre-existing failure: 9.5.1 A1 (budget constraint reason code) — verified to fail
+    at fc0cea8 (frozen Phase 9.5.5) AND fad2f0d (Phase 10), in isolation. Unrelated
+    to observation trust/provenance (decision-engine budget logic). Out of scope for 10.1.1.
+  Total: 59 PASS, 1 pre-existing FAIL (not introduced by this patch).
+  Lint: clean (eslint . exit 0).
+
+- FROZEN LAYERS (verified unchanged — no kernel/adapter/ranking/ledger/decision-budget code mutated):
+  - entitlement.ts (kernel) — no Phase 10.1.1 code.
+  - adapter contract — unchanged.
+  - ranking engine — unchanged.
+  - ledger — untouched.
+  - decision-engine.ts budget logic — unchanged (git diff fc0cea8..fad2f0d confirms Phase 10 did NOT touch decision-engine/intent-service/reevaluation/ranking-engine/reason-codes).
+  - intent-service.ts — unchanged.
+  - reason-code protocol — unchanged.
+
+Stage Summary:
+- HEAD: c4a3ecd (on GitHub, verified: git ls-remote origin main → c4a3ecd)
+- Phase 10.1.1: 4/4 adversarial tests PASS, 8/8 existing Phase 10 tests PASS, 12/12 Phase 9.1 tests PASS, 4/4 Phase 9.1.1 tests PASS, 30/31 Phase 9.5 tests PASS (1 pre-existing failure unrelated to observation trust).
+- The trust firewall architecture is sound and now ACTUALLY EXERCISED by device observations (previously dead code due to the undefined `input` reference).
+- The three dimensions remain genuinely separated: health (HEALTHY/DEGRADED/UNKNOWN), freshness (FRESH/STALE/EXPIRED/UNKNOWN), trust (TRUSTED/LIMITED/UNTRUSTED).
+- RESOURCE_MISMATCH is now reachable and persisted as a classification (auditable).
+- Rate limiting is genuinely per-device (keyed by deviceId on EdgeObservationRecord).
+- DUPLICATE is explicitly an ingestion outcome, not a measurement-integrity state (type system reflects this).
+- The ingestion acceptance window ≠ health contribution window — documented as intentionally distinct.
+- Frozen layers unchanged: entitlement.ts, adapter contract, ranking engine, ledger, decision-engine budget logic, intent-service, reason-code protocol.
+- Phase 10.1.1 is COMPLETE. The trust/firewall architecture is strong enough to freeze Phase 10.
