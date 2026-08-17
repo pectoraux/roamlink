@@ -18,7 +18,7 @@
 
 import { db } from "@/lib/db";
 import { logger } from "@/lib/logger";
-import { REASON_CODES, type ReasonCode } from "@roamlink/shared";
+import { REASON_CODES, type ReasonCode, parseReasonCodesWithIntegrity } from "@roamlink/shared";
 import type {
   CurrentConnectivity,
   CurrentConnectivitySession,
@@ -138,27 +138,33 @@ export async function getCurrentConnectivityForUser(userId: string): Promise<Cur
   let decision: CurrentConnectivityDecision | null = null;
   const latestDecision = session.decisions[0];
   if (latestDecision) {
-    // Phase 9.5.4: Parse + validate reason codes at the read boundary.
-    // Uses the shared protocol's isValidReasonCode which validates against
-    // the canonical registry and fails safe on corrupt data.
-    let reasonCodes: string[] = [];
-    if (latestDecision.reasonCodes) {
-      try {
-        const parsed = JSON.parse(latestDecision.reasonCodes);
-        if (Array.isArray(parsed)) {
-          // Filter against canonical registry (imported at module level)
-          reasonCodes = parsed.filter((c: string) => REASON_CODES.includes(c as ReasonCode));
-        }
-      } catch {
-        reasonCodes = [];
-      }
+    // Phase 9.5.5: Parse reason codes with full integrity tracking.
+    // Distinguishes ABSENT / MALFORMED / UNKNOWN_CODE / VALID rather than
+    // silently collapsing all non-valid states to [].
+    // Unknown/malformed codes are logged as data-integrity warnings —
+    // the valid subset is still exposed to consumers.
+    const parsed = parseReasonCodesWithIntegrity(latestDecision.reasonCodes);
+
+    if (parsed.integrity === "MALFORMED") {
+      logger.error("current_connectivity.malformed_reason_codes", {
+        sessionId: session.id,
+        decisionId: latestDecision.id,
+        raw: latestDecision.reasonCodes?.slice(0, 200),
+      });
+    } else if (parsed.integrity === "UNKNOWN_CODE") {
+      logger.warn("current_connectivity.unknown_reason_codes", {
+        sessionId: session.id,
+        decisionId: latestDecision.id,
+        unknownCodes: parsed.unknownCodes,
+        validCount: parsed.codes.length,
+      });
     }
 
     decision = {
       action: latestDecision.action,
       statusLabel: mapDecisionStatusLabel(latestDecision.action, session.state),
       reasons: latestDecision.reasons ? JSON.parse(latestDecision.reasons) : [],
-      reasonCodes,
+      reasonCodes: parsed.codes,
       createdAt: latestDecision.createdAt?.toISOString() ?? null,
     };
   }
