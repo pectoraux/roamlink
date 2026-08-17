@@ -38,6 +38,27 @@ export const DEFAULT_SAMPLE_N = 5; // last N measurements
 export const DEFAULT_DEGRADED_THRESHOLD = 0.4; // quality below this = degraded sample
 export const DEFAULT_MIN_DEGRADED_COUNT = 2; // M-of-N: at least 2 degraded → DEGRADED
 
+/**
+ * Phase 10.1.1 — Two distinct time windows (intentionally documented).
+ *
+ *   1. INGESTION ACCEPTANCE WINDOW  (OBSERVATION_VALIDATION.maxAgeMs)
+ *      Gate at the edge-ingestion boundary. An observation older than this is
+ *      classified STALE + UNTRUSTED at ingestion and stored for audit, but the
+ *      trust firewall excludes it from health derivation.
+ *
+ *   2. HEALTH CONTRIBUTION WINDOW  (DEFAULT_WINDOW_MS — this file)
+ *      Gate inside deriveResourceHealth(). Determines which ACCEPTED
+ *      measurements contribute to the CURRENT health snapshot. Finer-grained
+ *      than the ingestion window: the freshness classification (FRESH/STALE/
+ *      EXPIRED) is derived from capturedAt at read time and excludes EXPIRED
+ *      samples from the snapshot.
+ *
+ * These are different policies and MUST NOT be collapsed into one. The
+ * ingestion window is an acceptance/audit boundary; the health window is a
+ * control-plane authority boundary. Future agents: do not "simplify" one into
+ * the other — doing so would couple audit policy to decision policy.
+ */
+
 export type HealthDerivationParams = {
   windowMs?: number;
   sampleN?: number;

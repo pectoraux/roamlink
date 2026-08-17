@@ -6,6 +6,25 @@
  *   Persisted observation ≠ Eligible measurement ≠ Authoritative health ≠ Decision authority
  *
  * The server alone derives trust. The mobile client never submits trust.
+ *
+ * ---------------------------------------------------------------------------
+ * Two distinct time windows (Phase 10.1.1 — intentionally documented):
+ *
+ *   1. INGESTION ACCEPTANCE WINDOW  (OBSERVATION_VALIDATION.maxAgeMs)
+ *      Whether to ACCEPT an incoming observation at all. An observation older
+ *      than this is classified STALE + UNTRUSTED at ingestion and stored for
+ *      audit, but the trust firewall excludes it from health derivation.
+ *
+ *   2. HEALTH CONTRIBUTION WINDOW  (health-derivation.DEFAULT_WINDOW_MS)
+ *      Whether an ACCEPTED measurement contributes to the CURRENT health
+ *      snapshot. The freshness classification (FRESH/STALE/EXPIRED) is a
+ *      SEPARATE, finer-grained signal derived from capturedAt at read time.
+ *
+ * These are different policies and MUST NOT be collapsed into one. The
+ * ingestion window is an acceptance gate (audit boundary). The health window
+ * is a contribution gate (control-plane authority boundary). Future agents:
+ * do not “simplify” one into the other.
+ * ---------------------------------------------------------------------------
  */
 
 // ---------------------------------------------------------------------------
@@ -41,12 +60,20 @@ export type ObservationTrust = "UNTRUSTED" | "LIMITED" | "TRUSTED";
  * These are observation-integrity states, NOT decision reason codes.
  *
  * VALID — observation passed all validation checks
- * STALE — capturedAt is too old (beyond the acceptance window)
+ * STALE — capturedAt is too old (beyond the ingestion acceptance window)
  * FUTURE_TIMESTAMP — capturedAt is in the future (clock skew or fabrication)
  * INVALID_METRIC — metric values are physically impossible
- * RESOURCE_MISMATCH — device claims resource it doesn't own
+ * RESOURCE_MISMATCH — device claims a resource it doesn't own (hint doesn't
+ *   match the session's active resource, or session ownership violation)
  * RATE_LIMITED — device is submitting too fast (burst/flood)
- * DUPLICATE — already processed (deduplicated)
+ *
+ * Phase 10.1.1: DUPLICATE is NOT a member of this type. Duplicate observations
+ * are deduped at the ingestion boundary (by observationId / deviceId+sequence)
+ * BEFORE validateObservation() is called, so they never receive an integrity
+ * classification on a persisted measurement. DUPLICATE is an INGESTION OUTCOME
+ * surfaced in the EdgeObservationAck (duplicate=true / rejected[]), not a
+ * measurement-integrity state. Mixing the two would suggest a measurement could
+ * be persisted with integrity=DUPLICATE, which the pipeline never produces.
  */
 export type ObservationIntegrity =
   | "VALID"
@@ -54,15 +81,30 @@ export type ObservationIntegrity =
   | "FUTURE_TIMESTAMP"
   | "INVALID_METRIC"
   | "RESOURCE_MISMATCH"
-  | "RATE_LIMITED"
-  | "DUPLICATE";
+  | "RATE_LIMITED";
+
+/**
+ * Phase 10.1.1: Ingestion outcomes (distinct from measurement integrity).
+ *
+ * These are the outcomes of the ingestion pipeline, returned in the
+ * EdgeObservationAck. They are NOT persisted on ConnectivityMeasurement.integrity
+ * (which uses ObservationIntegrity). The separation makes explicit that
+ * DUPLICATE is an ingestion-time decision, not a measurement state.
+ */
+export type IngestionOutcome = "ACCEPTED" | "DUPLICATE" | "REJECTED";
 
 // ---------------------------------------------------------------------------
 // Validation parameters
 // ---------------------------------------------------------------------------
 
 export const OBSERVATION_VALIDATION = {
-  // capturedAt must be within this window of "now" to be considered VALID
+  // ---------------------------------------------------------------------------
+  // INGESTION ACCEPTANCE WINDOW (Phase 10.1.1)
+  // An observation older than this is classified STALE + UNTRUSTED at
+  // ingestion. It is persisted for audit but excluded from health derivation.
+  // This is conceptually distinct from the HEALTH CONTRIBUTION WINDOW
+  // (health-derivation.DEFAULT_WINDOW_MS) — see the file header.
+  // ---------------------------------------------------------------------------
   maxAgeMs: 5 * 60 * 1000,       // 5 minutes — older = STALE
   maxFutureMs: 30 * 1000,         // 30 seconds — future beyond this = FUTURE_TIMESTAMP
 
@@ -73,8 +115,16 @@ export const OBSERVATION_VALIDATION = {
   minThroughputMbps: 0,           // can't be negative
   minLatencyMs: 0,                // can't be negative
 
-  // Rate limiting: max observations per device per minute
-  maxObservationsPerMinute: 60,   // 1 per second max
+  // ---------------------------------------------------------------------------
+  // PER-DEVICE RATE LIMITING (Phase 10.1.1)
+  // The window over which observations from a single device are counted.
+  // Counting is done on EdgeObservationRecord (deviceId, observedAt) — NOT on
+  // ConnectivityMeasurement by resource. This makes the limit genuinely
+  // per-device: two devices reporting on the same resource get separate
+  // buckets, and a device cannot evade the limit by switching resource context.
+  // ---------------------------------------------------------------------------
+  rateLimitWindowMs: 60_000,      // 1 minute rolling window
+  maxObservationsPerMinute: 60,   // 1 per second max per device
 } as const;
 
 // ---------------------------------------------------------------------------

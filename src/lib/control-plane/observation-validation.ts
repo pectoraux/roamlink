@@ -7,14 +7,33 @@
  *
  *   Device telemetry is evidence, not authority.
  *
- * Validation checks:
+ * Validation checks (in evaluation order):
  *   A. capturedAt sanity window (STALE / FUTURE_TIMESTAMP)
  *   B. Impossible metric values (INVALID_METRIC)
  *   C. Resource/session consistency (RESOURCE_MISMATCH)
- *   D. Rate limiting (RATE_LIMITED)
+ *      — Phase 10.1.1: the caller passes the device-supplied hint + a
+ *        mismatch flag resolved by validateResourceHint(). The mismatch is
+ *        classified here so the persisted measurement carries the
+ *        RESOURCE_MISMATCH + UNTRUSTED classification (auditable), instead
+ *        of being silently cleared at the ingestion boundary.
+ *   D. Per-device rate limiting (RATE_LIMITED)
+ *      — Phase 10.1.1: keyed by (deviceId, observedAt) on EdgeObservationRecord,
+ *        NOT by (resourceId, source) on ConnectivityMeasurement. Two devices
+ *        reporting on the same resource get separate buckets; a device cannot
+ *        evade the limit by switching resource context. Counting observation
+ *        records (not measurements) is correct because suspicious observations
+ *        that never project to a measurement still count toward the limit.
  *
  * Suspicious observations are NOT deleted — they are persisted with their
  * integrity classification so they remain auditable.
+ *
+ * NOTE on duplicate semantics (Phase 10.1.1):
+ *   DUPLICATE is an INGESTION OUTCOME returned in the EdgeObservationAck
+ *   (duplicate=true / rejected[]), NOT a measurement-integrity state. Duplicate
+ *   observations are deduped before validateObservation() is called, so they
+ *   never receive an integrity classification on a persisted measurement.
+ *   The DUPLICATE value was removed from ObservationIntegrity to make this
+ *   explicit in the type system.
  */
 
 import { logger } from "@/lib/logger";
@@ -45,6 +64,19 @@ export async function validateObservation(input: {
   deviceId: string;
   resourceId?: string | null;
   sessionId?: string | null;
+  /**
+   * Phase 10.1.1: The device-supplied resourceId hint. Used to detect
+   * RESOURCE_MISMATCH when it differs from the session's active resource.
+   * The caller (validateResourceHint) resolves this signal; we classify it
+   * here so the persisted measurement carries the integrity state.
+   */
+  hintResourceId?: string | null;
+  /**
+   * Phase 10.1.1: Pre-resolved mismatch flag from validateResourceHint.
+   * When true, the observation is classified RESOURCE_MISMATCH + UNTRUSTED
+   * regardless of other checks (the device claimed a resource it doesn't own).
+   */
+  resourceMismatch?: boolean;
   userId: string;
   observedAt: Date;
   source: ObservationSource;
@@ -81,34 +113,39 @@ export async function validateObservation(input: {
     };
   }
 
-  // C. Resource/session consistency (if sessionId provided)
-  if (input.sessionId && input.resourceId) {
-    const session = await db.connectivitySession.findUnique({
-      where: { id: input.sessionId },
-      select: { activeResourceId: true, subjectId: true },
-    });
-    if (session && session.activeResourceId && session.activeResourceId !== input.resourceId) {
-      return {
-        integrity: "RESOURCE_MISMATCH",
-        trust: "UNTRUSTED",
-        reason: `Device claims resource ${input.resourceId} but session active resource is ${session.activeResourceId}`,
-      };
-    }
+  // C. Resource/session consistency.
+  // Phase 10.1.1: The caller resolves the mismatch signal in validateResourceHint()
+  // and passes it here. This is the authoritative classification point — the
+  // measurement is persisted with RESOURCE_MISMATCH + UNTRUSTED so it remains
+  // auditable (the health firewall excludes UNTRUSTED from derivation).
+  if (input.resourceMismatch) {
+    return {
+      integrity: "RESOURCE_MISMATCH",
+      trust: "UNTRUSTED",
+      reason: input.hintResourceId
+        ? `Device claims resource ${input.hintResourceId} but session active resource differs (or session ownership violation)`
+        : `Resource hint rejected by validateResourceHint (session missing, ownership violation, or no active resource)`,
+    };
   }
 
-  // D. Rate limiting
-  const recentCount = await db.connectivityMeasurement.count({
+  // D. Per-device rate limiting.
+  // Phase 10.1.1: Keyed by (deviceId, observedAt) on EdgeObservationRecord —
+  // genuinely per-device. Two devices reporting on the same resource get
+  // separate buckets. A device cannot evade the limit by switching resource
+  // context. Counting observation RECORDS (not measurements) is correct
+  // because suspicious observations that never project to a measurement
+  // (e.g., resource mismatch) still count toward the device's rate limit.
+  const recentCount = await db.edgeObservationRecord.count({
     where: {
-      resourceId: input.resourceId ?? undefined,
-      capturedAt: { gte: new Date(now - 60_000) },
-      source: input.source as string,
+      deviceId: input.deviceId,
+      observedAt: { gte: new Date(now - OBSERVATION_VALIDATION.rateLimitWindowMs) },
     },
   });
   if (recentCount >= OBSERVATION_VALIDATION.maxObservationsPerMinute) {
     return {
       integrity: "RATE_LIMITED",
       trust: "UNTRUSTED",
-      reason: `${recentCount} observations in the last minute (max ${OBSERVATION_VALIDATION.maxObservationsPerMinute})`,
+      reason: `${recentCount} observations from device ${input.deviceId} in the last ${OBSERVATION_VALIDATION.rateLimitWindowMs / 1000}s (max ${OBSERVATION_VALIDATION.maxObservationsPerMinute})`,
     };
   }
 

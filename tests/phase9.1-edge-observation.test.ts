@@ -261,17 +261,32 @@ describe("Phase 9.1 — Edge Observation Contract (DB-backed)", () => {
   // 9.1.5 device cannot impersonate resource/session
   // =========================================================================
   it("9.1.5: device-supplied resourceId is validated (hint, not authoritative)", async () => {
-    // Observation with a resourceId that doesn't match the session's active resource
-    // The hint is dropped (set to null), but the observation is still accepted.
+    // Observation with a resourceId that doesn't match the session's active resource.
+    //
+    // Phase 10.1.1: The mismatch is NO LONGER silently cleared. The observation
+    // record's resourceId is set to the SESSION'S actual active resource (not
+    // the bogus hint), and the projected measurement carries
+    // integrity=RESOURCE_MISMATCH + trust=UNTRUSTED so it remains auditable.
+    // The health firewall excludes UNTRUSTED from health derivation.
     const dev = await freshDevice(fx.userId);
     const obs = makeObservation(fx, { sequence: 1, deviceId: dev, resourceId: "fake-resource-id" });
     const ack = await ingestEdgeObservationBatch(fx.userId, { deviceId: dev, observations: [obs] });
 
     expect(ack.acceptedThroughSequence).toBe(1);
 
-    // The record's resourceId is NULL (hint was invalid → dropped)
+    // The record's resourceId is the session's actual active resource (resourceA),
+    // NOT null and NOT the bogus hint. The mismatch is preserved on the measurement.
     const record = await db.edgeObservationRecord.findUnique({ where: { observationId: obs.observationId } });
-    expect(record?.resourceId).toBeNull(); // hint dropped
+    expect(record?.resourceId).toBe(fx.resourceAId);
+
+    // The projected measurement carries RESOURCE_MISMATCH + UNTRUSTED (auditable).
+    expect(record?.derivedMeasurementId).not.toBeNull();
+    const measurement = await db.connectivityMeasurement.findUnique({
+      where: { id: record!.derivedMeasurementId! },
+      select: { integrity: true, trust: true },
+    });
+    expect(measurement?.integrity).toBe("RESOURCE_MISMATCH");
+    expect(measurement?.trust).toBe("UNTRUSTED");
   }, 30_000);
 
   it("9.1.5b: device cannot impersonate another user's session", async () => {

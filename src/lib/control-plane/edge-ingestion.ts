@@ -102,49 +102,119 @@ export async function validateDeviceOwnership(userId: string, deviceId: string):
 // ---------------------------------------------------------------------------
 
 /**
- * Validate the device-supplied resourceId hint against the authenticated
- * session's active resource. If the hint doesn't match, the observation is
- * still accepted (with resourceId cleared) — the device may be confused
- * about which resource it's on, but its connectivity observation is still
- * valid telemetry.
+ * Result of validating a device-supplied resourceId hint.
  *
- * Returns the validated resourceId (or null if the hint is invalid).
+ * Phase 10.1.1: The mismatch signal is preserved so the caller can persist
+ * a measurement with integrity=RESOURCE_MISMATCH + trust=UNTRUSTED against
+ * the session's actual active resource (not the bogus hint). The measurement
+ * remains auditable; the health firewall excludes UNTRUSTED from derivation.
+ */
+export type ResourceHintValidation = {
+  /** The resource to attach the projected measurement to (null if no session/no active resource). */
+  validatedResourceId: string | null;
+  /** True iff the device supplied a hint that doesn't match the session's active resource. */
+  mismatch: boolean;
+  /** The session's actual active resource (null if no session/no active resource). */
+  sessionActiveResourceId: string | null;
+  /** The original hint supplied by the device (null if absent). */
+  hintResourceId: string | null;
+  /** Reason the hint was rejected (for audit logging). */
+  reason?: string;
+};
+
+/**
+ * Validate the device-supplied resourceId hint against the authenticated
+ * session's active resource.
+ *
+ * Phase 10.1.1: The mismatch is preserved as a signal — the caller uses it to
+ * classify the projected measurement as RESOURCE_MISMATCH + UNTRUSTED. We do
+ * NOT silently clear the hint and pretend the observation was clean.
+ *
+ *   hint matches session.activeResourceId → validatedResourceId = hint, mismatch = false
+ *   hint mismatches session.activeResourceId → validatedResourceId = session.activeResourceId,
+ *                                           mismatch = true (caller classifies UNTRUSTED)
+ *   no session, no hint                   → validatedResourceId = null, mismatch = false
+ *   session ownership violation          → validatedResourceId = null, mismatch = true
+ *                                           (caller classifies UNTRUSTED — impersonation attempt)
  */
 export async function validateResourceHint(
   userId: string,
-  sessionId: string | undefined,
+  sessionId: string | null,
   resourceIdHint: string | undefined,
-): Promise<string | null> {
-  if (!resourceIdHint) return null;
+): Promise<ResourceHintValidation> {
+  const hintResourceId = resourceIdHint ?? null;
 
-  // If we have a session, check its active resource
-  if (sessionId) {
-    const session = await db.connectivitySession.findUnique({
-      where: { id: sessionId },
-      select: { subjectId: true, activeResourceId: true, state: true },
-    });
-
-    if (!session) return null; // session doesn't exist — drop the hint
-
-    // Validate session ownership
-    if (session.subjectId !== userId) {
-      logger.warn("edge.resource_hint_session_mismatch", { sessionId, userId, sessionSubject: session.subjectId });
-      return null; // session belongs to another user — drop the hint
-    }
-
-    // If the hint matches the session's active resource, accept it
-    if (session.activeResourceId === resourceIdHint) {
-      return resourceIdHint;
-    }
-
-    // Hint doesn't match — accept the observation but clear the hint
-    return null;
+  // No session — nothing to validate against. The hint is dropped (we cannot
+  // confidently attach the measurement to any resource).
+  if (!sessionId) {
+    return { validatedResourceId: null, mismatch: false, sessionActiveResourceId: null, hintResourceId };
   }
 
-  // No session — accept the hint only if the resource exists and belongs to
-  // a capability owned by the user's tenant. This is a weaker validation.
-  // For now, drop the hint if there's no session to validate against.
-  return null;
+  const session = await db.connectivitySession.findUnique({
+    where: { id: sessionId },
+    select: { subjectId: true, activeResourceId: true, state: true },
+  });
+
+  // Session doesn't exist — drop the hint. Mismatch = true if the device
+  // claimed a resource (the session reference itself is invalid).
+  if (!session) {
+    return {
+      validatedResourceId: null,
+      mismatch: hintResourceId !== null,
+      sessionActiveResourceId: null,
+      hintResourceId,
+      reason: `session ${sessionId} does not exist`,
+    };
+  }
+
+  // Session belongs to another user — impersonation attempt. Classify as
+  // mismatch (UNTRUSTED) so the observation is auditable but excluded from health.
+  if (session.subjectId !== userId) {
+    logger.warn("edge.resource_hint_session_mismatch", { sessionId, userId, sessionSubject: session.subjectId });
+    return {
+      validatedResourceId: null,
+      mismatch: true,
+      sessionActiveResourceId: session.activeResourceId,
+      hintResourceId,
+      reason: `session ${sessionId} belongs to another user`,
+    };
+  }
+
+  // No active resource on the session — can't attach the measurement.
+  if (!session.activeResourceId) {
+    return {
+      validatedResourceId: null,
+      mismatch: hintResourceId !== null,
+      sessionActiveResourceId: null,
+      hintResourceId,
+      reason: `session ${sessionId} has no active resource`,
+    };
+  }
+
+  // Hint matches → accept it.
+  if (hintResourceId && hintResourceId === session.activeResourceId) {
+    return {
+      validatedResourceId: hintResourceId,
+      mismatch: false,
+      sessionActiveResourceId: session.activeResourceId,
+      hintResourceId,
+    };
+  }
+
+  // Hint mismatches (or is absent while a session has an active resource).
+  // Attach the measurement to the SESSION'S active resource (not the hint),
+  // and flag the mismatch so the caller classifies RESOURCE_MISMATCH + UNTRUSTED.
+  // If the hint is absent, mismatch = false (the device simply didn't claim a resource).
+  const mismatch = hintResourceId !== null;
+  return {
+    validatedResourceId: mismatch ? session.activeResourceId : null,
+    mismatch,
+    sessionActiveResourceId: session.activeResourceId,
+    hintResourceId,
+    reason: mismatch
+      ? `device claims resource ${hintResourceId} but session active resource is ${session.activeResourceId}`
+      : undefined,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -257,14 +327,27 @@ async function ingestOneObservation(
     return { accepted: true, duplicate: true, measurementId: existingSeq.derivedMeasurementId ?? undefined };
   }
 
-  // 4. Validate session + resource hints (never trust device-supplied identity)
+  // 4. Validate session + resource hints (never trust device-supplied identity).
+  // Phase 10.1.1: validateResourceHint now returns a structured result that
+  // preserves the mismatch signal — the caller classifies it as
+  // RESOURCE_MISMATCH + UNTRUSTED instead of silently clearing the hint.
   const validatedSessionId = await validateSessionOwnership(userId, obs.sessionId);
-  const validatedResourceId = await validateResourceHint(userId, validatedSessionId ?? undefined, obs.resourceId);
+  const resourceHint = await validateResourceHint(userId, validatedSessionId, obs.resourceId);
+
+  // The resource to attach the projected measurement to. When the hint
+  // mismatches, we attach to the session's actual active resource (not the
+  // bogus hint) and mark the measurement UNTRUSTED so the health firewall
+  // excludes it.
+  const measurementResourceId = resourceHint.validatedResourceId;
 
   // 5. Persist the immutable observation record.
   // Phase 9.1.1: Handle P2002 (unique constraint) on concurrent create —
   // two requests with the same (deviceId, sequence) can both pass the check
   // above and race to create. The loser gets P2002 and is treated as a duplicate.
+  //
+  // The observation record stores the VALIDATED resource (null on mismatch
+  // when there's no session, or the session's active resource when there is).
+  // The mismatch is preserved on the projected measurement's integrity field.
   let record;
   try {
     record = await db.edgeObservationRecord.create({
@@ -273,7 +356,7 @@ async function ingestOneObservation(
         deviceId: obs.deviceId,
         userId,
         sessionId: validatedSessionId,
-        resourceId: validatedResourceId,
+        resourceId: measurementResourceId,
         sequence: obs.sequence,
         source: obs.source,
         observedAt: new Date(obs.observedAt),
@@ -295,15 +378,22 @@ async function ingestOneObservation(
   // 6. Phase 10: Validate the observation and derive trust/integrity.
   //    The server alone derives trust — the mobile client never submits trust.
   //    Validation checks: capturedAt sanity, metric plausibility, resource
-  //    consistency, rate limiting.
+  //    consistency (incl. hint mismatch), per-device rate limiting.
+  //
+  //    Phase 10.1.1: We always run validation when there's a resource to
+  //    attach to — including when the hint mismatches. The mismatch is
+  //    classified as RESOURCE_MISMATCH + UNTRUSTED and persisted on the
+  //    measurement so it remains auditable (the health firewall excludes it).
   let measurementId: string | undefined;
-  if (validatedResourceId) {
+  if (measurementResourceId) {
     try {
       const { validateObservation } = await import("./observation-validation");
       const validationResult = await validateObservation({
         deviceId: obs.deviceId,
-        resourceId: validatedResourceId,
+        resourceId: measurementResourceId,
         sessionId: validatedSessionId,
+        hintResourceId: resourceHint.hintResourceId,
+        resourceMismatch: resourceHint.mismatch,
         userId,
         observedAt: new Date(obs.observedAt),
         source: obs.source as any,
@@ -324,15 +414,21 @@ async function ingestOneObservation(
       // 7. Project to ConnectivityMeasurement with trust/integrity classification.
       //    UNTRUSTED measurements are stored but excluded from health derivation
       //    by the health firewall (isEligibleForHealth).
+      //
+      //    Phase 10.1.1: triggerReevaluation is true for the device ingestion
+      //    path (each device observation is a fresh signal). The previous code
+      //    referenced an undefined `input` identifier — a regression introduced
+      //    in Phase 10 that silently swallowed the ReferenceError in the
+      //    try/catch below, so measurements were never projected.
       const result = await ingestMeasurement({
-        resourceId: validatedResourceId,
+        resourceId: measurementResourceId,
         sessionId: validatedSessionId ?? undefined,
         type: "QUALITY",
         metrics: projectToMetrics(obs.connectivity, obs.device),
         source: "DEVICE",
         confidence: 0.7,
         capturedAt: new Date(obs.observedAt),
-        triggerReevaluation: input.triggerReevaluation !== false,
+        triggerReevaluation: true,
         // Phase 10: Pass server-derived trust + integrity
         trust: validationResult.trust,
         integrity: validationResult.integrity,
@@ -348,7 +444,7 @@ async function ingestOneObservation(
       // Measurement ingestion failure must not roll back the observation.
       // The observation is still persisted (immutable log).
       logger.error("edge.measurement_projection_failed", {
-        observationId: obs.observationId, resourceId: validatedResourceId,
+        observationId: obs.observationId, resourceId: measurementResourceId,
         error: err instanceof Error ? err.message : String(err),
       });
     }

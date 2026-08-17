@@ -2049,7 +2049,11 @@ model ConnectivityMeasurement {
   // UNTRUSTED measurements are stored but excluded from health derivation.
   trust           String   @default("TRUSTED")
   // Phase 10: Observation integrity state at ingestion.
-  // VALID | STALE | FUTURE_TIMESTAMP | INVALID_METRIC | RESOURCE_MISMATCH | RATE_LIMITED | DUPLICATE
+  // VALID | STALE | FUTURE_TIMESTAMP | INVALID_METRIC | RESOURCE_MISMATCH | RATE_LIMITED
+  // Phase 10.1.1: DUPLICATE is NOT a measurement-integrity state. It is an
+  // ingestion outcome surfaced in EdgeObservationAck (duplicate=true), because
+  // duplicate observations are deduped before validateObservation() runs and
+  // never project to a persisted measurement. See packages/shared/src/observation-trust.ts.
   integrity       String   @default("VALID")
 
   session         ConnectivitySession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
