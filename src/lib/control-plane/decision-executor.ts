@@ -154,7 +154,7 @@ export async function claimDecisionForExecution(workerId: string): Promise<{
 export async function executeDecision(decisionId: string): Promise<DecisionExecutionResult> {
   const decision = await db.connectivityDecision.findUnique({
     where: { id: decisionId },
-    select: { id: true, sessionId: true, action: true, targetResourceId: true, reasons: true, executionState: true },
+    select: { id: true, sessionId: true, action: true, targetResourceId: true, reasons: true, executionState: true, intentId: true, intentVersion: true },
   });
 
   if (!decision) {
@@ -167,6 +167,31 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
       decisionId,
       executionState: decision.executionState as "EXECUTED" | "FAILED" | "RECONCILIATION_REQUIRED" | "SKIPPED",
     };
+  }
+
+  // P1-5 (9.4.2): Execution-time intent authority check. Before executing a
+  // PENDING decision, verify the referenced intent is still ACTIVE and not
+  // expired/superseded. A superseded intent cannot produce an action.
+  if (decision.intentId && decision.intentVersion) {
+    const { isIntentExpired } = await import("./intent-service");
+    const expired = await isIntentExpired(decision.intentId, decision.intentVersion);
+    if (expired) {
+      await db.connectivityDecision.update({
+        where: { id: decisionId },
+        data: {
+          executionState: DECISION_SKIPPED,
+          executedAt: new Date(),
+        },
+      });
+      logger.warn("decision.execution_skipped_intent_expired", {
+        decisionId, intentId: decision.intentId, intentVersion: decision.intentVersion,
+      });
+      return {
+        decisionId,
+        executionState: "SKIPPED",
+        error: "intent-expired-or-superseded",
+      };
+    }
   }
 
   // KEEP/WAIT/ASK_USER → SKIPPED (no action).

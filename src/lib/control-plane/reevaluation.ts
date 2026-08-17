@@ -101,6 +101,26 @@ export async function isReevaluationNecessary(event: ReevaluationEventRow): Prom
   sessionId?: string;
   reason: string;
 }> {
+  // P0-1 (9.4.2): INTENT_CHANGED events are ALWAYS necessary — they can
+  // trigger ACTIVATE even without an existing session. The intent itself
+  // is a legitimate decision-loop trigger independent of session existence.
+  if (event.type === "INTENT_CHANGED") {
+    // Try to find an existing active session for the subject
+    if (event.subjectId) {
+      const session = await db.connectivitySession.findFirst({
+        where: { subjectId: event.subjectId, state: { in: ["ACTIVE", "DEGRADED", "SWITCHING"] } },
+        orderBy: { createdAt: "desc" },
+        select: { id: true },
+      });
+      if (session) {
+        return { necessary: true, sessionId: session.id, reason: "intent-changed-with-session" };
+      }
+      // No session — still necessary (intent can trigger ACTIVATE)
+      return { necessary: true, reason: "intent-changed-no-session" };
+    }
+    return { necessary: true, reason: "intent-changed" };
+  }
+
   if (event.sessionId) {
     const session = await db.connectivitySession.findUnique({
       where: { id: event.sessionId },
@@ -251,11 +271,8 @@ export async function evaluateEvent(event: ReevaluationEventRow): Promise<Evalua
     };
   }
 
-  const sessionId = necessity.sessionId!;
-
-  // Phase 9.4.1 (P0-1): If this is an INTENT_CHANGED event, resolve the
-  // authoritative intent from the event payload — NOT from session.intentId.
-  // The event carries intentId, intentVersion, subjectId, deviceId.
+  // P0-1 (9.4.2): For INTENT_CHANGED events, resolve intent from payload.
+  // The intent can trigger ACTIVATE even without an existing session.
   let intentId: string | undefined;
   let intentVersion: number | undefined;
   let deviceId: string | undefined;
@@ -274,7 +291,53 @@ export async function evaluateEvent(event: ReevaluationEventRow): Promise<Evalua
     subjectId = payload.subjectId;
   }
 
-  // If not an INTENT_CHANGED event, resolve from session (legacy path)
+  const sessionId = necessity.sessionId;
+
+  // P0-1: If there's no session (intent-changed-no-session), we still need
+  // to make a decision. The decision engine supports the no-session → ACTIVATE
+  // path. We resolve tenantId from the intent's subject.
+  if (!sessionId) {
+    // No session — resolve tenant from the subject's entitlement/tenant
+    if (!subjectId) {
+      return { eventId: event.id, decisionAction: "NONE", result: "skipped:no-subject" };
+    }
+
+    // Resolve tenantId from the subject's entitlement
+    const entitlement = await db.connectivityEntitlement.findFirst({
+      where: { userId: subjectId, status: "ACTIVE" },
+      select: { tenantId: true },
+    });
+    if (!entitlement) {
+      return { eventId: event.id, decisionAction: "NONE", result: "skipped:no-tenant" };
+    }
+
+    // No session — makeDecision with no sessionId → ACTIVATE path
+    const decision = await makeDecision({
+      tenantId: entitlement.tenantId,
+      subjectId,
+      intentId,
+      intentVersion,
+      deviceId,
+    });
+
+    const isTerminal = ["KEEP", "WAIT", "ASK_USER"].includes(decision.action);
+    await db.connectivityDecision.update({
+      where: { id: decision.decisionId },
+      data: {
+        executionState: isTerminal ? "SKIPPED" : "PENDING",
+        executedAt: isTerminal ? new Date() : null,
+      },
+    }).catch(() => {});
+
+    return {
+      eventId: event.id,
+      decisionId: decision.decisionId,
+      decisionAction: decision.action,
+      result: `evaluated:${decision.action}:${isTerminal ? "skipped" : "pending-execution"}`,
+    };
+  }
+
+  // Existing session path (unchanged from 9.4.1)
   const session = await db.connectivitySession.findUnique({
     where: { id: sessionId },
     select: { id: true, subjectId: true, state: true, intentId: true, activeResourceId: true },

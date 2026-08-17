@@ -95,27 +95,66 @@ export async function createIntent(input: CreateIntentInput): Promise<IntentResu
   // New intent (no supersession)
   if (!input.supersedesIntentId) {
     const intentId = `intent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const record = await db.connectivityIntentRecord.create({
-      data: {
-        intentId,
-        subjectId: input.subjectId,
-        deviceId: input.deviceId ?? null,
-        version: 1,
-        status: "ACTIVE",
-        payload: JSON.stringify(payload),
-        expiresAt: input.expiresAt ?? null,
-        priority: input.priority ?? "NORMAL",
-        source: input.source ?? "USER",
-        idempotencyKey: input.idempotencyKey ?? null,
-      },
-    });
 
-    logger.info("intent.created", { intentId, version: 1, subjectId: input.subjectId });
+    // P0-2 (9.4.2): Transactional durability — intent creation + INTENT_CHANGED
+    // event in one transaction. If either fails, neither persists.
+    try {
+      const result = await db.$transaction(async (tx) => {
+        const record = await tx.connectivityIntentRecord.create({
+          data: {
+            intentId,
+            subjectId: input.subjectId,
+            deviceId: input.deviceId ?? null,
+            version: 1,
+            status: "ACTIVE",
+            payload: JSON.stringify(payload),
+            expiresAt: input.expiresAt ?? null,
+            priority: input.priority ?? "NORMAL",
+            source: input.source ?? "USER",
+            idempotencyKey: input.idempotencyKey ?? null,
+          },
+        });
 
-    // P1-2: Durable event handoff — emit INTENT_CHANGED (no .catch swallow)
-    await emitIntentReevaluationEvent(intentId, 1, input.subjectId, input.deviceId);
+        // Emit INTENT_CHANGED within the same transaction
+        await tx.reevaluationEvent.create({
+          data: {
+            type: "INTENT_CHANGED",
+            subjectId: input.subjectId,
+            resourceId: null,
+            sessionId: null,
+            payload: JSON.stringify({
+              intentId,
+              intentVersion: 1,
+              subjectId: input.subjectId,
+              deviceId: input.deviceId ?? null,
+              reason: "intent-created",
+            }),
+            state: "PENDING",
+          },
+        });
 
-    return { intentId, version: 1, status: "ACTIVE" };
+        return record;
+      });
+
+      logger.info("intent.created", { intentId, version: 1, subjectId: input.subjectId });
+      return { intentId, version: 1, status: "ACTIVE" };
+    } catch (err: any) {
+      // P1-3 (9.4.2): Concurrent idempotency — P2002 on unique key
+      if (err?.code === "P2002" && input.idempotencyKey) {
+        const existing = await db.connectivityIntentRecord.findUnique({
+          where: { idempotencyKey: input.idempotencyKey },
+        });
+        if (existing) {
+          return {
+            intentId: existing.intentId,
+            version: existing.version,
+            status: existing.status as IntentState,
+            duplicate: true,
+          };
+        }
+      }
+      throw err;
+    }
   }
 
   // Supersession: atomic transaction (P0-3)
@@ -163,7 +202,8 @@ async function supersedeIntent(input: {
   }
 
   try {
-    // P0-3: Atomic transaction — supersede old + create new in one transaction
+    // P0-2 (9.4.2): Atomic transaction — supersede old + create new + emit
+    // INTENT_CHANGED event, all in one transaction.
     const result = await db.$transaction(async (tx) => {
       // Find current ACTIVE version within the transaction
       const current = await tx.connectivityIntentRecord.findFirst({
@@ -185,7 +225,6 @@ async function supersedeIntent(input: {
         if (input.expectedVersion < current.version) {
           return { intentId: input.intentId, version: current.version, status: "ACTIVE" as IntentState, rejected: "stale-version" };
         } else {
-          // expectedVersion > current.version is also wrong
           return { intentId: input.intentId, version: current.version, status: "ACTIVE" as IntentState, rejected: "version-mismatch" };
         }
       }
@@ -231,25 +270,26 @@ async function supersedeIntent(input: {
         },
       });
 
+      // P0-2: Emit INTENT_CHANGED within the same transaction
+      await tx.reevaluationEvent.create({
+        data: {
+          type: "INTENT_CHANGED",
+          subjectId: input.subjectId,
+          resourceId: null,
+          sessionId: null,
+          payload: JSON.stringify({
+            intentId: input.intentId,
+            intentVersion: newVersion,
+            subjectId: input.subjectId,
+            deviceId: input.deviceId ?? null,
+            reason: "intent-superseded",
+          }),
+          state: "PENDING",
+        },
+      });
+
       return { intentId: input.intentId, version: newVersion, status: "ACTIVE" as IntentState };
     });
-
-    // Emit reevaluation OUTSIDE the transaction (event emission is non-fatal
-    // to the intent state, but we DON'T swallow errors — we log them)
-    if (!result.rejected) {
-      try {
-        await emitIntentReevaluationEvent(result.intentId, result.version, input.subjectId, input.deviceId);
-      } catch (err) {
-        // P1-2: Log the error — don't silently swallow. The observation worker
-        // will also process on its cycle, but this is a real failure that should
-        // be visible.
-        logger.error("intent.reevaluation_emission_failed", {
-          intentId: result.intentId,
-          version: result.version,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
 
     logger.info("intent.superseded", {
       intentId: input.intentId,
@@ -379,6 +419,38 @@ export async function cancelIntent(
 
   if (result.count === 0) {
     return { intentId, version: anyRecord.version, status: "ACTIVE", rejected: "concurrent-modification" };
+  }
+
+  // P1-4 (9.4.2): Cancellation emits an INTENT_CHANGED event so the control
+  // loop can react (e.g., release the active resource, end the session).
+  // This is transactional with the cancellation — both succeed or neither does.
+  try {
+    await db.$transaction(async (tx) => {
+      await tx.reevaluationEvent.create({
+        data: {
+          type: "INTENT_CHANGED",
+          subjectId,
+          resourceId: null,
+          sessionId: null,
+          payload: JSON.stringify({
+            intentId,
+            intentVersion: anyRecord.version,
+            subjectId,
+            deviceId: null,
+            reason: "intent-cancelled",
+          }),
+          state: "PENDING",
+        },
+      });
+    });
+  } catch (err) {
+    // The cancellation already succeeded (updateMany committed). The event
+    // is best-effort — log the failure. The observation worker cycle is
+    // a fallback, not the primary guarantee.
+    logger.error("intent.cancel_event_emission_failed", {
+      intentId, version: anyRecord.version, subjectId,
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 
   logger.info("intent.cancelled", { intentId, version: anyRecord.version, subjectId });
