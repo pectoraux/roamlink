@@ -25,20 +25,26 @@ import { getPolicy, POLICY_PRESETS, type PolicyEvaluation } from "./policy-engin
 import type { EdgePolicyContext } from "@roamlink/shared";
 
 // ---------------------------------------------------------------------------
-// Phase 9.3.2: Server-defined rules for context → preset derivation
+// Phase 9.3.2: Server configuration for context → preset derivation
 // ---------------------------------------------------------------------------
 
 /**
  * Controls whether batterySaver context overrides the base preset.
  *
- * Phase 9.3.2: This is a server-defined deterministic rule, not a physical law.
- * A future policy could set `batterySaverOverridesBase = false` to maintain
- * reliable connectivity for a critical call even in battery saver mode.
+ * Phase 9.3.2: This is SERVER CONFIGURATION, not policy state. It is a
+ * global server-side rule that applies to all policies equally. It is NOT
+ * a per-policy field — a policy cannot set `overridesBase=false` to
+ * preserve reliable connectivity for a critical call.
  *
- * Default: true (battery conservation is the default behavior).
+ * If per-policy batterySaver behavior is needed in the future, it should
+ * be added as a first-class policy field (e.g. `batterySaverBehavior:
+ * DOWNGRADE | PRESERVE_BASE`), not by mutating this server constant.
+ *
+ * For now, this truthfully represents what the system does: batterySaver
+ * always downgrades to BATTERY unless the server configuration is changed.
  */
 export const BATTERY_SAVER_RULE = {
-  overridesBase: true, // batterySaver → BATTERY by default
+  overridesBase: true, // server configuration: batterySaver → BATTERY by default
 };
 
 // ---------------------------------------------------------------------------

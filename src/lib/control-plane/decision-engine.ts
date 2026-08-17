@@ -33,9 +33,6 @@ import { mayTriggerAutomaticSwitch } from "@/lib/control-plane/freshness";
 //
 // This prevents a future caller from accidentally bypassing the
 // effective-policy boundary by passing a pre-resolved policy object.
-//
-// If a legitimate internal/test case needs a pre-resolved policy, use the
-// explicitly named internal API: makeDecisionWithResolvedPolicy().
 export type DecisionInput = {
   tenantId: string;
   subjectId: string;
@@ -70,6 +67,13 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
   const constraintsSatisfied: string[] = [];
   const constraintsViolated: string[] = [];
   const reasons: string[] = [];
+
+  // Phase 9.3.2: Resolve the effective policy FIRST (before anything else).
+  // Policy resolution is INTERNAL — no caller-supplied escape hatch.
+  const { deriveEffectivePolicy } = await import("./effective-policy");
+  const effectivePolicy = input.deviceId
+    ? await deriveEffectivePolicy(input.subjectId, input.deviceId)
+    : await deriveEffectivePolicy(input.subjectId);
 
   // Step 1: Discover capabilities (first-class ProtocolCapability)
   const capabilities = await discoverCapabilities({
@@ -174,13 +178,8 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
       ? await db.connectivitySession.findUnique({ where: { id: input.sessionId } })
       : null;
 
-    // Phase 9.3.2: Resolve the effective policy EARLY (before the active-session
-    // check) so the switchThreshold uses the correct effective policy.
-    // Policy resolution is INTERNAL — no caller-supplied escape hatch.
-    const { deriveEffectivePolicy } = await import("./effective-policy");
-    const effectivePolicy = input.deviceId
-      ? await deriveEffectivePolicy(input.subjectId, input.deviceId)
-      : await deriveEffectivePolicy(input.subjectId);
+    // Phase 9.3.2: effectivePolicy was resolved at the top of makeDecision().
+    // It's available in this scope for the switchThreshold + reliability check.
 
     if (activeSession && activeSession.state === "ACTIVE") {
       // Active session — evaluate KEEP vs SWITCH using the PERSISTED health
@@ -322,7 +321,7 @@ export async function makeDecision(input: DecisionInput): Promise<DecisionOutput
       constraintsSatisfied: JSON.stringify(constraintsSatisfied),
       constraintsViolated: JSON.stringify(constraintsViolated),
       reasons: JSON.stringify(reasons),
-      policyVersion: effectivePolicy.basePolicyId ?? "default",
+      policyVersion: effectivePolicy.basePolicyId ?? "default", // LEGACY: holds policyId, not version. New consumers use basePolicyId/basePolicyVersion.
       // Phase 9.3.2: Durable provenance
       basePolicyId: effectivePolicy.basePolicyId,
       basePolicyVersion: effectivePolicy.basePolicyVersion,
