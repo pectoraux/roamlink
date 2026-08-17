@@ -412,20 +412,22 @@ export async function cancelIntent(
     return { intentId, version: anyRecord.version, status: "ACTIVE", rejected: expectedVersion < anyRecord.version ? "stale-version" : "version-mismatch" };
   }
 
-  const result = await db.connectivityIntentRecord.updateMany({
-    where: { intentId, version: anyRecord.version, status: "ACTIVE" },
-    data: { status: "CANCELLED", supersededAt: new Date() },
-  });
-
-  if (result.count === 0) {
-    return { intentId, version: anyRecord.version, status: "ACTIVE", rejected: "concurrent-modification" };
-  }
-
-  // P1-4 (9.4.2): Cancellation emits an INTENT_CHANGED event so the control
-  // loop can react (e.g., release the active resource, end the session).
-  // This is transactional with the cancellation — both succeed or neither does.
+  // P1-4 (9.4.2): Cancellation + INTENT_CHANGED event in ONE transaction.
+  // Both the guarded ACTIVE→CANCELLED transition and the event creation
+  // happen inside a single db.$transaction. If either fails, neither persists.
   try {
-    await db.$transaction(async (tx) => {
+    const txResult = await db.$transaction(async (tx) => {
+      // Guarded transition — only succeeds if still ACTIVE at this version
+      const cancelResult = await tx.connectivityIntentRecord.updateMany({
+        where: { intentId, version: anyRecord.version, status: "ACTIVE" },
+        data: { status: "CANCELLED", supersededAt: new Date() },
+      });
+
+      if (cancelResult.count === 0) {
+        return { cancelled: false, version: anyRecord.version };
+      }
+
+      // Create INTENT_CHANGED within the same transaction
       await tx.reevaluationEvent.create({
         data: {
           type: "INTENT_CHANGED",
@@ -442,19 +444,24 @@ export async function cancelIntent(
           state: "PENDING",
         },
       });
+
+      return { cancelled: true, version: anyRecord.version };
     });
+
+    if (!txResult.cancelled) {
+      return { intentId, version: txResult.version, status: "ACTIVE", rejected: "concurrent-modification" };
+    }
+
+    logger.info("intent.cancelled", { intentId, version: anyRecord.version, subjectId });
+    return { intentId, version: anyRecord.version, status: "CANCELLED" };
   } catch (err) {
-    // The cancellation already succeeded (updateMany committed). The event
-    // is best-effort — log the failure. The observation worker cycle is
-    // a fallback, not the primary guarantee.
-    logger.error("intent.cancel_event_emission_failed", {
+    // Transaction failed — intent remains ACTIVE, no event created
+    logger.error("intent.cancel_transaction_failed", {
       intentId, version: anyRecord.version, subjectId,
       error: err instanceof Error ? err.message : String(err),
     });
+    return { intentId, version: anyRecord.version, status: "ACTIVE", rejected: "transaction-failed" };
   }
-
-  logger.info("intent.cancelled", { intentId, version: anyRecord.version, subjectId });
-  return { intentId, version: anyRecord.version, status: "CANCELLED" };
 }
 
 // ---------------------------------------------------------------------------
