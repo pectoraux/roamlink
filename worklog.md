@@ -3563,3 +3563,72 @@ Stage Summary:
   + "An expired claim is dead-lettered only by the reclaim path (claim-expiry guarded)."
 - Phase 11.1 is now legitimately closed. The decision executor's claim ownership semantics are sound enough for Phase 11.2 to build the session-level DB serialization layer on top.
 - Next: Phase 11.2 — Session-level execution serialization (DB-authoritative primitive, highest-risk area).
+
+---
+Task ID: 11.2
+Agent: Principal Architect (main) — Phase 11.2 Session-Level Execution Serialization
+Task: Build the DB-authoritative session serialization primitive that owns the entire mutation window. Close the highest-risk concurrency gap: two concurrent SWITCH decisions for the same session racing on session.activeResourceId and leaving an orphaned target IN_USE. Prove acceptance invariant #2: "A session cannot have two connectivity mutations executing concurrently."
+
+Work Log:
+- Audited fc6b63f/564bf06. Confirmed the gap:
+  - Phase 11.1 fences at the *decision* level (one worker per decision).
+  - But there is NO *session* level fence. Two different decisions (both targeting the same session) can be claimed by two different workers and both proceed to execute concurrently.
+  - executeAction's SWITCH path (reserve target → mark IN_USE → update session.activeResourceId → release old) races if two SWITCH actions run concurrently on the same session.
+  - Result: session could end on an unintended resource; the losing target could be left orphaned IN_USE.
+
+- Schema (prisma/schema.prisma):
+  - Added to ConnectivitySession:
+    - executionSlotClaimId String?
+    - executionSlotClaimedAt DateTime?
+    - executionSlotClaimExpiresAt DateTime?
+  - Added @@index([executionSlotClaimExpiresAt]) for the reclaim query.
+  - The slot is a column on the session (not a separate table) — single-row update with WHERE guard, no joins. This is the DB-authoritative primitive.
+
+- DB migration: added the three columns via raw SQL ALTER TABLE on the SQLite dev DB. Regenerated Prisma client with sqlite provider (schema declares postgresql for production/Vercel; dev uses SQLite — the existing pattern).
+
+- New module: src/lib/control-plane/session-execution-slot.ts
+  - SESSION_EXECUTION_SLOT_LEASE_MS = 5 * 60_000 (matches DECISION_EXECUTION_LEASE_MS — the slot must cover the full action execution window).
+  - acquireSessionExecutionSlot(sessionId, claimId): fenced updateMany with WHERE guard:
+      WHERE id = sessionId
+        AND (executionSlotClaimId IS NULL OR executionSlotClaimExpiresAt < now)
+      DATA: executionSlotClaimId = claimId, executionSlotClaimedAt = now, executionSlotClaimExpiresAt = now + LEASE
+    Returns { acquired: true } if count>0, { acquired: false } if the slot is held by another worker with a non-expired lease.
+  - releaseSessionExecutionSlot(sessionId, claimId): fenced release — WHERE executionSlotClaimId = claimId (only the claim owner releases). Called in a finally block. If count=0 (slot was reclaimed after expiry), it's a safe no-op.
+  - reclaimExpiredSessionSlots(): cron cleanup for crashed slot holders. Fenced clear (checks claimId + expiry). Returns { reclaimed }.
+
+- decision-executor.ts (executeDecision):
+  - After marking EXECUTING, BEFORE creating the action: acquire the session execution slot (if decision.sessionId exists).
+  - If acquire fails (session busy): requeue the decision (return to PENDING, clear executionClaimId). Return { executionState: "SESSION_BUSY" } — a return-value-only state (not persisted; the decision is PENDING). The attemptCount stays incremented (the claim did happen).
+  - If acquire succeeds: proceed to create + execute the action.
+  - In a finally block after execution (success/failure/reconciliation): release the session execution slot. Fenced by claimId.
+  - Added DECISION_SESSION_BUSY constant + extended DecisionExecutionResult type.
+
+- API route (observe-connectivity/route.ts): wired reclaimExpiredSessionSlots into the cron (step 1, alongside reclaimExpiredClaims and reclaimExpiredDecisionClaims). Added sessionSlotsReclaimed to the log + response.
+
+Tests (tests/phase11.2-session-serialization.test.ts, 5 DB-backed runtime, all PASS):
+  11.2.1 PASS — THE DANGEROUS CASE (the architect's exact spec):
+    Session S ACTIVE on A. Decision 1: A→B. Decision 2: A→C.
+    Two workers execute concurrently (Promise.all).
+    Result: exactly one EXECUTED, one SESSION_BUSY (requeued to PENDING).
+    Final session resource is B or C (never a blend). Winning target IN_USE owned by session. Losing target NOT IN_USE (never touched — no action created). Old resource A is AVAILABLE. Exactly one action created. Requeued decision is PENDING with claimId null.
+  11.2.2 PASS — slot released after success: next decision acquires immediately (not SESSION_BUSY).
+  11.2.3 PASS — slot released after failure (finally block runs): next decision acquires.
+  11.2.4 PASS — expired slot → reclaimExpiredSessionSlots clears it.
+  11.2.5 PASS — two concurrent acquireSessionExecutionSlot → exactly one succeeds (fenced updateMany).
+
+Regression (all DB-backed against PostgreSQL + mock adapter):
+  Phase 11.1 (all 7):     7/7 PASS
+  Phase 11.2 (all 5):     5/5 PASS
+  Phase 8.6.6 (closure):  5/5 PASS
+  Phase 10/10.1.1:       13/13 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 30 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 0163764 (on GitHub, verified: git ls-remote origin main → 0163764)
+- The session serialization primitive is DB-authoritative (fenced updateMany on a session column). Two workers/processes cannot bypass it.
+- The slot owns the ENTIRE mutation window (claim → mutate → verify → release). Not "check session → mutate → later discover someone else mutated it."
+- The dangerous case is proven: concurrent SWITCH A→B + A→C → exactly one executes, losing decision requeued (PENDING), losing target not orphaned IN_USE.
+- Acceptance invariant #2 proven: "A session cannot have two connectivity mutations executing concurrently."
+- Frozen layers unchanged: entitlement.ts kernel, adapter contract, ranking engine, ledger, reason-code protocol, Phase 10 trust firewall.
+- Next: Phase 11.3 — Provider truth flips mid-execution (inject NOT_USABLE between reserve and verify → session remains on old resource, not stranded mid-switch).
