@@ -655,4 +655,73 @@ describe("Phase 11.2 — Session-Level Execution Serialization (DB-backed)", () 
     await releaseSessionExecutionSlot(fx.sessionId, slotClaimX);
     await db.connectivityDecision.delete({ where: { id: decision.id } }).catch(() => {});
   }, 60_000);
+
+  // =========================================================================
+  // 11.2.8 — Lost slot ownership during execution: no further mutation.
+  //
+  // Phase 11.2.2: If the heartbeat renewal fails (slot reclaimed by cron),
+  // the worker MUST NOT perform another connectivity mutation. The
+  // SlotOwnershipContext.verifySlotOwnership() check before each mutating
+  // stage throws SlotOwnershipLostError → RECONCILIATION_REQUIRED.
+  //
+  // This test simulates the dangerous sequence:
+  //   A loses slot → B acquires slot → A attempts next action → A is refused
+  //
+  // We use the slot ownership context directly (not through executeDecision,
+  // which would require simulating a 5-minute wait for the heartbeat). This
+  // tests the checkpoint mechanism itself — the invariant is:
+  //   "While a worker is performing the mutation window, either the worker
+  //    still owns the session slot OR the worker has stopped before performing
+  //    any further connectivity mutation."
+  // =========================================================================
+  it("11.2.8: lost slot ownership during execution → next checkpoint aborts mutation (RECONCILIATION_REQUIRED)", async () => {
+    // 1. Worker A acquires the session slot.
+    await db.connectivitySession.update({
+      where: { id: fx.sessionId },
+      data: { executionSlotClaimId: null, executionSlotClaimedAt: null, executionSlotClaimExpiresAt: null },
+    }).catch(() => {});
+
+    const claimA = `lost-slot-A-${Date.now()}`;
+    const acquired = await acquireSessionExecutionSlot(fx.sessionId, claimA);
+    expect(acquired.acquired).toBe(true);
+
+    // 2. Create the slot ownership context (same as executeDecision does).
+    const { createSlotOwnershipContext, SlotOwnershipLostError } = await import("@/lib/control-plane/session-execution-slot");
+    const ctx = createSlotOwnershipContext(fx.sessionId, claimA);
+
+    // 3. Worker A begins mutation — first checkpoint passes (slot is held).
+    await ctx.verifySlotOwnership(); // should NOT throw
+
+    // 4. Simulate slot loss: Worker B forcibly acquires the slot (e.g. cron
+    //    reclaimed A's expired slot, then B acquired it).
+    //    Set the lease to expired, reclaim, then B acquires.
+    await db.connectivitySession.update({
+      where: { id: fx.sessionId },
+      data: { executionSlotClaimExpiresAt: new Date(Date.now() - 1000) },
+    });
+    await reclaimExpiredSessionSlots();
+
+    const claimB = `lost-slot-B-${Date.now()}`;
+    const acquiredB = await acquireSessionExecutionSlot(fx.sessionId, claimB);
+    expect(acquiredB.acquired).toBe(true); // Worker B now holds the slot
+
+    // 5. Simulate the heartbeat detecting the loss (set slotLost = true).
+    //    In production, the heartbeat calls renewSessionExecutionSlot, which
+    //    returns { renewed: false }, and the heartbeat sets slotLost.
+    ctx.slotLost = true;
+
+    // 6. Worker A reaches the next mutation checkpoint. The checkpoint MUST
+    //    throw SlotOwnershipLostError — the worker must NOT perform the mutation.
+    await expect(ctx.verifySlotOwnership()).rejects.toThrow(SlotOwnershipLostError);
+
+    // 7. Worker A's mutation is aborted. Worker B's slot is intact.
+    const session = await db.connectivitySession.findUnique({
+      where: { id: fx.sessionId },
+      select: { executionSlotClaimId: true },
+    });
+    expect(session?.executionSlotClaimId).toBe(claimB); // B holds the slot, not A
+
+    // Cleanup.
+    await releaseSessionExecutionSlot(fx.sessionId, claimB);
+  }, 60_000);
 });

@@ -28,6 +28,7 @@ import { transitionSessionState } from "./session-manager";
 import { reserveResource, releaseResource, markResourceInUse } from "./capability-registry";
 import { resolveResourceBinding, verifyResourceUsable } from "./kernel-bridge";
 import { assertActiveConnectivityInvariant } from "./invariant-checker";
+import { SlotOwnershipLostError } from "./session-execution-slot";
 
 // Phase 8.5.10: Recovery timing constants
 const RECOVERY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes — actions EXECUTING longer than this are stale
@@ -179,7 +180,9 @@ export async function transitionActionState(
  *
  * Key invariant: releasing the old resource MUST NOT invalidate the new one.
  */
-export async function executeAction(actionId: string): Promise<{
+export async function executeAction(actionId: string, slotContext?: {
+  verifySlotOwnership: () => Promise<void>;
+}): Promise<{
   status: "succeeded" | "failed" | "reconciliation_required";
   error?: string;
 }> {
@@ -216,6 +219,11 @@ export async function executeAction(actionId: string): Promise<{
       // ACTIVATE: reserve → mark IN_USE → session ACTIVE
       // -------------------------------------------------------------------
       case "ACTIVATE": {
+        // Phase 11.2.2: Verify slot ownership before each mutating stage.
+        // If the slot was lost (heartbeat renewal failed / lease expired),
+        // abort the mutation safely → RECONCILIATION_REQUIRED.
+        await slotContext?.verifySlotOwnership();
+
         // 3a. Reserve the target resource
         const reserveResult = await reserveResource(targetResourceId, session.id);
         if (!reserveResult.reserved) {
@@ -237,6 +245,9 @@ export async function executeAction(actionId: string): Promise<{
           await releaseResource(targetResourceId, session.id);
           throw new Error(`Kernel bridge requires reconciliation: ${bridgeResult.error}`);
         }
+
+        // Phase 11.2.2: Verify slot ownership before marking IN_USE (mutating stage).
+        await slotContext?.verifySlotOwnership();
 
         // 3c. Mark resource as IN_USE — fail closed
         const activateResult = await markResourceInUse(targetResourceId, session.id);
@@ -261,6 +272,9 @@ export async function executeAction(actionId: string): Promise<{
           });
           return { status: "failed", error: `Verification UNKNOWN — target released, reconciliation required: ${verifyResult.reason}` };
         }
+
+        // Phase 11.2.2: Verify slot ownership before updating session (mutating stage).
+        await slotContext?.verifySlotOwnership();
 
         // 3e. Update session with entitlement link (only if USABLE)
         await db.connectivitySession.update({
@@ -321,6 +335,9 @@ export async function executeAction(actionId: string): Promise<{
 
         const previousResourceId = session.activeResourceId;
 
+        // Phase 11.2.2: Verify slot ownership before starting the mutation.
+        await slotContext?.verifySlotOwnership();
+
         // 3a. Transition session to SWITCHING
         await transitionSessionState(session.id, "SWITCHING");
 
@@ -349,6 +366,9 @@ export async function executeAction(actionId: string): Promise<{
           throw new Error(`Kernel bridge requires reconciliation for target: ${bridgeResult.error}`);
         }
 
+        // Phase 11.2.2: Verify slot ownership before marking IN_USE (mutating stage).
+        await slotContext?.verifySlotOwnership();
+
         // 3d. Mark target as IN_USE — fail closed
         const activateResult = await markResourceInUse(targetResourceId, session.id);
         if (!activateResult.activated) {
@@ -376,6 +396,10 @@ export async function executeAction(actionId: string): Promise<{
           return { status: "failed", error: `Switch verification UNKNOWN — reconciliation required: ${verifyResult.reason}` };
         }
 
+        // Phase 11.2.2: Verify slot ownership before updating session.activeResourceId
+        // (the critical mutation — this is where the session switches to the new resource).
+        await slotContext?.verifySlotOwnership();
+
         // 3f. Atomically update session to point to new resource + entitlement
         await db.connectivitySession.update({
           where: { id: session.id },
@@ -388,6 +412,10 @@ export async function executeAction(actionId: string): Promise<{
 
         // 3g. Transition session back to ACTIVE
         await transitionSessionState(session.id, "ACTIVE");
+
+        // Phase 11.2.2: Verify slot ownership before releasing the old resource
+        // (the final mutating stage — must not release old if slot was lost).
+        await slotContext?.verifySlotOwnership();
 
         // 3g. Release the previous resource (ownership-safe)
         // IMPORTANT: failure here does NOT invalidate the new resource.
@@ -501,6 +529,17 @@ export async function executeAction(actionId: string): Promise<{
     return { status: "succeeded" };
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
+
+    // Phase 11.2.2: Slot ownership lost during mutation → RECONCILIATION_REQUIRED
+    // (not FAILED). The session may be in an inconsistent state (partially mutated)
+    // that needs reconciliation, not a clean failure. The worker MUST NOT perform
+    // any further mutations after losing the slot.
+    if (err instanceof SlotOwnershipLostError) {
+      await transitionActionState(actionId, "RECONCILIATION_REQUIRED", errorMsg);
+      logger.error("action.slot_ownership_lost", { actionId, sessionId: session.id, error: errorMsg });
+      return { status: "reconciliation_required", error: errorMsg };
+    }
+
     await transitionActionState(actionId, "FAILED", errorMsg);
 
     logger.error("action.failed", { actionId, error: errorMsg });

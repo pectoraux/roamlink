@@ -65,6 +65,90 @@ export const SESSION_EXECUTION_SLOT_LEASE_MS = 5 * 60_000; // 5 minutes
 export const SESSION_EXECUTION_SLOT_RENEWAL_INTERVAL_MS = 60_000; // 1 minute (lease is 5 min)
 
 // ---------------------------------------------------------------------------
+// Phase 11.2.2: Slot ownership context — lost-slot mutation prevention
+// ---------------------------------------------------------------------------
+
+/**
+ * A shared mutable context that tracks whether the worker still owns the
+ * session execution slot. The heartbeat sets `slotLost = true` when a renewal
+ * fails. Before each mutating stage in the action executor, the worker calls
+ * `verifySlotOwnership()` — if the slot was lost, the worker MUST NOT perform
+ * another connectivity mutation.
+ *
+ * This closes the gap where a failed heartbeat renewal was merely logged,
+ * allowing the mutation to continue after the slot was reclaimed by another worker.
+ *
+ * The invariant:
+ *   "While a worker is performing the mutation window, either the worker still
+ *    owns the session slot OR the worker has stopped before performing any
+ *    further connectivity mutation."
+ */
+export type SlotOwnershipContext = {
+  sessionId: string;
+  claimId: string;
+  slotLost: boolean;
+  /**
+   * Check whether the worker still owns the session slot. Called before each
+   * mutating stage (reserve, activate, release-old). If the slot was lost
+   * (heartbeat renewal failed), throws a SlotOwnershipLostError to abort the
+   * mutation safely → RECONCILIATION_REQUIRED.
+   *
+   * Also performs a DB check (fenced read) to catch the case where the slot
+   * was reclaimed by cron but the heartbeat hasn't fired yet.
+   */
+  verifySlotOwnership: () => Promise<void>;
+};
+
+/**
+ * Error thrown when slot ownership is lost during a mutation. Caught by
+ * executeAction → maps to RECONCILIATION_REQUIRED (not FAILED — the session
+ * may be in an inconsistent state that needs reconciliation, not a clean failure).
+ */
+export class SlotOwnershipLostError extends Error {
+  constructor(sessionId: string, claimId: string, reason: string) {
+    super(`Session slot ownership lost (sessionId=${sessionId}, claimId=${claimId}): ${reason}. Mutation aborted — reconciliation required.`);
+    this.name = "SlotOwnershipLostError";
+  }
+}
+
+/**
+ * Create a slot ownership context for a session + claim. The context is shared
+ * between the heartbeat (which sets slotLost on renewal failure) and the action
+ * executor (which calls verifySlotOwnership before each mutating stage).
+ */
+export function createSlotOwnershipContext(sessionId: string, claimId: string): SlotOwnershipContext {
+  const ctx: SlotOwnershipContext = {
+    sessionId,
+    claimId,
+    slotLost: false,
+    verifySlotOwnership: async () => {
+      // Fast path: if the heartbeat already flagged loss, abort immediately.
+      if (ctx.slotLost) {
+        throw new SlotOwnershipLostError(sessionId, claimId, "heartbeat renewal failed (flagged)");
+      }
+      // DB check: verify the slot is still held by this claim. This catches
+      // the case where the slot was reclaimed by cron but the heartbeat
+      // hasn't fired yet (e.g. the worker was blocked in a long provider call).
+      const session = await db.connectivitySession.findUnique({
+        where: { id: sessionId },
+        select: { executionSlotClaimId: true, executionSlotClaimExpiresAt: true },
+      });
+      if (!session || session.executionSlotClaimId !== claimId) {
+        ctx.slotLost = true;
+        throw new SlotOwnershipLostError(sessionId, claimId, "slot claim no longer held (reclaimed or stolen)");
+      }
+      // Check lease expiry (defensive — the heartbeat should have renewed, but
+      // if it didn't fire, the lease may have expired even though claimId matches).
+      if (session.executionSlotClaimExpiresAt && session.executionSlotClaimExpiresAt < new Date()) {
+        ctx.slotLost = true;
+        throw new SlotOwnershipLostError(sessionId, claimId, "slot lease expired (heartbeat did not renew in time)");
+      }
+    },
+  };
+  return ctx;
+}
+
+// ---------------------------------------------------------------------------
 // Acquire the session execution slot (DB-authoritative fenced)
 // ---------------------------------------------------------------------------
 

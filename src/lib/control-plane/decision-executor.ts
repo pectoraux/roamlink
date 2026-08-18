@@ -33,7 +33,9 @@ import {
   acquireSessionExecutionSlot,
   releaseSessionExecutionSlot,
   renewSessionExecutionSlot,
+  createSlotOwnershipContext,
   SESSION_EXECUTION_SLOT_RENEWAL_INTERVAL_MS,
+  type SlotOwnershipContext,
 } from "./session-execution-slot";
 
 // ---------------------------------------------------------------------------
@@ -396,6 +398,10 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
   // session from both executing and racing on session.activeResourceId.
   let sessionSlotClaimId: string | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  // Phase 11.2.2: The slot ownership context is shared between the heartbeat
+  // (which sets slotLost on renewal failure) and executeAction (which checks
+  // it before each mutating stage). Declared here so it's in scope for both.
+  let slotOwnershipContext: SlotOwnershipContext | undefined = undefined;
   if (decision.sessionId) {
     sessionSlotClaimId = `slot-${decisionId}-${Date.now()}`;
     const slotResult = await acquireSessionExecutionSlot(decision.sessionId, sessionSlotClaimId);
@@ -451,14 +457,23 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
     // cannot expire mid-mutation — the invariant:
     //   "A session execution slot MUST NOT become available while its owner
     //    is still performing the mutation window."
-    // The heartbeat is cleared in the finally block below. If a renewal fails
-    // (slot reclaimed), the action's own fencing (idempotencyKey) and the
-    // invariant checker provide the recovery boundary.
+    //
+    // Phase 11.2.2: On renewal failure, set slotOwnershipContext.slotLost = true.
+    // The action executor checks this before each mutating stage and aborts
+    // safely (RECONCILIATION_REQUIRED) if the slot was lost. This closes the
+    // gap where a failed renewal was merely logged and the mutation continued.
+    slotOwnershipContext = createSlotOwnershipContext(decision.sessionId, sessionSlotClaimId);
     heartbeatTimer = setInterval(async () => {
-      if (sessionSlotClaimId && decision.sessionId) {
+      if (sessionSlotClaimId && decision.sessionId && slotOwnershipContext) {
         try {
-          await renewSessionExecutionSlot(decision.sessionId, sessionSlotClaimId);
+          const result = await renewSessionExecutionSlot(decision.sessionId, sessionSlotClaimId);
+          if (!result.renewed) {
+            // Phase 11.2.2: Slot lost — flag it so the next ownership checkpoint aborts.
+            slotOwnershipContext.slotLost = true;
+          }
         } catch (err) {
+          // Phase 11.2.2: Renewal threw — flag as lost.
+          slotOwnershipContext.slotLost = true;
           logger.error("decision.slot_heartbeat_error", {
             decisionId, sessionId: decision.sessionId, claimId: sessionSlotClaimId,
             error: err instanceof Error ? err.message : String(err),
@@ -471,6 +486,11 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
   // Create + execute the action. The session slot is released in a finally
   // block — regardless of success/failure/reconciliation, the slot MUST be
   // released so the next decision for the session can execute.
+  //
+  // Phase 11.2.2: slotOwnershipContext is passed to executeAction so it can
+  // verify slot ownership before each mutating stage. If the slot was lost
+  // (heartbeat renewal failed), executeAction aborts safely →
+  // RECONCILIATION_REQUIRED.
   try {
     const reasons = decision.reasons ? JSON.parse(decision.reasons) as string[] : [];
     const action = await createAction({
@@ -482,7 +502,7 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
       idempotencyKey: `decexec-${decision.id}`,
     });
 
-    const execResult = await executeAction(action.id);
+    const execResult = await executeAction(action.id, slotOwnershipContext);
 
     // Phase 8.6.6: Map action status → decision execution state explicitly.
     // "reconciliation_required" is NOT "succeeded" — propagate it.
