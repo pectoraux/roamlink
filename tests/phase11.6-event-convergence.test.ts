@@ -156,9 +156,10 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     await resetToActiveOnA();
     await db.connectivityDecision.deleteMany({ where: { sessionId: fx.sessionId, intentId: { contains: "dup-1161" } } }).catch(() => {});
     await db.connectivityAction.deleteMany({ where: { sessionId: fx.sessionId, decisionId: null } }).catch(() => {});
-    // Clean up ALL events for this subject (including fixture's MEASUREMENT_RECEIVED,
-    // REOBSERVE_REQUESTED, etc.) so the worker claims OUR test event.
-    await db.reevaluationEvent.deleteMany({ where: { subjectId: fx.subjectId } }).catch(() => {});
+    // Clean up ALL pending events globally — processOneEvent claims the OLDEST
+    // pending event, and leftover MEASUREMENT_RECEIVED events from prior tests
+    // would be claimed first. We need OUR event to be the only one available.
+    await db.reevaluationEvent.deleteMany({}).catch(() => {});
 
     // Create a real active intent so the event can actually trigger a decision.
     const intent = await createIntent({
@@ -198,14 +199,16 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     const events = await db.reevaluationEvent.findMany({ where: { idempotencyKey } });
     expect(events.length).toBe(1);
 
-    // At most one decision referencing this intent — no duplicate side effect.
+    // Exactly one decision referencing this intent — the event was processed
+    // exactly once. The session is ACTIVE, so isReevaluationNecessary returns
+    // true and makeDecision runs. The decision is ACTIVATE (the session already
+    // has a resource but makeDecision returns ACTIVATE when there are ranked
+    // offers). The decision reaches a terminal state.
     const decisions = await db.connectivityDecision.findMany({
       where: { intentId: intent.intentId, intentVersion: intent.version },
     });
-    expect(decisions.length).toBeLessThanOrEqual(1);
-    if (decisions.length === 1) {
-      expect(["EXECUTED", "SKIPPED", "FAILED", "RECONCILIATION_REQUIRED"]).toContain(decisions[0].executionState);
-    }
+    expect(decisions.length).toBe(1);
+    expect(["EXECUTED", "SKIPPED", "FAILED", "RECONCILIATION_REQUIRED"]).toContain(decisions[0].executionState);
 
     // Cleanup.
     await db.connectivityDecision.deleteMany({ where: { intentId: intent.intentId } }).catch(() => {});
