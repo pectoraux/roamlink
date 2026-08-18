@@ -149,6 +149,68 @@ export function createSlotOwnershipContext(sessionId: string, claimId: string): 
 }
 
 // ---------------------------------------------------------------------------
+// Phase 11.2.3: DB-authoritative mutation fence — fencedSessionUpdate
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 11.2.3: The checkpoint is a fast-path observation; the mutation itself
+ * must carry the DB fence. This helper performs a session update that is
+ * authorized by the currently valid session execution claim at the mutation
+ * boundary — not merely preceded by a successful observation of ownership.
+ *
+ * The update is a fenced updateMany:
+ *   WHERE id = sessionId
+ *     AND executionSlotClaimId = claimId
+ *     AND executionSlotClaimExpiresAt > now
+ *   DATA: <the session fields to update>
+ *
+ * If count=0, the slot was lost (reclaimed/stolen/expired) between the
+ * checkpoint and the mutation. The caller MUST treat this as a safety event
+ * → RECONCILIATION_REQUIRED. The mutation did NOT happen.
+ *
+ * This closes the TOCTOU window:
+ *   verifySlotOwnership() ← checkpoint (observation)
+ *       ↓ [time passes]
+ *   slot expires / reclaimed / stolen
+ *       ↓
+ *   fencedSessionUpdate() ← mutation is REJECTED (count=0, not authorized)
+ *
+ * The architectural rule:
+ *   "Every state-changing connectivity mutation must be authorized by the
+ *    currently valid session execution claim at the mutation boundary, not
+ *    merely preceded by a successful observation of ownership."
+ *
+ * Returns { applied: boolean }. If false, the caller does NOT own the slot
+ * at mutation time and must not proceed.
+ */
+export async function fencedSessionUpdate(
+  sessionId: string,
+  claimId: string,
+  data: Record<string, unknown>,
+): Promise<{ applied: boolean }> {
+  const now = new Date();
+  const result = await db.connectivitySession.updateMany({
+    where: {
+      id: sessionId,
+      executionSlotClaimId: claimId, // fenced — only the claim owner mutates
+      executionSlotClaimExpiresAt: { gt: now }, // lease must still be valid
+    },
+    data,
+  });
+
+  if (result.count > 0) {
+    logger.info("session.fenced_update_applied", { sessionId, claimId });
+    return { applied: true };
+  }
+
+  // count=0: slot was lost between the checkpoint and the mutation.
+  logger.error("session.fenced_update_rejected", {
+    sessionId, claimId, reason: "slot-not-owned-or-expired-at-mutation-boundary",
+  });
+  return { applied: false };
+}
+
+// ---------------------------------------------------------------------------
 // Acquire the session execution slot (DB-authoritative fenced)
 // ---------------------------------------------------------------------------
 

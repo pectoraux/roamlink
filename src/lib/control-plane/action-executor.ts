@@ -28,7 +28,7 @@ import { transitionSessionState } from "./session-manager";
 import { reserveResource, releaseResource, markResourceInUse } from "./capability-registry";
 import { resolveResourceBinding, verifyResourceUsable } from "./kernel-bridge";
 import { assertActiveConnectivityInvariant } from "./invariant-checker";
-import { SlotOwnershipLostError } from "./session-execution-slot";
+import { SlotOwnershipLostError, fencedSessionUpdate } from "./session-execution-slot";
 
 // Phase 8.5.10: Recovery timing constants
 const RECOVERY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes — actions EXECUTING longer than this are stale
@@ -181,6 +181,9 @@ export async function transitionActionState(
  * Key invariant: releasing the old resource MUST NOT invalidate the new one.
  */
 export async function executeAction(actionId: string, slotContext?: {
+  sessionId: string;
+  claimId: string;
+  slotLost: boolean;
   verifySlotOwnership: () => Promise<void>;
 }): Promise<{
   status: "succeeded" | "failed" | "reconciliation_required";
@@ -277,15 +280,33 @@ export async function executeAction(actionId: string, slotContext?: {
         await slotContext?.verifySlotOwnership();
 
         // 3e. Update session with entitlement link (only if USABLE)
-        await db.connectivitySession.update({
-          where: { id: session.id },
-          data: {
+        // Phase 11.2.3: DB-authoritative mutation fence. The session update is
+        // authorized by the currently valid session execution claim — not merely
+        // preceded by a checkpoint. If the slot was lost between the checkpoint
+        // and this mutation, fencedSessionUpdate returns { applied: false } and
+        // the mutation does NOT happen. → RECONCILIATION_REQUIRED.
+        if (slotContext) {
+          const fenced = await fencedSessionUpdate(session.id, slotContext.claimId, {
             activeResourceId: targetResourceId,
             entitlementId: bridgeResult.entitlementId,
             startedAt: new Date(),
             lastObservedAt: new Date(),
-          },
-        });
+          });
+          if (!fenced.applied) {
+            throw new SlotOwnershipLostError(session.id, slotContext.claimId, "fenced session update rejected (slot lost at mutation boundary)");
+          }
+        } else {
+          // No slot context (legacy path or test) — unconditional update.
+          await db.connectivitySession.update({
+            where: { id: session.id },
+            data: {
+              activeResourceId: targetResourceId,
+              entitlementId: bridgeResult.entitlementId,
+              startedAt: new Date(),
+              lastObservedAt: new Date(),
+            },
+          });
+        }
 
         // 3f. Transition session to ACTIVE.
         // Phase 8.6 runtime fix: the session state machine requires
@@ -401,14 +422,31 @@ export async function executeAction(actionId: string, slotContext?: {
         await slotContext?.verifySlotOwnership();
 
         // 3f. Atomically update session to point to new resource + entitlement
-        await db.connectivitySession.update({
-          where: { id: session.id },
-          data: {
+        // Phase 11.2.3: DB-authoritative mutation fence. The session update is
+        // authorized by the currently valid session execution claim. If the slot
+        // was lost between the checkpoint and this mutation, the fenced update
+        // returns { applied: false } and the session does NOT switch. →
+        // RECONCILIATION_REQUIRED.
+        if (slotContext) {
+          const fenced = await fencedSessionUpdate(session.id, slotContext.claimId, {
             activeResourceId: targetResourceId,
             entitlementId: bridgeResult.entitlementId,
             lastObservedAt: new Date(),
-          },
-        });
+          });
+          if (!fenced.applied) {
+            throw new SlotOwnershipLostError(session.id, slotContext.claimId, "fenced session update rejected (slot lost at mutation boundary)");
+          }
+        } else {
+          // No slot context (legacy path or test) — unconditional update.
+          await db.connectivitySession.update({
+            where: { id: session.id },
+            data: {
+              activeResourceId: targetResourceId,
+              entitlementId: bridgeResult.entitlementId,
+              lastObservedAt: new Date(),
+            },
+          });
+        }
 
         // 3g. Transition session back to ACTIVE
         await transitionSessionState(session.id, "ACTIVE");

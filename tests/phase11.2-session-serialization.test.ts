@@ -58,6 +58,8 @@ import {
   releaseSessionExecutionSlot,
   renewSessionExecutionSlot,
   reclaimExpiredSessionSlots,
+  fencedSessionUpdate,
+  createSlotOwnershipContext,
   SESSION_EXECUTION_SLOT_LEASE_MS,
 } from "@/lib/control-plane/session-execution-slot";
 import { reclaimExpiredDecisionClaims, DECISION_EXECUTION_LEASE_MS } from "@/lib/control-plane/decision-executor";
@@ -720,6 +722,87 @@ describe("Phase 11.2 — Session-Level Execution Serialization (DB-backed)", () 
       select: { executionSlotClaimId: true },
     });
     expect(session?.executionSlotClaimId).toBe(claimB); // B holds the slot, not A
+
+    // Cleanup.
+    await releaseSessionExecutionSlot(fx.sessionId, claimB);
+  }, 60_000);
+
+  // =========================================================================
+  // 11.2.9 — DB-authoritative mutation fence: slot lost between checkpoint
+  //          and mutation → fenced update rejects, B intact, no unauthorized
+  //          session mutation.
+  //
+  // Phase 11.2.3: The checkpoint is a fast-path observation; the mutation
+  // itself must carry the DB fence. This test proves the TOCTOU window is
+  // closed:
+  //
+  //   Worker A: checkpoint passes (slot owned)
+  //       ↓ [slot expires / reclaimed / stolen]
+  //   Worker B: acquires slot
+  //       ↓
+  //   Worker A: attempts the fenced mutation
+  //       ↓
+  //   fencedSessionUpdate returns { applied: false }
+  //       ↓
+  //   Mutation did NOT happen. Session is unchanged. B's claim intact.
+  //
+  // The architectural rule:
+  //   "Every state-changing connectivity mutation must be authorized by the
+  //    currently valid session execution claim at the mutation boundary, not
+  //    merely preceded by a successful observation of ownership."
+  // =========================================================================
+  it("11.2.9: DB-authoritative mutation fence — slot lost between checkpoint and mutation → fenced update rejects", async () => {
+    // 1. Worker A acquires the session slot.
+    await db.connectivitySession.update({
+      where: { id: fx.sessionId },
+      data: { executionSlotClaimId: null, executionSlotClaimedAt: null, executionSlotClaimExpiresAt: null },
+    }).catch(() => {});
+
+    const claimA = `fence-claim-A-${Date.now()}`;
+    const acquired = await acquireSessionExecutionSlot(fx.sessionId, claimA);
+    expect(acquired.acquired).toBe(true);
+
+    // 2. Worker A passes the ownership checkpoint (slot is held).
+    const ctx = createSlotOwnershipContext(fx.sessionId, claimA);
+    await ctx.verifySlotOwnership(); // passes — slot is held
+
+    // 3. Before A's mutation executes, force slot expiry + reclaim.
+    await db.connectivitySession.update({
+      where: { id: fx.sessionId },
+      data: { executionSlotClaimExpiresAt: new Date(Date.now() - 1000) },
+    });
+    await reclaimExpiredSessionSlots();
+
+    // 4. Worker B acquires the slot (A's expired lease was reclaimed).
+    const claimB = `fence-claim-B-${Date.now()}`;
+    const acquiredB = await acquireSessionExecutionSlot(fx.sessionId, claimB);
+    expect(acquiredB.acquired).toBe(true);
+
+    // 5. Worker A attempts the fenced mutation (e.g. update activeResourceId).
+    //    This is the exact mutation that would switch the session to a new
+    //    resource. The fenced update MUST reject it (count=0) because A no
+    //    longer holds the slot.
+    const fencedResult = await fencedSessionUpdate(fx.sessionId, claimA, {
+      activeResourceId: fx.resourceBId, // would switch A→B
+    });
+
+    // 6. Mutation is rejected by the DB/session fence.
+    expect(fencedResult.applied).toBe(false);
+
+    // 7. The session's activeResourceId is UNCHANGED (still A — the mutation
+    //    did NOT happen).
+    const session = await db.connectivitySession.findUnique({
+      where: { id: fx.sessionId },
+      select: { activeResourceId: true, executionSlotClaimId: true },
+    });
+    expect(session?.activeResourceId).toBe(fx.resourceAId); // unchanged — NOT B
+    expect(session?.executionSlotClaimId).toBe(claimB); // B holds the slot, not A
+
+    // 8. Worker B can now perform its own fenced mutation (it holds the slot).
+    const fencedB = await fencedSessionUpdate(fx.sessionId, claimB, {
+      lastObservedAt: new Date(),
+    });
+    expect(fencedB.applied).toBe(true);
 
     // Cleanup.
     await releaseSessionExecutionSlot(fx.sessionId, claimB);
