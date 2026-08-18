@@ -4353,3 +4353,42 @@ Stage Summary:
 - This is the same DB-authoritative standard as the session execution fencing (11.2.5).
 - Phase 11.4 is now ready to freeze.
 - Next: Phase 11.5 — Runtime invariant fail-closed.
+
+---
+Task ID: 11.4.10.2
+Agent: Principal Architect (main) — Phase 11.4.10.2 Exclusive Intent-Fence Ownership
+Task: Close the final hole in 11.4: the fence claim was not exclusive. Two decisions could race on the same intent version and overwrite each other's executionFenceId. Add exclusive ownership to the fence claim's conditional UPDATE.
+
+Work Log:
+- Fix (intent-authority.ts): Added exclusive ownership predicate to the fence claim's conditional UPDATE:
+    AND (executionFenceId IS NULL OR executionFenceExpiresAt <= now)
+  The fence claim now requires that no other decision currently holds an active fence on this exact intent version. If a fence is already active, the UPDATE affects 0 rows → rejected with reason "intent-fence-held-by-another-decision".
+
+- Updated reason detection to distinguish "held by another decision" from other rejection reasons (intent not found, status not ACTIVE, expired).
+
+- Documented intent fence expiry semantics: the fence is NOT renewable (unlike the session slot lease which has a heartbeat). The intent fence expiry is an EXECUTION SAFETY TIMEOUT — a mutation that takes > 5 minutes has its fence expire and subsequent mutations are rejected (fail-closed). This is intentional: a mutation that takes > 5 minutes is likely stuck and should be reconciled. The session slot heartbeat (which IS renewable) covers liveness between mutations. The intent fence covers authority at the mutation boundary. Both are required.
+
+- Test (11.4.10.2, DB-backed runtime, PASS):
+  1. Decision A claims the intent fence (ACTIVE, no active fence → succeeds).
+  2. Decision B tries to claim the same intent fence (ACTIVE, but A's fence is active → REJECTED with "intent-fence-held-by-another-decision").
+  3. B's decision is SKIPPED (fenced by claimId).
+  4. The intent's executionFenceId is still A's (B did NOT overwrite it).
+  5. A's fence remains valid for subsequent mutations.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 11.4 (all 11):  11/11 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 37 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: a466019 (on GitHub, verified: git ls-remote origin main → a466019)
+- The intent execution fence is now exclusive — two decisions cannot steal the same fence.
+- The architectural rule is fully enforced:
+  "Intent authority must be bound to the execution claim at the mutation boundary."
+  claim → exclusive fence (PERSISTS) → session slot → fenced resource mutation (checks fence inside $transaction) → action
+- Phase 11.4 is now ready to freeze.
+- Next: Phase 11.5 — Runtime invariant fail-closed.
