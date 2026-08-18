@@ -4307,3 +4307,49 @@ Stage Summary:
   conditional UPDATE (not SELECT) → row lock → authority predicate evaluation
 - Phase 11.4 is now ready to freeze.
 - Next: Phase 11.5 — Runtime invariant fail-closed.
+
+---
+Task ID: 11.4.10.1
+Agent: Principal Architect (main) — Phase 11.4.10.1 Durable Intent Execution Fence
+Task: Close the final conceptual hole in 11.4: the intent fence committed before the mutation. Make the fence PERSIST through the mutation window and be checked at EVERY fenced resource mutation boundary (same pattern as the session-slot lease fence in 11.2.5).
+
+Work Log:
+- Schema: Added executionFenceId String? + executionFenceExpiresAt DateTime? to ConnectivityIntentRecord. When an intent is claimed for execution, these fields are set and PERSIST until the decision completes (clearIntentExecutionFence in the finally block).
+
+- Fix 1 — verifyIntentAuthorityAtBoundary (intent-authority.ts): Now claims a DURABLE execution fence: conditional UPDATE sets executionFenceId + executionFenceExpiresAt (not just bumps fenceVersion). The fence PERSISTS after commit. Returns { authorized: true, fenceId }.
+
+- Fix 2 — verifyIntentExecutionFence (intent-authority.ts): New function called inside each fenced resource mutation's $transaction. A conditional UPDATE that verifies the fence is still held: WHERE intentId + version + status=ACTIVE + executionFenceId=fenceId + executionFenceExpiresAt > now + (expiresAt IS NULL OR > now). If 0 rows: intent was superseded/expired/fence-lost → mutation rejected.
+
+- Fix 3 — fencedReserveResource/MarkInUse/ReleaseResource (session-execution-slot.ts): Accept optional intentFence parameter. Inside each $transaction, AFTER the session-lease fence, call verifyIntentExecutionFence. If the intent fence is invalid, the resource mutation does NOT proceed.
+
+- Fix 4 — executeAction (action-executor.ts): slotContext now includes optional intentFence. All fenced resource calls pass slotContext.intentFence.
+
+- Fix 5 — executeDecision (decision-executor.ts): After verifyIntentAuthorityAtBoundary returns { authorized: true, fenceId }, the fenceId is stored and passed to executeAction. In the finally block, clearIntentExecutionFence clears the fence.
+
+- Test (11.4.10.1, DB-backed runtime, PASS):
+  1. Intent ACTIVE. Fence acquired (executionFenceId set, PERSISTS).
+  2. Intent superseded (status → SUPERSEDED) — AFTER the fence, BEFORE mutation.
+  3. fencedReserveResource called with the intentFence.
+  4. $transaction: session-lease fence OK, intent-fence check: conditional UPDATE WHERE status=ACTIVE → 0 rows (SUPERSEDED) → REJECTED.
+  5. Resource NOT reserved. Session unchanged. No orphaned resource.
+  6. reserveResult.reserved = false, reason contains "intent-fence-invalid".
+  This proves the fence PERSISTS through the mutation window and is checked at the actual mutation boundary.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 11.4 (all 10):  10/10 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 36 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 078aab2 (on GitHub, verified: git ls-remote origin main → 078aab2)
+- The intent execution fence now PERSISTS through the mutation window and is checked at EVERY fenced resource mutation boundary inside the same $transaction.
+- The architectural rule is fully enforced:
+  "Intent authority must be bound to the execution claim at the mutation boundary."
+  claim → fence (PERSISTS) → session slot → fenced resource mutation (checks fence inside $transaction) → action
+- This is the same DB-authoritative standard as the session execution fencing (11.2.5).
+- Phase 11.4 is now ready to freeze.
+- Next: Phase 11.5 — Runtime invariant fail-closed.
