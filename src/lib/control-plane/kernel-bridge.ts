@@ -175,15 +175,15 @@ export async function resolveResourceBinding(input: {
       status: "ACTIVE",
     },
     include: {
-      bindings: {
+      resourceBindings: {
         where: { providerType },
         take: 1,
       },
     },
   });
 
-  if (existingEntitlement && existingEntitlement.bindings.length > 0) {
-    const binding = existingEntitlement.bindings[0];
+  if (existingEntitlement && existingEntitlement.resourceBindings.length > 0) {
+    const binding = existingEntitlement.resourceBindings[0];
     logger.info("kernel_bridge.existing_binding", {
       resourceId: input.protocolResourceId,
       bindingId: binding.id,

@@ -53,6 +53,28 @@ import { logger } from "@/lib/logger";
  * its owner is still performing the mutation window — the invariant:
  *   "A session execution slot MUST NOT become available while its owner is
  *    still performing the mutation window."
+ *
+ * Phase 11.2.5 (DUAL-PURPOSE LEASE — intentionally documented):
+ * The session execution lease serves TWO purposes. A future agent must NOT
+ * "simplify away" the per-mutation renewal as redundant with the heartbeat.
+ *
+ *   1. EXECUTION OWNERSHIP (authorization):
+ *      The conditional session UPDATE inside withValidSessionExecutionLease()
+ *      is the DB-level authorization fence for every resource mutation. It
+ *      verifies the claim + renews the lease + takes the row lock — all in
+ *      one atomic operation inside the same transaction as the resource
+ *      mutation. Without this renewal, a concurrent reclaim could clear the
+ *      claim between the authorization check and the resource mutation (TOCTOU).
+ *
+ *   2. EXECUTION LIVENESS (heartbeat):
+ *      The heartbeat (setInterval in executeDecision) renews the lease
+ *      periodically BETWEEN mutation boundaries — during long provider calls
+ *      (e.g. adapter.getUsage) where no resource mutation is happening. This
+ *      prevents the lease from expiring during a long non-mutating operation.
+ *
+ *   The per-mutation renewal (purpose 1) provides the hard authorization fence.
+ *   The heartbeat (purpose 2) covers the gaps between mutations. Both are
+ *   required. Removing either one reintroduces a TOCTOU or a liveness gap.
  */
 export const SESSION_EXECUTION_SLOT_LEASE_MS = 5 * 60_000; // 5 minutes
 
