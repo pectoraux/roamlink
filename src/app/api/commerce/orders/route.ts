@@ -49,8 +49,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Product not found or inactive" }, { status: 404 });
   }
 
-  const customer = await db.tenantUser.findFirst({
-    where: { tenantId: ctx.tenantId, userId: customerId },
+  // Phase 12.2 P1-1: Fixed — was using db.tenantUser (staff) instead of
+  // db.tenantCustomer (actual customers). This bug meant only staff members
+  // could be the customerId of a commerce order.
+  const customer = await db.tenantCustomer.findFirst({
+    where: { id: customerId, tenantId: ctx.tenantId, status: "active" },
   });
 
   if (!customer) {

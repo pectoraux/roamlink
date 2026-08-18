@@ -34,7 +34,11 @@ export async function POST(req: NextRequest) {
     const ctx = await requireTenantContext(user);
     requireTenantRole(ctx, TENANT_WRITE_ROLES);
     const body = await req.json();
-    const { name, email, phone, userId, metadata } = body;
+    const { name, email, phone, metadata } = body;
+    // Phase 12.2 P1-4: Removed userId from client-supplied body — it was
+    // an unvalidated cross-reference that could link a customer to an
+    // arbitrary User. If user linking is needed, it should go through a
+    // separate authenticated flow.
     if (!name || !email) {
       return json({ error: "name and email are required" }, 400);
     }
@@ -43,7 +47,6 @@ export async function POST(req: NextRequest) {
       name,
       email,
       phone,
-      userId,
       metadata,
     });
     return json({ customer }, 201);

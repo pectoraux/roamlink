@@ -45,7 +45,16 @@ async function getSessionToken(): Promise<string | null> {
  * The activeTenantId on that session is the active tenant — not a global
  * user-level setting.
  *
- * Returns null if the user has no active tenant or no tenant memberships.
+ * Phase 12.2: Fail-closed tenant resolution.
+ * - If activeTenantId exists on the session → verify membership + active status.
+ *   Stale or inactive → null (deny).
+ * - If activeTenantId does NOT exist:
+ *   - 0 active memberships → null (deny)
+ *   - exactly 1 active membership → implicit resolution allowed (convenience)
+ *   - 2+ active memberships → null (deny — requires explicit selection)
+ * - Never selects an arbitrary "first" tenant for multi-tenant users.
+ *
+ * Returns null if the user has no active tenant or cannot be resolved.
  */
 export async function getActiveTenant(user: AuthUser): Promise<TenantContext | null> {
   const token = await getSessionToken();
@@ -55,45 +64,46 @@ export async function getActiveTenant(user: AuthUser): Promise<TenantContext | n
   if (token) {
     const session = await db.session.findUnique({
       where: { token },
-      select: { activeTenantId: true },
+      select: { activeTenantId: true, userId: true },
     });
-    activeTenantId = session?.activeTenantId ?? null;
+    // Phase 12.2: Verify the session belongs to the authenticated user.
+    if (!session || session.userId !== user.id) return null;
+    activeTenantId = session.activeTenantId ?? null;
   }
 
-  if (!activeTenantId) {
-    // No active tenant on this session — try first membership (convenience
-    // for single-tenant users). We do NOT persist this to the session here;
-    // setActiveTenant must be called explicitly to persist.
-    const firstMembership = await db.tenantUser.findFirst({
-      where: { userId: user.id, tenant: { status: "active" } },
+  if (activeTenantId) {
+    // Phase 12.2: Verify membership + active status.
+    const membership = await db.tenantUser.findUnique({
+      where: { tenantId_userId: { tenantId: activeTenantId, userId: user.id } },
       include: { tenant: { select: { id: true, name: true, slug: true, status: true } } },
-      orderBy: { createdAt: "asc" },
     });
-    if (!firstMembership) return null;
+    if (!membership) return null;          // stale activeTenantId — user was removed
+    if (membership.tenant.status !== "active") return null; // tenant inactive
     return {
-      tenantId: firstMembership.tenantId,
-      role: firstMembership.role,
-      tenant: firstMembership.tenant,
+      tenantId: membership.tenantId,
+      role: membership.role,
+      tenant: membership.tenant,
     };
   }
 
-  // Validate membership
-  const membership = await db.tenantUser.findUnique({
-    where: { tenantId_userId: { tenantId: activeTenantId, userId: user.id } },
+  // Phase 12.2: No activeTenantId on session — fail-closed resolution.
+  // Count active memberships to decide.
+  const activeMemberships = await db.tenantUser.findMany({
+    where: { userId: user.id, tenant: { status: "active" } },
     include: { tenant: { select: { id: true, name: true, slug: true, status: true } } },
+    orderBy: { createdAt: "asc" },
   });
-  if (!membership) {
-    // Stale activeTenantId — user was removed from this tenant
-    return null;
+
+  if (activeMemberships.length === 0) return null;       // 0 → deny
+  if (activeMemberships.length === 1) {                    // 1 → implicit
+    return {
+      tenantId: activeMemberships[0].tenantId,
+      role: activeMemberships[0].role,
+      tenant: activeMemberships[0].tenant,
+    };
   }
-  if (membership.tenant.status !== "active") {
-    return null;
-  }
-  return {
-    tenantId: membership.tenantId,
-    role: membership.role,
-    tenant: membership.tenant,
-  };
+  // 2+ → deny, require explicit selection
+  return null;
 }
 
 /**
@@ -133,6 +143,27 @@ export const TENANT_MANAGE_ROLES = ["owner", "admin"];
 export const TENANT_WRITE_ROLES = ["owner", "admin", "sales", "operations"];
 /** All roles that can view tenant data. */
 export const TENANT_VIEW_ROLES = ["owner", "admin", "sales", "support", "billing", "operations", "viewer"];
+
+/**
+ * Phase 12.2: Assert that a client-supplied tenantId matches the authenticated
+ * tenant context. If the client-supplied tenantId is null/undefined, it's allowed
+ * (the caller is not trying to override the session tenant). If it's present but
+ * doesn't match ctx.tenantId, throw 403.
+ *
+ * Use this helper wherever routes accept a tenantId from the client.
+ *
+ *   assertTenantScope(ctx, body.tenantId)  →  throws if body.tenantId !== ctx.tenantId
+ */
+export function assertTenantScope(ctx: TenantContext, requestedTenantId: string | null | undefined): void {
+  if (requestedTenantId == null) return; // omitted → allowed
+  if (requestedTenantId === ctx.tenantId) return; // matches → allowed
+  throw new AppError(
+    "authorization",
+    `Client-supplied tenantId '${requestedTenantId}' does not match session tenant '${ctx.tenantId}'`,
+    403,
+    "You don't have access to this tenant.",
+  );
+}
 
 /**
  * Set the active tenant for the CURRENT SESSION ONLY.

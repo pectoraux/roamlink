@@ -2,26 +2,26 @@
  * Phase 5.1C — Customer find-or-create API (SECURITY FIXED)
  * POST /api/commerce/customer
  *
- * SECURITY FIX (Phase 5.1C):
- * The previous version of this route had NO authentication and trusted the
- * `tenantId` from the request body — allowing anyone to create users in
- * any tenant. This was a P1 security vulnerability.
+ * Phase 12.2 P1-2: Added authentication requirement. Previously unauthenticated —
+ * anyone could create User + TenantUser rows. Now requires a logged-in user.
  *
- * The fix: the `tenantId` is NO LONGER trusted from the request body. It's
- * derived from the `productId` — the customer is created in the tenant that
- * owns the product. This means a customer can only be created in a tenant
- * that has a product they're trying to buy.
- *
- * Additionally, the route verifies the product is active before creating
- * the customer, preventing creation against archived/inactive products.
+ * The tenantId is derived from the productId (NOT from the request body).
+ * The product must be active. The user must be authenticated.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { hashPassword } from "@/lib/security";
 import { logger } from "@/lib/logger";
+import { getCurrentUser } from "@/lib/auth";
 
 export async function POST(req: NextRequest) {
+  // Phase 12.2 P1-2: Require authentication.
+  const authUser = await getCurrentUser();
+  if (!authUser) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const body = await req.json();
   const { email, name, productId } = body;
 
@@ -33,7 +33,6 @@ export async function POST(req: NextRequest) {
   }
 
   // SECURITY: derive tenantId from the product, NOT from the request body.
-  // This prevents an attacker from creating users in arbitrary tenants.
   const product = await db.resellerProduct.findFirst({
     where: { id: productId, status: "active" },
     select: { tenantId: true },
@@ -82,6 +81,7 @@ export async function POST(req: NextRequest) {
     userId: user.id,
     tenantId,
     productId,
+    createdBy: authUser.id,
   });
 
   return NextResponse.json({ customer: { id: user.id, email: user.email, name: user.name } });

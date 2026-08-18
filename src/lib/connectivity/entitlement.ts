@@ -198,6 +198,18 @@ export async function createEntitlement(input: {
   validUntil?: Date;
   userId?: string;
 }): Promise<{ id: string; status: string }> {
+  // Phase 12.2 P1-3: Verify the subscription belongs to this tenant.
+  const subscription = await db.tenantSubscription.findUnique({
+    where: { id: input.subscriptionId },
+    select: { tenantId: true },
+  });
+  if (!subscription) {
+    throw new AppError("not_found", "Subscription not found", 404, "The specified subscription does not exist.");
+  }
+  if (subscription.tenantId !== input.tenantId) {
+    throw new AppError("authorization", "Cross-tenant access denied", 403, "This subscription belongs to a different tenant.");
+  }
+
   // Look up the capability by type
   const capability = await db.connectivityCapability.findUnique({
     where: { type: input.capabilityType },
@@ -359,7 +371,19 @@ export async function createResourceBinding(input: {
   providerInstanceId?: string;
   providerMetadata?: Record<string, unknown>;
   userId?: string;
+  /** Phase 12.2: Tenant scope — if supplied, verify entitlement belongs to this tenant. */
+  tenantId?: string;
 }): Promise<{ id: string; status: string }> {
+  // Phase 12.2: Verify entitlement belongs to the tenant (if supplied).
+  if (input.tenantId) {
+    const entitlement = await db.connectivityEntitlement.findUnique({
+      where: { id: input.entitlementId },
+      select: { tenantId: true },
+    });
+    if (!entitlement || entitlement.tenantId !== input.tenantId) {
+      throw new AppError("authorization", "Cross-tenant access denied", 403, "You don't have access to this entitlement.");
+    }
+  }
   // Phase 2C.3.1: If a providerInstanceId is supplied, verify it belongs to
   // the same tenant as the entitlement and matches the providerType.
   if (input.providerInstanceId) {
@@ -449,6 +473,8 @@ export async function transitionBinding(input: {
   provisioningState?: string;
   reason?: string;
   userId?: string;
+  /** Phase 12.2: Tenant scope — if supplied, verify binding's entitlement belongs to this tenant. */
+  tenantId?: string;
 }): Promise<{ transitioned: boolean; status: string }> {
   const binding = await db.providerResourceBinding.findUnique({
     where: { id: input.bindingId },
@@ -456,6 +482,16 @@ export async function transitionBinding(input: {
   });
   if (!binding) {
     throw new AppError("not_found", "Binding not found", 404, "Provider resource binding not found.");
+  }
+  // Phase 12.2: Verify binding's entitlement belongs to the tenant (if supplied).
+  if (input.tenantId) {
+    const entitlement = await db.connectivityEntitlement.findUnique({
+      where: { id: binding.entitlementId },
+      select: { tenantId: true },
+    });
+    if (!entitlement || entitlement.tenantId !== input.tenantId) {
+      throw new AppError("authorization", "Cross-tenant access denied", 403, "You don't have access to this binding.");
+    }
   }
 
   const currentState = binding.status as BindingState;
@@ -509,7 +545,17 @@ export async function transitionBinding(input: {
 /**
  * List all resource bindings for an entitlement.
  */
-export async function listResourceBindings(entitlementId: string) {
+export async function listResourceBindings(entitlementId: string, tenantId?: string) {
+  // Phase 12.2: If tenantId is supplied, verify the entitlement belongs to it.
+  if (tenantId) {
+    const entitlement = await db.connectivityEntitlement.findUnique({
+      where: { id: entitlementId },
+      select: { tenantId: true },
+    });
+    if (!entitlement || entitlement.tenantId !== tenantId) {
+      throw new AppError("authorization", "Cross-tenant access denied", 403, "You don't have access to this entitlement.");
+    }
+  }
   return db.providerResourceBinding.findMany({
     where: { entitlementId },
     orderBy: { createdAt: "desc" },

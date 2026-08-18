@@ -37,6 +37,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
       provisioningState,
       reason,
       userId: user.id,
+      tenantId: ctx.tenantId, // Phase 12.2: ownership verification
     });
 
     return json(result, 200);
