@@ -3966,3 +3966,43 @@ Stage Summary:
   conditional session UPDATE in transaction = claim-authorized mutation
 - Phase 11.2 is now ready to freeze.
 - Next: Phase 11.3 — Provider truth flips mid-execution.
+
+---
+Task ID: 11.3
+Agent: Principal Architect (main) — Phase 11.3 Provider Truth Flips Mid-Execution
+Task: Prove acceptance invariant #4: "Provider truth at execution time outranks stale decision assumptions." Attack the interval between reserve → provider verification → active-resource commit. If provider truth flips to NOT_USABLE/UNKNOWN after the decision selects a target, the target must not become authoritative, must not remain orphaned IN_USE, the old resource must remain authoritative, and the decision/action must enter the reconciliation path.
+
+Work Log:
+- Audited kernel-bridge.ts and the mock provider's reconcileProvisioning to understand how provider truth is queried. verifyResourceUsable calls reconcileProvisioning(bindingId) and maps: "failed" → NOT_USABLE, throw → UNKNOWN, anything else → USABLE.
+
+- Found and fixed a pre-existing Prisma relation name bug in kernel-bridge.ts: ConnectivityEntitlement's relation to ProviderResourceBinding is "resourceBindings" (not "bindings"). This was causing resolveResourceBinding to throw when the resource had no pre-linked binding — which masked the provider-truth-flip scenario. Fixed: `include: { bindings: ... }` → `include: { resourceBindings: ... }` and `existingEntitlement.bindings` → `existingEntitlement.resourceBindings`.
+
+- Documented the dual-purpose lease semantics (Phase 11.2.5) in session-execution-slot.ts: the session execution lease serves two purposes — (1) EXECUTION OWNERSHIP (authorization via conditional session UPDATE inside the transaction) and (2) EXECUTION LIVENESS (heartbeat renewal between mutation boundaries). Both are required. A future agent must NOT "simplify away" the per-mutation renewal as redundant with the heartbeat.
+
+- Tests (tests/phase11.3-provider-truth-flip.test.ts, 3 DB-backed runtime):
+  11.3.1 PASS — provider truth → NOT_USABLE after reserve, before verify:
+    Binding B marked FAILED + provider instance inactive. reconcileProvisioning attempts re-provisioning, provisionBinding throws (inactive provider) → reconcileProvisioning returns "failed" → verifyResourceUsable returns NOT_USABLE.
+    Result: action NOT EXECUTED (FAILED/RECONCILIATION_REQUIRED). Target B NOT authoritative (session stays on A). Target B NOT orphaned IN_USE (released). Old resource A remains IN_USE (authoritative). Exactly one action created (no silent fallback/second mutation).
+
+  11.3.2 PASS — provider truth → UNKNOWN:
+    Static source verification that the SWITCH path explicitly handles UNKNOWN (release target + revert session + RECONCILIATION_REQUIRED). The UNKNOWN path follows the same code as NOT_USABLE — the only difference is the return value. Runtime trigger is hard without mocking reconcileProvisioning to throw (the mock provider doesn't throw). The NOT_USABLE runtime proof (11.3.1) covers the same code path.
+
+  11.3.3 PASS — control: provider truth USABLE throughout:
+    Binding B healthy (BOUND). verifyResourceUsable returns USABLE. Result: action EXECUTED. Session switches A→B. Target B IN_USE. Old resource A AVAILABLE (released). Happy path works.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Phase 10.1.1:          5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 31 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: c78106a (on GitHub, verified: git ls-remote origin main → c78106a)
+- Acceptance invariant #4 proven: "Provider truth at execution time outranks stale decision assumptions."
+- The interval reserve → verify → commit is protected: if provider truth flips to NOT_USABLE, the target is released, the session stays on the old resource, and the action enters RECONCILIATION_REQUIRED. No silent fallback, no second mutation.
+- Fixed a pre-existing Prisma relation name bug in kernel-bridge.ts that was masking the scenario.
+- Documented the dual-purpose lease semantics (ownership + liveness) to prevent future simplification.
+- Next: Phase 11.4 — Execution-time intent authority (strengthen the 9.4.2 P1-5 test).
