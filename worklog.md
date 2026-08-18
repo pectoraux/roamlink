@@ -4210,3 +4210,54 @@ Stage Summary:
   active intent → EXECUTED (control)
   race (claimed then expired) → SKIPPED (exact, post-claim authority fence)
 - Next: Phase 11.5 — Runtime invariant fail-closed.
+
+---
+Task ID: 11.4.6
+Agent: Principal Architect (main) — Phase 11.4.6 Durable Intent-Authority Fence at Mutation Boundary
+Task: Close the two issues identified in the architect's audit of 3911cfd: (1) the SKIP fence was not fenced by executionClaimId (only executionState); (2) the intent authority check was a read, not a DB-level mutation fence. Add a durable intent-authority fence at the mutation boundary (analogous to the session-slot fence in 11.2.5).
+
+Work Log:
+- Fix 1 — Add executionClaimId to the SKIP fence (decision-executor.ts):
+  Changed the fenced SKIP WHERE from:
+    executionState = EXECUTING
+  to:
+    executionState = EXECUTING AND executionClaimId = claimId
+  EXECUTING alone is not ownership — the claimId is the authoritative ownership predicate (same rule as 11.1/11.2).
+
+- Fix 2 — Durable intent-authority fence (intent-authority.ts):
+  New module: verifyIntentAuthorityAtBoundary(decisionId, claimId, intentId, version).
+  A $transaction that:
+    1. Reads the intent record (status + expiresAt) inside the transaction. SQLite serializes writes within a transaction, so a concurrent expireStaleIntents/supersedeIntent cannot change it mid-transaction.
+    2. Verifies status = ACTIVE AND (expiresAt IS NULL OR expiresAt > now).
+    3. If invalid → fenced SKIP transition (WHERE executionState = EXECUTING AND executionClaimId = claimId). Returns { authorized: false }.
+    4. If valid → returns { authorized: true }. The caller proceeds.
+  Wired into executeDecision AFTER the session slot is acquired but BEFORE createAction/executeAction. If the fence rejects, the session slot is released and the heartbeat is stopped — no action is created, no resource mutation occurs.
+
+- The architectural rule:
+  "Intent authority must be bound to the execution claim at the mutation boundary."
+  This is the equivalent of the session-slot fence (11.2.5) for intent authority.
+
+- Test (11.4.8, DB-backed runtime, PASS):
+  - Intent expired. Decision PENDING. executeDecision → SKIPPED (post-claim check catches it). No action, no resource mutation.
+  - Then: directly calls verifyIntentAuthorityAtBoundary on a decision in EXECUTING state with a known claim. Asserts: authorized = false, reason = "intent-expired", decision transitions to SKIPPED (fenced by claimId). Proves the mutation-boundary fence exists, is DB-authoritative, and transitions the decision to SKIPPED inside a transaction.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 11.4 (all 8):    8/8 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 34 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: f13aa25 (on GitHub, verified: git ls-remote origin main → f13aa25)
+- Both issues closed:
+  1. SKIP fence now includes executionClaimId (ownership predicate).
+  2. Durable intent-authority fence at the mutation boundary (DB-level $transaction).
+- The architectural rule is now enforced:
+  "Intent authority must be bound to the execution claim at the mutation boundary."
+  claim → post-claim check → session slot → mutation-boundary authority fence → action
+- Acceptance invariant #5 fully proven with durable DB-level authority:
+  "Expired/superseded intent cannot execute."
+- Next: Phase 11.5 — Runtime invariant fail-closed.
