@@ -4392,3 +4392,37 @@ Stage Summary:
   claim → exclusive fence (PERSISTS) → session slot → fenced resource mutation (checks fence inside $transaction) → action
 - Phase 11.4 is now ready to freeze.
 - Next: Phase 11.5 — Runtime invariant fail-closed.
+
+---
+Task ID: 11.5
+Agent: Principal Architect (main) — Phase 11.5 Runtime Invariant Fail-Closed
+Task: Prove at runtime that the invariant checker is not merely diagnostic. If session/resource/binding/provider state diverges, RoamLink MUST NOT present the session as clean ACTIVE. Detection ≠ enforcement — the read model must fail closed.
+
+Work Log:
+- Fix (current-connectivity.ts): getCurrentConnectivityForUser now calls assertActiveConnectivityInvariant for ACTIVE sessions. If the invariant fails, the read model surfaces the session state as RECONCILIATION_REQUIRED (not ACTIVE). The read model is the user-facing projection — if it says ACTIVE, the user believes their connectivity is healthy. A corrupted chain (e.g. resource reservedBy mismatched) would still be presented as ACTIVE without this check. Now the read model fails closed.
+
+- Tests (tests/phase11.5-invariant-fail-closed.test.ts, 6 DB-backed runtime, all PASS):
+  11.5.6 PASS — control (no corruption): invariant passes, read model shows clean ACTIVE.
+  11.5.1 PASS — resource.reservedBy corrupted: invariant detects, read model RECONCILIATION_REQUIRED.
+  11.5.2 PASS — resource.state not IN_USE: invariant detects, read model RECONCILIATION_REQUIRED.
+  11.5.3 PASS — resource.providerBindingId null: invariant detects, read model RECONCILIATION_REQUIRED.
+  11.5.4 PASS — binding.entitlement.userId mismatch: invariant detects, read model RECONCILIATION_REQUIRED.
+  11.5.5 PASS — session.entitlementId mismatch: invariant detects, read model RECONCILIATION_REQUIRED.
+  Each test corrupts one link in the chain (session → resource → binding → entitlement → provider truth), runs the invariant checker, and verifies the read model. The invariant detects the divergence, and the read model fails closed by surfacing RECONCILIATION_REQUIRED.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 11.4 (all 11):  11/11 PASS
+  Phase 11.5 (all 6):    6/6 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 43 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 378c993 (on GitHub, verified: git ls-remote origin main → 378c993)
+- Acceptance invariant #6 proven at runtime:
+  "Broken session/resource/provider convergence cannot be presented as clean ACTIVE."
+  Detection → enforcement: the read model fails closed by surfacing RECONCILIATION_REQUIRED.
+- Next: Phase 11.6 — Out-of-order event convergence.
