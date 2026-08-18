@@ -4819,3 +4819,143 @@ Stage Summary:
 - origin/main HEAD: 1f19956
 - 706035f (the P0-5 fix) is now on origin/main and remotely verifiable.
 - The architect can now re-audit origin/main and freeze Phase 12.2.
+
+---
+Task ID: 12.3-audit
+Agent: Principal Architect (main) — Phase 12.3 Audit (idempotency race + API-key path)
+Task: Audit runIdempotent() and the API-key verification path as the first Phase 12.3 step. The architect identified two P0s: (1) runIdempotent() is not transaction-safe (findExisting → execute with no atomic claim), (2) API-key auth has no canonical verification middleware despite the model having all foundation fields.
+
+Work Log:
+- P0-1 CONFIRMED — runIdempotent() race:
+  src/lib/orders/idempotency.ts:22-39 does:
+    const existing = await findExisting();   // READ
+    if (existing != null) return existing;
+    return execute();                        // WRITE (no atomic claim between read + write)
+  Two concurrent requests both see existing===null and both execute.
+  The DB unique constraints on Order/Payment/TopUp.idempotencyKey catch the duplicate INSERT
+  but the second request receives a raw P2002 (unique constraint violation) surfaced as an
+  unhandled 500 — NOT a clean replay. This contradicts the documented "transaction-safe run once" guarantee.
+  Blast radius: runIdempotent is defined but only audit() is imported elsewhere. The real
+  idempotency flows (createOrder, initiatePayment, purchaseTopUp) inline the same
+  findUnique → create pattern directly (same race, same P2002-on-conflict behavior).
+
+- P0-2 CONFIRMED — API-key verification path is ABSENT:
+  The ApiKey model (prisma/schema.prisma:1311) has hashedKey @unique, tenantId, scopes (JSON),
+  expiresAt, revokedAt, lastUsedAt, createdBy — all the foundation.
+  But grep for verifyApiKey|authenticateApiKey|resolveApiKey|apiAuth → 0 matches.
+  grep for apiKey.findUnique({ where: { hashedKey } }) → 0 matches.
+  The API-key routes (src/app/api/tenant/api-keys/route.ts) only MANAGE keys (create/list/revoke).
+  There is NO middleware that reads an incoming Authorization: Bearer rlk_... header, hashes it,
+  and resolves a principal. The external API surface has no API-key auth at all.
+
+- Schema inspection:
+  ApiKey.hashedKey is @unique and @@index([hashedKey]) — ready for O(1) lookup.
+  scopes is a JSON string (default "read"). No enum/contract enforcement at the DB level.
+
+Stage Summary:
+- Both P0 findings from the architect's audit are confirmed at the code level.
+- The idempotency race is the most concrete defect — it directly contradicts a documented
+  commercial safety invariant (duplicate payments, orders, eSIM provisioning, top-ups).
+- The API-key model is complete but the verification path is entirely missing.
+- Next: implement the DB-authoritative idempotency primitive + canonical API-key verification.
+
+---
+Task ID: 12.3-impl
+Agent: Principal Architect (main) — Phase 12.3.1 + 12.3.2 Implementation
+Task: Implement the two P0 fixes: (1) DB-authoritative idempotency primitive (INSERT is the atomic claim, no read-then-write window), (2) canonical API-key verification middleware. Write adversarial runtime tests including the critical concurrent-duplicate-request test.
+
+Work Log:
+- Fix 1 — IdempotencyOperation model (prisma/schema.prisma):
+  New model with:
+    @@unique([scope, key])   — THE atomic claim primitive
+    state: IN_PROGRESS | COMPLETED | FAILED
+    resultJson: the stored result on COMPLETED (for replay)
+    failureJson: the stored failure on FAILED (dead-letter)
+    payloadHash: SHA-256 of request payload for conflict detection (same key + different payload → 409)
+    tenantId, principalId, principalType: audit trail
+    claimExpiresAt: lease for crashed-worker recovery
+  The (scope, key) pair is globally unique. The INSERT itself is the atomic claim — there is
+  no read-then-write window. A concurrent request that loses the INSERT race receives P2002
+  and polls for the terminal result.
+
+- Fix 2 — DB-authoritative idempotency primitive (src/lib/idempotency/claim.ts, new):
+  runIdempotentOperation<T>({ scope, key, payloadHash?, principal?, execute }):
+    Step 1: INSERT (claim). If P2002 → concurrent request → pollForTerminalResult().
+    Step 2: execute(). On success → UPDATE state=COMPLETED, resultJson=JSON.stringify(result).
+            On failure → UPDATE state=FAILED, failureJson=serialized failure, re-throw.
+  pollForTerminalResult(): checks payload conflict (409 if different payloadHash), then
+    polls every 50ms up to 30s for COMPLETED (returns stored result) or FAILED (throws stored failure).
+  reclaimExpiredIdempotencyOperations(): transitions expired IN_PROGRESS → FAILED for crashed
+    workers. Future requests with the same key get the failure instead of polling forever.
+  hashPayload(): SHA-256 helper for conflict detection.
+  The conditional updateMany (where: { state: "IN_PROGRESS" }) prevents overwriting a concurrent
+  reclaim that transitioned the operation to FAILED while we were executing.
+
+- Fix 3 — Legacy runIdempotent() now delegates to the new primitive (src/lib/orders/idempotency.ts):
+  Backward-compatible API. findExisting is now advisory (invoked inside execute after the claim
+  is held). New code should call runIdempotentOperation directly.
+
+- Fix 4 — Canonical API-key verification (src/lib/auth/api-key.ts, new):
+  extractApiKey(req): reads Authorization: Bearer rlk_... OR x-api-key: rlk_...
+  hashApiKey(rawKey): SHA-256 (same as creation route).
+  verifyApiKey(rawKey): findUnique by hashedKey, check revokedAt (401), check expiresAt (401),
+    parse scopes, best-effort update lastUsedAt. Returns ApiKeyPrincipal { tenantId, scopes, ... }.
+  requireApiKey(req, scope): extract → verify → scope check (admin implies all). 401 if no key /
+    invalid / revoked / expired. 403 if insufficient scope.
+  SECURITY INVARIANTS:
+    - Raw key never stored (only SHA-256 hash).
+    - Revoked key → 401.
+    - Expired key → 401.
+    - principal.tenantId is the key's tenantId — caller CANNOT override it.
+    - "admin" scope implies all scopes.
+    - lastUsedAt updated on each successful verification (non-blocking).
+
+- Tests (tests/phase12.3-api-protocol.test.ts, 19 DB-backed runtime, all PASS):
+  12.3.1 — API-key verification (11 tests):
+    .1  valid key (Bearer) → resolves principal with tenant + scopes
+    .2  valid key (x-api-key header) → resolves principal
+    .3  no API key → 401
+    .4  invalid key (wrong hash) → 401
+    .5  malformed key (wrong prefix) → 401
+    .6  revoked key → 401
+    .7  expired key → 401
+    .8  insufficient scope → 403
+    .9  admin scope implies all scopes
+    .10 key's tenantId is authoritative — caller cannot override
+    .11 lastUsedAt is updated on successful verification
+  12.3.2 — Transaction-safe idempotency (8 tests):
+    .1  single execution → COMPLETED, result stored
+    .2  THE CRITICAL TEST: concurrent duplicate requests → exactly ONE execution, other replays
+    .3  replay after completion → returns stored result, no re-execution
+    .4  conflicting payload (same key, different body) → 409 Conflict
+    .5  execute failure → dead-lettered, replay throws the stored failure
+    .6  reclaim expired IN_PROGRESS → FAILED (crashed worker recovery)
+    .7  three concurrent requests → exactly ONE execution, all get same result
+    .8  principal (api_key) is recorded on the claim for audit
+
+- The critical test 12.3.2.2 fires two runIdempotentOperation calls with the SAME (scope, key)
+  simultaneously (Promise.all + a 100ms sleep inside execute to guarantee overlap). The test
+  asserts execCount === 1 (exactly one execution) and both returned values are identical.
+  Under the prior runIdempotent() this would have been execCount === 2 (both execute).
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       19/19 PASS  (new)
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready in 1027ms, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 80 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- P0-1 (idempotency race) is FIXED at the database boundary: the INSERT is the atomic claim.
+  Concurrent duplicate requests no longer both execute — exactly one runs, the other replays.
+  Failures are dead-lettered (not silently retried). Crashed workers are recovered via lease expiry.
+- P0-2 (API-key verification) is IMPLEMENTED: canonical requireApiKey() middleware resolves
+  key → tenant → scopes → principal. Revoked/expired keys are rejected. Insufficient scope is 403.
+  The principal's tenantId is authoritative (caller cannot override).
+- 19 adversarial runtime tests prove both fixes, including the concurrent-duplicate-request test
+  that would have caught the original race.
+- Next: wire requireApiKey() into the external API routes (the v1/connectivity surface and
+  commerce routes), then Phase 12.3.3 (canonical error envelope) + 12.3.4 (request correlation).

@@ -1328,6 +1328,67 @@ model ApiKey {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 12.3.2 — IdempotencyOperation — DB-authoritative "run once" primitive.
+//
+// The prior runIdempotent() helper had a classic read-then-write race:
+//   A: findExisting → null
+//   B: findExisting → null
+//   A: execute  (creates side effect #1)
+//   B: execute  (creates side effect #2 — duplicate payment/order/provision)
+//
+// The DB unique constraints on Order/Payment/TopUp.idempotencyKey caught the
+// duplicate INSERT, but the second request received a raw P2002 unique-constraint
+// violation surfaced as an unhandled 500 — NOT a clean replay of the first result.
+//
+// This model makes the INSERT itself the atomic claim. A concurrent request that
+// loses the claim race receives a P2002, polls for the claim to reach a terminal
+// state (COMPLETED | FAILED), and returns the stored result (replay) or the
+// failure (dead-letter). There is no read-then-write window.
+//
+// State machine:
+//   IN_PROGRESS → COMPLETED  (execute succeeded; resultJson stored)
+//   IN_PROGRESS → FAILED     (execute threw; error stored, retriable via new key)
+//
+// The (scope, key) pair is globally unique — the caller must namespace the key
+// (e.g. "checkout:user_X:abc123"). The tenantId + principalId are recorded for
+// audit but are NOT part of the uniqueness key (the caller's scope already
+// encodes the authority boundary).
+// ---------------------------------------------------------------------------
+
+model IdempotencyOperation {
+  id              String   @id @default(cuid())
+  // Logical namespace for the key, e.g. "checkout", "payment", "topup", "provision".
+  scope           String
+  // The idempotency key supplied by the client (or generated). Unique within (scope, key).
+  key             String
+  // State: IN_PROGRESS | COMPLETED | FAILED
+  state           String   @default("IN_PROGRESS")
+  // The operation's result (JSON-serialized). Present when state = COMPLETED.
+  resultJson      String?
+  // The operation's failure (JSON-serialized { errorClass, message, statusCode }).
+  // Present when state = FAILED.
+  failureJson     String?
+  // A SHA-256 hash of the request payload, for conflict detection. If two
+  // requests use the same key but different payloads, the second is rejected
+  // with 409 Conflict (idempotency key reuse with conflicting payload).
+  payloadHash     String?
+  // Audit: who claimed this operation.
+  tenantId        String?
+  principalId     String?  // user.id or api_key.id
+  principalType   String?  // "session" | "api_key"
+  // Lease: when this claim expires if still IN_PROGRESS (crashed worker recovery).
+  // A reclaim worker can transition expired IN_PROGRESS → FAILED after the lease.
+  claimExpiresAt  DateTime?
+  createdAt       DateTime @default(now())
+  completedAt     DateTime?
+
+  @@unique([scope, key])
+  @@index([state])
+  @@index([claimExpiresAt])
+  @@index([tenantId])
+}
+
+// ---------------------------------------------------------------------------
 // Phase 2B.1 — Reseller Balance & Transactions
 // ---------------------------------------------------------------------------
 
