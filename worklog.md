@@ -4530,3 +4530,22 @@ Stage Summary:
 - The event cleanup ensures processOneEvent claims the correct test event.
 - All 8 Phase 11 acceptance invariants are now runtime-proven with exact assertions.
 - Phase 11 is now ready to freeze as a whole.
+
+---
+Task ID: 11.6-exact-state
+Agent: Principal Architect (main) — Phase 11.6.1 Exact Terminal State
+Task: Tighten 11.6.1's terminal-state assertion from a broad union to one exact expected state.
+
+Work Log:
+- Changed from `expect(["EXECUTED","SKIPPED","FAILED","RECONCILIATION_REQUIRED"]).toContain(state)` to `expect(decisions[0].executionState).toBe("SKIPPED")`.
+- For this fixture: session is ACTIVE on A, intent is ACTIVE, the decision engine produces KEEP (session already active on a healthy resource — no need to switch). KEEP/WAIT/ASK_USER decisions have executionState SKIPPED.
+- Now proves exactly: one decision, one exact terminal state (SKIPPED).
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7 + 8.6.6: 49 PASS, 0 FAIL.
+  Lint: clean.
+
+Stage Summary:
+- HEAD: 90896bf (on GitHub, verified: git ls-remote origin main → 90896bf)
+- 11.6.1 now asserts exactly 1 decision with exact state SKIPPED.
+- Phase 11 is now ready to freeze as a whole.
