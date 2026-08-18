@@ -4006,3 +4006,58 @@ Stage Summary:
 - Fixed a pre-existing Prisma relation name bug in kernel-bridge.ts that was masking the scenario.
 - Documented the dual-purpose lease semantics (ownership + liveness) to prevent future simplification.
 - Next: Phase 11.4 — Execution-time intent authority (strengthen the 9.4.2 P1-5 test).
+
+---
+Task ID: 11.3.1
+Agent: Principal Architect (main) — Phase 11.3.1 Deterministic Mid-Execution Provider-Truth Flip
+Task: Close the three issues identified in the architect's audit of c78106a: (1) 11.3.1 was a pre-execution state setup, not a mid-execution flip; (2) 11.3.2 was static source inspection, not runtime proof; (3) acceptance assertions accepted FAILED | RECONCILIATION_REQUIRED (too broad). Provide deterministic mid-execution proof with exact reconciliation-state assertions.
+
+Work Log:
+- Fix 1 — Test-only provider-truth injection hook (kernel-bridge.ts):
+  - Added setProviderTruthOverride(fn) / clearProviderTruthOverride().
+  - When set, verifyResourceUsable calls the override function with the resourceId. If it returns a non-null result, that result is used instead of the real provider verification.
+  - This provides a DETERMINISTIC injection point between reserve and verify inside executeAction — no timing race. The provider is healthy (T0=USABLE) when the decision is created and the target is reserved. The flip happens DURING execution, at the exact verification boundary.
+  - The hook is TEST-ONLY. It must NEVER be set in production code.
+
+- Fix 2 — UNKNOWN path status mapping (action-executor.ts):
+  - The UNKNOWN path in executeAction transitioned the action state to RECONCILIATION_REQUIRED but returned { status: "failed" }. The decision-executor mapped "failed" → "FAILED", so the decision ended up FAILED even though the action was RECONCILIATION_REQUIRED.
+  - Fixed: the UNKNOWN path now returns { status: "reconciliation_required" } (not { status: "failed" }). The decision-executor maps it to RECONCILIATION_REQUIRED. This makes the state model consistent: Action state === Decision execution state.
+  - Applied to both ACTIVATE and SWITCH UNKNOWN paths.
+
+- Tests (rewritten, all DB-backed runtime):
+  11.3.4 PASS — deterministic mid-execution flip to NOT_USABLE:
+    T0 = USABLE. Decision targets B. B reserved.
+    Provider truth flips to NOT_USABLE at verify time (deterministic injection).
+    Result: action NOT EXECUTED. B released. A remains IN_USE + authoritative.
+    Exactly one action. No silent fallback.
+
+  11.3.5 PASS — deterministic mid-execution flip to UNKNOWN:
+    T0 = USABLE. Decision targets B. B reserved.
+    Provider truth flips to UNKNOWN at verify time (deterministic injection).
+    Result: action RECONCILIATION_REQUIRED (EXACT, not FAILED).
+    B released. A remains IN_USE + authoritative. Exactly one action.
+    Action state = RECONCILIATION_REQUIRED (EXACT).
+
+  11.3.3 PASS — control (USABLE throughout):
+    No override. Real provider verification returns USABLE.
+    Result: EXECUTED. Session switches A→B. Old A released. Happy path works.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Phase 10.1.1:          5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 31 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 969b16f (on GitHub, verified: git ls-remote origin main → 969b16f)
+- All three issues closed:
+  1. Deterministic mid-execution flip (not pre-execution setup) — via test-only injection hook.
+  2. Runtime UNKNOWN proof (not static source inspection) — via the same hook.
+  3. Exact reconciliation-state assertions — UNKNOWN → RECONCILIATION_REQUIRED (not the broad FAILED | RECONCILIATION_REQUIRED union).
+- Bonus: fixed a state-model inconsistency where the UNKNOWN path returned { status: "failed" } despite transitioning the action to RECONCILIATION_REQUIRED. Now Action state === Decision execution state.
+- Acceptance invariant #4 proven with deterministic mid-execution proof:
+  "Provider truth at execution time outranks stale decision assumptions."
+- Next: Phase 11.4 — Execution-time intent authority (strengthen the 9.4.2 P1-5 test).
