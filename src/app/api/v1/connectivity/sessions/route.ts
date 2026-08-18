@@ -3,7 +3,25 @@
  * GET  /api/v1/connectivity/sessions — list sessions for the user (tenant-scoped)
  * POST /api/v1/connectivity/sessions — create a session
  *
- * Phase 12.2 P0-5: GET now filters by ctx.tenantId via entitlement join.
+ * Phase 12.2 P0-5 (corrected): GET now constrains the tenant AT THE DATABASE
+ * QUERY LEVEL via the entitlement relation filter:
+ *
+ *   WHERE subjectId = user.id
+ *     AND entitlement.tenantId = ctx.tenantId
+ *     AND entitlement.userId = user.id
+ *   ORDER BY createdAt DESC
+ *   LIMIT 20
+ *
+ * The tenant filter is part of the query itself, applied BEFORE `take`. This is
+ * the authoritative boundary — there is no post-fetch application-level filtering.
+ *
+ * The previous implementation fetched 20 rows first, then filtered them by
+ * tenant in application code. That was tenant-safe (no cross-tenant leak) but
+ * incorrect for pagination/limit semantics: if the newest 20 sessions were
+ * predominantly from tenant B, a tenant-A caller would receive fewer than 20
+ * valid sessions even when older tenant-A sessions existed. The DB query must
+ * constrain the tenant before take.
+ *
  * Phase 12.2: POST verifies entitlementId belongs to ctx.tenantId before session creation.
  */
 
@@ -18,18 +36,28 @@ export async function GET() {
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const ctx = await requireTenantContext(user);
 
-  // Phase 12.2 P0-5: Filter sessions by the authenticated tenant.
-  // Sessions are linked to a tenant via their entitlement (ConnectivityEntitlement.tenantId).
-  // We query sessions where the user is the subject AND the session's entitlement
-  // belongs to ctx.tenantId. Sessions without an entitlementId are excluded
-  // (they have no tenant authority).
+  // Phase 12.2 P0-5 (corrected): Tenant ownership is part of the database query
+  // itself, via the entitlement relation. The query is:
+  //
+  //   WHERE subjectId = user.id
+  //     AND entitlement.tenantId = ctx.tenantId
+  //     AND entitlement.userId = user.id
+  //   ORDER BY createdAt DESC
+  //   LIMIT 20
+  //
+  // Sessions without an entitlement (entitlementId IS NULL) are excluded by
+  // the relation filter — they have no tenant authority. The `take: 20` is
+  // applied AFTER the tenant filter, so pagination/limit semantics are correct:
+  // the caller receives up to 20 of their own tenant-scoped sessions, not
+  // "20 of the newest, then filtered" (which could return fewer than 20 even
+  // when valid older sessions exist).
   const sessions = await db.connectivitySession.findMany({
     where: {
       subjectId: user.id,
-      entitlementId: { not: null },
-      // We can't do a direct join in Prisma findMany, so we filter in two steps:
-      // 1. Get all entitlement IDs for this tenant + user.
-      // 2. Filter sessions by those entitlement IDs.
+      entitlement: {
+        tenantId: ctx.tenantId,
+        userId: user.id,
+      },
     },
     orderBy: { createdAt: "desc" },
     take: 20,
@@ -39,15 +67,7 @@ export async function GET() {
     },
   });
 
-  // Phase 12.2 P0-5: Further filter by tenant via entitlement lookup.
-  const tenantEntitlementIds = await db.connectivityEntitlement.findMany({
-    where: { tenantId: ctx.tenantId, userId: user.id },
-    select: { id: true },
-  });
-  const entitlementIdSet = new Set(tenantEntitlementIds.map((e) => e.id));
-  const tenantScopedSessions = sessions.filter((s) => s.entitlementId && entitlementIdSet.has(s.entitlementId));
-
-  return NextResponse.json({ sessions: tenantScopedSessions });
+  return NextResponse.json({ sessions });
 }
 
 export async function POST(req: NextRequest) {

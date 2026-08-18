@@ -334,24 +334,54 @@ describe("Phase 11.5 — Runtime Invariant Fail-Closed (DB-backed)", () => {
 
   // =========================================================================
   // 11.5.5 — session.entitlementId mismatch → invariant detects, read model shows divergence
+  //
+  // Phase 12.2 P0-5 note: ConnectivitySession.entitlementId is now a real FK
+  // to ConnectivityEntitlement (added so the sessions GET route can filter by
+  // tenant at the DB query level). The corruption can no longer point to a
+  // non-existent ID — it must point to a real (but different) entitlement to
+  // simulate "session's entitlementId was swapped to a different entitlement".
+  // The invariant check #6 (session.entitlementId !== binding.entitlementId)
+  // still catches this mismatch.
   // =========================================================================
   it("11.5.5: session.entitlementId mismatch → invariant detects, read model shows RECONCILIATION_REQUIRED", async () => {
     const snap = await snapshotState(fx);
 
-    // Corrupt: session's entitlementId points to a different entitlement.
-    await db.connectivitySession.update({
-      where: { id: fx.sessionId },
-      data: { entitlementId: "different-entitlement-id" },
+    // Create a second real entitlement in the same tenant (so the FK is satisfied)
+    // but distinct from the session's original entitlement. Reuse the original's
+    // subscriptionId + capabilityId so all FK/consistency constraints hold.
+    const origEnt = await db.connectivityEntitlement.findUnique({ where: { id: fx.entitlementId } });
+    const otherEnt = await db.connectivityEntitlement.create({
+      data: {
+        tenantId: fx.tenantId,
+        subscriptionId: origEnt!.subscriptionId,
+        capabilityId: origEnt!.capabilityId,
+        status: "ACTIVE",
+        capabilitySet: JSON.stringify({ downloadMbps: 1 }),
+        validFrom: new Date(),
+        userId: fx.subjectId,
+      },
     });
 
-    const invariant = await assertActiveConnectivityInvariant(fx.sessionId);
-    expect(invariant.valid).toBe(false);
-    expect(invariant.violations.some((v) => v.includes("entitlementId"))).toBe(true);
+    try {
+      // Corrupt: session's entitlementId points to a DIFFERENT (real) entitlement.
+      // The binding still points to the original entitlement → invariant #6 mismatch.
+      await db.connectivitySession.update({
+        where: { id: fx.sessionId },
+        data: { entitlementId: otherEnt.id },
+      });
 
-    const current = await getCurrentConnectivityForUser(fx.subjectId);
-    expect(current.session).not.toBeNull();
-    expect(current.session?.state).toBe("RECONCILIATION_REQUIRED");
+      const invariant = await assertActiveConnectivityInvariant(fx.sessionId);
+      expect(invariant.valid).toBe(false);
+      expect(invariant.violations.some((v) => v.includes("entitlementId"))).toBe(true);
 
-    await restoreState(fx, snap);
+      const current = await getCurrentConnectivityForUser(fx.subjectId);
+      expect(current.session).not.toBeNull();
+      expect(current.session?.state).toBe("RECONCILIATION_REQUIRED");
+    } finally {
+      // Restore the session first (so the FK from session → original entitlement is
+      // back in place), then delete the second entitlement.
+      await restoreState(fx, snap);
+      await db.connectivityEntitlement.delete({ where: { id: otherEnt.id } }).catch(() => {});
+    }
   }, 60_000);
 });

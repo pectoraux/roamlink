@@ -1530,6 +1530,11 @@ model ConnectivityEntitlement {
   tenant          Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   capability      ConnectivityCapability @relation(fields: [capabilityId], references: [id])
   resourceBindings ProviderResourceBinding[]
+  // Phase 12.2 P0-5: Sessions are linked to a tenant via their entitlement.
+  // This relation allows the sessions GET route to filter by tenant at the
+  // database query level (entitlement: { tenantId, userId }) BEFORE take/limit,
+  // rather than fetching take rows and filtering in application code.
+  sessions        ConnectivitySession[]
 
   @@index([tenantId])
   @@index([subscriptionId])
@@ -2052,6 +2057,14 @@ model ConnectivitySession {
   decisions       ConnectivityDecision[]
   actions         ConnectivityAction[]
   policy          ConnectivityPolicy? @relation(fields: [policyId], references: [id], onDelete: SetNull)
+  // Phase 12.2 P0-5: Authoritative tenant linkage. A session's tenant is the
+  // tenant of its entitlement. This relation enables the sessions GET route to
+  // filter by tenant at the database query level (WHERE entitlement.tenantId =
+  // ctx.tenantId AND entitlement.userId = user.id) BEFORE take/limit — not
+  // fetch-then-filter in application code. onDelete: SetNull preserves session
+  // history if an entitlement is deleted (the session becomes tenantless and
+  // is excluded from tenant-scoped reads).
+  entitlement     ConnectivityEntitlement? @relation(fields: [entitlementId], references: [id], onDelete: SetNull)
 
   @@index([subjectId])
   @@index([state])
