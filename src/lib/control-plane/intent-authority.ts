@@ -1,40 +1,31 @@
 /**
- * Control Plane — Intent Authority Fence (Phase 11.4.9)
+ * Control Plane — Intent Authority Fence (Phase 11.4.10.1)
  *
- * A PostgreSQL-authoritative intent authority fence at the mutation boundary.
+ * A durable execution fence that PERSISTS through the mutation window.
  * Analogous to the session execution slot fence (Phase 11.2.5).
  *
  * The architectural rule:
  *   "Intent authority must be bound to the execution claim at the mutation boundary."
  *
- * Phase 11.4.9 (PostgreSQL-authoritative):
- * The previous implementation used a SELECT inside a transaction. On PostgreSQL,
- * a normal SELECT does NOT prevent another transaction from updating the intent
- * row. This is the same TOCTOU we eliminated for session slots in 11.2.5.
+ * Phase 11.4.9 used a conditional UPDATE that committed immediately — the
+ * fence was released before the actual connectivity mutation. Phase 11.4.10.1
+ * fixes this: the fence PERSISTS (executionFenceId + executionFenceExpiresAt
+ * on the intent record) and is checked at EVERY fenced resource mutation.
  *
- * The fix: use a conditional UPDATE on the intent row (not a SELECT) as the
- * first operation inside the transaction. The UPDATE takes the row lock and
- * evaluates the authority predicate atomically:
- *
- *   UPDATE connectivity_intent_record
- *   SET fenceVersion = fenceVersion + 1   -- harmless bump, takes row lock
- *   WHERE intentId = ?
- *     AND version = ?                      -- exact version attached to decision
- *     AND status = 'ACTIVE'
- *     AND (expiresAt IS NULL OR expiresAt > now)
- *
- * If affectedRows != 1, the intent is no longer authoritative (superseded,
- * expired, or not found). The decision is transitioned to SKIPPED (fenced by
- * executionClaimId). No resource mutation occurs.
- *
- * If affectedRows = 1, the intent was authoritative at the mutation boundary.
- * The row lock prevents a concurrent supersede/expire from changing the intent
- * until the transaction commits. The caller proceeds to the action.
- *
- * The fence binds to the EXACT intent version attached to the decision — not
- * "whatever the current intent happens to be." This protects:
- *   v1 decision → v2 supersedes v1 → the v1 decision's fence fails
- *   (status is SUPERSEDED, not ACTIVE).
+ * The fence lifecycle:
+ *   1. verifyIntentAuthorityAtBoundary: conditional UPDATE on the intent row
+ *      to SET executionFenceId + executionFenceExpiresAt (takes row lock +
+ *      evaluates authority predicate). The fence PERSISTS after commit.
+ *   2. Each fenced resource mutation (fencedReserveResource, fencedMarkResourceInUse,
+ *      fencedReleaseResource) calls verifyIntentExecutionFence inside its
+ *      $transaction — a conditional UPDATE that verifies the fence is still
+ *      held by this claim AND the intent is still ACTIVE AND unexpired.
+ *   3. If the intent is superseded/expired between the fence claim and the
+ *      mutation, the fence's executionFenceId is still set (the supersede
+ *      doesn't clear it), BUT the intent's status is no longer ACTIVE →
+ *      the conditional UPDATE affects 0 rows → mutation rejected.
+ *   4. The fence is cleared (executionFenceId = null) when the decision
+ *      completes (executeDecision's finally block) or when it expires.
  */
 
 import { db } from "@/lib/db";
@@ -44,11 +35,17 @@ const DECISION_EXECUTING = "EXECUTING";
 const DECISION_SKIPPED = "SKIPPED";
 
 /**
- * Test-only hook for deterministic post-check race testing.
+ * Duration the intent execution fence is valid. Must cover the full mutation
+ * window (reserve → activate → verify → release). Matches the session slot
+ * lease + decision execution lease (5 min).
+ */
+const INTENT_EXECUTION_FENCE_LEASE_MS = 5 * 60_000;
+
+/**
+ * Test-only hook for deterministic race testing.
  * When set, the hook is called AFTER the post-claim authority check but BEFORE
  * the mutation-boundary fence. The test can use this to expire/supersede the
- * intent between the two checks, proving the mutation-boundary fence catches
- * the race.
+ * intent between the two checks, proving the fence catches the race.
  */
 type IntentExpiryHook = (intentId: string, intentVersion: number) => void;
 let intentExpiryHook: IntentExpiryHook | null = null;
@@ -62,40 +59,40 @@ export function clearIntentExpiryHook(): void {
 }
 
 /**
- * Verify intent authority at the mutation boundary using a conditional UPDATE
- * on the intent row. Returns { authorized } indicating whether the intent was
- * ACTIVE and unexpired at the mutation boundary.
+ * Phase 11.4.10.1: Claim a durable intent execution fence.
  *
- * If unauthorized, transitions the decision to SKIPPED (fenced by claimId)
- * inside the same transaction. The caller must NOT proceed to the action.
+ * Conditional UPDATE on the intent row:
+ *   SET executionFenceId = fenceId, executionFenceExpiresAt = now + LEASE
+ *   WHERE intentId = ? AND version = ?
+ *     AND status = 'ACTIVE'
+ *     AND (expiresAt IS NULL OR expiresAt > now)
  *
- * This is the DB-level intent authority fence — a conditional UPDATE, not a
- * preflight SELECT.
+ * If affectedRows = 1: the intent was ACTIVE + unexpired. The fence is set
+ * and PERSISTS after commit. The fenceId ties the intent to this specific
+ * decision execution.
+ *
+ * If affectedRows = 0: the intent is no longer authoritative. Fenced SKIP
+ * transition. Returns { authorized: false }.
+ *
+ * The fence is cleared by clearIntentExecutionFence when the decision completes.
  */
 export async function verifyIntentAuthorityAtBoundary(
   decisionId: string,
   executionClaimId: string,
   intentId: string,
   intentVersion: number,
-): Promise<{ authorized: boolean; reason?: string }> {
+): Promise<{ authorized: boolean; reason?: string; fenceId?: string }> {
   // Phase 11.4.10: Test-only hook for deterministic race testing.
-  // The test can expire/supersede the intent here — between the post-claim
-  // check and the mutation-boundary fence — to prove the fence catches it.
-  // The hook is AWAITED so its DB update commits before the fence's
-  // conditional UPDATE runs. This makes the race deterministic.
   if (intentExpiryHook) {
     await intentExpiryHook(intentId, intentVersion);
   }
 
-  return await db.$transaction(async (tx) => {
-    const now = new Date();
+  const now = new Date();
+  const fenceId = `intent-fence-${decisionId}-${now.getTime()}`;
+  const fenceExpiresAt = new Date(now.getTime() + INTENT_EXECUTION_FENCE_LEASE_MS);
 
-    // 1. Conditional UPDATE on the intent row — takes the row lock and
-    //    evaluates the authority predicate atomically.
-    //    WHERE: exact intentId + version (bound to the decision)
-    //           status = ACTIVE
-    //           (expiresAt IS NULL OR expiresAt > now)
-    //    DATA: fenceVersion = fenceVersion + 1 (harmless bump, establishes lock)
+  return await db.$transaction(async (tx) => {
+    // 1. Conditional UPDATE — takes the row lock + evaluates authority.
     const fenceResult = await tx.connectivityIntentRecord.updateMany({
       where: {
         intentId,
@@ -107,14 +104,13 @@ export async function verifyIntentAuthorityAtBoundary(
         ],
       },
       data: {
-        fenceVersion: { increment: 1 },
+        executionFenceId: fenceId,
+        executionFenceExpiresAt: fenceExpiresAt,
       },
     });
 
-    // 2. If the conditional UPDATE affected 0 rows, the intent is no longer
-    //    authoritative (superseded, expired, or not found).
     if (fenceResult.count === 0) {
-      // Determine the reason for a better error message.
+      // Determine the reason.
       const intent = await tx.connectivityIntentRecord.findUnique({
         where: { intentId_version: { intentId, version: intentVersion } },
         select: { status: true, expiresAt: true },
@@ -131,13 +127,12 @@ export async function verifyIntentAuthorityAtBoundary(
         reason = "intent-fence-rejected";
       }
 
-      // 3. Fenced SKIP transition — only the claim owner can SKIP.
-      //    WHERE executionState = EXECUTING AND executionClaimId = claimId.
+      // Fenced SKIP transition.
       const skipResult = await tx.connectivityDecision.updateMany({
         where: {
           id: decisionId,
           executionState: DECISION_EXECUTING,
-          executionClaimId: executionClaimId,
+          executionClaimId,
         },
         data: {
           executionState: DECISION_SKIPPED,
@@ -154,13 +149,95 @@ export async function verifyIntentAuthorityAtBoundary(
       return { authorized: false, reason };
     }
 
-    // 4. Authorized — the conditional UPDATE affected 1 row, meaning the
-    //    intent was ACTIVE and unexpired at the mutation boundary. The row
-    //    lock prevents a concurrent supersede/expire from changing it until
-    //    the transaction commits. The caller proceeds to the action.
+    // 2. Authorized — the fence is set and PERSISTS after commit.
     logger.info("intent.authority_fence_acquired", {
-      intentId, intentVersion, decisionId, fenceVersion: fenceResult.count,
+      intentId, intentVersion, decisionId, fenceId, fenceExpiresAt,
     });
-    return { authorized: true };
+    return { authorized: true, fenceId };
   });
+}
+
+/**
+ * Phase 11.4.10.1: Verify the intent execution fence at a resource mutation boundary.
+ *
+ * Called inside each fenced resource mutation's $transaction (fencedReserveResource,
+ * fencedMarkResourceInUse, fencedReleaseResource). A conditional UPDATE that
+ * verifies the fence is still held by this claim AND the intent is still ACTIVE:
+ *
+ *   UPDATE connectivity_intent_record
+ *   SET fenceVersion = fenceVersion + 1   -- harmless bump, takes row lock
+ *   WHERE intentId = ?
+ *     AND version = ?
+ *     AND status = 'ACTIVE'                -- must still be ACTIVE (not superseded)
+ *     AND (expiresAt IS NULL OR expiresAt > now)
+ *     AND executionFenceId = ?            -- must be our fence
+ *     AND executionFenceExpiresAt > now    -- fence must not have expired
+ *
+ * If affectedRows = 0: the intent was superseded/expired/fence-lost between
+ * the fence claim and this mutation. Returns { valid: false }.
+ *
+ * This is the same pattern as withValidSessionExecutionLease (11.2.5):
+ * a conditional UPDATE inside the mutation's $transaction, not a SELECT.
+ */
+export async function verifyIntentExecutionFence(
+  tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+  intentId: string,
+  intentVersion: number,
+  fenceId: string,
+): Promise<{ valid: boolean; reason?: string }> {
+  const now = new Date();
+
+  const result = await tx.connectivityIntentRecord.updateMany({
+    where: {
+      intentId,
+      version: intentVersion,
+      status: "ACTIVE",
+      executionFenceId: fenceId,
+      executionFenceExpiresAt: { gt: now },
+      OR: [
+        { expiresAt: null },
+        { expiresAt: { gt: now } },
+      ],
+    },
+    data: {
+      fenceVersion: { increment: 1 },
+    },
+  });
+
+  if (result.count === 0) {
+    // The fence is no longer valid — intent was superseded/expired, or the
+    // fence was cleared/expired. The resource mutation MUST NOT proceed.
+    logger.error("intent.execution_fence_invalid_at_mutation", {
+      intentId, intentVersion, fenceId,
+    });
+    return { valid: false, reason: "intent-fence-invalid-at-mutation-boundary" };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Phase 11.4.10.1: Clear the intent execution fence.
+ *
+ * Called in executeDecision's finally block (or when the decision completes).
+ * Clears executionFenceId + executionFenceExpiresAt so the intent can be
+ * claimed by a future decision execution.
+ */
+export async function clearIntentExecutionFence(
+  intentId: string,
+  intentVersion: number,
+  fenceId: string,
+): Promise<void> {
+  await db.connectivityIntentRecord.updateMany({
+    where: {
+      intentId,
+      version: intentVersion,
+      executionFenceId: fenceId,
+    },
+    data: {
+      executionFenceId: null,
+      executionFenceExpiresAt: null,
+    },
+  }).catch(() => {});
+  logger.info("intent.execution_fence_cleared", { intentId, intentVersion, fenceId });
 }

@@ -32,6 +32,7 @@ import { createAction, executeAction } from "@/lib/control-plane/action-executor
 import { createOrUpdatePolicy } from "@/lib/control-plane/policy-engine";
 import { executeDecision } from "@/lib/control-plane/decision-executor";
 import { createIntent } from "@/lib/control-plane/intent-service";
+import { acquireSessionExecutionSlot, releaseSessionExecutionSlot, fencedReserveResource } from "@/lib/control-plane/session-execution-slot";
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -908,5 +909,171 @@ describe("Phase 11.4 — Execution-Time Intent Authority (DB-backed)", () => {
 
     // Cleanup.
     await db.connectivityDecision.deleteMany({ where: { id: decision.id } }).catch(() => {});
+  }, 60_000);
+
+  // =========================================================================
+  // 11.4.10.1 — Intent execution fence survives into the mutation boundary.
+  //
+  // The strongest proof: the intent fence is acquired (ACTIVE), then the
+  // intent is superseded BETWEEN the fence acquisition and the first resource
+  // mutation. The fenced resource mutation's $transaction checks the intent
+  // fence inside the same transaction — the conditional UPDATE sees status =
+  // SUPERSEDED → 0 rows → mutation rejected.
+  //
+  // This proves the fence PERSISTS through the mutation window and is checked
+  // at the actual mutation boundary (not merely at the preceding transaction).
+  //
+  // The sequence:
+  //   intent ACTIVE → fence acquired (executionFenceId set) →
+  //   intent superseded (status → SUPERSEDED) →
+  //   first resource mutation (fencedReserveResource) →
+  //   $transaction: session-lease fence OK, intent-fence check →
+  //   conditional UPDATE WHERE status=ACTIVE → 0 rows → REJECTED →
+  //   no resource mutation → RECONCILIATION_REQUIRED or FAILED →
+  //   no orphaned resource.
+  //
+  // We use the test-only hook to supersede the intent BETWEEN the fence
+  // acquisition and the resource mutation.
+  // =========================================================================
+  it("11.4.10.1: intent fence survives into mutation — superseded after fence, before resource mutation → rejected, no orphan", async () => {
+    await resetToActiveOnA();
+
+    // 1. Create an active intent.
+    const intent = await createIntent({
+      subjectId: fx.subjectId,
+      rawText: "fence-survives intent",
+      capabilityType: "INTERNET",
+      mode: "AUTOMATIC",
+    });
+
+    // 2. Create a PENDING decision.
+    const decision = await db.connectivityDecision.create({
+      data: {
+        intentId: intent.intentId,
+        intentVersion: intent.version,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: fence survives"]),
+        executionState: "PENDING",
+      },
+    });
+
+    // 3. Set up the hook: supersede the intent when the fence is claimed
+    //    (AFTER verifyIntentAuthorityAtBoundary runs but BEFORE the resource
+    //    mutations inside executeAction). The hook fires inside
+    //    verifyIntentAuthorityAtBoundary — BUT the fence has already been
+    //    acquired (executionFenceId set + committed). So the intent is
+    //    SUPERSEDED by the time executeAction runs its fenced mutations.
+    //
+    //    Wait — the hook fires BEFORE the conditional UPDATE in
+    //    verifyIntentAuthorityAtBoundary. So the fence's conditional UPDATE
+    //    would see status=SUPERSEDED → 0 rows → SKIPPED.
+    //
+    //    To test the case where the fence IS acquired (status was ACTIVE at
+    //    fence time) but THEN the intent is superseded before the mutation,
+    //    we need the hook to fire AFTER the fence commits but BEFORE
+    //    executeAction. That's between verifyIntentAuthorityAtBoundary
+    //    returning and executeAction being called.
+    //
+    //    Since executeDecision calls verifyIntentAuthorityAtBoundary then
+    //    immediately calls executeAction, there's no hook between them.
+    //    But we can use a DIFFERENT approach: set the hook to supersede
+    //    the intent, and rely on the fact that the hook fires BEFORE the
+    //    fence's conditional UPDATE (so the fence itself rejects → SKIPPED).
+    //
+    //    For the "fence acquired, then superseded" case, we need the fence
+    //    to succeed first. That requires the intent to be ACTIVE when the
+    //    fence runs. Then a CONCURRENT process supersedes it before the
+    //    resource mutation.
+    //
+    //    The cleanest deterministic approach: don't use the hook at all.
+    //    Instead, call verifyIntentAuthorityAtBoundary directly (it acquires
+    //    the fence), then supersede the intent, then call fencedReserveResource
+    //    directly — and prove the resource mutation is rejected by the
+    //    intent-fence check inside its $transaction.
+
+    // 4. Create a decision in EXECUTING state with a claim.
+    const execDecision = await db.connectivityDecision.create({
+      data: {
+        intentId: intent.intentId,
+        intentVersion: intent.version,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: direct fence survive"]),
+        executionState: "EXECUTING",
+        executionClaimId: "test-survive-claim",
+        executionAttemptCount: 1,
+      },
+    });
+
+    // 5. Acquire the session slot (needed for fencedReserveResource).
+    const slotClaim = `survive-slot-${Date.now()}`;
+    await acquireSessionExecutionSlot(fx.sessionId, slotClaim);
+
+    // 6. Acquire the intent execution fence (intent is ACTIVE).
+    const { verifyIntentAuthorityAtBoundary, verifyIntentExecutionFence, clearIntentExecutionFence } = await import("@/lib/control-plane/intent-authority");
+    const fenceResult = await verifyIntentAuthorityAtBoundary(
+      execDecision.id,
+      "test-survive-claim",
+      intent.intentId,
+      intent.version,
+    );
+    expect(fenceResult.authorized).toBe(true);
+    expect(fenceResult.fenceId).toBeDefined();
+    const fenceId = fenceResult.fenceId!;
+
+    // 7. The fence is acquired (executionFenceId set on the intent record).
+    //    Now supersede the intent — this happens AFTER the fence is acquired
+    //    but BEFORE the resource mutation.
+    await db.connectivityIntentRecord.update({
+      where: { intentId_version: { intentId: intent.intentId, version: intent.version } },
+      data: { status: "SUPERSEDED", supersededAt: new Date() },
+    });
+
+    // 8. Attempt the first resource mutation (fencedReserveResource) with the
+    //    intent fence. The $transaction should:
+    //    a. Session-lease fence → OK (slot held).
+    //    b. Intent-fence check → conditional UPDATE WHERE status=ACTIVE → 0 rows
+    //       (status is SUPERSEDED) → REJECTED.
+    //    c. No resource mutation occurs.
+    const reserveResult = await fencedReserveResource(
+      fx.resourceBId,
+      fx.sessionId,
+      slotClaim,
+      { intentId: intent.intentId, intentVersion: intent.version, fenceId },
+    );
+
+    // 9. The resource mutation MUST be rejected.
+    expect(reserveResult.reserved).toBe(false);
+    expect(reserveResult.reason).toContain("intent-fence-invalid");
+
+    // 10. The target (B) must NOT be reserved/orphaned.
+    const resB = await db.protocolResource.findUnique({
+      where: { id: fx.resourceBId },
+      select: { state: true, reservedBy: true },
+    });
+    expect(resB?.state).not.toBe("IN_USE");
+    expect(resB?.state).not.toBe("RESERVED");
+    expect(resB?.reservedBy).not.toBe(fx.sessionId);
+
+    // 11. The session is unchanged (still on A).
+    const session = await db.connectivitySession.findUnique({
+      where: { id: fx.sessionId },
+      select: { activeResourceId: true },
+    });
+    expect(session?.activeResourceId).toBe(fx.resourceAId);
+
+    // Cleanup: clear the fence + release the slot.
+    await clearIntentExecutionFence(intent.intentId, intent.version, fenceId);
+    await releaseSessionExecutionSlot(fx.sessionId, slotClaim);
+    await db.connectivityDecision.deleteMany({ where: { id: { in: [decision.id, execDecision.id] } } }).catch(() => {});
   }, 60_000);
 });

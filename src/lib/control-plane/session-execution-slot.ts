@@ -386,12 +386,22 @@ export async function fencedReserveResource(
   resourceId: string,
   sessionId: string,
   claimId: string,
+  intentFence?: { intentId: string; intentVersion: number; fenceId: string },
 ): Promise<{ reserved: boolean; reason?: string }> {
   return await db.$transaction(async (tx) => {
     // 1. Atomic session-lease fence — conditional UPDATE (takes row lock).
     const lease = await withValidSessionExecutionLease(tx, sessionId, claimId, "reserve");
     if (!lease.authorized) {
       return { reserved: false, reason: "session-execution-slot-not-held" };
+    }
+
+    // Phase 11.4.10.1: Intent execution fence check — inside the same transaction.
+    if (intentFence) {
+      const { verifyIntentExecutionFence } = await import("./intent-authority");
+      const intentFenceResult = await verifyIntentExecutionFence(tx, intentFence.intentId, intentFence.intentVersion, intentFence.fenceId);
+      if (!intentFenceResult.valid) {
+        return { reserved: false, reason: intentFenceResult.reason ?? "intent-fence-invalid" };
+      }
     }
 
     // 2. Reserve the resource (AVAILABLE → RESERVED) — within the same transaction.
@@ -419,12 +429,22 @@ export async function fencedMarkResourceInUse(
   resourceId: string,
   sessionId: string,
   claimId: string,
+  intentFence?: { intentId: string; intentVersion: number; fenceId: string },
 ): Promise<{ activated: boolean; reason?: string }> {
   return await db.$transaction(async (tx) => {
     // 1. Atomic session-lease fence — conditional UPDATE (takes row lock).
     const lease = await withValidSessionExecutionLease(tx, sessionId, claimId, "markInUse");
     if (!lease.authorized) {
       return { activated: false, reason: "session-execution-slot-not-held" };
+    }
+
+    // Phase 11.4.10.1: Intent execution fence check — inside the same transaction.
+    if (intentFence) {
+      const { verifyIntentExecutionFence } = await import("./intent-authority");
+      const intentFenceResult = await verifyIntentExecutionFence(tx, intentFence.intentId, intentFence.intentVersion, intentFence.fenceId);
+      if (!intentFenceResult.valid) {
+        return { activated: false, reason: intentFenceResult.reason ?? "intent-fence-invalid" };
+      }
     }
 
     // 2. Mark IN_USE (RESERVED → IN_USE) — within the same transaction.
@@ -457,12 +477,22 @@ export async function fencedReleaseResource(
   resourceId: string,
   sessionId: string,
   claimId: string,
+  intentFence?: { intentId: string; intentVersion: number; fenceId: string },
 ): Promise<{ released: boolean; reason?: string }> {
   return await db.$transaction(async (tx) => {
     // 1. Atomic session-lease fence — conditional UPDATE (takes row lock).
     const lease = await withValidSessionExecutionLease(tx, sessionId, claimId, "release");
     if (!lease.authorized) {
       return { released: false, reason: "session-execution-slot-not-held" };
+    }
+
+    // Phase 11.4.10.1: Intent execution fence check — inside the same transaction.
+    if (intentFence) {
+      const { verifyIntentExecutionFence } = await import("./intent-authority");
+      const intentFenceResult = await verifyIntentExecutionFence(tx, intentFence.intentId, intentFence.intentVersion, intentFence.fenceId);
+      if (!intentFenceResult.valid) {
+        return { released: false, reason: intentFenceResult.reason ?? "intent-fence-invalid" };
+      }
     }
 
     // 2. Release the resource (ownership-safe) — within the same transaction.

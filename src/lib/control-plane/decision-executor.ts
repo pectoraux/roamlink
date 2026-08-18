@@ -517,17 +517,14 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
     }, SESSION_EXECUTION_SLOT_RENEWAL_INTERVAL_MS);
   }
 
-  // Phase 11.4.6: Durable intent-authority fence at the mutation boundary.
+  // Phase 11.4.10.1: Durable intent-authority fence at the mutation boundary.
   // After the session slot is acquired (the mutation window is about to open),
-  // verify intent authority ONE FINAL TIME inside a DB transaction. This
-  // prevents the TOCTOU where the intent was valid at the post-claim check
-  // but expires/superseded before the resource mutation begins.
+  // claim a durable intent execution fence (executionFenceId + expiresAt on
+  // the intent record). This fence PERSISTS through the mutation window and
+  // is checked at EVERY fenced resource mutation inside executeAction.
   //
   // "Intent authority must be bound to the execution claim at the mutation boundary."
-  //
-  // If the intent is no longer authorized, the decision transitions to SKIPPED
-  // (fenced by executionClaimId) inside the transaction. No action is created,
-  // no resource mutation occurs.
+  let intentFence: { intentId: string; intentVersion: number; fenceId: string } | undefined = undefined;
   if (decision.intentId && decision.intentVersion) {
     const { verifyIntentAuthorityAtBoundary } = await import("./intent-authority");
     const authorityResult = await verifyIntentAuthorityAtBoundary(
@@ -552,6 +549,15 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
         error: `intent-authority-fence-rejected: ${authorityResult.reason}`,
       };
     }
+    // The fence was acquired — it PERSISTS through the mutation window.
+    // Pass it to executeAction so every fenced resource mutation can verify it.
+    if (authorityResult.fenceId) {
+      intentFence = {
+        intentId: decision.intentId,
+        intentVersion: decision.intentVersion,
+        fenceId: authorityResult.fenceId,
+      };
+    }
   }
 
   // Create + execute the action. The session slot is released in a finally
@@ -573,6 +579,11 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
       idempotencyKey: `decexec-${decision.id}`,
     });
 
+    // Phase 11.4.10.1: Pass the intent fence to executeAction so every fenced
+    // resource mutation can verify it inside its $transaction.
+    if (slotOwnershipContext && intentFence) {
+      (slotOwnershipContext as any).intentFence = intentFence;
+    }
     const execResult = await executeAction(action.id, slotOwnershipContext);
 
     // Phase 8.6.6: Map action status → decision execution state explicitly.
@@ -627,6 +638,12 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
     // expiry (crashed worker), this is a no-op (count=0, safe).
     if (sessionSlotClaimId && decision.sessionId) {
       await releaseSessionExecutionSlot(decision.sessionId, sessionSlotClaimId);
+    }
+    // Phase 11.4.10.1: Clear the intent execution fence so the intent can be
+    // claimed by a future decision execution.
+    if (intentFence) {
+      const { clearIntentExecutionFence } = await import("./intent-authority");
+      await clearIntentExecutionFence(intentFence.intentId, intentFence.intentVersion, intentFence.fenceId);
     }
   }
 }

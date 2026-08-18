@@ -2464,6 +2464,15 @@ model ConnectivityIntentRecord {
   // fence on PostgreSQL. This field is bumped by verifyIntentAuthorityAtBoundary
   // to take the row lock + evaluate the authority predicate atomically.
   fenceVersion        Int      @default(0)
+  // Phase 11.4.10.1: Durable execution fence. When an intent is claimed for
+  // execution, executionFenceId is set + executionFenceExpiresAt is set.
+  // This fence PERSISTS through the mutation window (unlike the fenceVersion
+  // bump which commits immediately). Every fenced resource mutation must
+  // verify the intent's executionFenceId matches the decision's claim AND
+  // the fence has not expired — inside the same $transaction as the resource
+  // mutation. This is the same pattern as the session-slot lease fence (11.2.5).
+  executionFenceId      String?
+  executionFenceExpiresAt DateTime?
 
   @@unique([intentId, version]) // version fencing
   @@index([subjectId])
