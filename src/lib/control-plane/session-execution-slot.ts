@@ -288,11 +288,75 @@ export async function fencedTransitionSessionState(
 }
 
 /**
- * Phase 11.2.4: Fenced resource reservation. The reservation is authorized
- * by the currently valid session execution claim. Uses a $transaction:
- * (1) verify the slot claim, (2) reserve the resource (AVAILABLE → RESERVED).
+ * Phase 11.2.5: The atomic session-lease fence primitive. This is the
+ * DB-level authorization/fencing record for resource mutations.
  *
- * If the slot is invalid, the reservation does NOT happen.
+ * Inside the same transaction as the resource mutation, the FIRST operation
+ * is a conditional UPDATE on the session row:
+ *
+ *   UPDATE ConnectivitySession
+ *   SET executionSlotClaimExpiresAt = now + lease   -- renew the lease
+ *   WHERE id = sessionId
+ *     AND executionSlotClaimId = claimId             -- must still hold the claim
+ *     AND executionSlotClaimExpiresAt > now            -- lease must still be valid
+ *
+ * If affectedRows != 1, the claim is invalid → ROLLBACK → no resource mutation.
+ *
+ * Why a conditional UPDATE (not a SELECT)?
+ *   - The UPDATE takes the row lock. A concurrent reclaim/reacquire must wait,
+ *     then reevaluate the predicate against the committed lease state.
+ *   - A SELECT inside a transaction does NOT prevent a concurrent UPDATE from
+ *     clearing the claim between the SELECT and the resource mutation (TOCTOU).
+ *   - The conditional UPDATE is the durable authorization fence.
+ *
+ * This also renews the lease as a side effect of authorizing the mutation —
+ * the worker's lease is extended while it holds the slot and performs mutations.
+ * This is intentional: the worker is actively mutating, so its lease should be
+ * fresh. The heartbeat is still useful for mutations that take longer than
+ * SESSION_EXECUTION_SLOT_RENEWAL_INTERVAL_MS, but this per-mutation renewal
+ * provides a hard DB-level guarantee.
+ *
+ * Returns true if the claim is valid (and the lease was renewed). The caller
+ * then performs the resource mutation in the same transaction.
+ */
+async function withValidSessionExecutionLease<T>(
+  tx: Parameters<Parameters<typeof db.$transaction>[0]>[0],
+  sessionId: string,
+  claimId: string,
+  operation: string,
+): Promise<{ authorized: boolean }> {
+  const now = new Date();
+  const newExpiresAt = new Date(now.getTime() + SESSION_EXECUTION_SLOT_LEASE_MS);
+
+  // Conditional UPDATE — takes the row lock + verifies the claim atomically.
+  const result = await tx.connectivitySession.updateMany({
+    where: {
+      id: sessionId,
+      executionSlotClaimId: claimId,
+      executionSlotClaimExpiresAt: { gt: now },
+    },
+    data: {
+      executionSlotClaimExpiresAt: newExpiresAt, // renew the lease
+    },
+  });
+
+  if (result.count === 0) {
+    logger.error("session.lease_fence_rejected", {
+      sessionId, claimId, operation, reason: "slot-not-owned-or-expired-at-fence-boundary",
+    });
+    return { authorized: false };
+  }
+
+  return { authorized: true };
+}
+
+/**
+ * Phase 11.2.5: Fenced resource reservation. The reservation is authorized
+ * by a conditional session-row UPDATE inside the same transaction — not
+ * merely a SELECT. The UPDATE takes the row lock and renews the lease.
+ *
+ * If the claim is invalid (UPDATE affects 0 rows), the transaction returns
+ * without performing the resource mutation.
  *
  * Returns { reserved: boolean, reason?: string }.
  */
@@ -302,18 +366,14 @@ export async function fencedReserveResource(
   claimId: string,
 ): Promise<{ reserved: boolean; reason?: string }> {
   return await db.$transaction(async (tx) => {
-    // 1. Verify the session slot claim (authority check).
-    const now = new Date();
-    const session = await tx.connectivitySession.findUnique({
-      where: { id: sessionId },
-      select: { executionSlotClaimId: true, executionSlotClaimExpiresAt: true },
-    });
-    if (!session || session.executionSlotClaimId !== claimId || !session.executionSlotClaimExpiresAt || session.executionSlotClaimExpiresAt < now) {
-      logger.error("session.fenced_reserve_rejected", { resourceId, sessionId, claimId, reason: "slot-not-owned-or-expired" });
+    // 1. Atomic session-lease fence — conditional UPDATE (takes row lock).
+    const lease = await withValidSessionExecutionLease(tx, sessionId, claimId, "reserve");
+    if (!lease.authorized) {
       return { reserved: false, reason: "session-execution-slot-not-held" };
     }
 
     // 2. Reserve the resource (AVAILABLE → RESERVED) — within the same transaction.
+    const now = new Date();
     const result = await tx.protocolResource.updateMany({
       where: { id: resourceId, state: "AVAILABLE" },
       data: { state: "RESERVED", reservedAt: now, reservedBy: sessionId },
@@ -329,9 +389,7 @@ export async function fencedReserveResource(
 }
 
 /**
- * Phase 11.2.4: Fenced mark-resource-in-use. The mutation is authorized by
- * the currently valid session execution claim. Uses a $transaction:
- * (1) verify the slot claim, (2) mark IN_USE (RESERVED → IN_USE).
+ * Phase 11.2.5: Fenced mark-resource-in-use. Same atomic session-lease fence.
  *
  * Returns { activated: boolean, reason?: string }.
  */
@@ -341,16 +399,13 @@ export async function fencedMarkResourceInUse(
   claimId: string,
 ): Promise<{ activated: boolean; reason?: string }> {
   return await db.$transaction(async (tx) => {
-    const now = new Date();
-    const session = await tx.connectivitySession.findUnique({
-      where: { id: sessionId },
-      select: { executionSlotClaimId: true, executionSlotClaimExpiresAt: true },
-    });
-    if (!session || session.executionSlotClaimId !== claimId || !session.executionSlotClaimExpiresAt || session.executionSlotClaimExpiresAt < now) {
-      logger.error("session.fenced_activate_rejected", { resourceId, sessionId, claimId, reason: "slot-not-owned-or-expired" });
+    // 1. Atomic session-lease fence — conditional UPDATE (takes row lock).
+    const lease = await withValidSessionExecutionLease(tx, sessionId, claimId, "markInUse");
+    if (!lease.authorized) {
       return { activated: false, reason: "session-execution-slot-not-held" };
     }
 
+    // 2. Mark IN_USE (RESERVED → IN_USE) — within the same transaction.
     const result = await tx.protocolResource.updateMany({
       where: { id: resourceId, reservedBy: sessionId, state: "RESERVED" },
       data: { state: "IN_USE" },
@@ -372,9 +427,7 @@ export async function fencedMarkResourceInUse(
 }
 
 /**
- * Phase 11.2.4: Fenced resource release. The release is authorized by the
- * currently valid session execution claim. Uses a $transaction:
- * (1) verify the slot claim, (2) release the resource (ownership-safe).
+ * Phase 11.2.5: Fenced resource release. Same atomic session-lease fence.
  *
  * Returns { released: boolean, reason?: string }.
  */
@@ -384,16 +437,13 @@ export async function fencedReleaseResource(
   claimId: string,
 ): Promise<{ released: boolean; reason?: string }> {
   return await db.$transaction(async (tx) => {
-    const now = new Date();
-    const session = await tx.connectivitySession.findUnique({
-      where: { id: sessionId },
-      select: { executionSlotClaimId: true, executionSlotClaimExpiresAt: true },
-    });
-    if (!session || session.executionSlotClaimId !== claimId || !session.executionSlotClaimExpiresAt || session.executionSlotClaimExpiresAt < now) {
-      logger.error("session.fenced_release_rejected", { resourceId, sessionId, claimId, reason: "slot-not-owned-or-expired" });
+    // 1. Atomic session-lease fence — conditional UPDATE (takes row lock).
+    const lease = await withValidSessionExecutionLease(tx, sessionId, claimId, "release");
+    if (!lease.authorized) {
       return { released: false, reason: "session-execution-slot-not-held" };
     }
 
+    // 2. Release the resource (ownership-safe) — within the same transaction.
     const result = await tx.protocolResource.updateMany({
       where: { id: resourceId, reservedBy: sessionId },
       data: { state: "AVAILABLE", reservedAt: null, reservedBy: null },

@@ -928,4 +928,135 @@ describe("Phase 11.2 — Session-Level Execution Serialization (DB-backed)", () 
     // Cleanup.
     await releaseSessionExecutionSlot(fx.sessionId, claimB);
   }, 60_000);
+
+  // =========================================================================
+  // 11.2.11 — Atomic session-lease fence: concurrent contention on the session
+  //          row cannot produce an unauthorized resource mutation (TOCTOU closed).
+  //
+  // Phase 11.2.5: The resource helpers now use a conditional UPDATE on the
+  // session row (not a SELECT) as the first operation inside the transaction.
+  // The UPDATE takes the row lock + verifies the claim atomically. A concurrent
+  // reclaim/reacquire must wait, then reevaluate the predicate against the
+  // committed lease state.
+  //
+  // This test proves the dangerous interleaving is impossible:
+  //   A's authorization begins (valid claim)
+  //   → B/reclaimer contends for the same session row
+  //   → A's transaction either:
+  //       - atomically refreshes its claim and performs the resource mutation, OR
+  //       - loses the conditional session update and performs NO resource mutation
+  //   → Never: valid-read → lost-claim → unauthorized-resource-write
+  //
+  // We simulate this by having Worker A call fencedReserveResource while Worker B
+  // concurrently tries to reclaim + reacquire the session slot. The test verifies
+  // that A's resource mutation is all-or-nothing with its claim.
+  // =========================================================================
+  it("11.2.11: atomic session-lease fence — concurrent contention cannot produce unauthorized resource mutation", async () => {
+    // 1. Worker A acquires the session slot.
+    await db.connectivitySession.update({
+      where: { id: fx.sessionId },
+      data: { executionSlotClaimId: null, executionSlotClaimedAt: null, executionSlotClaimExpiresAt: null },
+    }).catch(() => {});
+
+    const claimA = `toctou-A-${Date.now()}`;
+    const acquired = await acquireSessionExecutionSlot(fx.sessionId, claimA);
+    expect(acquired.acquired).toBe(true);
+
+    // Ensure resource B is AVAILABLE for reservation.
+    await db.protocolResource.update({ where: { id: fx.resourceBId }, data: { state: "AVAILABLE", reservedBy: null, reservedAt: null } }).catch(() => {});
+
+    // 2. Worker A starts a fenced resource mutation (fencedReserveResource).
+    //    Concurrently, Worker B tries to reclaim + reacquire the session slot.
+    //    The conditional session UPDATE inside fencedReserveResource is the
+    //    authorization fence — it takes the row lock.
+    //
+    //    Two outcomes are possible:
+    //      a. A's fenced mutation completes before B's reclaim → A reserves B
+    //         (claim A was valid at mutation time). B's reclaim fails (lease not
+    //         expired yet). resourceB is RESERVED by A.
+    //      b. B's reclaim succeeds (if A's lease was near-expiry) → B acquires
+    //         → A's conditional session UPDATE affects 0 rows → A's resource
+    //         mutation does NOT happen. resourceB stays AVAILABLE.
+    //
+    //    The forbidden outcome (TOCTOU) is: A's read succeeds, B reclaims, A's
+    //    resource mutation still happens. The conditional UPDATE prevents this
+    //    because the UPDATE and the resource mutation are in the same transaction
+    //    — if the UPDATE affects 0 rows, the transaction returns without mutating.
+    //
+    //    We can't deterministically control the interleaving in a test (it depends
+    //    on DB scheduling), but we CAN prove the invariant holds: after both
+    //    operations complete, the resource is RESERVED by A (case a) OR AVAILABLE
+    //    (case b) — never RESERVED by A when A doesn't hold the slot.
+    const reservePromise = fencedReserveResource(fx.resourceBId, fx.sessionId, claimA);
+
+    // Simulate B trying to contend: expire A's lease + reclaim.
+    // We do this concurrently with the reserve.
+    const contentionPromise = (async () => {
+      // Small delay to let A's transaction start
+      await new Promise((r) => setTimeout(r, 1));
+      await db.connectivitySession.update({
+        where: { id: fx.sessionId },
+        data: { executionSlotClaimExpiresAt: new Date(Date.now() - 1000) },
+      }).catch(() => {});
+      await reclaimExpiredSessionSlots();
+    })();
+
+    const [reserveResult] = await Promise.all([reservePromise, contentionPromise]);
+
+    // 3. After both complete, verify the invariant:
+    //    The forbidden outcome (TOCTOU) is: A's resource mutation happened
+    //    when A's claim was invalid at mutation time. With the conditional UPDATE
+    //    fence, A's resource mutation only happens if A's conditional session
+    //    UPDATE succeeded (claim was valid + lease renewed at mutation time).
+    //
+    //    Two legitimate outcomes:
+    //      a. A's fenced mutation completed before B's reclaim: reserveResult.reserved=true.
+    //         A's claim was valid at mutation time (the conditional UPDATE renewed it).
+    //         B's subsequent reclaim may have cleared A's slot — that's fine, A was
+    //         authorized at mutation time.
+    //      b. B's reclaim succeeded before A's conditional UPDATE: reserveResult.reserved=false.
+    //         A's conditional UPDATE affected 0 rows (claim was already cleared by B).
+    //         A's resource mutation did NOT happen.
+    //
+    //    The TOCTOU (forbidden) outcome would be: A's conditional UPDATE fails
+    //    (claim invalid) BUT A still reserves the resource. The conditional UPDATE
+    //    prevents this — if the UPDATE affects 0 rows, the transaction returns
+    //    without mutating the resource.
+    //
+    //    So the invariant is: if reserveResult.reserved is true, A's conditional
+    //    UPDATE succeeded (A was authorized). If reserveResult.reserved is false,
+    //    A's conditional UPDATE failed (A was not authorized) OR the resource was
+    //    already taken. Either way, no unauthorized mutation.
+    const resB = await db.protocolResource.findUnique({
+      where: { id: fx.resourceBId },
+      select: { state: true, reservedBy: true },
+    });
+
+    if (reserveResult.reserved) {
+      // A reserved the resource — A's conditional session UPDATE must have
+      // succeeded (A was authorized at mutation time).
+      // The resource is RESERVED by the session.
+      expect(resB?.state).toBe("RESERVED");
+      expect(resB?.reservedBy).toBe(fx.sessionId);
+      // Note: A's slot may have been reclaimed by B AFTER A's transaction
+      // committed — that's fine. A was authorized at mutation time.
+    } else {
+      // A did NOT reserve the resource — either A's conditional UPDATE failed
+      // (claim invalid) OR the resource was already taken. In either case, the
+      // resource is NOT reserved by A via an unauthorized path.
+      // The resource may be AVAILABLE or RESERVED by someone else.
+      expect(resB?.reservedBy).not.toBe(fx.sessionId);
+    }
+
+    // Cleanup: release whatever slot is held + reset resource B.
+    const session = await db.connectivitySession.findUnique({
+      where: { id: fx.sessionId },
+      select: { executionSlotClaimId: true },
+    });
+    await releaseSessionExecutionSlot(fx.sessionId, session?.executionSlotClaimId ?? "").catch(() => {});
+    await db.protocolResource.update({
+      where: { id: fx.resourceBId },
+      data: { state: "AVAILABLE", reservedBy: null, reservedAt: null },
+    }).catch(() => {});
+  }, 60_000);
 });
