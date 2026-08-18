@@ -373,10 +373,10 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
   // This eliminates the TOCTOU where the intent was valid at check time but
   // expired before the claim/execution.
   //
-  // The SKIP transition is fenced by executionClaimId — only the claim owner
-  // can transition the decision to SKIPPED. A concurrent worker that claimed
-  // the same decision (impossible due to the fenced claim above, but
-  // defensively) cannot overwrite this worker's SKIP.
+  // Phase 11.4.6: The SKIP transition is fenced by BOTH executionState = EXECUTING
+  // AND executionClaimId = claimId. Only the claim owner can transition to SKIPPED.
+  // EXECUTING alone is not ownership — the claimId is the authoritative ownership
+  // predicate (same rule as 11.1/11.2).
   //
   // "Intent authority is not a preflight check. It is an execution boundary."
   if (decision.intentId && decision.intentVersion) {
@@ -384,14 +384,12 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
     const expired = await isIntentExpired(decision.intentId, decision.intentVersion);
     if (expired) {
       // Fenced SKIP: only transition to SKIPPED if we still own the claim.
-      // WHERE executionState = EXECUTING (we just set it) AND executionClaimId = claimId.
+      // WHERE executionState = EXECUTING AND executionClaimId = claimId.
       const skipResult = await db.connectivityDecision.updateMany({
         where: {
           id: decisionId,
           executionState: DECISION_EXECUTING,
-          // Note: executionClaimId was set during the claim, but after Mark EXECUTING
-          // the claimId field is still present (we only changed executionState).
-          // We fence by executionState = EXECUTING — only this worker set that state.
+          executionClaimId: claimId, // fenced — only the claim owner can SKIP
         },
         data: {
           executionState: DECISION_SKIPPED,
@@ -517,6 +515,43 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
         }
       }
     }, SESSION_EXECUTION_SLOT_RENEWAL_INTERVAL_MS);
+  }
+
+  // Phase 11.4.6: Durable intent-authority fence at the mutation boundary.
+  // After the session slot is acquired (the mutation window is about to open),
+  // verify intent authority ONE FINAL TIME inside a DB transaction. This
+  // prevents the TOCTOU where the intent was valid at the post-claim check
+  // but expires/superseded before the resource mutation begins.
+  //
+  // "Intent authority must be bound to the execution claim at the mutation boundary."
+  //
+  // If the intent is no longer authorized, the decision transitions to SKIPPED
+  // (fenced by executionClaimId) inside the transaction. No action is created,
+  // no resource mutation occurs.
+  if (decision.intentId && decision.intentVersion) {
+    const { verifyIntentAuthorityAtBoundary } = await import("./intent-authority");
+    const authorityResult = await verifyIntentAuthorityAtBoundary(
+      decisionId,
+      claimId,
+      decision.intentId,
+      decision.intentVersion,
+    );
+    if (!authorityResult.authorized) {
+      // Release the session slot (we acquired it above).
+      if (sessionSlotClaimId && decision.sessionId) {
+        await releaseSessionExecutionSlot(decision.sessionId, sessionSlotClaimId);
+      }
+      // Stop the heartbeat.
+      if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      return {
+        decisionId,
+        executionState: "SKIPPED",
+        error: `intent-authority-fence-rejected: ${authorityResult.reason}`,
+      };
+    }
   }
 
   // Create + execute the action. The session slot is released in a finally
