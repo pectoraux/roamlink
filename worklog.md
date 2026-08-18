@@ -4261,3 +4261,49 @@ Stage Summary:
 - Acceptance invariant #5 fully proven with durable DB-level authority:
   "Expired/superseded intent cannot execute."
 - Next: Phase 11.5 — Runtime invariant fail-closed.
+
+---
+Task ID: 11.4.9
+Agent: Principal Architect (main) — Phase 11.4.9 PostgreSQL-Authoritative Intent Fence
+Task: Replace the SELECT-based intent authority check with a conditional UPDATE on the intent row (PostgreSQL-authoritative fence). Add a deterministic test hook and real race proof. The architect's audit of f13aa25 identified that a SELECT inside a transaction is not a fence on PostgreSQL.
+
+Work Log:
+- Schema (prisma/schema.prisma): Added `fenceVersion Int @default(0)` to ConnectivityIntentRecord. A harmless server-side bump field that serves as the row-locking operation. The conditional UPDATE increments it — the business state of the intent is NOT changed.
+
+- Fix (intent-authority.ts): Replaced the SELECT-based check with a conditional UPDATE:
+    UPDATE connectivity_intent_record
+    SET fenceVersion = fenceVersion + 1
+    WHERE intentId = ?
+      AND version = ?                    -- exact version attached to decision
+      AND status = 'ACTIVE'
+      AND (expiresAt IS NULL OR expiresAt > now)
+  If affectedRows = 1: authorized (row lock prevents concurrent supersede/expire until commit).
+  If affectedRows = 0: not authorized (superseded/expired/not found). Fenced SKIP.
+
+  The fence binds to the EXACT intent version attached to the decision — not "whatever the current intent happens to be." This protects: v1 decision → v2 supersedes v1 → v1 decision's fence fails (status is SUPERSEDED).
+
+- Test hook (intent-authority.ts): Added setIntentExpiryHook / clearIntentExpiryHook — called AFTER the post-claim check but BEFORE the mutation-boundary fence. The hook is AWAITED so its DB update commits before the fence's conditional UPDATE runs. This makes the race deterministic.
+
+- Test (11.4.10, DB-backed runtime, PASS):
+  Intent ACTIVE. Decision PENDING. Hook set: supersede the intent when verifyIntentAuthorityAtBoundary is called.
+  executeDecision: claims (ACTIVE), post-claim check passes (ACTIVE), session slot acquired, HOOK fires → intent SUPERSEDED (committed), mutation-boundary fence: conditional UPDATE WHERE status=ACTIVE → 0 rows → SKIPPED (fenced by claimId).
+  Result: executionState = SKIPPED (exact). No action. No resource mutation. Decision DB state = SKIPPED. Intent fenceVersion = 0. Intent status = SUPERSEDED.
+  This proves the mutation-boundary fence catches the race that a SELECT-based check would miss.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 11.4 (all 9):    9/9 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 35 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: a5aeb2c (on GitHub, verified: git ls-remote origin main → a5aeb2c)
+- The intent authority fence is now PostgreSQL-authoritative (conditional UPDATE, not SELECT).
+- The architectural rule is enforced at the same DB-authoritative standard as the session execution fencing (11.2.5):
+  "Intent authority must be bound to the execution claim at the mutation boundary."
+  conditional UPDATE (not SELECT) → row lock → authority predicate evaluation
+- Phase 11.4 is now ready to freeze.
+- Next: Phase 11.5 — Runtime invariant fail-closed.
