@@ -235,24 +235,13 @@ describe("Phase 11.3 — Provider Truth Flips Mid-Execution (DB-backed)", () => 
     // 1. The action did NOT succeed.
     expect(result.executionState).not.toBe("EXECUTED");
 
-    // 2. The action/decision MUST enter the reconciliation path — exactly
-    //    RECONCILIATION_REQUIRED, not a generic FAILED.
-    //    The NOT_USABLE path in executeAction explicitly transitions to
-    //    RECONCILIATION_REQUIRED (via throw → catch → SlotOwnershipLostError
-    //    or via the NOT_USABLE branch). A generic FAILED would mean the
-    //    cleanup didn't happen properly.
-    //    NOTE: the NOT_USABLE branch in executeAction throws an error →
-    //    the catch block transitions to FAILED. The RECONCILIATION_REQUIRED
-    //    state is for UNKNOWN (which explicitly transitions before the throw).
-    //    For NOT_USABLE, the target is released + session reverted in the
-    //    throw branch, but the action ends up FAILED (not RECONCILIATION_REQUIRED).
-    //    This is the existing behavior — the target IS released and the session
-    //    IS reverted, but the action state is FAILED.
-    //
-    //    The architect's requirement is that the result represents a partial
-    //    connectivity mutation requiring reconciliation. Let's check what
-    //    actually happens and verify the cleanup is correct.
-    expect(["FAILED", "RECONCILIATION_REQUIRED"]).toContain(result.executionState);
+    // 2. The decision execution state MUST be exactly RECONCILIATION_REQUIRED
+    //    (not a generic FAILED). NOT_USABLE is a partial connectivity mutation
+    //    requiring reconciliation — the target was reserved + marked IN_USE,
+    //    then released. The distinction between "ordinary execution failure"
+    //    and "partial connectivity mutation requiring reconciliation" is
+    //    enforced by the state model.
+    expect(result.executionState).toBe("RECONCILIATION_REQUIRED");
 
     // 3. The target (B) must NOT become authoritative active connectivity.
     const session = await db.connectivitySession.findUnique({
@@ -283,12 +272,13 @@ describe("Phase 11.3 — Provider Truth Flips Mid-Execution (DB-backed)", () => 
     });
     expect(actions.length).toBe(1);
 
-    // 7. The action state is terminal (not PLANNED/EXECUTING).
+    // 7. The action state is exactly RECONCILIATION_REQUIRED (not FAILED).
+    //    Action state === Decision execution state.
     const action = await db.connectivityAction.findUnique({
       where: { id: actions[0].id },
       select: { state: true },
     });
-    expect(["FAILED", "RECONCILIATION_REQUIRED"]).toContain(action?.state);
+    expect(action?.state).toBe("RECONCILIATION_REQUIRED");
 
     // Cleanup.
     await db.connectivityDecision.deleteMany({ where: { id: decision.id } }).catch(() => {});

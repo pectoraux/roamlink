@@ -281,12 +281,19 @@ export async function executeAction(actionId: string, slotContext?: {
         }
 
         // 3d. Verify via kernel bridge (USABLE | NOT_USABLE | UNKNOWN)
+        // Phase 11.3.2: NOT_USABLE and UNKNOWN both → RECONCILIATION_REQUIRED.
+        // The difference is WHY reconciliation is required, not WHETHER.
+        // The target is released and the session is NOT activated in either case.
         const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
         if (verifyResult.status === "NOT_USABLE") {
           await (slotContext
             ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
             : releaseResource(targetResourceId, session.id));
-          throw new Error(`Resource verification failed: ${verifyResult.reason}`);
+          await transitionActionState(actionId, "RECONCILIATION_REQUIRED", `Verification NOT_USABLE: ${verifyResult.reason}`);
+          logger.warn("action.activate_not_usable_verification", {
+            actionId, targetResourceId, reason: verifyResult.reason,
+          });
+          return { status: "reconciliation_required", error: `Verification NOT_USABLE — target released, reconciliation required: ${verifyResult.reason}` };
         }
 
         // Phase 8.5.9: UNKNOWN → release target, do NOT activate session, RECONCILIATION_REQUIRED
@@ -464,6 +471,9 @@ export async function executeAction(actionId: string, slotContext?: {
         }
 
         // 3e. Verify target is usable (USABLE | NOT_USABLE | UNKNOWN)
+        // Phase 11.3.2: NOT_USABLE and UNKNOWN both → RECONCILIATION_REQUIRED.
+        // The difference is WHY reconciliation is required, not WHETHER.
+        // The target is released and the session reverts to the old resource.
         const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
         if (verifyResult.status === "NOT_USABLE") {
           await (slotContext
@@ -472,7 +482,11 @@ export async function executeAction(actionId: string, slotContext?: {
           await (slotContext
             ? fencedTransitionSessionState(session.id, slotContext.claimId, revertState, ["SWITCHING"])
             : transitionSessionState(session.id, revertState));
-          throw new Error(`Target verification failed: ${verifyResult.reason}`);
+          await transitionActionState(actionId, "RECONCILIATION_REQUIRED", `Switch verification NOT_USABLE: ${verifyResult.reason}`);
+          logger.warn("action.switch_verification_not_usable", {
+            actionId, targetResourceId, reason: verifyResult.reason,
+          });
+          return { status: "reconciliation_required", error: `Switch verification NOT_USABLE — reconciliation required: ${verifyResult.reason}` };
         }
         if (verifyResult.status === "UNKNOWN") {
           // Phase 8.5.8: UNKNOWN → RECONCILIATION_REQUIRED (NOT SUCCEEDED)
