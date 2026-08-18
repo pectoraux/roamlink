@@ -19,6 +19,7 @@
 import { db } from "@/lib/db";
 import { logger } from "@/lib/logger";
 import { REASON_CODES, type ReasonCode, parseReasonCodesWithIntegrity } from "@roamlink/shared";
+import { assertActiveConnectivityInvariant } from "./invariant-checker";
 import type {
   CurrentConnectivity,
   CurrentConnectivitySession,
@@ -64,10 +65,29 @@ export async function getCurrentConnectivityForUser(userId: string): Promise<Cur
     };
   }
 
+  // Phase 11.5: Runtime invariant fail-closed.
+  // If the session is ACTIVE, verify the full identity chain (session → resource
+  // → binding → entitlement → provider truth). If any link is broken, the read
+  // model MUST NOT present the session as clean ACTIVE. Instead, it surfaces the
+  // divergence as RECONCILIATION_REQUIRED so the user/UI knows connectivity is
+  // not actually healthy.
+  //
+  // "Broken session/resource/provider convergence cannot be presented as clean ACTIVE."
+  let effectiveState = session.state;
+  if (session.state === "ACTIVE") {
+    const invariant = await assertActiveConnectivityInvariant(session.id);
+    if (!invariant.valid) {
+      effectiveState = "RECONCILIATION_REQUIRED";
+      logger.error("current_connectivity.invariant_violation_detected", {
+        sessionId: session.id, userId, violations: invariant.violations,
+      });
+    }
+  }
+
   // Project the session
   const sessionProjection: CurrentConnectivitySession = {
     id: session.id,
-    state: session.state as CurrentConnectivitySession["state"],
+    state: effectiveState as CurrentConnectivitySession["state"],
     activeResourceId: session.activeResourceId,
     startedAt: session.startedAt?.toISOString() ?? null,
     lastObservedAt: session.lastObservedAt?.toISOString() ?? null,
