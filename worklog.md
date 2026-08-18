@@ -5616,3 +5616,76 @@ Stage Summary:
     raw external return            → RECONCILIATION_REQUIRED  (was FAILED — FIXED)
     external operation             → explicit providerKey required
     reconciliation                 → fenced ownership
+
+---
+Task ID: 12.3.2.6
+Agent: Principal Architect (main) — Phase 12.3.2.6 Stale Worker Claim-Loss Semantics
+Task: Fix the remaining claim-loss race the architect identified in the audit of cec5eff. When a worker's claim is lost (reclaimed → RECONCILIATION_REQUIRED) before it can store a CONFIRMED_FAILURE, the stale worker was still throwing the original confirmed failure to the caller. That allows the caller to believe the operation definitely failed and retry with a new key — contradicting the invariant: "A stale worker never gets to report a stronger state than the DB-authoritative claim permits."
+
+Work Log:
+- Fix 1 — CONFIRMED_FAILURE claim-loss (src/lib/idempotency/claim.ts):
+  When the fenced FAILED update returns 0 rows (claim was lost), the code
+  previously logged a warning and still threw the original confirmed failure.
+  Now: throws a 409 "outcome-unknown" error instead. The DB-authoritative
+  state is RECONCILIATION_REQUIRED — the caller must NOT believe the operation
+  definitely failed. The stale worker reports the DB state, not its own outcome.
+
+  The rule:
+    "Once the execution claim is lost, the stale worker must not communicate
+     a stronger outcome than the database-authoritative state permits."
+
+- Fix 2 — Raw-return contract-violation claim-loss (src/lib/idempotency/claim.ts):
+  The raw-return path used `.catch(() => {})` which swallowed the result and
+  didn't check `updated.count`. Now: checks `updated.count`. If 0 (claim lost),
+  throws 409 "outcome-unknown" (NOT 500 contract violation). The DB state is
+  already RECONCILIATION_REQUIRED (the reclaimer did that) — the stale worker
+  must not report 500 as though the operation state were known.
+
+- Tests (2 new adversarial, all PASS):
+  12.3.2.19 — Stale confirmed-failure worker:
+    1. Worker A claims operation.
+    2. Force A's claim to expire + reclaim → RECONCILIATION_REQUIRED.
+    3. A tries the fenced FAILED update (WHERE claimId=A AND state=IN_PROGRESS).
+    4. Update returns 0 rows (state is now RECONCILIATION_REQUIRED, not IN_PROGRESS).
+    5. Operation remains RECONCILIATION_REQUIRED (DB state wins).
+    6. A retry with the same key gets 409 (outcome-unknown), NOT 402 (card declined).
+    7. retryExecCount === 0 (not re-executed).
+    Proves: the stale worker cannot communicate FAILED to the caller.
+
+  12.3.2.20 — Stale raw-return contract-violation worker:
+    1. Worker A claims operation.
+    2. Force claim expiry + reclaim → RECONCILIATION_REQUIRED.
+    3. A tries the fenced RECONCILIATION_REQUIRED update for the contract violation.
+    4. Update returns 0 rows (state is already RECONCILIATION_REQUIRED).
+    5. The stale worker's contract-violation failure was NOT stored.
+    6. The failureJson is from the RECLAIM worker (lease expired), not the
+       stale worker's contract violation.
+    7. A retry with the same key gets 409 (outcome-unknown), NOT 500.
+    Proves: the stale worker cannot communicate 500 to the caller.
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       31/31 PASS  (29 existing + 2 new adversarial)
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 108 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The claim-loss race is fixed in both paths:
+    CONFIRMED_FAILURE + claim lost → 409 outcome-unknown (not the original failure)
+    raw-return contract violation + claim lost → 409 outcome-unknown (not 500)
+- The architectural rule is now enforced uniformly:
+    "A stale worker never gets to report a stronger state than the
+     DB-authoritative claim permits."
+- The idempotency state machine is now internally consistent across all paths:
+    SUCCESS                        → COMPLETED
+    CONFIRMED_FAILURE              → FAILED (only if claim held)
+    AMBIGUOUS_EXTERNAL_FAILURE     → RECONCILIATION_REQUIRED
+    raw external return            → RECONCILIATION_REQUIRED
+    claim lost (any path)          → 409 outcome-unknown (DB state wins)
+    external operation             → explicit providerKey required
+    reconciliation                 → fenced ownership

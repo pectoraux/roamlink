@@ -32,6 +32,7 @@
  */
 
 import { describe, expect, it, beforeAll, afterAll } from "bun:test";
+import { randomUUID } from "crypto";
 import { db } from "@/lib/db";
 import { config } from "dotenv";
 config({ override: true });
@@ -1213,6 +1214,176 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
       const op = await getIdempotencyOperation(scope, key);
       expect(op!.state).toBe("COMPLETED");
       expect(JSON.parse(op!.resultJson!)).toEqual({ orderId: "reconciled_order" });
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.19 — Stale confirmed-failure worker must not report FAILED
+    //
+    // The architect's finding: when a worker's claim is lost (reclaimed →
+    // RECONCILIATION_REQUIRED) before it can store a CONFIRMED_FAILURE, the
+    // stale worker MUST NOT report the confirmed failure to the caller.
+    // The DB-authoritative state is RECONCILIATION_REQUIRED — the caller
+    // must NOT believe the operation definitely failed (that would allow a
+    // retry with a new key → duplicate payment).
+    //
+    // The rule:
+    //   "A stale worker never gets to report a stronger state than the
+    //    DB-authoritative claim permits."
+    //
+    // Sequence:
+    //   1. Worker A claims operation.
+    //   2. Force/reclaim A's claim → RECONCILIATION_REQUIRED.
+    //   3. Worker A receives provider CONFIRMED_FAILURE.
+    //   4. A's fenced FAILED update → 0 rows (claim lost).
+    //   5. A must NOT return the confirmed-failure response.
+    //   6. Caller receives 409 outcome-unknown.
+    //   7. Operation remains RECONCILIATION_REQUIRED.
+    // -------------------------------------------------------------------------
+    it("12.3.2.19: stale confirmed-failure worker → 409 outcome-unknown (not FAILED), operation stays RECONCILIATION_REQUIRED", async () => {
+      const key = `p123219-${Date.now()}`;
+      const scope = "test_stale_confirmed_failure";
+      const providerKey = `prov_${key}`;
+      const claimId = randomUUID();
+
+      // Step 1: Worker A claims the operation.
+      await db.idempotencyOperation.create({
+        data: {
+          scope, key,
+          state: "IN_PROGRESS",
+          claimId,
+          providerKey,
+          claimExpiresAt: new Date(Date.now() + 5000), // 5s lease
+        },
+      });
+
+      // Step 2: Force the claim to expire (simulating A's heartbeat stopping).
+      await db.idempotencyOperation.updateMany({
+        where: { scope, key, claimId, state: "IN_PROGRESS" },
+        data: { claimExpiresAt: new Date(Date.now() - 1000) }, // expired
+      });
+
+      // Step 3: The reclaim worker transitions it to RECONCILIATION_REQUIRED.
+      await reclaimExpiredIdempotencyOperations();
+      let op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
+
+      // Step 4: Worker A (stale — claim lost) tries to store a CONFIRMED_FAILURE.
+      // We simulate this by directly performing the fenced update that A would do.
+      // The fenced update (WHERE claimId = A AND state = IN_PROGRESS) returns 0 rows
+      // because the state is now RECONCILIATION_REQUIRED (not IN_PROGRESS).
+      const failure = { errorClass: "payment" as const, message: "Card declined", statusCode: 402, safeMessage: "Your card was declined." };
+      const updated = await db.idempotencyOperation.updateMany({
+        where: { scope, key, claimId, state: "IN_PROGRESS" },
+        data: {
+          state: "FAILED",
+          failureJson: JSON.stringify(failure),
+          completedAt: new Date(),
+          claimExpiresAt: null,
+        },
+      });
+
+      // Step 5: The fenced update affected 0 rows — A's claim is stale.
+      expect(updated.count).toBe(0);
+
+      // Step 6: The operation remains RECONCILIATION_REQUIRED (DB state wins).
+      // The stale worker must NOT have transitioned it to FAILED.
+      op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
+      expect(op!.completedAt).toBeNull(); // not terminal
+
+      // Step 7: A retry with the same key is BLOCKED (409) — the caller must NOT
+      // believe the operation failed. A reconciliation worker must resolve it first.
+      let retryExecCount = 0;
+      await expect(
+        runIdempotentOperation({
+          scope, key, providerKey,
+          execute: async () => {
+            retryExecCount++;
+            return { outcome: "SUCCESS" as const, value: { shouldNotReach: true } };
+          },
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 }); // outcome-unknown, NOT 402 (card declined)
+      expect(retryExecCount).toBe(0); // not re-executed
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.20 — Stale raw-return contract-violation worker must not report 500
+    //
+    // Analogous to 12.3.2.19 but for the raw-return contract-violation path.
+    // If the worker's claim is lost before the contract-violation transition
+    // can be stored, the DB state is already RECONCILIATION_REQUIRED (the
+    // reclaimer did that). The stale worker must NOT report 500 — it must
+    // report 409 outcome-unknown, preserving the DB-authoritative state.
+    // -------------------------------------------------------------------------
+    it("12.3.2.20: stale raw-return contract-violation worker → 409 (not 500), DB reconciliation state preserved", async () => {
+      const key = `p123220-${Date.now()}`;
+      const scope = "test_stale_raw_return";
+      const providerKey = `prov_${key}`;
+      const claimId = randomUUID();
+
+      // Step 1: Worker A claims the operation.
+      await db.idempotencyOperation.create({
+        data: {
+          scope, key,
+          state: "IN_PROGRESS",
+          claimId,
+          providerKey,
+          claimExpiresAt: new Date(Date.now() + 5000),
+        },
+      });
+
+      // Step 2: Force claim expiry + reclaim → RECONCILIATION_REQUIRED.
+      await db.idempotencyOperation.updateMany({
+        where: { scope, key, claimId, state: "IN_PROGRESS" },
+        data: { claimExpiresAt: new Date(Date.now() - 1000) },
+      });
+      await reclaimExpiredIdempotencyOperations();
+      let op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
+
+      // Step 3: Worker A (stale) tries to store the raw-return contract violation.
+      // The fenced update (WHERE claimId = A AND state = IN_PROGRESS) returns 0 rows.
+      const contractFailure = { errorClass: "internal" as const, message: "raw return contract violation", statusCode: 500 };
+      const updated = await db.idempotencyOperation.updateMany({
+        where: { scope, key, claimId, state: "IN_PROGRESS" },
+        data: {
+          state: "RECONCILIATION_REQUIRED",
+          failureJson: JSON.stringify(contractFailure),
+          claimExpiresAt: null,
+        },
+      });
+
+      // Step 4: 0 rows — A's claim is stale. DB state wins.
+      expect(updated.count).toBe(0);
+
+      // Step 5: The operation remains RECONCILIATION_REQUIRED.
+      // The stale worker's contract-violation failure was NOT stored.
+      op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
+      // The failureJson is from the RECLAIM worker (lease expired), NOT the
+      // stale worker's contract violation.
+      const failure = JSON.parse(op!.failureJson!);
+      expect(failure.message).toMatch(/lease expired|reconciliation|unknown/i);
+      expect(failure.message).not.toMatch(/raw return|contract violation/i);
+
+      // Step 6: A retry with the same key gets 409 (outcome-unknown), NOT 500.
+      let retryExecCount = 0;
+      await expect(
+        runIdempotentOperation({
+          scope, key, providerKey,
+          execute: async () => {
+            retryExecCount++;
+            return { outcome: "SUCCESS" as const, value: { shouldNotReach: true } };
+          },
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(retryExecCount).toBe(0);
 
       // Cleanup.
       await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});

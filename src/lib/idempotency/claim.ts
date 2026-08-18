@@ -421,7 +421,7 @@ export async function runIdempotentOperation<T>(input: {
         "An internal error occurred. The operation's outcome could not be classified and is pending reconciliation.",
       );
       const failure = serializeFailure(contractError);
-      await db.idempotencyOperation.updateMany({
+      const updated = await db.idempotencyOperation.updateMany({
         where: { scope, key, claimId, state: "IN_PROGRESS" },
         data: {
           // RECONCILIATION_REQUIRED (NOT FAILED): the external outcome is unknown.
@@ -433,7 +433,28 @@ export async function runIdempotentOperation<T>(input: {
           // but leave it in RECONCILIATION_REQUIRED for a reconciliation worker.
           claimExpiresAt: null,
         },
-      }).catch(() => {});
+      }).catch(() => ({ count: 0 }));
+
+      if (updated.count === 0) {
+        // Phase 12.3.2.6: The claim was lost (reclaimed → RECONCILIATION_REQUIRED)
+        // before we could store the contract violation. The DB state is already
+        // RECONCILIATION_REQUIRED (the reclaimer did that). A stale worker MUST NOT
+        // report a stronger outcome than the DB-authoritative state permits.
+        // Throw 409 outcome-unknown, NOT 500 contract violation.
+        logger.error("idempotency.raw_return_claim_lost", {
+          scope, key, claimId, providerKey,
+          message: "Claim was reclaimed before raw-return contract violation could be stored. DB state is RECONCILIATION_REQUIRED — stale worker must not report 500.",
+        });
+        const claimLostErr = new AppError(
+          "conflict",
+          "Idempotency claim was lost before contract violation could be stored — outcome is unknown",
+          409,
+          "Your request's outcome could not be confirmed. The operation is pending reconciliation — do not retry with a new key.",
+        );
+        (claimLostErr as any)._outcomeClassified = true;
+        throw claimLostErr;
+      }
+
       logger.error("idempotency.external_contract_violation_raw_return", {
         scope, key, claimId, providerKey,
         message: "External execute() returned a raw value instead of an OperationOutcome. Contract violation — external outcome is UNKNOWN. Transitioned to RECONCILIATION_REQUIRED (not FAILED) because the provider side effect may have occurred.",
@@ -496,16 +517,30 @@ export async function runIdempotentOperation<T>(input: {
       }).catch(() => ({ count: 0 }));
 
       if (updated.count === 0) {
-        logger.warn("idempotency.confirmed_failure_not_stored", {
+        // Phase 12.3.2.6: The claim was lost (reclaimed → RECONCILIATION_REQUIRED)
+        // before we could store the CONFIRMED_FAILURE. A stale worker MUST NOT
+        // report a stronger outcome than the DB-authoritative state permits.
+        // The DB says RECONCILIATION_REQUIRED — the caller must NOT believe the
+        // operation definitely failed (that would allow a retry with a new key).
+        // Throw 409 outcome-unknown, NOT the original confirmed failure.
+        logger.error("idempotency.confirmed_failure_claim_lost", {
           scope, key, claimId,
-          message: "Claim was reclaimed before CONFIRMED_FAILURE could be stored.",
+          message: "Claim was reclaimed before CONFIRMED_FAILURE could be stored. DB state is RECONCILIATION_REQUIRED — stale worker must not report FAILED.",
         });
-      } else {
-        logger.warn("idempotency.operation_failed_confirmed", {
-          scope, key, claimId,
-          errorClass: failure.errorClass, statusCode: failure.statusCode,
-        });
+        const claimLostErr = new AppError(
+          "conflict",
+          "Idempotency claim was lost before confirmed failure could be stored — outcome is unknown",
+          409,
+          "Your request's outcome could not be confirmed. The operation is pending reconciliation — do not retry with a new key.",
+        );
+        (claimLostErr as any)._outcomeClassified = true;
+        throw claimLostErr;
       }
+
+      logger.warn("idempotency.operation_failed_confirmed", {
+        scope, key, claimId,
+        errorClass: failure.errorClass, statusCode: failure.statusCode,
+      });
 
       const confirmedErr = new AppError(failure.errorClass, failure.message, failure.statusCode, failure.safeMessage);
       (confirmedErr as any)._outcomeClassified = true;
