@@ -4466,3 +4466,39 @@ Stage Summary:
   8. Every failed/recovered path is auditable.
 - Phase 11 is now ready to freeze as a whole.
 - Next: Stop adding control-plane mechanics until a fresh architecture-wide audit.
+
+---
+Task ID: 11.6-final
+Agent: Principal Architect (main) — Phase 11.6 Event Convergence Final Fixes
+Task: Close the two issues identified in the architect's fresh audit of 5125cde: (1) 11.6.1 didn't process through the worker; (2) 11.6.5 was a measurement-based test, not a real event-ordering test. Add real event convergence proof.
+
+Work Log:
+- 11.6.1 (fixed): Now processes the duplicate event through the worker using processOneEvent (the official worker entry point). Proves: exactly one event persisted, event was processed (result !== null), at most one decision created (no duplicate side effect), if a decision was created it reached a terminal state.
+
+- 11.6.5 (rewritten): Replaced the measurement-based test with one that actually creates and processes RESOURCE_DEGRADED and RESOURCE_RECOVERED events through the worker in BOTH orderings:
+  Case A: RESOURCE_DEGRADED → RESOURCE_RECOVERED (normal order)
+  Case B: RESOURCE_RECOVERED → RESOURCE_DEGRADED (reverse order)
+  Both cases prove the architectural principle: events are triggers, not authority. The decision engine reads the CURRENT ResourceHealth snapshot (HEALTHY from measurements), not the event payload. Neither ordering produces an unauthorized connectivity mutation.
+  The test explicitly: emits RESOURCE_DEGRADED event manually, processes through the worker, verifies health is still HEALTHY, emits RESOURCE_RECOVERED event manually, processes through the worker, verifies health is still HEALTHY, repeats with reversed order, verifies no SWITCH action was created by any event.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 11.4 (all 11):  11/11 PASS
+  Phase 11.5 (all 6):    6/6 PASS
+  Phase 11.6 (all 5):    5/5 PASS
+  Phase 11.7 (all 1):    1/1 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 49 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 5fa7d7e (on GitHub, verified: git ls-remote origin main → 5fa7d7e)
+- The two event convergence proof gaps are closed:
+  1. 11.6.1 now processes through the worker (processOneEvent).
+  2. 11.6.5 now creates and processes real RESOURCE_DEGRADED + RESOURCE_RECOVERED events in both orderings.
+- The architectural principle is now explicitly proven at runtime:
+  "Events are triggers, not authority. Current state + policy + intent authority are authority. Event ordering only changes reevaluation timing."
+- All 8 Phase 11 acceptance invariants are now runtime-proven with 49 tests, 0 failures.
+- Phase 11 is now ready to freeze as a whole.
