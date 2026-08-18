@@ -4549,3 +4549,39 @@ Stage Summary:
 - HEAD: 90896bf (on GitHub, verified: git ls-remote origin main → 90896bf)
 - 11.6.1 now asserts exactly 1 decision with exact state SKIPPED.
 - Phase 11 is now ready to freeze as a whole.
+
+---
+Task ID: 12.1
+Agent: Principal Architect (main) — Phase 12.1 Database Canonicalization
+Task: Eliminate the PostgreSQL/SQLite architecture contradiction identified in the post-Phase-11 audit. The schema declared provider = "postgresql" but DATABASE_URL pointed to a SQLite file, causing repeated engineering friction during Phase 11.
+
+Work Log:
+- Audited the contradiction:
+  - prisma/schema.prisma: provider = "postgresql"
+  - .env: DATABASE_URL = file:/home/z/my-project/db/custom.db (SQLite)
+  - Actual DB: SQLite 3.x
+  - PostgreSQL NOT available in sandbox (no psql, no root access, no Docker)
+  - Schema uses only portable Prisma types (no @db.*, no Json, no Decimal, no Bytes)
+  - All JSON data stored as String with JSON.stringify/parse
+
+- Fix (prisma/schema.prisma): Changed provider from "postgresql" to "sqlite" — matching the actual DATABASE_URL. The schema now honestly declares what's running. Updated the schema header to document:
+  - Development/test: SQLite (sandbox constraint)
+  - Production target: PostgreSQL (Neon/Vercel)
+  - Schema is fully portable (only portable types)
+  - Production deployment: one-line provider change in CI/CD before prisma generate
+
+- Verification:
+  - bun run db:generate now works directly (no provider switching needed)
+  - All 49 Phase 11 tests pass with the canonicalized schema
+  - Lint: clean
+
+- The Phase 11 friction is now eliminated permanently — no more sed/generate/sed cycle for schema changes.
+
+Stage Summary:
+- HEAD: 5c1ca19 (on GitHub, verified: git ls-remote origin main → 5c1ca19)
+- The database provider contradiction is resolved. The schema matches the actual DATABASE_URL.
+- PostgreSQL is not available in this sandbox — this is documented honestly rather than contradicted.
+- The schema is portable: switching to PostgreSQL for production is a one-line change.
+- bun run db:generate works directly without provider switching.
+- Phase 11 regression: 49/49 PASS.
+- Next: Phase 12.2 — Multi-tenant security boundary.
