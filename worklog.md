@@ -4585,3 +4585,66 @@ Stage Summary:
 - bun run db:generate works directly without provider switching.
 - Phase 11 regression: 49/49 PASS.
 - Next: Phase 12.2 — Multi-tenant security boundary.
+
+---
+Task ID: 12.2
+Agent: Principal Architect (main) — Phase 12.2 Multi-Tenant Security Boundary
+Task: Audit and harden the reseller tenant isolation boundary with adversarial rigor comparable to Phase 11. Fix fail-closed tenant resolution, add assertTenantScope helper, fix all P0/P1 cross-tenant authorization gaps, and write adversarial test matrix.
+
+Work Log:
+- Comprehensive repository-wide audit identified 4 P0 (cross-tenant authorization gaps) + 4 P1 (logic/security bugs).
+
+- Fix 1 — getActiveTenant() fail-closed resolution (context.ts):
+  - activeTenantId exists → verify membership + tenant.status === "active"
+  - no activeTenantId + 0 memberships → deny
+  - no activeTenantId + 1 membership → implicit (convenience)
+  - no activeTenantId + 2+ memberships → deny (requires explicit selection)
+  - Never selects arbitrary "first" tenant for multi-tenant users
+  - Verifies session.userId === authenticated user.id (foreign session guard)
+
+- Fix 2 — assertTenantScope helper (context.ts):
+  - requestedTenantId omitted → allowed
+  - requestedTenantId === ctx.tenantId → allowed
+  - otherwise → 403
+
+- Fix 3 (P0-1): Entitlement bindings routes now pass ctx.tenantId to listResourceBindings, createResourceBinding, and transitionBinding. Service functions verify entitlement→tenant ownership before operating.
+
+- Fix 4 (P0-2): v1/connectivity/actions route now verifies session.subjectId === user.id and session.entitlementId → entitlement.tenantId === ctx.tenantId before creating/executing actions.
+
+- Fix 5 (P0-3): v1/connectivity/measurements route now verifies session→entitlement→tenant, providerInstanceId→tenant, and resourceId→capability→tenant before ingesting.
+
+- Fix 6 (P0-4): v1/connectivity/sessions route now verifies entitlementId → tenantId === ctx.tenantId and entitlementId → userId === user.id before creating sessions.
+
+- Fix 7 (P1-1): commerce/orders customer lookup fixed from db.tenantUser (staff table) to db.tenantCustomer (actual customers).
+
+- Fix 8 (P1-2): commerce/customer route now requires authentication (getCurrentUser).
+
+- Fix 9 (P1-3): createEntitlement now verifies subscription.tenantId === input.tenantId before creating.
+
+- Fix 10 (P1-4): tenant/customers POST no longer accepts client-supplied userId.
+
+- Tests (tests/phase12.2-tenant-security.test.ts, 8 DB-backed runtime, all PASS):
+  12.2.1: single-tenant user resolves A; B denied (not a member)
+  12.2.2: multi-tenant user without activeTenantId → denied (2+ memberships)
+  12.2.3: multi-tenant user switches between A and B; sessions isolated
+  12.2.4: stale activeTenantId (user removed) → denied
+  12.2.5: inactive tenant → denied
+  12.2.6: client tenant spoofing → assertTenantScope throws 403
+  12.2.7: cross-tenant resource read (A cannot read B's customers)
+  12.2.8: cross-tenant connectivity (A cannot access B's provider instance)
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7: 49/49 PASS
+  Phase 12.2: 8/8 PASS
+  Phase 8.6.6: 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 57 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 1606f5e (on GitHub, verified: git ls-remote origin main → 1606f5e)
+- All 4 P0 cross-tenant authorization gaps closed.
+- All 4 P1 logic/security bugs fixed.
+- getActiveTenant() now fails closed for multi-tenant users.
+- assertTenantScope helper available for all routes.
+- 8 adversarial runtime tests prove tenant isolation.
+- Phase 12.2 is ready for audit.

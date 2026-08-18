@@ -1,0 +1,602 @@
+   901→    // Phase 2B.3.7: Perform the completion inside ONE transaction with row locks.
+   902→    const result = await db.$transaction(async (tx) => {
+   903→      // 1. Lock the SaasRenewalCycle row
+   904→      const lockedCycle: Array<{ id: string; state: string; subscriptionId: string; periodEnd: Date; invoiceId: string | null }> = await tx.$queryRaw`
+   905→        SELECT id, state, "subscriptionId", "periodEnd", "invoiceId"
+   906→        FROM "SaasRenewalCycle"
+   907→        WHERE id = ${cycle.id}
+   908→        FOR UPDATE
+   909→      `;
+   910→      if (lockedCycle.length === 0) {
+   911→        return { completed: false, reason: "Cycle not found" };
+   912→      }
+   913→      const c = lockedCycle[0];
+   914→
+   915→      // 2. Lock the TenantSubscription row
+   916→      const lockedSub: Array<{ id: string; currentPeriodEnd: Date; status: string }> = await tx.$queryRaw`
+   917→        SELECT id, "currentPeriodEnd", status
+   918→        FROM "TenantSubscription"
+   919→        WHERE id = ${c.subscriptionId}
+   920→        FOR UPDATE
+   921→      `;
+   922→      if (lockedSub.length === 0) {
+   923→        return { completed: false, reason: "Subscription not found" };
+   924→      }
+   925→      const sub = lockedSub[0];
+   926→
+   927→      // 3. If already COMPLETED, verify the invariant. Repair if stale.
+   928→      // Phase 2B.3.19: The COMPLETED idempotent path now ALSO verifies the
+   929→      // ledger transaction still exists. LedgerTransaction rows are immutable
+   930→      // (no delete path in the codebase), but this check provides defense-in-depth
+   931→      // and explicitly answers: "every call that recognizes COMPLETED independently
+   932→      // proves the ledger still exists." If the ledger was somehow removed, the
+   933→      // cycle is transitioned to RECONCILIATION_REQUIRED rather than returning
+   934→      // a false success.
+   935→      if (c.state === "COMPLETED") {
+   936→        // Verify the invoice is still paid and the ledger still exists.
+   937→        if (c.invoiceId) {
+   938→          const invCheck = await tx.tenantInvoice.findUnique({
+   939→            where: { id: c.invoiceId },
+   940→            select: { status: true, ledgerTransactionId: true },
+   941→          });
+   942→          if (!invCheck || invCheck.status !== "paid" || !invCheck.ledgerTransactionId) {
+   943→            logger.error("saas.cycle_completed_invoice_not_ready", {
+   944→              cycleId: c.id, invoiceId: c.invoiceId, invoiceStatus: invCheck?.status,
+   945→            });
+   946→            return { completed: false, reason: "COMPLETED cycle's invoice is no longer paid" };
+   947→          }
+   948→          const ledgerStillExists: Array<{ id: string }> = await tx.$queryRaw`
+   949→            SELECT id FROM "LedgerTransaction" WHERE id = ${invCheck.ledgerTransactionId}
+   950→          `;
+   951→          if (ledgerStillExists.length === 0) {
+   952→            logger.error("saas.cycle_completed_ledger_missing", {
+   953→              cycleId: c.id, invoiceId: c.invoiceId, ledgerTxnId: invCheck.ledgerTransactionId,
+   954→              message: "CRITICAL: COMPLETED cycle references a ledger transaction that no longer exists. Cycle left in COMPLETED state but completion refused — manual audit required.",
+   955→            });
+   956→            return { completed: false, reason: "COMPLETED cycle's ledger transaction no longer exists" };
+   957→          }
+   958→        }
+   959→
+   960→        if (sub.currentPeriodEnd.getTime() === c.periodEnd.getTime()) {
+   961→          // Invariant holds — idempotent success
+   962→          return { completed: true, reason: "already_completed" };
+   963→        }
+   964→        // Stale legacy state: cycle says COMPLETED but period wasn't extended.
+   965→        // Repair inside this transaction.
+   966→        logger.warn("saas.cycle_stale_repairing", {
+   967→          cycleId: c.id,
+   968→          currentPeriodEnd: sub.currentPeriodEnd,
+   969→          expectedPeriodEnd: c.periodEnd,
+   970→        });
+   971→        await tx.tenantSubscription.update({
+   972→          where: { id: c.subscriptionId },
+   973→          data: { status: "active", currentPeriodEnd: c.periodEnd },
+   974→        });
+   975→        return { completed: true, reason: "stale_repaired" };
+   976→      }
+   977→
+   978→      // 4. Verify the invoice is financially ready (paid + ledger exists)
+   979→      if (!c.invoiceId) {
+   980→        return { completed: false, reason: "No invoice linked to cycle" };
+   981→      }
+   982→      const invoice = await tx.tenantInvoice.findUnique({
+   983→        where: { id: c.invoiceId },
+   984→        select: { status: true, ledgerTransactionId: true },
+   985→      });
+   986→      if (!invoice || invoice.status !== "paid" || !invoice.ledgerTransactionId) {
+   987→        return { completed: false, reason: `Invoice not ready (status: ${invoice?.status})` };
+   988→      }
+   989→
+   990→      // Phase 2B.3.14 P1-7: Verify the referenced LedgerTransaction ACTUALLY EXISTS
+   991→      // inside the helper's own transaction — symmetric with activateInitialSaasSubscription.
+   992→      // The authoritative completion function must NOT trust a non-null ledgerTransactionId
+   993→      // without proving the row exists.
+   994→      const ledgerCheck: Array<{ id: string }> = await tx.$queryRaw`
+   995→        SELECT id FROM "LedgerTransaction" WHERE id = ${invoice.ledgerTransactionId}
+   996→      `;
+   997→      if (ledgerCheck.length === 0) {
+   998→        logger.error("saas.cycle_completion_dangling_ledger", {
+   999→          cycleId: c.id, invoiceId: c.invoiceId, ledgerTxnId: invoice.ledgerTransactionId,
+  1000→        });
+  1001→        return { completed: false, reason: "Ledger transaction referenced by invoice does not exist (dangling reference)" };
+  1002→      }
+  1003→
+  1004→      // 5. Update the subscription period FIRST (before marking cycle COMPLETED)
+  1005→      await tx.tenantSubscription.update({
+  1006→        where: { id: c.subscriptionId },
+  1007→        data: {
+  1008→          status: "active",
+  1009→          currentPeriodEnd: c.periodEnd,
+  1010→        },
+  1011→      });
+  1012→
+  1013→      // 6. Mark the cycle COMPLETED (after subscription update succeeds)
+  1014→      // Status-guarded: only non-COMPLETED → COMPLETED
+  1015→      await tx.saasRenewalCycle.updateMany({
+  1016→        where: { id: c.id, state: { not: "COMPLETED" } },
+  1017→        data: { state: "COMPLETED", failureReason: null },
+  1018→      });
+  1019→
+  1020→      return { completed: true, reason: "completed" };
+  1021→    }, { timeout: 30000, maxWait: 15000 });
+  1022→
+  1023→    if (result.completed) {
+  1024→      if (result.reason === "stale_repaired") {
+  1025→        logger.info("saas.cycle_stale_repaired", { cycleId: cycle.id });
+  1026→      } else if (result.reason !== "already_completed") {
+  1027→        logger.info("saas.renewal_cycle_completed", {
+  1028→          cycleId: cycle.id,
+  1029→          subscriptionId: cycle.subscriptionId,
+  1030→          newPeriodEnd: cycle.periodEnd,
+  1031→        });
+  1032→      } else {
+  1033→        logger.info("saas.cycle_already_completed", { cycleId: cycle.id });
+  1034→      }
+  1035→    } else {
+  1036→      logger.warn("saas.cycle_not_completed", { cycleId: cycle.id, reason: result.reason });
+  1037→    }
+  1038→
+  1039→    return { completed: result.completed };
+  1040→  } catch (err) {
+  1041→    // Transaction failed — neither the cycle nor the subscription was updated
+  1042→    logger.error("saas.cycle_completion_failed", {
+  1043→      cycleId: cycle.id,
+  1044→      error: err instanceof Error ? err.message : String(err),
+  1045→    });
+  1046→    return { completed: false };
+  1047→  }
+  1048→}
+  1049→
+  1050→/**
+  1051→ * Cancel a subscription. The subscription remains active until the end of the
+  1052→ * current period, then expires. No more renewals.
+  1053→ */
+  1054→export async function cancelSubscription(input: {
+  1055→  tenantId: string;
+  1056→  userId: string;
+  1057→  reason?: string;
+  1058→}): Promise<{ status: string; currentPeriodEnd: Date }> {
+  1059→  const subscription = await db.tenantSubscription.findUnique({
+  1060→    where: { tenantId: input.tenantId },
+  1061→  });
+  1062→  if (!subscription) {
+  1063→    throw new AppError("not_found", "No subscription found", 404, "This tenant has no subscription.");
+  1064→  }
+  1065→
+  1066→  // Phase 2B.3.14 P2-10: Guard cancellation against financial recovery states.
+  1067→  // A subscription in reconciliation_required has a paid invoice + posted ledger
+  1068→  // that is awaiting domain activation. Cancelling it would orphan the financial
+  1069→  // state with no recovery path.
+  1070→  if (subscription.status === "reconciliation_required") {
+  1071→    throw new AppError(
+  1072→      "conflict",
+  1073→      "Cannot cancel subscription in recovery state",
+  1074→      409,
+  1075→      "This subscription has a pending financial reconciliation. Wait for the reconciliation worker to complete before cancelling, or contact support.",
+  1076→    );
+  1077→  }
+  1078→
+  1079→  // Phase 2B.3.14 P2-10: Guarded transition — only cancel if not already cancelled.
+  1080→  const result = await db.tenantSubscription.updateMany({
+  1081→    where: { id: subscription.id, status: { not: "cancelled" } },
+  1082→    data: {
+  1083→      status: "cancelled",
+  1084→      cancelledAt: new Date(),
+  1085→      cancelReason: input.reason ?? null,
+  1086→    },
+  1087→  });
+  1088→  if (result.count === 0) {
+  1089→    // Already cancelled — idempotent
+  1090→    return { status: "cancelled", currentPeriodEnd: subscription.currentPeriodEnd };
+  1091→  }
+  1092→
+  1093→  await audit({
+  1094→    tenantId: input.tenantId,
+  1095→    userId: input.userId,
+  1096→    action: "saas.subscription_cancelled",
+  1097→    entity: "tenant_subscription",
+  1098→    entityId: subscription.id,
+  1099→    detail: { reason: input.reason },
+  1100→  });
+  1101→
+  1102→  logger.info("saas.subscription_cancelled", { tenantId: input.tenantId, subscriptionId: subscription.id });
+  1103→
+  1104→  return { status: "cancelled", currentPeriodEnd: subscription.currentPeriodEnd };
+  1105→}
+  1106→
+  1107→/**
+  1108→ * Renew a subscription for the next billing period.
+  1109→ * Creates an invoice + payment intent + charges.
+  1110→ *
+  1111→ * Idempotent: uses a durable renewalIdempotencyKey derived from the
+  1112→ * subscription ID + period end. Duplicate cron calls or webhook retries
+  1113→ * cannot double-charge.
+  1114→ */
+  1115→export async function renewSubscription(tenantId: string): Promise<{ success: boolean; status: string; reason?: string }> {
+  1116→  const subscription = await db.tenantSubscription.findUnique({
+  1117→    where: { tenantId },
+  1118→    include: { saaasPlan: true },
+  1119→  });
+  1120→  if (!subscription) {
+  1121→    return { success: false, status: "none", reason: "No subscription found" };
+  1122→  }
+  1123→
+  1124→  // Don't renew cancelled subscriptions
+  1125→  if (subscription.status === "cancelled") {
+  1126→    return { success: false, status: "cancelled", reason: "Subscription is cancelled" };
+  1127→  }
+  1128→
+  1129→  // Phase 2B.3.14 P2-13: Don't renew free plans through the paid SaaS machinery.
+  1130→  // Free plans have monthlyPriceMinor = 0 — the ledger rejects zero-amount
+  1131→  // transactions, and there's no payment to process. Free-plan subscriptions
+  1132→  // should be handled by a separate product-level flow, not the payment pipeline.
+  1133→  if (subscription.saaasPlan && subscription.saaasPlan.monthlyPriceMinor <= 0) {
+  1134→    logger.info("saas.free_plan_renewal_skipped", { tenantId, planName: subscription.saaasPlan.name });
+  1135→    // Extend the period without payment/ledger — free plan.
+  1136→    // Phase 2B.3.15 P1-3: Use addBillingInterval for canonical calendar derivation.
+  1137→    const newPeriodEnd = addBillingInterval(subscription.currentPeriodEnd, subscription.billingCycle);
+  1138→    await db.tenantSubscription.updateMany({
+  1139→      where: { id: subscription.id, status: { in: ["active", "past_due"] } },
+  1140→      data: { status: "active", currentPeriodEnd: newPeriodEnd },
+  1141→    });
+  1142→    return { success: true, status: "active" };
+  1143→  }
+  1144→
+  1145→  // Don't renew if the current period hasn't ended yet
+  1146→  if (subscription.currentPeriodEnd > new Date()) {
+  1147→    return { success: false, status: subscription.status, reason: "Current period has not ended" };
+  1148→  }
+  1149→
+  1150→  const plan = subscription.saaasPlan;
+  1151→  const amountMinor = subscription.billingCycle === "yearly" ? plan.monthlyPriceMinor * 12 : plan.monthlyPriceMinor;
+  1152→
+  1153→  // Phase 2B.3.5: Derive the durable cycle identity from immutable periodStart.
+  1154→  // The cycleKey is subscriptionId + immutable periodStart (the expired period's end).
+  1155→  // This is the SAME key regardless of how many workers run concurrently.
+  1156→  // Phase 2B.3.15 P1-3: Use addBillingInterval for canonical calendar derivation.
+  1157→  const newPeriodStart = subscription.currentPeriodEnd;
+  1158→  const newPeriodEnd = addBillingInterval(newPeriodStart, subscription.billingCycle);
+  1159→
+  1160→  const cycleKey = `saas_renewal_${subscription.id}_${newPeriodStart.getTime()}`;
+  1161→
+  1162→  // Phase 2B.3.5: Atomically get-or-create the SaasRenewalCycle.
+  1163→  // The unique constraint on cycleKey ensures two concurrent workers
+  1164→  // resolve to the SAME cycle.
+  1165→  let cycle = await db.saasRenewalCycle.findUnique({ where: { cycleKey } });
+  1166→  if (!cycle) {
+  1167→    try {
+  1168→      cycle = await db.saasRenewalCycle.create({
+  1169→        data: {
+  1170→          subscriptionId: subscription.id,
+  1171→          tenantId,
+  1172→          cycleKey,
+  1173→          state: "PENDING",
+  1174→          periodStart: newPeriodStart,
+  1175→          periodEnd: newPeriodEnd,
+  1176→        },
+  1177→      });
+  1178→      logger.info("saas.renewal_cycle_created", { cycleId: cycle.id, cycleKey, subscriptionId: subscription.id });
+  1179→    } catch (err: any) {
+  1180→      // P2002 = another concurrent worker created it. Re-fetch.
+  1181→      if (err?.code === "P2002") {
+  1182→        cycle = await db.saasRenewalCycle.findUnique({ where: { cycleKey } });
+  1183→        logger.info("saas.renewal_cycle_existing", { cycleId: cycle?.id, cycleKey });
+  1184→      } else {
+  1185→        throw err;
+  1186→      }
+  1187→    }
+  1188→  }
+  1189→  if (!cycle) {
+  1190→    return { success: false, status: "error", reason: "Failed to create/find renewal cycle" };
+  1191→  }
+  1192→
+  1193→  // Phase 2B.3.9: If the cycle is already COMPLETED, do NOT blindly return success.
+  1194→  // Route through completeSaasRenewalCycle() which verifies the invariant
+  1195→  // (subscription.currentPeriodEnd == cycle.periodEnd) and repairs if stale.
+  1196→  if (cycle.state === "COMPLETED") {
+  1197→    if (!cycle.invoiceId) {
+  1198→      // COMPLETED cycle with no invoice — fail closed, don't silently succeed
+  1199→      logger.error("saas.completed_cycle_no_invoice", { cycleId: cycle.id });
+  1200→      return { success: false, status: "error", reason: "Completed cycle has no invoice — manual reconciliation required" };
+  1201→    }
+  1202→    const completion = await completeSaasRenewalCycle({ invoiceId: cycle.invoiceId, tenantId });
+  1203→    if (completion.completed) {
+  1204→      return { success: true, status: "active" };
+  1205→    } else {
+  1206→      return { success: false, status: "error", reason: "Completed cycle invariant verification failed" };
+  1207→    }
+  1208→  }
+  1209→
+  1210→  // Phase 2B.3.17 P0-1/P0-3: AMBIGUOUS_PAYMENT is a separate state from
+  1211→  // RECONCILIATION_REQUIRED. It represents a payment-operation creation that
+  1212→  // timed out without a providerReference — the payment may or may not exist
+  1213→  // at the provider. It MUST NOT be fed into activateSubscriptionAndPostLedger(),
+  1214→  // because that would post revenue without proof of payment.
+  1215→  if (cycle.state === "AMBIGUOUS_PAYMENT") {
+  1216→    logger.error("saas.renewal_refused_ambiguous_payment", {
+  1217→      cycleId: cycle.id, tenantId, subscriptionId: subscription.id,
+  1218→      message: "CRITICAL: Renewal refused for AMBIGUOUS_PAYMENT cycle. This state requires manual/provider audit to determine whether a payment operation was created. Revenue must NOT be recognized until the ambiguity is resolved.",
+  1219→    });
+  1220→    return {
+  1221→      success: false,
+  1222→      status: "error",
+  1223→      reason: "Cycle is in AMBIGUOUS_PAYMENT state — manual/provider audit required before renewal can proceed",
+  1224→    };
+  1225→  }
+  1226→
+  1227→  // If the cycle is RECONCILIATION_REQUIRED, attempt to finalize the existing invoice.
+  1228→  // Phase 2B.3.17 P0-4: This path does NOT pass paymentVerified=true.
+  1229→  // The guard inside activateSubscriptionAndPostLedger() will refuse to post
+  1230→  // the ledger if the invoice is "pending" (unverified). Only invoices in
+  1231→  // "reconciliation_required" or "paid" status are allowed — these prove the
+  1232→  // payment was verified in a prior attempt.
+  1233→  if (cycle.state === "RECONCILIATION_REQUIRED" || cycle.state === "FINANCIAL_POSTED") {
+  1234→    if (!cycle.invoiceId) {
+  1235→      return { success: false, status: "error", reason: "Cycle in financial state but no invoice" };
+  1236→    }
+  1237→    // Phase 2B.3.17 P0-4: paymentVerified is intentionally NOT passed here.
+  1238→    // If the invoice is "pending", the guard refuses the ledger posting.
+  1239→    const result = await activateSubscriptionAndPostLedger({
+  1240→      subscriptionId: subscription.id,
+  1241→      invoiceId: cycle.invoiceId,
+  1242→      tenantId,
+  1243→      userId: "renewal-worker",
+  1244→    });
+  1245→
+  1246→    if (result.activated) {
+  1247→      // Phase 2B.3.10: Use the single authoritative completion function.
+  1248→      // If completion fails, mark cycle RECONCILIATION_REQUIRED for recovery.
+  1249→      const completion = await completeSaasRenewalCycle({ invoiceId: cycle.invoiceId!, tenantId });
+  1250→      if (completion.completed) {
+  1251→        return { success: true, status: "active" };
+  1252→      } else {
+  1253→        await db.saasRenewalCycle.updateMany({
+  1254→          where: { id: cycle.id, state: { not: "COMPLETED" } },
+  1255→          data: { state: "RECONCILIATION_REQUIRED", failureReason: "Period extension failed during renewal retry" },
+  1256→        }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+  1257→        return { success: false, status: "financial_pending", reason: "Period extension failed during renewal retry" };
+  1258→      }
+  1259→    } else {
+  1260→      return { success: false, status: "financial_pending", reason: "Ledger posting still failing during renewal retry" };
+  1261→    }
+  1262→  }
+  1263→
+  1264→  // If the cycle is PAST_DUE (payment failed), don't retry automatically.
+  1265→  if (cycle.state === "PAST_DUE") {
+  1266→    return { success: false, status: "past_due", reason: "Renewal payment previously failed" };
+  1267→  }
+  1268→
+  1269→  // Cycle is PENDING or PAYMENT_PENDING — proceed with the renewal.
+  1270→  // Use the invoice idempotency key derived from the cycle identity.
+  1271→  const renewalKey = cycleKey;
+  1272→
+  1273→  // Check if an invoice already exists for this cycle
+  1274→  const existingInvoice = cycle.invoiceId
+  1275→    ? await db.tenantInvoice.findUnique({ where: { id: cycle.invoiceId } })
+  1276→    : await db.tenantInvoice.findUnique({ where: { idempotencyKey: renewalKey } });
+  1277→
+  1278→  if (existingInvoice && existingInvoice.status === "paid") {
+  1279→    // Phase 2B.3.8: Use the single authoritative completion function.
+  1280→    // NO direct cycle/subscription mutation outside completeSaasRenewalCycle().
+  1281→    if (!cycle.invoiceId) {
+  1282→      // Phase 2B.3.14 P2-12: Guarded — only update invoiceId if not already set.
+  1283→      await db.saasRenewalCycle.updateMany({
+  1284→        where: { id: cycle.id, invoiceId: null },
+  1285→        data: { invoiceId: existingInvoice.id },
+  1286→      });
+  1287→    }
+  1288→    const completion = await completeSaasRenewalCycle({ invoiceId: existingInvoice.id, tenantId });
+  1289→    if (completion.completed) {
+  1290→      return { success: true, status: "active" };
+  1291→    } else {
+  1292→      // Phase 2B.3.10: Mark cycle for recovery
+  1293→      await db.saasRenewalCycle.updateMany({
+  1294→        where: { id: cycle.id, state: { not: "COMPLETED" } },
+  1295→        data: { state: "RECONCILIATION_REQUIRED", failureReason: "Completion failed for already-paid invoice" },
+  1296→      }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+  1297→      return { success: false, status: "financial_pending", reason: "Completion failed for already-paid invoice" };
+  1298→    }
+  1299→  }
+  1300→
+  1301→  // Create or reuse the invoice
+  1302→  const invoice = await db.tenantInvoice.upsert({
+  1303→    where: { idempotencyKey: renewalKey },
+  1304→    create: {
+  1305→      tenantId,
+  1306→      subscriptionId: subscription.id,
+  1307→      saaasPlanName: plan.name,
+  1308→      amountMinor,
+  1309→      currency: plan.currency,
+  1310→      billingCycle: subscription.billingCycle,
+  1311→      periodStart: newPeriodStart,
+  1312→      periodEnd: newPeriodEnd,
+  1313→      status: "pending",
+  1314→      idempotencyKey: renewalKey,
+  1315→    },
+  1316→    update: {},
+  1317→  });
+  1318→
+  1319→  // Link the invoice to the cycle + transition to PAYMENT_PENDING.
+  1320→  // Phase 2B.3.14 P2-12: Guarded — don't overwrite COMPLETED or RECONCILIATION_REQUIRED.
+  1321→  await db.saasRenewalCycle.updateMany({
+  1322→    where: { id: cycle.id, state: { notIn: ["COMPLETED", "RECONCILIATION_REQUIRED", "PAYMENT_PENDING"] } },
+  1323→    data: { state: "PAYMENT_PENDING", invoiceId: invoice.id },
+  1324→  });
+  1325→
+  1326→  if (invoice.status === "paid") {
+  1327→    // Phase 2B.3.10: Use the single authoritative completion function.
+  1328→    const completion = await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId });
+  1329→    if (completion.completed) {
+  1330→      return { success: true, status: "active" };
+  1331→    } else {
+  1332→      await db.saasRenewalCycle.updateMany({
+  1333→        where: { id: cycle.id, state: { not: "COMPLETED" } },
+  1334→        data: { state: "RECONCILIATION_REQUIRED", failureReason: "Completion failed for paid invoice" },
+  1335→      }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+  1336→      return { success: false, status: "financial_pending", reason: "Completion failed for paid invoice" };
+  1337→    }
+  1338→  }
+  1339→
+  1340→  // If the invoice is reconciliation_required, attempt to finalize
+  1341→  if (invoice.status === "reconciliation_required") {
+  1342→    await db.saasRenewalCycle.updateMany({
+  1343→      where: { id: cycle.id, state: { notIn: ["COMPLETED", "RECONCILIATION_REQUIRED"] } },
+  1344→      data: { state: "FINANCIAL_POSTED" },
+  1345→    });
+  1346→    const result = await activateSubscriptionAndPostLedger({
+  1347→      subscriptionId: subscription.id,
+  1348→      invoiceId: invoice.id,
+  1349→      tenantId,
+  1350→      userId: "renewal-worker",
+  1351→    });
+  1352→
+  1353→    if (result.activated) {
+  1354→      // Phase 2B.3.10: Use the single authoritative completion function.
+  1355→      const completion = await completeSaasRenewalCycle({ invoiceId: invoice.id, tenantId });
+  1356→      if (completion.completed) {
+  1357→        return { success: true, status: "active" };
+  1358→      } else {
+  1359→        await db.saasRenewalCycle.updateMany({
+  1360→          where: { id: cycle.id, state: { not: "COMPLETED" } },
+  1361→          data: { state: "RECONCILIATION_REQUIRED", failureReason: "Period extension failed" },
+  1362→        }).catch((err) => { logger.error("saas.state_update_failed", { error: err instanceof Error ? err.message : String(err) }); });
+  1363→        return { success: false, status: "financial_pending", reason: "Period extension failed" };
+  1364→      }
+  1365→    } else {
+  1366→      await db.saasRenewalCycle.updateMany({
+  1367→        where: { id: cycle.id, state: { not: "COMPLETED" } },
+  1368→        data: { state: "RECONCILIATION_REQUIRED" },
+  1369→      });
+  1370→      return { success: false, status: "financial_pending", reason: "Ledger posting still failing during renewal retry" };
+  1371→    }
+  1372→  }
+  1373→
+  1374→  // Phase 2B.3.3: Use the subscription's stored payment provider.
+  1375→  // Phase 2B.3.16: ATOMIC PAYMENT-OPERATION ACQUISITION.
+  1376→  //
+  1377→  // The previous code (2B.3.15) had a race: two concurrent workers could both
+  1378→  // read providerReference = null, both call createPaymentIntent(), and both
+  1379→  // try to persist. The invariant "ONE INVOICE → ONE PROVIDER PAYMENT OPERATION"
+  1380→  // relied entirely on provider-level idempotency.
+  1381→  //
+  1382→  // This fix introduces a durable payment-operation state machine at the
+  1383→  // APPLICATION level, using the SaasRenewalCycle's state field:
+  1384→  //
+  1385→  //   PAYMENT_PENDING → PAYMENT_CREATING → PAYMENT_CONFIRMED
+  1386→  //
+  1387→  // The transition PAYMENT_PENDING → PAYMENT_CREATING is a PostgreSQL-atomic
+  1388→  // conditional mutation (updateMany WHERE state = 'PAYMENT_PENDING'). Only
+  1389→  // ONE worker can win this claim. The winner calls createPaymentIntent and
+  1390→  // persists the providerReference. Losers re-read and reuse the reference.
+  1391→  //
+  1392→  // Crash recovery: if the winner crashes after claiming PAYMENT_CREATING but
+  1393→  // before persisting the providerReference, the cycle is stuck in
+  1394→  // PAYMENT_CREATING. The reconciliation worker scans for cycles stuck in
+  1395→  // PAYMENT_CREATING for > 5 minutes and re-claims them (see
+  1396→  // processDueSaasFinancialReconciliation).
+  1397→  //
+  1398→  // This does NOT eliminate provider-level idempotency as a defense — it
+  1399→  // adds an APPLICATION-LEVEL guarantee that only one worker calls
+  1400→  // createPaymentIntent, without relying on the provider to deduplicate.
+  1401→  const provider = getPaymentProviderByKey(subscription.paymentProvider || "mock");
+  1402→  let providerReference: string;
+  1403→
+  1404→  // Re-read the invoice to get the current providerReference.
+  1405→  const currentInvoice = await db.tenantInvoice.findUnique({
+  1406→    where: { id: invoice.id },
+  1407→    select: { providerReference: true, paymentProvider: true },
+  1408→  });
+  1409→
+  1410→  if (currentInvoice?.providerReference) {
+  1411→    // Reuse the existing provider operation — never create a second one.
+  1412→    providerReference = currentInvoice.providerReference;
+  1413→    logger.info("saas.renewal_reusing_provider_reference", {
+  1414→      invoiceId: invoice.id, cycleId: cycle.id, providerReference,
+  1415→    });
+  1416→  } else {
+  1417→    // Phase 2B.3.16: ATOMIC CLAIM — transition cycle to PAYMENT_CREATING.
+  1418→    // Only the worker that successfully transitions PAYMENT_PENDING →
+  1419→    // PAYMENT_CREATING may call createPaymentIntent. This is a
+  1420→    // PostgreSQL-atomic conditional mutation.
+  1421→    const claim = await db.saasRenewalCycle.updateMany({
+  1422→      where: { id: cycle.id, state: "PAYMENT_PENDING" },
+  1423→      data: { state: "PAYMENT_CREATING" },
+  1424→    });
+  1425→
+  1426→    if (claim.count === 0) {
+  1427→      // Another worker is already creating the payment operation (cycle is in
+  1428→      // PAYMENT_CREATING) or has already moved past it. We must NOT call
+  1429→      // createPaymentIntent. Wait briefly for the winner to persist the
+  1430→      // providerReference, then re-read and reuse it.
+  1431→      logger.info("saas.payment_creation_claim_lost", {
+  1432→        cycleId: cycle.id, invoiceId: invoice.id,
+  1433→      });
+  1434→
+  1435→      // Wait up to 10 seconds (polling every 500ms) for the providerReference
+  1436→      // to appear. If it doesn't appear, return financial_pending — the
+  1437→      // reconciliation worker will recover the stuck cycle.
+  1438→      let waited = 0;
+  1439→      let ref: string | null = null;
+  1440→      while (waited < 10000) {
+  1441→        await new Promise((r) => setTimeout(r, 500));
+  1442→        waited += 500;
+  1443→        const reRead = await db.tenantInvoice.findUnique({
+  1444→          where: { id: invoice.id },
+  1445→          select: { providerReference: true },
+  1446→        });
+  1447→        if (reRead?.providerReference) {
+  1448→          ref = reRead.providerReference;
+  1449→          break;
+  1450→        }
+  1451→      }
+  1452→
+  1453→      if (ref) {
+  1454→        providerReference = ref;
+  1455→        logger.info("saas.payment_creation_reuse_after_wait", {
+  1456→          cycleId: cycle.id, invoiceId: invoice.id, providerReference, waitedMs: waited,
+  1457→        });
+  1458→      } else {
+  1459→        // The winner didn't persist the reference within 10 seconds.
+  1460→        // This could be a crash or a slow provider. Return financial_pending —
+  1461→        // the reconciliation worker will re-claim the cycle after 5 minutes.
+  1462→        logger.warn("saas.payment_creation_timeout", {
+  1463→          cycleId: cycle.id, invoiceId: invoice.id, waitedMs: waited,
+  1464→        });
+  1465→        return {
+  1466→          success: false,
+  1467→          status: "financial_pending",
+  1468→          reason: "Payment operation creation in progress by another worker — cycle will be recovered if stuck",
+  1469→        };
+  1470→      }
+  1471→    } else {
+  1472→      // We won the claim — we are the ONLY worker allowed to call createPaymentIntent.
+  1473→      logger.info("saas.payment_creation_claimed", {
+  1474→        cycleId: cycle.id, invoiceId: invoice.id,
+  1475→      });
+  1476→
+  1477→      // Create the payment intent at the provider.
+  1478→      const intent = await provider.createPaymentIntent({
+  1479→        amountMinor,
+  1480→        currency: plan.currency as Currency,
+  1481→        description: `SaaS renewal: ${plan.displayName} (${subscription.billingCycle})`,
+  1482→        idempotencyKey: renewalKey,
+  1483→        metadata: { tenantId, planName: plan.name, type: "saas_renewal" },
+  1484→      });
+  1485→      providerReference = intent.providerReference;
+  1486→
+  1487→      // Persist the providerReference BEFORE any other work.
+  1488→      // If persistence fails, the cycle stays in PAYMENT_CREATING — the
+  1489→      // reconciliation worker will re-claim it after 5 minutes and retry.
+  1490→      try {
+  1491→        await db.tenantInvoice.update({
+  1492→          where: { id: invoice.id },
+  1493→          data: { providerReference, paymentProvider: provider.id },
+  1494→        });
+  1495→      } catch (err) {
+  1496→        const errorMsg = err instanceof Error ? err.message : String(err);
+  1497→        logger.error("saas.providerReference_persist_failed", {
+  1498→          invoiceId: invoice.id, cycleId: cycle.id, providerReference, error: errorMsg,
+  1499→          message: "CRITICAL: Failed to persist providerReference after claiming PAYMENT_CREATING. Cycle will be recovered by the reconciliation worker after 5 minutes.",
+  1500→        });
+
+[showing lines 901-1500 of 2350; use offset=1501 with limit to continue reading]
