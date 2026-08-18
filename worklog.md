@@ -5819,3 +5819,81 @@ Stage Summary:
 - Repository hygiene: db/custom.db is no longer tracked; .gitignore updated.
 - The idempotency state machine is now ready to freeze — all proofs are real
   runtime proofs, and the stale-worker invariant holds across every path.
+
+---
+Task ID: 12.3.5
+Agent: Principal Architect (main) — Phase 12.3.5 API Version / Compatibility Contract
+Task: Define and enforce the /api/v1/* version contract. v1 = stable contract; non-breaking additions allowed; breaking changes require v2. This is the last item before Phase 12.3 can be frozen.
+
+Work Log:
+- Contract module (src/lib/api/version.ts, new):
+  - CURRENT_API_VERSION = 1 (the stable major version).
+  - SUPPORTED_API_VERSIONS = [1] (all supported versions).
+  - MIN_API_VERSION = 1 (requests to older versions get 410 Gone).
+  - isSupportedVersion(version): validates a version number.
+  - parseApiVersion(pathname): extracts the version from /api/vN/* paths.
+  - versionHeaders(version): produces X-API-Version + X-API-Stable headers.
+  - deprecationHeaders(info): produces Deprecation + Sunset + Link headers (RFC 7231).
+  - BREAKING_CHANGE_POLICY: documented in code — breaking changes require a new
+    major version. Non-breaking additions (new fields, new endpoints, new optional
+    params, new error codes) are allowed.
+  - UNKNOWN_CODE_COMPATIBILITY_RULE: clients MUST treat unknown error codes as
+    "internal_error" (forward compatibility).
+
+- Version endpoint (src/app/api/v1/version/route.ts, new):
+  GET /api/v1/version — returns the version contract metadata:
+    {
+      currentVersion: 1,
+      supportedVersions: [1],
+      stable: true,
+      deprecation: { deprecated: false },
+      contract: {
+        versionInPath: true,
+        versionNegotiation: "url-path",
+        breakingChangesRequire: "new-major-version",
+        nonBreakingAdditions: "allowed",
+        errorCodes: "stable-taxonomy",
+        requestIdHeader: "x-request-id"
+      }
+    }
+  Includes X-API-Version + X-API-Stable response headers.
+
+- Tests (tests/phase12.3-version-contract.test.ts, 8 DB-backed runtime, all PASS):
+  12.3.5.1: GET /api/v1/version → 200, returns contract metadata.
+  12.3.5.2: X-API-Version header present on v1 responses.
+  12.3.5.3: X-API-Stable header present (= true for v1).
+  12.3.5.4: unknown version (v99) → not supported (isSupportedVersion returns false).
+  12.3.5.5: parseApiVersion extracts version from /api/vN/* paths.
+  12.3.5.6: classifyError maps unknown error classes to internal_error (forward compat).
+  12.3.5.7: versionHeaders + deprecationHeaders produce correct HTTP headers.
+  12.3.5.8: real v1 route (capabilities) response is functional with session auth.
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       32/32 PASS
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 12.3.5:       8/8 PASS  (new)
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, GET /api/v1/version → 200 with contract metadata.
+  Verified via Agent Browser — no runtime/console errors.
+  Total tracked regression: 117 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The /api/v1/* version contract is now EXPLICIT and ENFORCED:
+    v1 = stable contract
+    non-breaking additions allowed
+    breaking changes require v2
+  The version endpoint (/api/v1/version) is the canonical source of truth.
+- Phase 12.3 roadmap:
+    12.3.1  Canonical API-key verification        ✅
+    12.3.2  DB-authoritative idempotency          ✅ FROZEN @ 14a82c6
+    12.3.3  Canonical error envelope              ✅
+    12.3.4  Request correlation                  ✅
+    12.3.5  Version/compatibility contract       ✅ (this commit)
+    12.3.6  Wire API-key auth into routes         ✅
+    12.3.7  Migrate commerce idempotency          ✅
+- Phase 12.3 is now ready for a fresh architecture audit before freezing.
+- Known maintenance item outside this freeze: Phase 9.5.1 A1 (BUDGET_CONSTRAINT).
