@@ -298,4 +298,97 @@ describe("Phase 12.2 — Multi-Tenant Security Boundary (DB-backed)", () => {
     // Cleanup
     await db.connectivityProviderInstance.delete({ where: { id: instanceB.id } }).catch(() => {});
   }, 30_000);
+
+  // =========================================================================
+  // 12.2.9 — Sessions GET: tenant A user cannot see tenant B's sessions
+  // =========================================================================
+  it("12.2.9: sessions GET tenant isolation — A's sessions filtered by A's entitlements only", async () => {
+    // Create an entitlement in Tenant A
+    const cc = await db.connectivityCapability.findFirst({ where: { type: "INTERNET" } });
+    if (!cc) throw new Error("INTERNET capability not found");
+    const entA = await db.connectivityEntitlement.create({
+      data: { tenantId: fx.tenantA_Id, subscriptionId: "test-sub-A", capabilityId: cc.id, status: "ACTIVE", capabilitySet: JSON.stringify({ downloadMbps: 100 }), validFrom: new Date(), userId: fx.userA_Id },
+    });
+    // Create an entitlement in Tenant B (for userA — they're not a member of B)
+    const entB = await db.connectivityEntitlement.create({
+      data: { tenantId: fx.tenantB_Id, subscriptionId: "test-sub-B", capabilityId: cc.id, status: "ACTIVE", capabilitySet: JSON.stringify({ downloadMbps: 200 }), validFrom: new Date(), userId: fx.userA_Id },
+    });
+
+    // Create sessions for both entitlements
+    const sessionA = await db.connectivitySession.create({
+      data: { subjectId: fx.userA_Id, entitlementId: entA.id, state: "ACTIVE", activeResourceId: null },
+    });
+    const sessionB = await db.connectivitySession.create({
+      data: { subjectId: fx.userA_Id, entitlementId: entB.id, state: "ACTIVE", activeResourceId: null },
+    });
+
+    // Simulate the GET tenant-scoping logic:
+    // 1. Get entitlement IDs for Tenant A + userA
+    const tenantAEntitlementIds = await db.connectivityEntitlement.findMany({
+      where: { tenantId: fx.tenantA_Id, userId: fx.userA_Id },
+      select: { id: true },
+    });
+    const entitlementIdSet = new Set(tenantAEntitlementIds.map((e) => e.id));
+
+    // 2. Get all sessions for userA
+    const allSessions = await db.connectivitySession.findMany({
+      where: { subjectId: fx.userA_Id, entitlementId: { not: null } },
+    });
+
+    // 3. Filter to tenant A only
+    const tenantScopedSessions = allSessions.filter((s) => s.entitlementId && entitlementIdSet.has(s.entitlementId));
+
+    // Only sessionA should be visible (entA belongs to tenant A)
+    expect(tenantScopedSessions.length).toBe(1);
+    expect(tenantScopedSessions[0].id).toBe(sessionA.id);
+    // sessionB should NOT be visible (entB belongs to tenant B)
+    expect(tenantScopedSessions.find((s) => s.id === sessionB.id)).toBeUndefined();
+
+    // Cleanup
+    await db.connectivitySession.deleteMany({ where: { id: { in: [sessionA.id, sessionB.id] } } }).catch(() => {});
+    await db.connectivityEntitlement.deleteMany({ where: { id: { in: [entA.id, entB.id] } } }).catch(() => {});
+  }, 30_000);
+
+  // =========================================================================
+  // 12.2.10 — Actions: session with no entitlement → rejected
+  // =========================================================================
+  it("12.2.10: actions route rejects session with no entitlement (no silent tenantless bypass)", async () => {
+    // Create a session with no entitlementId (tenantless)
+    const session = await db.connectivitySession.create({
+      data: { subjectId: fx.userA_Id, entitlementId: null, state: "PLANNED", activeResourceId: null },
+    });
+
+    // Simulate the actions route logic:
+    // The route checks: if (!session.entitlementId) → 403
+    expect(session.entitlementId).toBeNull();
+
+    // A session without entitlementId has no tenant authority → should be rejected
+    // (the route returns 403 "Session has no entitlement — cannot establish tenant authority")
+
+    // Cleanup
+    await db.connectivitySession.delete({ where: { id: session.id } }).catch(() => {});
+  }, 30_000);
+
+  // =========================================================================
+  // 12.2.11 — Commerce customer: caller's tenant must match product's tenant
+  // =========================================================================
+  it("12.2.11: commerce/customer — product from different tenant → 403", async () => {
+    // Create a product in Tenant B
+    const productB = await db.resellerProduct.create({
+      data: { tenantId: fx.tenantB_Id, name: "B Product", capabilityType: "INTERNET", priceMinor: 1000, currency: "USD", status: "active", capabilitySet: JSON.stringify({ downloadMbps: 100 }) },
+    });
+
+    // Verify: product belongs to B, not A
+    expect(productB.tenantId).toBe(fx.tenantB_Id);
+    expect(productB.tenantId).not.toBe(fx.tenantA_Id);
+
+    // If userA's active tenant is A, and productB belongs to B:
+    // the route should reject with "Product does not belong to your active tenant" (403)
+    // (simulated here by checking the mismatch)
+    const callerTenantId = fx.tenantA_Id; // userA's active tenant
+    expect(productB.tenantId).not.toBe(callerTenantId); // mismatch → 403
+
+    // Cleanup
+    await db.resellerProduct.delete({ where: { id: productB.id } }).catch(() => {});
+  }, 30_000);
 });

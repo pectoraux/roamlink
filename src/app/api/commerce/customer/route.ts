@@ -14,6 +14,7 @@ import { db } from "@/lib/db";
 import { hashPassword } from "@/lib/security";
 import { logger } from "@/lib/logger";
 import { getCurrentUser } from "@/lib/auth";
+import { requireTenantContext } from "@/lib/tenant/context";
 
 export async function POST(req: NextRequest) {
   // Phase 12.2 P1-2: Require authentication.
@@ -21,6 +22,10 @@ export async function POST(req: NextRequest) {
   if (!authUser) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
+
+  // Phase 12.2 P0-7: Require tenant context — the caller must have an active
+  // tenant, and that tenant must match the product's tenant.
+  const ctx = await requireTenantContext(authUser);
 
   const body = await req.json();
   const { email, name, productId } = body;
@@ -42,7 +47,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Product not found or inactive" }, { status: 404 });
   }
 
-  const tenantId = product.tenantId;
+  // Phase 12.2 P0-7: Verify the product's tenant matches the caller's active tenant.
+  if (product.tenantId !== ctx.tenantId) {
+    return NextResponse.json({ error: "Product does not belong to your active tenant" }, { status: 403 });
+  }
+
+  const tenantId = ctx.tenantId;
 
   // Find or create the user
   let user = await db.user.findUnique({

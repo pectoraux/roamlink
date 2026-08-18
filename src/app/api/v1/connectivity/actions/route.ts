@@ -44,15 +44,18 @@ export async function POST(req: NextRequest) {
   if (session.subjectId !== user.id) {
     return NextResponse.json({ error: "Session does not belong to this user" }, { status: 403 });
   }
-  // Verify the entitlement (if linked) belongs to the tenant.
-  if (session.entitlementId) {
-    const entitlement = await db.connectivityEntitlement.findUnique({
-      where: { id: session.entitlementId },
-      select: { tenantId: true },
-    });
-    if (!entitlement || entitlement.tenantId !== ctx.tenantId) {
-      return NextResponse.json({ error: "Session entitlement does not belong to this tenant" }, { status: 403 });
-    }
+  // Phase 12.2 P0-6: Verify the session has an entitlement AND it belongs to this tenant.
+  // A tenantless session (entitlementId = null) is rejected — the API requires
+  // an authoritative tenant relationship for every action-bearing session.
+  if (!session.entitlementId) {
+    return NextResponse.json({ error: "Session has no entitlement — cannot establish tenant authority" }, { status: 403 });
+  }
+  const entitlement = await db.connectivityEntitlement.findUnique({
+    where: { id: session.entitlementId },
+    select: { tenantId: true },
+  });
+  if (!entitlement || entitlement.tenantId !== ctx.tenantId) {
+    return NextResponse.json({ error: "Session entitlement does not belong to this tenant" }, { status: 403 });
   }
 
   const action = await createAction({
