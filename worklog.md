@@ -3912,3 +3912,57 @@ Stage Summary:
 - The architectural rule is fully enforced: "Every state-changing connectivity mutation must be authorized by the currently valid session execution claim at the mutation boundary, not merely preceded by a successful observation of ownership."
 - Phase 11.2 is now ready to freeze.
 - Next: Phase 11.3 — Provider truth flips mid-execution.
+
+---
+Task ID: 11.2.5
+Agent: Principal Architect (main) — Phase 11.2.5 Atomic Session-Lease Fence Around Resource Mutations
+Task: Close the TOCTOU inside the resource helpers identified in the architect's audit of fdd683d. fencedReserveResource/MarkInUse/ReleaseResource used a SELECT inside the transaction (not a conditional UPDATE), so a concurrent reclaim could clear the claim between the SELECT and the resource mutation. read claim inside transaction ≠ claim-authorized mutation.
+
+Work Log:
+- Audited fdd683d directly. Confirmed the TOCTOU:
+  - fencedReserveResource did: BEGIN → SELECT session (check claimId + expiry) → UPDATE ProtocolResource → COMMIT.
+  - A concurrent reclaim/reacquire could clear the claim between the SELECT and the resource UPDATE.
+  - The SELECT inside a transaction does NOT prevent a concurrent UPDATE from clearing the claim (SQLite default isolation doesn't serialize reads + writes across rows this way).
+
+- Fix — withValidSessionExecutionLease primitive (session-execution-slot.ts):
+  - The FIRST operation inside the transaction is a conditional UPDATE on the session row (not a SELECT):
+      UPDATE ConnectivitySession
+      SET executionSlotClaimExpiresAt = now + lease   -- renew the lease
+      WHERE id = sessionId
+        AND executionSlotClaimId = claimId             -- must still hold the claim
+        AND executionSlotClaimExpiresAt > now           -- lease must still be valid
+  - If affectedRows != 1, the claim is invalid → return without performing the resource mutation.
+  - The UPDATE takes the row lock — a concurrent reclaim/reacquire must wait, then reevaluate the predicate against the committed lease state.
+  - Side effect: the lease is renewed as part of authorizing the mutation. The worker's lease is extended while it holds the slot and performs mutations.
+
+- Rewrote all three resource helpers to use withValidSessionExecutionLease:
+  - fencedReserveResource: conditional session UPDATE + resource reserve
+  - fencedMarkResourceInUse: conditional session UPDATE + mark IN_USE
+  - fencedReleaseResource: conditional session UPDATE + resource release
+
+- Adversarial test (11.2.11, DB-backed runtime, PASS):
+  - Worker A starts fencedReserveResource.
+  - Concurrently, Worker B expires A's lease + reclaims.
+  - After both complete:
+    - If A reserved the resource (reserveResult.reserved=true), A's conditional UPDATE succeeded (A was authorized at mutation time).
+    - If A did NOT reserve (reserveResult.reserved=false), A's conditional UPDATE failed (claim invalid) OR resource was taken. No unauthorized mutation.
+  - The forbidden TOCTOU outcome (A's read succeeds, B reclaims, A's resource mutation still happens) is impossible — the conditional UPDATE and the resource mutation are in the same transaction.
+  - Initial test version failed because it checked `aHoldsSlot` after the contention path reclaimed A's slot. Fixed: the correct invariant is that A's resource mutation only happens if A's conditional UPDATE succeeded (authorized at mutation time), not that A still holds the slot afterward (B may legitimately reclaim after A commits).
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Phase 10/10.1.1:      13/13 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 36 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 74ccbd2 (on GitHub, verified: git ls-remote origin main → 74ccbd2)
+- The TOCTOU inside the resource helpers is closed. The resource mutations are now authorized by a conditional session-row UPDATE inside the same transaction — not merely a SELECT.
+- The architectural rule is fully enforced with durable DB-level authorization:
+  "Every state-changing connectivity mutation must be authorized by the currently valid session execution claim at the mutation boundary, not merely preceded by a successful observation of ownership."
+  read claim inside transaction ≠ claim-authorized mutation
+  conditional session UPDATE in transaction = claim-authorized mutation
+- Phase 11.2 is now ready to freeze.
+- Next: Phase 11.3 — Provider truth flips mid-execution.
