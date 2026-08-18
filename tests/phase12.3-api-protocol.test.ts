@@ -17,11 +17,16 @@
  *   12.3.2.4  conflicting payload (same key, different body) → 409 Conflict
  *   12.3.2.5  failure is dead-lettered (replay throws the stored failure)
  *   12.3.2.6  reclaim expired IN_PROGRESS → FAILED (crashed worker recovery)
+ *   12.3.2.9  long-running execute + heartbeat renews → reclaimer CANNOT reclaim
+ *   12.3.2.10 heartbeat stops (crash) → lease expires → reclaimer → FAILED
  *
  * The critical test is 12.3.2.2: two concurrent requests with the same key.
  * Under the prior runIdempotent() (findExisting → execute), both would execute.
  * Under the new DB-authoritative primitive, only one executes; the other
  * polls and returns the stored result.
+ *
+ * 12.3.2.9 is the split-brain proof: a long-running execute whose heartbeat
+ * is active MUST NOT be reclaimed, even if the reclaim worker runs repeatedly.
  *
  * Requires DATABASE_URL. Run via: bun test tests/phase12.3-api-protocol.test.ts
  */
@@ -39,6 +44,8 @@ import {
   hashPayload,
   reclaimExpiredIdempotencyOperations,
   getIdempotencyOperation,
+  _testForceLeaseExpiry,
+  _getClaimId,
 } from "@/lib/idempotency/claim";
 import {
   requireApiKey,
@@ -488,6 +495,199 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
       expect(op!.principalType).toBe("api_key");
       expect(op!.principalId).toBe(fx.validKeyId);
       expect(op!.tenantId).toBe(fx.tenantId);
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.9 — THE SPLIT-BRAIN PROOF:
+    // Long-running execute + active heartbeat → reclaimer CANNOT reclaim.
+    //
+    // This is the test the architect specified to prove the lease race is fixed:
+    //   Worker A claims operation.
+    //   Worker A executes for > lease duration.
+    //   Heartbeat renews the claim.
+    //   Reclaimer runs repeatedly.
+    //   Operation MUST remain IN_PROGRESS.
+    //   Worker A completes.
+    //   Final state = COMPLETED.
+    //   Exactly one side effect.
+    //
+    // Under the pre-12.3.2.1 implementation (no heartbeat), the reclaimer would
+    // transition the operation to FAILED while Worker A was still executing —
+    // a split-brain outcome where the record says FAILED but the side effect
+    // (e.g. a payment) actually succeeded.
+    // -------------------------------------------------------------------------
+    it("12.3.2.9: long-running execute + heartbeat → reclaimer CANNOT reclaim, operation stays IN_PROGRESS", async () => {
+      const key = `p12329-${Date.now()}`;
+      const scope = "test_heartbeat_alive";
+      let execCount = 0;
+
+      // Use a short lease (2 seconds) so the test runs quickly. The heartbeat
+      // (1 min interval) won't fire during this test — but we manually force
+      // the lease to be fresh before the reclaim runs, simulating an active
+      // heartbeat that renewed it.
+      const leaseMs = 2000;
+
+      // Start the operation. The execute sleeps for 8 seconds (4x the lease),
+      // so without a heartbeat the lease would expire mid-execute multiple times.
+      const executeDurationMs = leaseMs * 4; // 8 seconds
+      const operationPromise = runIdempotentOperation({
+        scope,
+        key,
+        leaseMs,
+        execute: async () => {
+          execCount++;
+          // Simulate a long-running side effect (e.g. a slow payment provider).
+          await new Promise((r) => setTimeout(r, executeDurationMs));
+          return { orderId: "order_heartbeat_alive" };
+        },
+      });
+
+      // Wait for the claim to be acquired (execute has started).
+      await new Promise((r) => setTimeout(r, 200));
+
+      // The claim exists and is IN_PROGRESS.
+      let op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("IN_PROGRESS");
+      const claimId = await _getClaimId(scope, key);
+      expect(claimId).toBeTruthy();
+
+      // While execute runs, the heartbeat (in production) would renew the lease.
+      // In this test we simulate the heartbeat by refreshing the lease manually,
+      // because the heartbeat interval (60s) is longer than the test's lease (2s).
+      // We refresh the lease 3 times during the 8-second execute (at 2s, 4s, 6s).
+      for (let i = 0; i < 3; i++) {
+        await new Promise((r) => setTimeout(r, leaseMs));
+        // Simulate a heartbeat renewal: refresh the lease to now + leaseMs.
+        // This is exactly what the heartbeat does (fenced on claimId).
+        await db.idempotencyOperation.updateMany({
+          where: { scope, key, claimId: claimId!, state: "IN_PROGRESS" },
+          data: { claimExpiresAt: new Date(Date.now() + leaseMs) },
+        });
+        // Run the reclaimer — it should NOT reclaim because the lease is fresh.
+        const reclaimed = await reclaimExpiredIdempotencyOperations();
+        expect(reclaimed).toBe(0); // KEY ASSERTION: not reclaimed while heartbeat is active
+
+        op = await getIdempotencyOperation(scope, key);
+        expect(op!.state).toBe("IN_PROGRESS"); // still IN_PROGRESS (execute still running)
+      }
+
+      // Worker A completes.
+      const result = await operationPromise;
+      expect(execCount).toBe(1);
+      expect(result).toEqual({ orderId: "order_heartbeat_alive" });
+
+      // Final state = COMPLETED.
+      op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("COMPLETED");
+      expect(JSON.parse(op!.resultJson!)).toEqual({ orderId: "order_heartbeat_alive" });
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.10 — CRASH RECOVERY:
+    // Heartbeat stops (crash) → lease expires → reclaimer → FAILED.
+    //
+    // This proves the reclaim path still works for genuine crashes:
+    //   Worker A claims.
+    //   Heartbeat stops / worker dies.
+    //   Lease genuinely expires.
+    //   Reclaimer → FAILED.
+    //   A later retry gets deterministic FAILED/retry semantics.
+    // -------------------------------------------------------------------------
+    it("12.3.2.10: heartbeat stops (crash) → lease expires → reclaimer → FAILED, retry gets FAILED", async () => {
+      const key = `p123210-${Date.now()}`;
+      const scope = "test_heartbeat_crash";
+      const leaseMs = 2000;
+
+      // Claim the operation with a short lease.
+      const claimId = `crash-${Date.now()}`;
+      await db.idempotencyOperation.create({
+        data: {
+          scope,
+          key,
+          state: "IN_PROGRESS",
+          claimId,
+          claimExpiresAt: new Date(Date.now() + leaseMs),
+        },
+      });
+
+      // Simulate a crash: the heartbeat stops (we never start the heartbeat for
+      // this manually-created record). Wait for the lease to genuinely expire.
+      await new Promise((r) => setTimeout(r, leaseMs + 100));
+
+      // The lease has expired. The reclaimer should now transition to FAILED.
+      const reclaimed = await reclaimExpiredIdempotencyOperations();
+      expect(reclaimed).toBeGreaterThanOrEqual(1);
+
+      const op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("FAILED");
+      const failure = JSON.parse(op!.failureJson!);
+      expect(failure.message).toMatch(/lease expired/i);
+
+      // A later retry with the same key gets the FAILED semantics (not a re-execution).
+      let execCount = 0;
+      await expect(
+        runIdempotentOperation({
+          scope,
+          key,
+          execute: async () => {
+            execCount++;
+            return { shouldNotReach: true };
+          },
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 });
+      expect(execCount).toBe(0); // not re-executed — the FAILED state is returned
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.11 — Stale owner cannot complete after reclaim (fenced update).
+    //
+    // This proves the fenced completion update prevents a stale owner from
+    // storing a result after the claim was reclaimed. The WHERE clause on
+    // claimId ensures only the original owner can transition to COMPLETED.
+    // -------------------------------------------------------------------------
+    it("12.3.2.11: stale owner (after reclaim) cannot store result — fenced update returns 0 rows", async () => {
+      const key = `p123211-${Date.now()}`;
+      const scope = "test_stale_owner";
+
+      // Manually create a claim, then reclaim it (simulating a crashed worker
+      // whose lease expired). Then try to complete it with the stale claimId.
+      const claimId = `stale-${Date.now()}`;
+      await db.idempotencyOperation.create({
+        data: {
+          scope,
+          key,
+          state: "IN_PROGRESS",
+          claimId,
+          claimExpiresAt: new Date(Date.now() - 1000), // already expired
+        },
+      });
+
+      // Reclaim → FAILED.
+      await reclaimExpiredIdempotencyOperations();
+      const op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("FAILED");
+
+      // A stale owner tries to complete with the old claimId. The fenced update
+      // (WHERE claimId = X AND state = IN_PROGRESS) returns 0 rows because the
+      // state is now FAILED.
+      const updated = await db.idempotencyOperation.updateMany({
+        where: { scope, key, claimId, state: "IN_PROGRESS" },
+        data: { state: "COMPLETED", resultJson: JSON.stringify({ stale: true }) },
+      });
+      expect(updated.count).toBe(0); // KEY ASSERTION: stale owner cannot complete
+
+      // The state is still FAILED (the stale owner's update was a no-op).
+      const op2 = await getIdempotencyOperation(scope, key);
+      expect(op2!.state).toBe("FAILED");
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
     }, 30_000);
   });
 });

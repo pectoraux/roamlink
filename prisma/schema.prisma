@@ -1376,8 +1376,16 @@ model IdempotencyOperation {
   tenantId        String?
   principalId     String?  // user.id or api_key.id
   principalType   String?  // "session" | "api_key"
+  // Phase 12.3.2.1: Fenced ownership token. Generated when the claim is
+  // acquired. All lease renewals and terminal-state transitions use a
+  // conditional WHERE clause on claimId — only the claim owner can renew
+  // or complete. A stale owner (whose claim was reclaimed after genuine
+  // lease expiry) cannot extend the lease or store a result.
+  claimId         String?
   // Lease: when this claim expires if still IN_PROGRESS (crashed worker recovery).
-  // A reclaim worker can transition expired IN_PROGRESS → FAILED after the lease.
+  // The heartbeat renews this while execute() runs. A reclaim worker can only
+  // transition to FAILED when this has genuinely expired AND the owner is not
+  // actively renewing it (the fenced renewal uses claimId).
   claimExpiresAt  DateTime?
   createdAt       DateTime @default(now())
   completedAt     DateTime?
@@ -1386,6 +1394,7 @@ model IdempotencyOperation {
   @@index([state])
   @@index([claimExpiresAt])
   @@index([tenantId])
+  @@index([claimId])
 }
 
 // ---------------------------------------------------------------------------

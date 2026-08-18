@@ -1,60 +1,65 @@
 /**
  * Phase 12.3.2 — DB-authoritative idempotency primitive.
  *
- * This module replaces the race-prone `runIdempotent()` in lib/orders/idempotency.ts.
+ * Phase 12.3.2.1: The lease is now RENEWABLE via a heartbeat while execute()
+ * runs, with fenced ownership (claimId). This closes the split-brain race the
+ * architect identified:
+ *
+ *   THE BUG (pre-12.3.2.1):
+ *     Worker A claims (lease = 5 min).
+ *     Worker A executes for > 5 min (e.g. a slow payment provider).
+ *     Reclaim worker sees IN_PROGRESS + expired lease → transitions to FAILED.
+ *     Worker A's side effect actually completes (the payment goes through).
+ *     Result: the record says FAILED even though the payment succeeded.
+ *     A retry may initiate a SECOND payment. Split-brain outcome.
+ *
+ *   THE FIX (12.3.2.1):
+ *     Worker A claims (lease = 5 min, claimId = random UUID).
+ *     Worker A starts execute(). A heartbeat (setInterval) renews the lease
+ *       every RENEWAL_INTERVAL_MS via a fenced update:
+ *         WHERE claimId = X AND state = IN_PROGRESS
+ *       The fenced update means only the claim owner can renew. A stale owner
+ *       (whose claim was reclaimed) cannot extend the lease.
+ *     Reclaim worker runs but the lease is fresh (heartbeat renewed it).
+ *       Operation STAYS IN_PROGRESS.
+ *     Worker A completes → fenced update to COMPLETED.
+ *     Exactly one side effect.
+ *
+ *   CRASH RECOVERY:
+ *     Worker A claims.
+ *     Worker A crashes (heartbeat stops, process dies).
+ *     Lease genuinely expires (no renewal).
+ *     Reclaim worker → FAILED.
+ *     A later retry gets deterministic FAILED semantics.
+ *
+ * This mirrors the Phase 11.2 session-execution-slot pattern: fenced ownership
+ * + heartbeat renewal + conditional terminal transitions.
  *
  * ARCHITECTURE
  * ============
  *
- * The INSERT is the atomic claim. There is no read-then-write window.
- *
- *   claim (INSERT, unique on (scope, key)) → IN_PROGRESS
+ *   claim (INSERT, unique on (scope, key), claimId = UUID) → IN_PROGRESS
  *     ↓
- *     ├─ execute succeeds → UPDATE state=COMPLETED, resultJson=...
- *     ├─ execute fails   → UPDATE state=FAILED, failureJson=...
- *     └─ concurrent request → P2002 unique violation → poll for terminal state
+ *     ├─ start heartbeat (renews lease every RENEWAL_INTERVAL_MS via fenced update)
+ *     ├─ execute()
+ *     │    ├─ succeeds → fenced UPDATE state=COMPLETED (WHERE claimId=X AND state=IN_PROGRESS)
+ *     │    └─ fails   → fenced UPDATE state=FAILED   (WHERE claimId=X AND state=IN_PROGRESS)
+ *     └─ stop heartbeat
  *
- * A concurrent request that loses the claim race (Prisma throws P2002 on the
- * INSERT) does NOT execute the side effect. It polls the claim record until it
- * reaches a terminal state (COMPLETED | FAILED), then:
- *   - COMPLETED → returns the stored result (clean replay)
- *   - FAILED    → throws the stored failure (dead-letter, caller retries with a new key)
+ *   concurrent request → P2002 unique violation → poll for terminal state
  *
- * PAYLOAD CONFLICT DETECTION
- * ==========================
- *
- * If two requests use the same idempotency key but different payloads, the second
- * is rejected with 409 Conflict. This catches "idempotency key reuse with a
- * different request" — a protocol error, not a retry.
- *
- * LEASE / CRASH RECOVERY
- * ======================
- *
- * A claim has a lease (default 5 minutes). If the executing process crashes
- * while IN_PROGRESS, the claim's lease expires. A reclaim worker
- * (reclaimExpiredIdempotencyOperations) transitions expired IN_PROGRESS → FAILED
- * so a future request with the same key gets a clean failure (not a hung poll).
- *
- * USAGE
- * =====
- *
- *   const result = await runIdempotentOperation({
- *     scope: "checkout",
- *     key: body.idempotencyKey,
- *     payloadHash: hashPayload(body),
- *     principal: { type: "session", id: user.id, tenantId: ctx.tenantId },
- *     execute: async () => createOrder(...),
- *   });
- *
- * The `execute` callback runs AT MOST ONCE per (scope, key) pair. If the process
- * crashes mid-execute, the lease expires and the operation is dead-lettered.
+ * The fenced updates guarantee:
+ *   - Only the claim owner can renew the lease or transition to a terminal state.
+ *   - A stale owner (reclaimed) gets 0 rows affected → detects the loss.
+ *   - The reclaim worker only transitions IN_PROGRESS → FAILED when the lease
+ *     has genuinely expired (the owner is not renewing).
  */
 
 import { db } from "@/lib/db";
 import { logger } from "@/lib/logger";
 import { AppError, type ErrorClass } from "@/lib/errors";
 import { Prisma } from "@prisma/client";
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -73,6 +78,7 @@ export type IdempotencyClaim = {
   resultJson: string | null;
   failureJson: string | null;
   payloadHash: string | null;
+  claimId: string | null;
 };
 
 export type IdempotencyResult<T> =
@@ -90,7 +96,20 @@ export type StoredFailure = {
 // Configuration
 // ---------------------------------------------------------------------------
 
-const DEFAULT_LEASE_MS = 5 * 60 * 1000; // 5 minutes
+/**
+ * Default lease duration. A claim's lease expires after this if the owner
+ * is not actively renewing it (heartbeat). 5 minutes — matches Phase 11.
+ */
+const DEFAULT_LEASE_MS = 5 * 60 * 1000;
+
+/**
+ * How often the heartbeat renews the lease while execute() runs.
+ * Must be substantially shorter than the lease so that a single missed
+ * heartbeat doesn't let the lease expire. 1/5 of the lease — even 4 missed
+ * heartbeats in a row still leave time before expiry.
+ */
+const RENEWAL_INTERVAL_MS = 60 * 1000; // 1 minute (lease is 5 min)
+
 const POLL_INTERVAL_MS = 50;
 const POLL_TIMEOUT_MS = 30 * 1000; // 30 seconds max to wait for a concurrent op
 
@@ -136,6 +155,83 @@ function isUniqueConstraintViolation(err: unknown): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Fenced renewal: heartbeat keeps the lease alive while execute() runs
+// ---------------------------------------------------------------------------
+
+/**
+ * A fenced lease renewal context. The heartbeat uses this to renew the lease
+ * periodically. If a renewal fails (claim was reclaimed), the context flags
+ * the loss so the execute() completion can detect it.
+ */
+type LeaseContext = {
+  claimId: string;
+  scope: string;
+  key: string;
+  leaseMs: number;
+  /** Set to true if a fenced renewal failed (claim was reclaimed). */
+  lost: boolean;
+  /** The interval handle, used to stop the heartbeat. */
+  heartbeatHandle: ReturnType<typeof setInterval> | null;
+};
+
+/**
+ * Start the heartbeat that renews the lease while execute() runs.
+ * The renewal is fenced: WHERE claimId = X AND state = IN_PROGRESS.
+ * If the renewal fails (0 rows), the claim was reclaimed — flag the loss.
+ */
+function startLeaseHeartbeat(ctx: LeaseContext): void {
+  ctx.heartbeatHandle = setInterval(async () => {
+    if (ctx.lost) return; // already lost — don't keep trying
+    try {
+      const renewed = await db.idempotencyOperation.updateMany({
+        where: {
+          scope: ctx.scope,
+          key: ctx.key,
+          claimId: ctx.claimId,
+          state: "IN_PROGRESS",
+        },
+        data: {
+          claimExpiresAt: new Date(Date.now() + ctx.leaseMs),
+        },
+      });
+      if (renewed.count === 0) {
+        // The claim was reclaimed (lease genuinely expired and a reclaim
+        // worker transitioned it to FAILED). We are now a stale owner.
+        // Flag the loss — the execute() completion will detect it.
+        ctx.lost = true;
+        logger.error("idempotency.heartbeat_renewal_failed", {
+          scope: ctx.scope,
+          key: ctx.key,
+          claimId: ctx.claimId,
+          message: "Lease renewal returned 0 rows — claim was reclaimed.",
+        });
+        stopHeartbeat(ctx);
+      }
+    } catch (err) {
+      // Transient DB error — don't flag as lost yet (the next heartbeat will retry).
+      // If the DB is genuinely down, the lease will eventually expire and the
+      // reclaim worker will handle it.
+      logger.warn("idempotency.heartbeat_renewal_error", {
+        scope: ctx.scope,
+        key: ctx.key,
+        claimId: ctx.claimId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }, RENEWAL_INTERVAL_MS);
+}
+
+/**
+ * Stop the heartbeat. Called after execute() completes (success or failure).
+ */
+function stopHeartbeat(ctx: LeaseContext): void {
+  if (ctx.heartbeatHandle) {
+    clearInterval(ctx.heartbeatHandle);
+    ctx.heartbeatHandle = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Primitive: runIdempotentOperation
 // ---------------------------------------------------------------------------
 
@@ -143,16 +239,25 @@ function isUniqueConstraintViolation(err: unknown): boolean {
  * Run an operation exactly once per (scope, key) pair. The INSERT is the atomic
  * claim — concurrent requests lose the race and poll for the terminal result.
  *
+ * Phase 12.3.2.1: The lease is renewable via a heartbeat while execute() runs.
+ * A long-running side effect (e.g. a slow payment provider) cannot be reclaimed
+ * as long as the owner is alive and renewing. Only a genuine crash (heartbeat
+ * stops) leads to lease expiry and reclamation.
+ *
  * Behavior:
- *   - First caller: claims (INSERT IN_PROGRESS), executes, stores result/failure.
+ *   - First caller: claims (INSERT IN_PROGRESS, claimId=UUID), starts heartbeat,
+ *     executes, fenced-update to COMPLETED/FAILED, stops heartbeat.
  *   - Concurrent caller (P2002 on INSERT): polls until COMPLETED or FAILED.
- *     - COMPLETED → returns the stored result (replay=true).
+ *     - COMPLETED → returns the stored result (replay).
  *     - FAILED → throws the stored failure.
  *   - Conflicting payload (same key, different payloadHash): 409 Conflict.
- *   - Replayed key (same key, same payloadHash, already COMPLETED): returns stored result.
+ *   - Stale owner (claim reclaimed during execute): fenced completion update
+ *     returns 0 rows → throws 409 (the side effect ran but the result is
+ *     orphaned — the caller must retry with a new key).
  *
  * @throws AppError("conflict", 409) if the key is reused with a different payload.
  * @throws AppError("conflict", 409) if the operation is still IN_PROGRESS after POLL_TIMEOUT_MS.
+ * @throws AppError("conflict", 409) if the claim was reclaimed during execute (stale owner).
  * @throws (re-thrown) the stored failure if the operation previously FAILED.
  */
 export async function runIdempotentOperation<T>(input: {
@@ -168,6 +273,9 @@ export async function runIdempotentOperation<T>(input: {
     throw new AppError("validation", "scope and key are required for idempotency", 400, "Idempotency scope and key are required.");
   }
 
+  const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
+  const claimId = randomUUID();
+
   // Step 1: Try to CLAIM the operation via INSERT.
   // This is the atomic primitive — if two requests race, only one INSERT succeeds.
   try {
@@ -180,7 +288,8 @@ export async function runIdempotentOperation<T>(input: {
         tenantId: input.principal?.tenantId ?? null,
         principalId: input.principal?.id ?? null,
         principalType: input.principal?.type ?? null,
-        claimExpiresAt: new Date(Date.now() + (input.leaseMs ?? DEFAULT_LEASE_MS)),
+        claimId,
+        claimExpiresAt: new Date(Date.now() + leaseMs),
       },
     });
   } catch (err) {
@@ -193,17 +302,29 @@ export async function runIdempotentOperation<T>(input: {
     return pollForTerminalResult<T>(scope, key, input.payloadHash ?? null);
   }
 
-  // Step 2: We hold the claim. Execute the side effect.
+  // Step 2: We hold the claim. Start the heartbeat, then execute.
+  const leaseCtx: LeaseContext = {
+    claimId,
+    scope,
+    key,
+    leaseMs,
+    lost: false,
+    heartbeatHandle: null,
+  };
+  startLeaseHeartbeat(leaseCtx);
+
   try {
     const result = await input.execute();
 
-    // Store the result and transition to COMPLETED.
-    // Use a conditional updateMany to avoid overwriting a concurrent reclaim
-    // (if the lease expired and a reclaim worker marked it FAILED while we
-    // were executing). Only transition if still IN_PROGRESS.
+    // Stop the heartbeat before the terminal update.
+    stopHeartbeat(leaseCtx);
+
+    // Store the result via a FENCED update: only the claim owner can transition
+    // to COMPLETED. If the claim was reclaimed (lease expired, heartbeat failed),
+    // this returns 0 rows — the result is orphaned.
     const resultJson = JSON.stringify(result);
     const updated = await db.idempotencyOperation.updateMany({
-      where: { scope, key, state: "IN_PROGRESS" },
+      where: { scope, key, claimId, state: "IN_PROGRESS" },
       data: {
         state: "COMPLETED",
         resultJson,
@@ -213,47 +334,73 @@ export async function runIdempotentOperation<T>(input: {
     });
 
     if (updated.count === 0) {
-      // The lease expired and a reclaim worker transitioned this to FAILED
-      // while we were executing. This is a rare edge case. The result is
-      // orphaned — we executed the side effect but cannot store the result.
-      // Log it; the caller will see a conflict on retry.
-      logger.error("idempotency.lease_expired_during_execute", {
+      // The claim was reclaimed while we were executing. The side effect ran
+      // (e.g. the payment went through) but we cannot store the result — the
+      // record now says FAILED. This is the split-brain edge case.
+      //
+      // We log it as a critical error and throw 409. The caller must retry with
+      // a new idempotency key. The caller's retry will see the FAILED record and
+      // (depending on the failure semantics) may or may not re-execute.
+      //
+      // IMPORTANT: this can only happen if the heartbeat FAILED to renew the
+      // lease for > leaseMs (e.g. the DB was unreachable for 5+ minutes). Under
+      // normal operation, the heartbeat keeps the lease alive and this branch
+      // is unreachable.
+      logger.error("idempotency.claim_reclaimed_during_execute", {
         scope,
         key,
-        message: "Operation lease expired during execute; result could not be stored.",
+        claimId,
+        message: "Claim was reclaimed during execute; side effect ran but result could not be stored. Possible split-brain — caller must retry with a new key.",
       });
       throw new AppError(
         "conflict",
-        "Idempotency operation lease expired during execute",
+        "Idempotency claim was reclaimed during execute (lease renewal failed)",
         409,
-        "Your request took too long and the idempotency lease expired. Please retry with a new idempotency key.",
+        "Your request took too long and the idempotency lease could not be renewed. Please retry with a new idempotency key.",
       );
     }
 
-    logger.info("idempotency.operation_completed", { scope, key });
+    logger.info("idempotency.operation_completed", { scope, key, claimId });
     return result;
   } catch (err) {
-    // The side effect failed. Dead-letter the operation so a future request
-    // with the same key gets the failure (not a silent retry).
-    const failure = serializeFailure(err);
+    // Stop the heartbeat.
+    stopHeartbeat(leaseCtx);
 
-    // Only transition to FAILED if still IN_PROGRESS (same reclaim-safety guard).
-    await db.idempotencyOperation.updateMany({
-      where: { scope, key, state: "IN_PROGRESS" },
+    // The side effect failed. Dead-letter via a FENCED update: only the claim
+    // owner can transition to FAILED. If the claim was already reclaimed (and
+    // possibly re-executed by a new claimant), this returns 0 rows — we don't
+    // overwrite the new claimant's state.
+    const failure = serializeFailure(err);
+    const updated = await db.idempotencyOperation.updateMany({
+      where: { scope, key, claimId, state: "IN_PROGRESS" },
       data: {
         state: "FAILED",
         failureJson: JSON.stringify(failure),
         completedAt: new Date(),
         claimExpiresAt: null,
       },
-    }).catch(() => {});
+    }).catch(() => ({ count: 0 }));
 
-    logger.warn("idempotency.operation_failed", {
-      scope,
-      key,
-      errorClass: failure.errorClass,
-      statusCode: failure.statusCode,
-    });
+    if (updated.count === 0) {
+      // The claim was reclaimed before we could store the failure. The
+      // reclaim worker already marked it FAILED (with a "lease expired" message),
+      // or a new claimant may have re-claimed and is now executing. Either way,
+      // we don't overwrite. Log and re-throw the original error.
+      logger.warn("idempotency.failure_not_stored", {
+        scope,
+        key,
+        claimId,
+        message: "Claim was reclaimed before failure could be stored. The reclaim worker or a new claimant owns the state.",
+      });
+    } else {
+      logger.warn("idempotency.operation_failed", {
+        scope,
+        key,
+        claimId,
+        errorClass: failure.errorClass,
+        statusCode: failure.statusCode,
+      });
+    }
 
     // Re-throw the original error (it's already classified).
     throw err;
@@ -339,9 +486,15 @@ function sleep(ms: number): Promise<void> {
 /**
  * Transition expired IN_PROGRESS operations to FAILED.
  *
- * A worker that crashed mid-execute leaves the claim IN_PROGRESS with an expired
- * lease. This function dead-letters those claims so future requests with the same
- * key get a clean failure instead of polling forever.
+ * Phase 12.3.2.1: This is the CRASH RECOVERY path. It only transitions an
+ * operation to FAILED when the lease has genuinely expired — meaning the
+ * owner's heartbeat has stopped renewing it. A long-running legitimate
+ * execution (whose heartbeat is active) will have a fresh lease and will
+ * NOT be reclaimed.
+ *
+ * The invariant:
+ *   "An IN_PROGRESS operation is only reclaimed if its owner has stopped
+ *    renewing the lease for > leaseMs."
  *
  * Returns the number of operations reclaimed.
  */
@@ -375,8 +528,37 @@ export async function reclaimExpiredIdempotencyOperations(): Promise<number> {
 export async function getIdempotencyOperation(scope: string, key: string): Promise<IdempotencyClaim | null> {
   const op = await db.idempotencyOperation.findUnique({
     where: { scope_key: { scope, key } },
-    select: { scope: true, key: true, state: true, resultJson: true, failureJson: true, payloadHash: true },
+    select: { scope: true, key: true, state: true, resultJson: true, failureJson: true, payloadHash: true, claimId: true },
   });
   if (!op) return null;
   return op as IdempotencyClaim;
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers (exported for adversarial tests)
+// ---------------------------------------------------------------------------
+
+/**
+ * Manually set the lease expiry to a past time, simulating a heartbeat that
+ * stopped (crashed worker). Used by adversarial tests to prove the reclaim
+ * path without waiting for the full lease duration.
+ *
+ * This is fenced on claimId to ensure only the owner's lease is manipulated.
+ */
+export async function _testForceLeaseExpiry(scope: string, key: string, claimId: string): Promise<void> {
+  await db.idempotencyOperation.updateMany({
+    where: { scope, key, claimId, state: "IN_PROGRESS" },
+    data: { claimExpiresAt: new Date(Date.now() - 1000) },
+  });
+}
+
+/**
+ * Get the current claimId for an operation (for test assertions).
+ */
+export async function _getClaimId(scope: string, key: string): Promise<string | null> {
+  const op = await db.idempotencyOperation.findUnique({
+    where: { scope_key: { scope, key } },
+    select: { claimId: true },
+  });
+  return op?.claimId ?? null;
 }

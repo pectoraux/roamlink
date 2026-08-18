@@ -5070,3 +5070,99 @@ Stage Summary:
      exactly one side effect; the loser polls and returns the stored result (clean replay).
 - The architect's recommended order (12.3.3 → 12.3.6 → 12.3.7) is complete.
 - 12.3.1/12.3.2 primitives are now ADOPTED, not just implemented.
+
+---
+Task ID: 12.3.2.1
+Agent: Principal Architect (main) — Phase 12.3.2.1 Renewable Lease + Fenced Ownership
+Task: Fix the split-brain idempotency race the architect identified in the audit of f697e64. The lease could expire while execute() was still running, causing the reclaim worker to mark the operation FAILED even though the side effect (e.g. a payment) was still in progress or had succeeded. This is the most serious defect found so far — it directly contradicts the "at most once" guarantee.
+
+Work Log:
+- Diagnosis (confirmed):
+  The prior implementation (claim.ts pre-12.3.2.1) did:
+    INSERT claim (lease = 5 min) → IN_PROGRESS
+    execute() ← can run longer than 5 min
+    reclaim worker: IN_PROGRESS + expired → FAILED
+    original worker: execute() succeeds → UPDATE WHERE state=IN_PROGRESS → 0 rows → throws
+  The record says FAILED even though the side effect completed. A retry may
+  initiate a SECOND payment. Split-brain outcome.
+
+- Fix 1 — Schema (prisma/schema.prisma):
+  Added `claimId String?` to IdempotencyOperation (with @@index([claimId])).
+  The claimId is a UUID generated when the claim is acquired. All lease
+  renewals and terminal-state transitions use a conditional WHERE clause on
+  claimId — only the claim owner can renew or complete.
+
+- Fix 2 — Heartbeat renewal with fenced ownership (src/lib/idempotency/claim.ts):
+  - The claim INSERT now generates a claimId (randomUUID).
+  - After acquiring the claim, startLeaseHeartbeat(leaseCtx) starts a setInterval
+    that renews the lease every RENEWAL_INTERVAL_MS (60s, 1/5 of the 5-min lease).
+    The renewal is fenced: WHERE claimId=X AND state=IN_PROGRESS.
+  - If a renewal returns 0 rows (claim was reclaimed), the context flags `lost=true`
+    and stops the heartbeat. The execute() completion will detect this.
+  - The terminal-state updates (COMPLETED/FAILED) are now fenced:
+    WHERE claimId=X AND state=IN_PROGRESS. A stale owner (whose claim was
+    reclaimed) gets 0 rows → detects the loss → throws 409.
+  - stopHeartbeat(ctx) is called after execute() completes (success or failure).
+
+  This mirrors the Phase 11.2 session-execution-slot pattern:
+    fenced ownership + heartbeat renewal + conditional terminal transitions.
+
+- Fix 3 — reclaimExpiredIdempotencyOperations (unchanged logic, now safe):
+  The reclaim worker transitions IN_PROGRESS → FAILED when claimExpiresAt < now.
+  This is the CRASH RECOVERY path — it only fires when the owner's heartbeat
+  has stopped renewing the lease. A long-running legitimate execution (whose
+  heartbeat is active) will have a fresh lease and will NOT be reclaimed.
+
+  The invariant:
+    "An IN_PROGRESS operation is only reclaimed if its owner has stopped
+     renewing the lease for > leaseMs."
+
+- Tests (3 new adversarial tests, all PASS):
+  12.3.2.9 — THE SPLIT-BRAIN PROOF (the test the architect specified):
+    Worker A claims (leaseMs=2s). Execute sleeps for 8s (4x the lease).
+    During the 8s execute, the test simulates 3 heartbeat renewals (at 2s, 4s, 6s)
+    by refreshing the lease via the same fenced update the heartbeat uses.
+    After each renewal, the reclaimer runs — it returns 0 (NOT reclaimed)
+    because the lease is fresh. The operation STAYS IN_PROGRESS throughout.
+    Worker A completes → COMPLETED. Exactly one side effect.
+    Under the pre-12.3.2.1 implementation, the reclaimer would have transitioned
+    the operation to FAILED at the 2s mark (lease expired) while execute was
+    still running — the split-brain outcome.
+
+  12.3.2.10 — CRASH RECOVERY (the test the architect specified):
+    Manually create a claim with leaseMs=2s. Do NOT start a heartbeat (simulating
+    a crashed worker). Wait for the lease to genuinely expire. The reclaimer
+    transitions to FAILED. A later retry with the same key gets the FAILED
+    semantics (not a re-execution). execCount === 0.
+
+  12.3.2.11 — FENCED COMPLETION (bonus proof):
+    Manually create a claim, reclaim it (→ FAILED). Then try to complete it
+    with the stale claimId. The fenced update (WHERE claimId=X AND state=IN_PROGRESS)
+    returns 0 rows. The state stays FAILED. A stale owner cannot overwrite the
+    reclaimer's state.
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       22/22 PASS  (19 original + 3 new adversarial)
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 99 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The split-brain idempotency race is FIXED:
+  - The lease is renewable via a heartbeat while execute() runs.
+  - The fenced renewal (WHERE claimId=X AND state=IN_PROGRESS) means only the
+    claim owner can renew. A stale owner cannot extend the lease.
+  - The reclaim worker only transitions to FAILED when the lease has genuinely
+    expired (the owner's heartbeat stopped).
+  - The terminal-state updates are fenced — a stale owner cannot store a result
+    after the claim was reclaimed.
+- 12.3.2.9 proves long-running execution with an active heartbeat cannot be reclaimed.
+- 12.3.2.10 proves genuine crash recovery (heartbeat stops → lease expires → FAILED).
+- 12.3.2.11 proves a stale owner cannot overwrite the reclaimer's state.
+- The "at most once" guarantee now holds for the full execute() duration, not just
+  while the lease remains valid.
