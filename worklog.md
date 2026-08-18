@@ -3698,3 +3698,94 @@ Stage Summary:
   + "Any transition from EXECUTING → PENDING/other state MUST be fenced by the execution claim that owns EXECUTING."
 - Phase 11.2 is now ready to freeze.
 - Next: Phase 11.3 — Provider truth flips mid-execution.
+
+---
+Task ID: 11.2.2
+Agent: Principal Architect (main) — Phase 11.2.2 Lost-Slot Mutation Prevention
+Task: Close the final lease-safety gap identified in the architect's audit of c05e2e6. A failed heartbeat renewal was merely logged, allowing the mutation to continue after the slot was reclaimed by another worker. Treat loss of session-slot ownership as a control-plane safety event, not a logging event. The executing worker must not perform another mutation after ownership is lost.
+
+Work Log:
+- Audited c05e2e6 directly. Confirmed the gap:
+  - The heartbeat called renewSessionExecutionSlot, and on failure only logged `logger.error(...)`.
+  - The mutation continued regardless.
+  - If heartbeat failed repeatedly → 5-min lease expires → cron reclaims → Worker B acquires → two mutations concurrent.
+  - The invariant "A session execution slot MUST NOT become available while its owner is still performing the mutation window" was not absolutely guaranteed.
+  - The architect's required invariant: "While a worker is performing the mutation window, either the worker still owns the session slot OR the worker has stopped before performing any further connectivity mutation."
+
+- Fix 1 — SlotOwnershipContext (session-execution-slot.ts):
+  - New type: { sessionId, claimId, slotLost: boolean, verifySlotOwnership(): Promise<void> }.
+  - verifySlotOwnership() checks:
+    a. Fast path: if slotLost is already true → throw SlotOwnershipLostError.
+    b. DB check: verify executionSlotClaimId still matches claimId (catches cron-reclaim before the heartbeat fires) + lease not expired.
+    c. If either check fails → set slotLost = true, throw SlotOwnershipLostError.
+  - New SlotOwnershipLostError class (extends Error).
+  - New createSlotOwnershipContext(sessionId, claimId) factory.
+
+- Fix 2 — Ownership checkpoints in executeAction (action-executor.ts):
+  - executeAction now accepts optional slotContext parameter.
+  - Calls `await slotContext?.verifySlotOwnership()` before each mutating stage:
+    - ACTIVATE: before reserve, before markResourceInUse, before session update (3 checkpoints).
+    - SWITCH: before reserve, before markResourceInUse, before session update, before release-old (4 checkpoints).
+  - On SlotOwnershipLostError → transitionActionState(RECONCILIATION_REQUIRED), return { status: "reconciliation_required" }. The worker does NOT perform the next mutation.
+
+- Fix 3 — Heartbeat sets slotLost (decision-executor.ts):
+  - Creates the SlotOwnershipContext after slot acquire.
+  - Heartbeat: on renewSessionExecutionSlot returning { renewed: false } OR throwing → set slotOwnershipContext.slotLost = true.
+  - Passes the context to executeAction.
+
+- The checkpoint sequence (owns the entire mutation window):
+    acquire slot
+      ↓
+    verify slot ownership ← checkpoint
+      ↓
+    reserve
+      ↓
+    verify slot ownership ← checkpoint
+      ↓
+    activate (mark IN_USE)
+      ↓
+    verify
+      ↓
+    verify slot ownership ← checkpoint
+      ↓
+    update session.activeResourceId
+      ↓
+    verify slot ownership ← checkpoint
+      ↓
+    release old resource
+      ↓
+    verify convergence
+      ↓
+    release slot
+
+  At a failed checkpoint: DO NOT perform the next mutation → RECONCILIATION_REQUIRED.
+
+- Adversarial test (11.2.8, DB-backed runtime, PASS):
+  - Worker A acquires session slot.
+  - Creates slot ownership context.
+  - First checkpoint passes (slot held).
+  - Simulate slot loss: expire A's lease, reclaimExpiredSessionSlots, Worker B acquires.
+  - Heartbeat flags slotLost = true.
+  - Worker A reaches next checkpoint → SlotOwnershipLostError thrown.
+  - Worker A's mutation aborted. Worker B's slot intact (executionSlotClaimId = B's claimId).
+  - Proves: A loses slot → B acquires → A attempts next action → A is refused.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 8):    8/8 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Phase 10/10.1.1:      13/13 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 33 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: cae816b (on GitHub, verified: git ls-remote origin main → cae816b)
+- The lost-slot mutation prevention gap is closed. A failed renewal is now a safety event, not a logging event.
+- The ownership checkpoints ensure: while a worker is performing the mutation window, either the worker still owns the session slot OR the worker has stopped (SlotOwnershipLostError → RECONCILIATION_REQUIRED) before performing any further connectivity mutation.
+- Acceptance invariant #2 now fully proven even under lease failure:
+  "A session cannot have two connectivity mutations executing concurrently."
+  + "A session execution slot MUST NOT become available while its owner is still performing the mutation window."
+  + "Any transition from EXECUTING → PENDING/other state MUST be fenced by the execution claim that owns EXECUTING."
+  + "While a worker is performing the mutation window, either the worker still owns the session slot OR the worker has stopped before performing any further connectivity mutation."
+- Phase 11.2 is now ready to freeze.
+- Next: Phase 11.3 — Provider truth flips mid-execution.
