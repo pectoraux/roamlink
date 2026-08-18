@@ -4502,3 +4502,31 @@ Stage Summary:
   "Events are triggers, not authority. Current state + policy + intent authority are authority. Event ordering only changes reevaluation timing."
 - All 8 Phase 11 acceptance invariants are now runtime-proven with 49 tests, 0 failures.
 - Phase 11 is now ready to freeze as a whole.
+
+---
+Task ID: 11.6-final-tighten
+Agent: Principal Architect (main) — Phase 11.6.1 Exact Decision Count
+Task: Tighten 11.6.1 from '<= 1' to exact '=== 1' with terminal-state assertion. Fix the event cleanup so processOneEvent claims the correct event.
+
+Work Log:
+- Fix 1: Changed 'decisions.length <= 1' to 'decisions.length === 1' with exact terminal-state assertion. Now proves exactly one effective decision was produced (not zero, not two).
+- Fix 2: Changed the event cleanup from 'subjectId: fx.subjectId' to a global deleteMany({}). The prior cleanup left MEASUREMENT_RECEIVED events from other test fixtures in the DB. processOneEvent claims the OLDEST pending event — so it was claiming a leftover MEASUREMENT_RECEIVED event instead of our test's INTENT_CHANGED event. With all pending events cleared, processOneEvent correctly claims our event.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 11.4 (all 11):  11/11 PASS
+  Phase 11.5 (all 6):    6/6 PASS
+  Phase 11.6 (all 5):    5/5 PASS (11.6.1 now exact)
+  Phase 11.7 (all 1):    1/1 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 49 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: b41ac5d (on GitHub, verified: git ls-remote origin main → b41ac5d)
+- 11.6.1 now asserts exactly 1 decision with a terminal state (not <= 1).
+- The event cleanup ensures processOneEvent claims the correct test event.
+- All 8 Phase 11 acceptance invariants are now runtime-proven with exact assertions.
+- Phase 11 is now ready to freeze as a whole.
