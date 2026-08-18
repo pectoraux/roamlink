@@ -265,15 +265,26 @@ function stopHeartbeat(ctx: LeaseContext): void {
 /**
  * Run an operation exactly once per (scope, key) pair.
  *
- * Phase 12.3.2.3: The execute() callback now returns an `OperationOutcome<T>`
+ * Phase 12.3.2.4: Strict external contract.
+ *   - If `isExternal` is true (default), `providerKey` is REQUIRED. An external
+ *     side-effect operation without an explicit providerKey is REJECTED with 400
+ *     validation error before any side effect runs. There is NO silent default.
+ *     The providerKey is part of the external provider's deduplication contract —
+ *     silently substituting the RoamLink key hides integration mistakes and can
+ *     cause two distinct provider operations to share an inappropriate namespace.
+ *   - If `isExternal` is true, `execute()` MUST return an `OperationOutcome<T>`.
+ *     A raw return value is rejected (the caller must explicitly classify the
+ *     outcome as SUCCESS, CONFIRMED_FAILURE, or AMBIGUOUS_EXTERNAL_FAILURE).
+ *     This forces the caller to make the ambiguity decision explicitly at the
+ *     compiler/contract boundary, rather than relying on thrown exceptions.
+ *   - If `isExternal` is false (pure DB operation), `providerKey` is optional
+ *     and `execute()` may return a raw value (treated as SUCCESS).
+ *
+ * Phase 12.3.2.3: The execute() callback returns an `OperationOutcome<T>`
  * which classifies the result as SUCCESS, CONFIRMED_FAILURE, or
  * AMBIGUOUS_EXTERNAL_FAILURE. Only CONFIRMED_FAILURE transitions to FAILED;
  * AMBIGUOUS_EXTERNAL_FAILURE transitions to RECONCILIATION_REQUIRED (the
  * outcome is unknown — the provider may have accepted the request).
- *
- * Phase 12.3.2.3: If `isExternal` is true, `providerKey` is REQUIRED. An
- * external side-effect operation without a providerKey is rejected before
- * execution — it would be unreconcilable if the worker crashed.
  *
  * Behavior:
  *   - First caller: claims (INSERT IN_PROGRESS, claimId=UUID, providerKey),
@@ -286,8 +297,8 @@ function stopHeartbeat(ctx: LeaseContext): void {
  *   - Ambiguous external error during execute: transitions to RECONCILIATION_REQUIRED.
  *     The caller gets a 409 — the outcome is unknown, do not retry.
  *
- * @param isExternal If true, the operation performs an external side effect
- *   (payment, provisioning) and providerKey is REQUIRED. Defaults to true.
+ * @param isExternal If true (default), the operation performs an external side
+ *   effect and providerKey is REQUIRED and execute() MUST return OperationOutcome.
  * @param providerKey The provider-side idempotency key. REQUIRED if isExternal.
  *   Pass to the provider in execute() so the provider deduplicates on it.
  */
@@ -299,23 +310,24 @@ export async function runIdempotentOperation<T>(input: {
   leaseMs?: number;
   /**
    * Phase 12.3.2.3: If true (default), the operation performs an external side
-   * effect and providerKey is REQUIRED. If false, the operation is a pure DB
-   * operation and providerKey is optional (RECONCILIATION_REQUIRED is terminal
-   * if no providerKey is set).
+   * effect and providerKey is REQUIRED and execute() MUST return OperationOutcome.
+   * If false, the operation is a pure DB operation: providerKey is optional and
+   * execute() may return a raw value (treated as SUCCESS).
    */
   isExternal?: boolean;
   /** The provider-side idempotency key. REQUIRED if isExternal is true. */
   providerKey?: string | null;
   /**
    * The operation to execute. Receives the providerKey (to pass to the provider).
-   * Returns an OperationOutcome that classifies the result.
    *
-   * For backward compatibility, if execute() returns a raw value (not an
-   * OperationOutcome), it is treated as SUCCESS. If execute() throws, the
-   * error is classified: AppError with errorClass "validation"/"not_found"/
-   * "conflict"/"authorization"/"auth" is a CONFIRMED_FAILURE; everything else
-   * (including network errors, timeouts, provider errors) is an
-   * AMBIGUOUS_EXTERNAL_FAILURE.
+   * If isExternal is true: MUST return an OperationOutcome<T> that explicitly
+   * classifies the result (SUCCESS / CONFIRMED_FAILURE / AMBIGUOUS_EXTERNAL_FAILURE).
+   * A raw return value is rejected with a 500 contract violation.
+   *
+   * If isExternal is false: may return a raw value (treated as SUCCESS) or an
+   * OperationOutcome. If it throws, the error is classified by errorClass:
+   * validation/not_found/conflict/authorization/auth = CONFIRMED_FAILURE;
+   * everything else = AMBIGUOUS_EXTERNAL_FAILURE.
    */
   execute: (providerKey: string) => Promise<OperationOutcome<T> | T>;
 }): Promise<T> {
@@ -328,21 +340,17 @@ export async function runIdempotentOperation<T>(input: {
   const leaseMs = input.leaseMs ?? DEFAULT_LEASE_MS;
   const claimId = randomUUID();
 
-  // Phase 12.3.2.3: providerKey is REQUIRED for external side-effect operations.
-  // Without it, a crash after the provider accepted the request would be
-  // permanently unreconcilable.
-  let providerKey = input.providerKey ?? null;
-  if (isExternal) {
-    if (!providerKey) {
-      // Default to the RoamLink key if the caller didn't supply one — but
-      // only for external operations. This ensures reconciliation is always
-      // possible. (We log a warning that the caller should supply one explicitly.)
-      providerKey = key;
-      logger.warn("idempotency.provider_key_defaulted", {
-        scope, key,
-        message: "providerKey was not supplied for an external operation; defaulting to the RoamLink key. Callers should supply an explicit providerKey.",
-      });
-    }
+  // Phase 12.3.2.4: providerKey is REQUIRED for external side-effect operations.
+  // NO silent default. The providerKey is part of the external provider's
+  // deduplication contract — the caller MUST supply it explicitly.
+  const providerKey = input.providerKey ?? null;
+  if (isExternal && !providerKey) {
+    throw new AppError(
+      "validation",
+      "providerKey is required for external side-effect idempotency operations",
+      400,
+      "An explicit providerKey is required for this operation. It is passed to the external provider so the provider deduplicates on it, and enables reconciliation if the worker crashes.",
+    );
   }
 
   // Step 1: CLAIM via INSERT.
@@ -387,8 +395,43 @@ export async function runIdempotentOperation<T>(input: {
     let outcome: OperationOutcome<T>;
     if (rawResult && typeof rawResult === "object" && "outcome" in rawResult) {
       outcome = rawResult as OperationOutcome<T>;
+    } else if (isExternal) {
+      // Phase 12.3.2.4: External operations MUST return an OperationOutcome.
+      // A raw return value is a contract violation — the caller must explicitly
+      // classify the outcome (SUCCESS / CONFIRMED_FAILURE / AMBIGUOUS_EXTERNAL_FAILURE).
+      // This forces the ambiguity decision to be made at the contract boundary.
+      stopHeartbeat(leaseCtx);
+      // Transition to FAILED with a contract violation — this is a programming
+      // error, not an external failure. The operation did not complete successfully
+      // (we can't confirm it), and it's the caller's code that's wrong.
+      const contractError = new AppError(
+        "internal",
+        "External execute() returned a raw value instead of an OperationOutcome — contract violation",
+        500,
+        "An internal error occurred. The operation's outcome could not be classified.",
+      );
+      const failure = serializeFailure(contractError);
+      await db.idempotencyOperation.updateMany({
+        where: { scope, key, claimId, state: "IN_PROGRESS" },
+        data: {
+          state: "FAILED",
+          failureJson: JSON.stringify(failure),
+          completedAt: new Date(),
+          claimExpiresAt: null,
+        },
+      }).catch(() => {});
+      logger.error("idempotency.external_contract_violation_raw_return", {
+        scope, key, claimId, providerKey,
+        message: "External execute() returned a raw value instead of an OperationOutcome. This is a programming error — the caller must explicitly classify the outcome.",
+      });
+      // Mark as already-classified so the catch block below re-throws it
+      // directly instead of re-classifying it as an AMBIGUOUS_EXTERNAL_FAILURE.
+      // The contract violation is a programming error, NOT an external failure —
+      // the operation transitions to FAILED (above) and the caller gets a 500.
+      (contractError as any)._outcomeClassified = true;
+      throw contractError;
     } else {
-      // Backward compatibility: raw return value is treated as SUCCESS.
+      // Pure DB operation: raw return value is treated as SUCCESS.
       outcome = { outcome: "SUCCESS", value: rawResult as T };
     }
 

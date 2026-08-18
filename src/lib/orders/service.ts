@@ -38,7 +38,7 @@ import {
   type FulfillmentStatus,
 } from "./fulfillment-state-machine";
 import { generateIdempotencyKey, audit } from "./idempotency";
-import { runIdempotentOperation, hashPayload } from "@/lib/idempotency/claim";
+import { runIdempotentOperation, hashPayload, type OperationOutcome } from "@/lib/idempotency/claim";
 import { logger } from "@/lib/logger";
 import { AppError, classifyProviderError } from "@/lib/errors";
 import { recordProviderResult } from "@/lib/providers/routing";
@@ -403,7 +403,7 @@ export async function createOrder(input: {
         include: { plan: true, esim: true },
       });
       if (existing) {
-        return toSnapshot(existing as OrderWithIncludes);
+        return { outcome: "SUCCESS" as const, value: toSnapshot(existing as OrderWithIncludes) };
       }
   // === BEGIN original createOrder body (preserved verbatim) ===
   const plan = await getCanonicalPlan(input.planId);
@@ -493,7 +493,7 @@ export async function createOrder(input: {
     distributionOfferId: distOffer.id,
     tenantId: input.tenantId ?? null,
   });
-  return toSnapshot(order as OrderWithIncludes);
+  return { outcome: "SUCCESS" as const, value: toSnapshot(order as OrderWithIncludes) };
   // === END original createOrder body ===
     },
   });
@@ -558,8 +558,11 @@ export async function initiatePayment(input: {
       const existingPayment = await db.payment.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
       if (existingPayment) {
         return {
-          payment: { id: existingPayment.id, providerReference: existingPayment.providerReference },
-          intent: { providerReference: existingPayment.providerReference },
+          outcome: "SUCCESS" as const,
+          value: {
+            payment: { id: existingPayment.id, providerReference: existingPayment.providerReference },
+            intent: { providerReference: existingPayment.providerReference },
+          },
         };
       }
 
@@ -588,8 +591,11 @@ export async function initiatePayment(input: {
       });
 
       return {
-        payment: { id: created.id, providerReference: newIntent.providerReference },
-        intent: { providerReference: newIntent.providerReference, clientSecret: newIntent.clientSecret, nextAction: newIntent.nextAction },
+        outcome: "SUCCESS" as const,
+        value: {
+          payment: { id: created.id, providerReference: newIntent.providerReference },
+          intent: { providerReference: newIntent.providerReference, clientSecret: newIntent.clientSecret, nextAction: newIntent.nextAction },
+        },
       };
     },
   });

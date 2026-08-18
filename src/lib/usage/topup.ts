@@ -13,7 +13,7 @@ import { mockPaymentProvider } from "@/lib/payments";
 import { logger } from "@/lib/logger";
 import { AppError } from "@/lib/errors";
 import { audit } from "@/lib/orders/idempotency";
-import { runIdempotentOperation, hashPayload } from "@/lib/idempotency/claim";
+import { runIdempotentOperation, hashPayload, type OperationOutcome } from "@/lib/idempotency/claim";
 import { notify } from "@/lib/notifications/service";
 import type { Currency } from "@/lib/money";
 
@@ -58,7 +58,7 @@ export async function purchaseTopUp(input: {
       const existing = await db.topUp.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
       if (existing) {
         const esim = await db.esim.findUnique({ where: { id: input.esimId } });
-        return { topUpId: existing.id, dataAddedMB: existing.dataAmount, newRemainingMB: esim?.dataRemaining ?? 0 };
+        return { outcome: "SUCCESS" as const, value: { topUpId: existing.id, dataAddedMB: existing.dataAmount, newRemainingMB: esim?.dataRemaining ?? 0 } };
       }
 
       const esim = await db.esim.findUnique({ where: { id: input.esimId } });
@@ -132,7 +132,7 @@ export async function purchaseTopUp(input: {
       await audit({ userId: input.userId, action: "topup.purchased", entity: "esim", entityId: input.esimId, ip: input.ip });
       await notify.topUpSuccessful(input.userId, input.esimId, pkg.dataAmountMB);
       logger.info("topup.applied", { esimId: input.esimId, packageId: pkg.id, added: pkg.dataAmountMB });
-      return { topUpId: topUp.id, dataAddedMB: pkg.dataAmountMB, newRemainingMB: result.newRemainingMB };
+      return { outcome: "SUCCESS" as const, value: { topUpId: topUp.id, dataAddedMB: pkg.dataAmountMB, newRemainingMB: result.newRemainingMB } };
     },
   });
 }

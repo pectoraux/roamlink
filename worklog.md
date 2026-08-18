@@ -5365,3 +5365,186 @@ Stage Summary:
     reconciliation → DB-authoritative claim + lease (fenced ownership)
 - This brings the SaaS/payment/provider side of RoamLink up to the same rigor
   as the Connectivity OS execution plane (Phase 11).
+
+---
+Task ID: 12.3.2.4-tests
+Agent: Test updater (subagent)
+Task: Update Phase 12.3.2 tests for the strict external contract (isExternal flag + OperationOutcome requirement).
+
+Work Log:
+- Reviewed the new strict external contract in src/lib/idempotency/claim.ts:
+  * isExternal defaults to true.
+  * isExternal=true + no providerKey → 400 validation error (NO silent default).
+  * isExternal=true + execute() returns a raw value → 500 contract violation, op→FAILED.
+  * isExternal=false (pure DB) → providerKey optional, raw return treated as SUCCESS.
+
+- Mechanical tests (claim/replay/reclaim machinery — not external semantics):
+  Added `isExternal: false` so they can return raw values without a providerKey:
+    12.3.2.1  (single execution)
+    12.3.2.2  (concurrent duplicate → ONE execution)
+    12.3.2.3  (replay after completion)
+    12.3.2.4  (conflicting payload → 409)
+    12.3.2.6  (reclaim expired → RECONCILIATION_REQUIRED) — the retry call
+    12.3.2.7  (three concurrent → ONE execution)
+    12.3.2.8  (principal audit trail)
+    12.3.2.9  (long-running execute + heartbeat)
+    12.3.2.10 (heartbeat stops → RECONCILIATION_REQUIRED) — the retry call
+    12.3.2.12 (crash after side effect) — the retry call (poll-path 409)
+    12.3.2.13 (reconciliation) — the retry call (poll-path 404)
+
+- External-semantics tests (must use isExternal=true + providerKey + OperationOutcome):
+    12.3.2.5  (CONFIRMED_FAILURE → FAILED): added explicit providerKey on both
+              calls; updated the replay execute() to return OperationOutcome
+              (was raw { shouldNotReach: true }).
+    12.3.2.14 (duplicate provider safety): updated both execute() callbacks to
+              return `{ outcome: "SUCCESS", value: ... }` instead of raw values.
+              First call already had providerKey; second call (replay) already
+              had providerKey — kept both.
+    12.3.2.15 (ambiguous external failure): already returned OperationOutcome
+              and had providerKey — verified and left as-is.
+
+- 12.3.2.16 — REPLACED the test:
+  Old: "external op without providerKey → defaults to RoamLink key (with warning)"
+       (tested silent default behavior, which is no longer the contract)
+  New: "external op without providerKey → 400, provider never called, no DB row"
+       * Asserts runIdempotentOperation rejects with statusCode 400.
+       * Asserts the execute() callback was NEVER called (executeCallCount===0).
+       * Asserts no IdempotencyOperation row was created in the DB
+         (validation fires BEFORE the INSERT).
+
+- 12.3.2.18 — NEW test (added between 12.3.2.16 and 12.3.2.17):
+  "external execute returns raw value → 500 contract violation, op FAILED,
+   replay gets stored failure"
+       * Calls runIdempotentOperation with isExternal=true (default), explicit
+         providerKey, and `execute: async () => ({ raw: true })` (raw return).
+       * Asserts it rejects with statusCode 500 (contract violation).
+       * Asserts the operation transitions to FAILED.
+       * Asserts the stored failure mentions raw value / OperationOutcome /
+         contract violation.
+       * Asserts a replay with the same key gets the stored 500 failure (NOT a
+         re-execution, NOT a fresh contract violation).
+
+- Bug fix in src/lib/idempotency/claim.ts (required for 12.3.2.18 to pass):
+  The contract-violation branch threw `contractError` (statusCode 500) but did
+  NOT mark it with `_outcomeClassified = true`. The outer catch block then
+  re-caught it, failed the `_outcomeClassified` check, and re-classified it as
+  AMBIGUOUS_EXTERNAL_FAILURE → threw a 409 instead of the documented 500.
+  Fix: set `(contractError as any)._outcomeClassified = true` before throwing,
+  matching the pattern used by the other classified-outcome throws
+  (reclaimedErr, confirmedErr, ambiguousErr). Now the catch block re-throws
+  the original 500 directly, the operation stays FAILED with the stored
+  contract violation, and replays return the stored failure as expected.
+
+- Verification:
+    bun test tests/phase12.3-api-protocol.test.ts → 29 pass, 0 fail
+      (28 prior + 1 new = 29; 12.3.2.16 replaced, 12.3.2.18 added)
+    bun run lint (eslint .) → clean (no output)
+    bun test tests/phase12.3-adoption.test.ts → 16 pass, 0 fail (regression)
+    bun test tests/phase12.2-tenant-security.test.ts → 12 pass, 0 fail (regression)
+    (phase2b3-saas-billing.test.ts has 4 pre-existing failures due to a
+     SQLite "FOR" syntax error in a raw SQL query — unrelated to this task;
+     verified present on the unmodified branch via git stash.)
+
+Stage Summary:
+- The Phase 12.3.2 test suite is now aligned with the strict external contract
+  (Phase 12.3.2.4):
+    * Mechanical tests use isExternal:false (no providerKey, raw returns OK).
+    * External-semantics tests use isExternal:true (default) + providerKey +
+      OperationOutcome.
+    * 12.3.2.16 now proves the no-providerKey rejection (400, no execute, no row).
+    * 12.3.2.18 (new) proves the raw-return contract violation (500, op→FAILED,
+      replay gets stored failure).
+- One minimal bug fix in claim.ts: the contract-violation error now carries
+  `_outcomeClassified = true` so it bypasses the catch block's re-classification
+  and reaches the caller as the documented 500 (instead of being silently
+  downgraded to a 409 AMBIGUOUS_EXTERNAL_FAILURE).
+- HEAD: (to be committed)
+- 29/29 Phase 12.3 tests PASS, lint clean, no regressions in adjacent suites.
+
+---
+Task ID: 12.3.2.4
+Agent: Principal Architect (main) — Phase 12.3.2.4 Strict External Contract
+Task: Fix the contract-level inconsistency the architect identified in the audit of 82a87d4. The providerKey fallback for external operations contradicted the stated invariant ("providerKey is REQUIRED for external operations"). Also: external execute() must return OperationOutcome (not a raw value), forcing the caller to make the ambiguity decision explicitly.
+
+Work Log:
+- Fix 1 — providerKey is now STRICTLY REQUIRED for external operations (src/lib/idempotency/claim.ts):
+  Removed the silent fallback that defaulted providerKey to the RoamLink key.
+  Now: if isExternal === true and no providerKey is supplied → throws 400
+  validation error BEFORE any side effect runs. The providerKey is part of the
+  external provider's deduplication contract — the caller MUST supply it explicitly.
+  No silent default. No "provider_key_defaulted" warning. Just a hard rejection.
+
+- Fix 2 — External execute() MUST return OperationOutcome (src/lib/idempotency/claim.ts):
+  If isExternal === true and execute() returns a raw value (not an OperationOutcome),
+  the primitive now:
+    1. Stops the heartbeat.
+    2. Transitions the operation to FAILED with a contract violation.
+    3. Throws a 500 contract violation error.
+  This forces the caller to explicitly classify the outcome as SUCCESS,
+  CONFIRMED_FAILURE, or AMBIGUOUS_EXTERNAL_FAILURE at the contract boundary.
+  For pure DB operations (isExternal === false), raw returns are still accepted
+  as SUCCESS (backward compatible).
+
+- Fix 3 — Contract violation throw marked _outcomeClassified (subagent-found bug):
+  The contract-violation branch threw `contractError` (statusCode 500) without
+  setting `_outcomeClassified = true`. The outer catch block then re-caught it
+  and re-classified it as AMBIGUOUS_EXTERNAL_FAILURE → threw a 409 instead of
+  the documented 500. Fixed: set `_outcomeClassified = true` before throw.
+
+- Fix 4 — Commerce flows updated to return OperationOutcome:
+  - createOrder (src/lib/orders/service.ts): both return paths (domain-level replay
+    + new creation) now return { outcome: "SUCCESS", value: ... }.
+  - initiatePayment: both return paths now return { outcome: "SUCCESS", value: ... }.
+  - purchaseTopUp (src/lib/usage/topup.ts): both return paths now return
+    { outcome: "SUCCESS", value: ... }.
+
+- Fix 5 — Tests updated for the strict contract:
+  Mechanical tests (testing claim/replay/reclaim machinery, not external semantics)
+  now use `isExternal: false` so they can return raw values without a providerKey:
+    12.3.2.1, 12.3.2.2, 12.3.2.3, 12.3.2.4, 12.3.2.6 retry, 12.3.2.7, 12.3.2.8,
+    12.3.2.9, 12.3.2.10 retry, 12.3.2.12 retry, 12.3.2.13 retry.
+
+  External-semantics tests use isExternal=true (default) + providerKey + OperationOutcome:
+    12.3.2.5 (CONFIRMED_FAILURE) — added explicit providerKey + OperationOutcome return.
+    12.3.2.14 (duplicate provider safety) — both execute() callbacks return OperationOutcome.
+    12.3.2.15 (ambiguous external failure) — already correct, verified.
+
+- Fix 6 — 12.3.2.16 REPLACED (was testing the fallback, now tests the strict rejection):
+  OLD: "external op without providerKey → defaults to RoamLink key (with warning)"
+  NEW: "external op without providerKey → rejected with 400, provider never called"
+  The test asserts:
+    - runIdempotentOperation with isExternal=true and NO providerKey rejects with 400.
+    - The execute() callback is NEVER called (provider never called).
+    - No IdempotencyOperation row is created in the DB.
+
+- Fix 7 — NEW test 12.3.2.18 (external execute returns raw value → rejected):
+  Proves the contract violation path:
+    - runIdempotentOperation with isExternal=true, explicit providerKey, but
+      execute: async () => ({ raw: true }) (raw return, no OperationOutcome).
+    - Rejects with statusCode 500 (contract violation).
+    - Operation transitions to FAILED with the stored contract violation.
+    - A replay with the same key gets the stored 500 failure (no re-execution).
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       29/29 PASS  (28 adapted + 12.3.2.18 new)
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 106 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The contract-level inconsistency is fixed:
+  - providerKey is STRICTLY REQUIRED for external operations (no silent default).
+  - External execute() MUST return OperationOutcome (no raw returns).
+- The state machine is now internally consistent:
+    SUCCESS → COMPLETED
+    CONFIRMED_FAILURE → FAILED
+    AMBIGUOUS_EXTERNAL_FAILURE → RECONCILIATION_REQUIRED
+    external operation → explicit providerKey required
+    reconciliation → fenced ownership
+- 12.3.2.16 proves external op without providerKey → rejected (provider never called).
+- 12.3.2.18 proves external execute returning raw value → rejected by contract.

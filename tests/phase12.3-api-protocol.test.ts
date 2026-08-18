@@ -250,6 +250,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
       const result = await runIdempotentOperation({
         scope,
         key,
+        isExternal: false,
         execute: async () => {
           execCount++;
           return { value: 42, label: "answer" };
@@ -287,8 +288,8 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
 
       // Fire two concurrent requests.
       const [a, b] = await Promise.all([
-        runIdempotentOperation({ scope, key, execute }),
-        runIdempotentOperation({ scope, key, execute }),
+        runIdempotentOperation({ scope, key, isExternal: false, execute }),
+        runIdempotentOperation({ scope, key, isExternal: false, execute }),
       ]);
 
       // Exactly one execution.
@@ -316,6 +317,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
       const first = await runIdempotentOperation({
         scope,
         key,
+        isExternal: false,
         execute: async () => {
           execCount++;
           return { id: "abc" };
@@ -327,6 +329,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
       const second = await runIdempotentOperation({
         scope,
         key,
+        isExternal: false,
         execute: async () => {
           execCount++;
           return { id: "should_not_reach" };
@@ -351,6 +354,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
         scope,
         key,
         payloadHash: payloadA,
+        isExternal: false,
         execute: async () => ({ orderId: "order_A" }),
       });
 
@@ -360,6 +364,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
           scope,
           key,
           payloadHash: payloadB,
+          isExternal: false,
           execute: async () => ({ orderId: "order_B" }),
         }),
       ).rejects.toMatchObject({ statusCode: 409 });
@@ -378,6 +383,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
     it("12.3.2.5: CONFIRMED_FAILURE → FAILED, replay throws the stored failure", async () => {
       const key = `p12325-${Date.now()}`;
       const scope = "test_confirmed_failure";
+      const providerKey = `prov_${key}`;
       let execCount = 0;
 
       // First request: provider explicitly rejects (card declined).
@@ -385,6 +391,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
         runIdempotentOperation({
           scope,
           key,
+          providerKey,
           execute: async () => {
             execCount++;
             return {
@@ -408,9 +415,10 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
         runIdempotentOperation({
           scope,
           key,
+          providerKey,
           execute: async () => {
             execCount++;
-            return { shouldNotReach: true };
+            return { outcome: "SUCCESS" as const, value: { shouldNotReach: true } };
           },
         }),
       ).rejects.toMatchObject({ statusCode: 402 });
@@ -453,6 +461,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
         runIdempotentOperation({
           scope,
           key,
+          isExternal: false,
           execute: async () => ({ shouldNotReach: true }),
         }),
       ).rejects.toMatchObject({ statusCode: 409 });
@@ -473,9 +482,9 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
       };
 
       const [a, b, c] = await Promise.all([
-        runIdempotentOperation({ scope, key, execute }),
-        runIdempotentOperation({ scope, key, execute }),
-        runIdempotentOperation({ scope, key, execute }),
+        runIdempotentOperation({ scope, key, isExternal: false, execute }),
+        runIdempotentOperation({ scope, key, isExternal: false, execute }),
+        runIdempotentOperation({ scope, key, isExternal: false, execute }),
       ]);
 
       expect(execCount).toBe(1);
@@ -500,6 +509,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
         scope,
         key,
         principal,
+        isExternal: false,
         execute: async () => ({ ok: true }),
       });
 
@@ -549,6 +559,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
         scope,
         key,
         leaseMs,
+        isExternal: false,
         execute: async () => {
           execCount++;
           // Simulate a long-running side effect (e.g. a slow payment provider).
@@ -651,6 +662,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
         runIdempotentOperation({
           scope,
           key,
+          isExternal: false,
           execute: async () => {
             execCount++;
             return { shouldNotReach: true };
@@ -756,6 +768,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
         runIdempotentOperation({
           scope,
           key,
+          isExternal: false,
           execute: async () => {
             execCount++;
             return { shouldNotReach: true };
@@ -851,6 +864,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
         runIdempotentOperation({
           scope: scopeB,
           key: keyB,
+          isExternal: false,
           execute: async () => ({ shouldNotReach: true }),
         }),
       ).rejects.toMatchObject({ statusCode: 404 });
@@ -887,7 +901,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
           providerCallCount++;
           const result = { orderId: `order_${pk}` };
           providerResults.set(pk, result); // provider stores the result under the key
-          return result;
+          return { outcome: "SUCCESS" as const, value: result };
         },
       });
 
@@ -906,7 +920,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
         providerKey,
         execute: async () => {
           providerCallCount++;
-          return { orderId: "should_not_reach" };
+          return { outcome: "SUCCESS" as const, value: { orderId: "should_not_reach" } };
         },
       });
 
@@ -1007,35 +1021,115 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
     }, 30_000);
 
     // -------------------------------------------------------------------------
-    // 12.3.2.16 — External side-effect operation without providerKey → rejected
+    // 12.3.2.16 — External side-effect operation without providerKey → REJECTED
     //
-    // The architect's finding: an external operation without a providerKey is
-    // unreconcilable if the worker crashes. The API must require providerKey
-    // for external side-effect operations.
+    // Phase 12.3.2.4: Strict external contract — providerKey is REQUIRED for
+    // external side-effect operations. There is NO silent default. An external
+    // operation without a providerKey is REJECTED with 400 validation error
+    // before any side effect runs (the execute() callback is never called and
+    // no IdempotencyOperation row is created in the DB).
+    //
+    // Rationale: the providerKey is part of the external provider's deduplication
+    // contract — silently substituting the RoamLink key hides integration
+    // mistakes and can cause two distinct provider operations to share an
+    // inappropriate namespace. The caller MUST supply it explicitly.
     // -------------------------------------------------------------------------
-    it("12.3.2.16: external operation without providerKey → defaults to RoamLink key (with warning)", async () => {
+    it("12.3.2.16: external operation without providerKey → 400, provider never called, no DB row", async () => {
       const key = `p123216-${Date.now()}`;
-      const scope = "test_no_provider_key_external";
+      const scope = "test_no_provider_key_external_rejected";
+
+      // The execute() callback must NEVER be called — providerKey validation
+      // runs BEFORE the INSERT and before execute().
+      let executeCallCount = 0;
 
       // An external operation (isExternal defaults to true) without a providerKey.
-      // The primitive defaults providerKey to the RoamLink key so reconciliation
-      // is always possible. The operation succeeds, and the providerKey is stored.
-      const result = await runIdempotentOperation({
-        scope,
-        key,
-        // No providerKey supplied — isExternal defaults to true.
-        execute: async (pk) => {
-          // The providerKey defaults to the RoamLink key.
-          expect(pk).toBe(key);
-          return { orderId: "order_with_defaulted_key" };
-        },
-      });
+      // The primitive REJECTS with 400 validation error — NO silent default.
+      await expect(
+        runIdempotentOperation({
+          scope,
+          key,
+          // No providerKey supplied — isExternal defaults to true.
+          execute: async () => {
+            executeCallCount++;
+            return { outcome: "SUCCESS" as const, value: { shouldNotReach: true } };
+          },
+        }),
+      ).rejects.toMatchObject({ statusCode: 400 });
 
-      expect(result).toEqual({ orderId: "order_with_defaulted_key" });
+      // The execute() callback was NEVER called (provider never called).
+      expect(executeCallCount).toBe(0);
 
-      // The providerKey was stored (defaulted to the RoamLink key).
-      const storedProviderKey = await _getProviderKey(scope, key);
-      expect(storedProviderKey).toBe(key);
+      // No IdempotencyOperation row was created in the DB — the validation
+      // error fired BEFORE the INSERT.
+      const op = await getIdempotencyOperation(scope, key);
+      expect(op).toBeNull();
+
+      // Cleanup (defensive — nothing should exist, but if a future regression
+      // creates a row, we don't want it leaking into other tests).
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.18 — External execute() returns a raw value → 500 contract violation
+    //
+    // Phase 12.3.2.4: Strict external contract — execute() MUST return an
+    // OperationOutcome<T> when isExternal is true. A raw return value is a
+    // programming error (the caller forgot to classify the outcome). The
+    // primitive transitions the operation to FAILED with a stored contract
+    // violation and throws 500. A replay with the same key gets the stored
+    // failure (NOT a re-execution).
+    //
+    // Rationale: forcing the caller to classify SUCCESS / CONFIRMED_FAILURE /
+    // AMBIGUOUS_EXTERNAL_FAILURE at the contract boundary prevents the
+    // ambiguity decision from being silently made by exception classification.
+    // -------------------------------------------------------------------------
+    it("12.3.2.18: external execute returns raw value → 500 contract violation, operation FAILED, replay gets stored failure", async () => {
+      const key = `p123218-${Date.now()}`;
+      const scope = "test_external_raw_return_contract_violation";
+      const providerKey = `prov_${key}`;
+      let execCount = 0;
+
+      // External operation with explicit providerKey, but execute() returns a
+      // raw value instead of an OperationOutcome → 500 contract violation.
+      await expect(
+        runIdempotentOperation({
+          scope,
+          key,
+          providerKey,
+          // isExternal defaults to true.
+          execute: async () => {
+            execCount++;
+            return { raw: true } as any; // raw value, NOT an OperationOutcome
+          },
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 });
+      expect(execCount).toBe(1); // execute WAS called once (the contract violation is detected after the raw return)
+
+      // The operation transitions to FAILED — the contract violation is stored.
+      const op = await getIdempotencyOperation(scope, key);
+      expect(op).not.toBeNull();
+      expect(op!.state).toBe("FAILED");
+      const failure = JSON.parse(op!.failureJson!);
+      expect(failure.statusCode).toBe(500);
+      expect(failure.errorClass).toBe("internal");
+      // The stored failure mentions the contract violation.
+      expect(failure.message).toMatch(/raw value|OperationOutcome|contract violation/i);
+
+      // A replay with the same key gets the STORED failure (500) — it does NOT
+      // re-execute, and it does NOT throw a fresh contract violation.
+      let replayExecCount = 0;
+      await expect(
+        runIdempotentOperation({
+          scope,
+          key,
+          providerKey,
+          execute: async () => {
+            replayExecCount++;
+            return { outcome: "SUCCESS" as const, value: { shouldNotReach: true } };
+          },
+        }),
+      ).rejects.toMatchObject({ statusCode: 500 });
+      expect(replayExecCount).toBe(0); // not re-executed — replay throws the stored failure
 
       // Cleanup.
       await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
