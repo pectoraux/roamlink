@@ -1017,6 +1017,29 @@ export async function _testForceLeaseExpiry(scope: string, key: string, claimId:
 }
 
 /**
+ * Phase 12.3.2.8: Test hook that simulates a stale worker whose claim was lost
+ * MID-EXECUTE. Called from inside execute() right before it throws/returns.
+ *
+ * This forces the lease to expire AND runs the reclaim worker, so the operation
+ * transitions to RECONCILIATION_REQUIRED before the catch path's fenced update.
+ * The catch path's fenced update (WHERE state = IN_PROGRESS) will then return
+ * 0 rows — proving the stale-worker invariant through the REAL production code
+ * path, not a simulation.
+ *
+ * Returns the claimId that was reclaimed (for assertion).
+ */
+export async function _testForceClaimLossMidExecute(scope: string, key: string): Promise<string | null> {
+  const op = await db.idempotencyOperation.findUnique({
+    where: { scope_key: { scope, key } },
+    select: { claimId: true },
+  });
+  if (!op?.claimId) return null;
+  await _testForceLeaseExpiry(scope, key, op.claimId);
+  await reclaimExpiredIdempotencyOperations();
+  return op.claimId;
+}
+
+/**
  * Get the current claimId for an operation.
  */
 export async function _getClaimId(scope: string, key: string): Promise<string | null> {

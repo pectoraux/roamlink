@@ -56,3 +56,7 @@ server.log
 
 # Tool artifact outputs (root-level)
 /tool-results/
+
+# Local SQLite database (development artifact — do not commit)
+db/custom.db
+db/custom.db-journal

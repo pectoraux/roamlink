@@ -47,6 +47,7 @@ import {
   getIdempotencyOperation,
   reconcileOperation,
   _testForceLeaseExpiry,
+  _testForceClaimLossMidExecute,
   _getClaimId,
   _getProviderKey,
 } from "@/lib/idempotency/claim";
@@ -1392,83 +1393,82 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
     // -------------------------------------------------------------------------
     // 12.3.2.21 — Stale THROWN-error confirmed-failure worker must not report FAILED
     //
-    // The architect's final finding: the catch-path isConfirmedFailure branch
-    // (when execute() THROWS an AppError with a client errorClass, rather than
-    // returning an explicit OperationOutcome) still had the old bug — when the
-    // fenced FAILED update returned 0 rows, it fell through to `throw err`,
-    // leaking the original confirmed failure to the caller.
+    // Phase 12.3.2.8: This test now exercises the REAL production catch path
+    // via runIdempotentOperation(), not a simulated fenced update. The test
+    // uses _testForceClaimLossMidExecute() — a test hook called from inside
+    // execute() — to deterministically force the claim to expire and be
+    // reclaimed RIGHT BEFORE execute() throws. This means:
     //
-    // This test proves the thrown-error path now follows the same rule:
-    //   claim lost → 409 outcome-unknown (not the original failure).
+    //   1. runIdempotentOperation() claims (INSERT IN_PROGRESS).
+    //   2. execute() starts.
+    //   3. execute() calls _testForceClaimLossMidExecute() → lease expires +
+    //      reclaim worker runs → state becomes RECONCILIATION_REQUIRED.
+    //   4. execute() throws AppError("validation", ...).
+    //   5. The REAL catch path classifies it as CONFIRMED_FAILURE.
+    //   6. The REAL catch path performs the fenced FAILED update.
+    //   7. The fenced update returns 0 rows (state is RECONCILIATION_REQUIRED).
+    //   8. The REAL catch path throws 409 outcome-unknown (NOT the original 400).
+    //   9. Operation remains RECONCILIATION_REQUIRED.
     //
-    // Sequence:
-    //   1. Worker A claims.
-    //   2. Force claim expiry + reclaim → RECONCILIATION_REQUIRED.
-    //   3. Worker A (stale) executes and throws AppError("validation", ...).
-    //   4. The catch path classifies it as CONFIRMED_FAILURE.
-    //   5. The fenced FAILED update → 0 rows (claim lost).
-    //   6. A must NOT throw the original validation error.
-    //   7. Caller receives 409 outcome-unknown.
-    //   8. Operation remains RECONCILIATION_REQUIRED.
-    //
-    // NOTE: This test is tricky because the stale worker's execute() must run
-    // AFTER the claim was already lost. We simulate this by manually creating
-    // the IN_PROGRESS claim, reclaiming it, and then directly performing the
-    // fenced FAILED update (the same UPDATE the catch path would do). This
-    // proves the fenced update returns 0 rows and the operation stays
-    // RECONCILIATION_REQUIRED.
+    // This proves the stale-worker invariant through the actual production code
+    // path, not a source-equivalent simulation.
     // -------------------------------------------------------------------------
-    it("12.3.2.21: stale thrown-error confirmed-failure worker → 409 (not original error), operation stays RECONCILIATION_REQUIRED", async () => {
+    it("12.3.2.21: stale thrown-error confirmed-failure worker → 409 (not original error), real catch path, operation stays RECONCILIATION_REQUIRED", async () => {
       const key = `p123221-${Date.now()}`;
-      const scope = "test_stale_thrown_confirmed_failure";
+      const scope = "test_stale_thrown_confirmed_failure_real";
       const providerKey = `prov_${key}`;
-      const claimId = randomUUID();
 
-      // Step 1: Worker A claims.
-      await db.idempotencyOperation.create({
-        data: {
-          scope, key,
-          state: "IN_PROGRESS",
-          claimId,
-          providerKey,
-          claimExpiresAt: new Date(Date.now() + 5000),
-        },
-      });
+      // Track whether execute() was called and whether the hook ran.
+      let executeCalled = false;
+      let hookRan = false;
+      let reclaimedClaimId: string | null = null;
 
-      // Step 2: Force claim expiry + reclaim → RECONCILIATION_REQUIRED.
-      await db.idempotencyOperation.updateMany({
-        where: { scope, key, claimId, state: "IN_PROGRESS" },
-        data: { claimExpiresAt: new Date(Date.now() - 1000) },
-      });
-      await reclaimExpiredIdempotencyOperations();
-      let op = await getIdempotencyOperation(scope, key);
-      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
+      // Invoke the REAL runIdempotentOperation. execute() will force the claim
+      // loss mid-execute (simulating a stale worker whose heartbeat stopped),
+      // then throw a confirmed failure. The catch path must detect the claim
+      // loss and return 409 — NOT the original 400 validation error.
+      const error: { statusCode?: number; message?: string } = {};
+      try {
+        await runIdempotentOperation({
+          scope, key, providerKey,
+          execute: async () => {
+            executeCalled = true;
+            // Force the claim to expire + reclaim RIGHT BEFORE throwing.
+            // This makes the catch path's fenced update return 0 rows.
+            reclaimedClaimId = await _testForceClaimLossMidExecute(scope, key);
+            hookRan = true;
+            // Verify the operation is now RECONCILIATION_REQUIRED (claim lost).
+            const op = await getIdempotencyOperation(scope, key);
+            expect(op!.state).toBe("RECONCILIATION_REQUIRED");
+            // Now throw a confirmed failure — the catch path must handle this.
+            throw new AppError("validation", "Invalid plan ID", 400, "The plan ID is invalid.");
+          },
+        });
+      } catch (err) {
+        error.statusCode = (err as AppError).statusCode;
+        error.message = (err as AppError).message;
+      }
 
-      // Step 3-4: Worker A (stale) throws AppError("validation", ...) — a
-      // CONFIRMED_FAILURE by errorClass classification. The catch path tries
-      // the fenced FAILED update. We simulate that directly:
-      const thrownFailure = { errorClass: "validation" as const, message: "Invalid plan ID", statusCode: 400, safeMessage: "The plan ID is invalid." };
-      const updated = await db.idempotencyOperation.updateMany({
-        where: { scope, key, claimId, state: "IN_PROGRESS" }, // fenced on claimId + IN_PROGRESS
-        data: {
-          state: "FAILED",
-          failureJson: JSON.stringify(thrownFailure),
-          completedAt: new Date(),
-          claimExpiresAt: null,
-        },
-      });
+      // execute() WAS called and the hook DID run.
+      expect(executeCalled).toBe(true);
+      expect(hookRan).toBe(true);
+      expect(reclaimedClaimId).not.toBeNull();
 
-      // Step 5: 0 rows — claim is stale. DB state wins.
-      expect(updated.count).toBe(0);
+      // The caller receives 409 outcome-unknown — NOT 400 (the original
+      // validation error). The stale worker must not report a stronger state
+      // than the DB permits.
+      expect(error.statusCode).toBe(409);
+      expect(error.message).toMatch(/outcome.*unknown|reconciliation|claim.*lost/i);
 
-      // Step 6: Operation remains RECONCILIATION_REQUIRED (NOT FAILED).
-      op = await getIdempotencyOperation(scope, key);
+      // The operation remains RECONCILIATION_REQUIRED (DB state wins).
+      // The catch path's fenced FAILED update returned 0 rows — it did NOT
+      // transition to FAILED.
+      const op = await getIdempotencyOperation(scope, key);
       expect(op!.state).toBe("RECONCILIATION_REQUIRED");
       expect(op!.completedAt).toBeNull(); // not terminal
 
-      // Step 7: A retry with the same key gets 409 (outcome-unknown),
-      // NOT 400 (the original validation error). The caller must NOT believe
-      // the operation definitely failed.
+      // A retry with the same key gets 409 (outcome-unknown), NOT 400.
+      // The caller is blocked from retrying with a new key.
       let retryExecCount = 0;
       await expect(
         runIdempotentOperation({
@@ -1478,7 +1478,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
             return { outcome: "SUCCESS" as const, value: { shouldNotReach: true } };
           },
         }),
-      ).rejects.toMatchObject({ statusCode: 409 }); // outcome-unknown, NOT 400
+      ).rejects.toMatchObject({ statusCode: 409 });
       expect(retryExecCount).toBe(0);
 
       // Cleanup.

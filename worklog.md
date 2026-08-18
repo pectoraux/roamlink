@@ -5753,3 +5753,69 @@ Stage Summary:
      DB-authoritative claim permits."
   This holds for SUCCESS, CONFIRMED_FAILURE (explicit + thrown), AMBIGUOUS,
   raw-return contract violation, and lease-expiry reclaim — every path.
+
+---
+Task ID: 12.3.2.8
+Agent: Principal Architect (main) — Phase 12.3.2.8 Real Runtime Proof + Repository Hygiene
+Task: Close the proof-quality gap the architect identified in the audit of 10dbfd0. The production fix was correct, but 12.3.2.21 simulated the fenced update instead of running the real runIdempotentOperation() catch path. Also: remove db/custom.db from git tracking (it's a local dev artifact).
+
+Work Log:
+- Fix 1 — Test hook for deterministic mid-execute claim loss (src/lib/idempotency/claim.ts):
+  New exported test helper: _testForceClaimLossMidExecute(scope, key).
+  Called from inside execute() RIGHT BEFORE it throws/returns. It:
+    1. Looks up the current claimId for the operation.
+    2. Forces the lease to expire (_testForceLeaseExpiry).
+    3. Runs the reclaim worker (reclaimExpiredIdempotencyOperations).
+  After this hook runs, the operation is in RECONCILIATION_REQUIRED. The catch
+  path's fenced update (WHERE state = IN_PROGRESS) will return 0 rows — proving
+  the stale-worker invariant through the REAL production code path.
+
+- Fix 2 — 12.3.2.21 rewritten to exercise the REAL catch path:
+  OLD: manually created the claim, reclaimed it, directly performed the fenced
+       FAILED update (simulated the catch path). Proved the DB fence works but
+       NOT the full behavioral invariant.
+  NEW: invokes runIdempotentOperation() with an execute() that:
+    1. Calls _testForceClaimLossMidExecute() (forces claim loss mid-execute).
+    2. Verifies the operation is now RECONCILIATION_REQUIRED.
+    3. Throws AppError("validation", ...) — a CONFIRMED_FAILURE.
+  The REAL catch path then:
+    1. Classifies the throw as CONFIRMED_FAILURE.
+    2. Performs the fenced FAILED update (WHERE claimId=X AND state=IN_PROGRESS).
+    3. Gets 0 rows (state is RECONCILIATION_REQUIRED, not IN_PROGRESS).
+    4. Throws 409 outcome-unknown (NOT the original 400 validation error).
+  The test asserts:
+    - execute() was called, the hook ran, the claimId was reclaimed.
+    - statusCode === 409 (NOT 400).
+    - message matches /outcome.*unknown|reconciliation|claim.*lost/i.
+    - operation.state === RECONCILIATION_REQUIRED (DB state wins).
+    - operation.completedAt === null (not terminal).
+    - A retry with the same key gets 409 (blocked), retryExecCount === 0.
+  This proves the stale-worker invariant through the actual production code path,
+  not a source-equivalent simulation.
+
+- Fix 3 — Repository hygiene:
+  Removed db/custom.db from git tracking (git rm --cached db/custom.db).
+  Added db/custom.db + db/custom.db-journal to .gitignore.
+  The database file is a local development artifact — it should not be committed
+  to a production infrastructure repository. Each environment has its own
+  database (SQLite in dev, PostgreSQL in production).
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       32/32 PASS  (12.3.2.21 now exercises the real catch path)
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 109 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The proof-quality gap is closed:
+  12.3.2.21 now invokes the REAL runIdempotentOperation() catch path with a
+  deterministic mid-execute claim-loss hook. It proves the stale-worker invariant
+  through the actual production code, not a simulation.
+- Repository hygiene: db/custom.db is no longer tracked; .gitignore updated.
+- The idempotency state machine is now ready to freeze — all proofs are real
+  runtime proofs, and the stale-worker invariant holds across every path.
