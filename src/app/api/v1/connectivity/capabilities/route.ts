@@ -2,61 +2,72 @@
  * Protocol API — Capabilities
  * GET  /api/v1/connectivity/capabilities — discover capabilities
  * POST /api/v1/connectivity/capabilities — advertise a capability
+ *
+ * Phase 12.3.6: Accepts API-key OR session auth. Canonical error envelope.
  */
 
-import { NextRequest, NextResponse } from "next/server";
-import { getCurrentUser } from "@/lib/auth";
-import { requireTenantContext } from "@/lib/tenant/context";
+import { NextRequest } from "next/server";
+import { resolveApiPrincipal, principalTenantId } from "@/lib/api/principal";
+import { getRequestId, apiErrorResponse, apiSuccessResponse } from "@/lib/api/protocol";
 import { advertiseCapability, discoverCapabilities } from "@/lib/control-plane/capability-registry";
+import { AppError } from "@/lib/errors";
 
 export async function GET(req: NextRequest) {
-  const user = await getCurrentUser();
-  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  const ctx = await requireTenantContext(user);
+  const requestId = getRequestId(req);
+  try {
+    const principal = await resolveApiPrincipal(req, "read");
+    const tenantId = principalTenantId(principal);
 
-  const { searchParams } = req.nextUrl;
-  const type = searchParams.get("type") ?? undefined;
-  const country = searchParams.get("country") ?? undefined;
-  const city = searchParams.get("city") ?? undefined;
-  const minReliability = searchParams.get("minReliability")
-    ? parseFloat(searchParams.get("minReliability")!)
-    : undefined;
+    const { searchParams } = req.nextUrl;
+    const type = searchParams.get("type") ?? undefined;
+    const country = searchParams.get("country") ?? undefined;
+    const city = searchParams.get("city") ?? undefined;
+    const minReliability = searchParams.get("minReliability")
+      ? parseFloat(searchParams.get("minReliability")!)
+      : undefined;
 
-  const capabilities = await discoverCapabilities({
-    tenantId: ctx.tenantId,
-    type,
-    country,
-    city,
-    minReliability,
-  });
+    const capabilities = await discoverCapabilities({
+      tenantId,
+      type,
+      country,
+      city,
+      minReliability,
+    });
 
-  return NextResponse.json({ capabilities });
+    return apiSuccessResponse({ capabilities }, requestId);
+  } catch (err) {
+    return apiErrorResponse(err, requestId);
+  }
 }
 
 export async function POST(req: NextRequest) {
-  const user = await getCurrentUser();
-  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  const ctx = await requireTenantContext(user);
+  const requestId = getRequestId(req);
+  try {
+    const principal = await resolveApiPrincipal(req, "write");
+    const tenantId = principalTenantId(principal);
 
-  const body = await req.json();
-  const { providerInstanceId, type, providerType, bandwidth, latency, reliability, geographicCoverage, mobility, metering } = body;
+    const body = await req.json();
+    const { providerInstanceId, type, providerType, bandwidth, latency, reliability, geographicCoverage, mobility, metering } = body;
 
-  if (!providerInstanceId || !type || !providerType) {
-    return NextResponse.json({ error: "providerInstanceId, type, and providerType are required" }, { status: 400 });
+    if (!providerInstanceId || !type || !providerType) {
+      throw new AppError("validation", "providerInstanceId, type, and providerType are required", 400, "providerInstanceId, type, and providerType are required.");
+    }
+
+    const result = await advertiseCapability({
+      tenantId,
+      providerInstanceId,
+      type,
+      providerType,
+      bandwidth,
+      latency,
+      reliability,
+      geographicCoverage,
+      mobility,
+      metering,
+    });
+
+    return apiSuccessResponse({ capability: result }, requestId, 201);
+  } catch (err) {
+    return apiErrorResponse(err, requestId);
   }
-
-  const result = await advertiseCapability({
-    tenantId: ctx.tenantId,
-    providerInstanceId,
-    type,
-    providerType,
-    bandwidth,
-    latency,
-    reliability,
-    geographicCoverage,
-    mobility,
-    metering,
-  });
-
-  return NextResponse.json({ capability: result }, { status: 201 });
 }

@@ -2,76 +2,76 @@
  * Protocol API — Measurements
  * POST /api/v1/connectivity/measurements
  *
- * Phase 8.6: records a measurement through the canonical ingestion path
- * (ingestMeasurement), which validates source provenance, computes freshness,
- * derives persisted ResourceHealth, and emits re-evaluation events.
- *
- * Phase 12.2: Verifies session/resource/providerInstance belong to ctx.tenantId.
+ * Phase 8.6: records a measurement through the canonical ingestion path.
+ * Phase 12.2: Verifies session/resource/providerInstance belong to tenant.
+ * Phase 12.3.6: Accepts API-key OR session auth. Canonical error envelope.
  */
 
-import { NextRequest, NextResponse } from "next/server";
-import { getCurrentUser } from "@/lib/auth";
-import { requireTenantContext } from "@/lib/tenant/context";
+import { NextRequest } from "next/server";
+import { resolveApiPrincipal, principalTenantId } from "@/lib/api/principal";
+import { getRequestId, apiErrorResponse, apiSuccessResponse } from "@/lib/api/protocol";
 import { ingestMeasurement, isValidSource } from "@/lib/control-plane/measurement-store";
 import { db } from "@/lib/db";
+import { AppError } from "@/lib/errors";
 
 export async function POST(req: NextRequest) {
-  const user = await getCurrentUser();
-  if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
-  const ctx = await requireTenantContext(user);
-
-  const body = await req.json();
-  const { sessionId, resourceId, providerInstanceId, type, metrics, source, confidence, capturedAt } = body;
-
-  if (!type || !["USAGE", "QUALITY", "AVAILABILITY"].includes(type)) {
-    return NextResponse.json({ error: "type must be USAGE, QUALITY, or AVAILABILITY" }, { status: 400 });
-  }
-
-  if (!metrics || typeof metrics !== "object") {
-    return NextResponse.json({ error: "metrics object is required" }, { status: 400 });
-  }
-
-  // Phase 8.6: source provenance is required and validated.
-  const resolvedSource = source ?? "PROVIDER";
-  if (!isValidSource(resolvedSource)) {
-    return NextResponse.json(
-      {
-        error: `Invalid source "${resolvedSource}". Must be one of: ADAPTER, DEVICE, PROBE, PROVIDER, DERIVED.`,
-      },
-      { status: 400 },
-    );
-  }
-
-  // Phase 12.2: Verify session belongs to this tenant.
-  if (sessionId) {
-    const session = await db.connectivitySession.findUnique({
-      where: { id: sessionId },
-      select: { subjectId: true, entitlementId: true },
-    });
-    if (!session) return NextResponse.json({ error: "Session not found" }, { status: 404 });
-    if (session.subjectId !== user.id) return NextResponse.json({ error: "Session does not belong to this user" }, { status: 403 });
-    if (session.entitlementId) {
-      const ent = await db.connectivityEntitlement.findUnique({ where: { id: session.entitlementId }, select: { tenantId: true } });
-      if (!ent || ent.tenantId !== ctx.tenantId) return NextResponse.json({ error: "Session entitlement does not belong to this tenant" }, { status: 403 });
-    }
-  }
-
-  // Phase 12.2: Verify providerInstance belongs to this tenant.
-  if (providerInstanceId) {
-    const instance = await db.connectivityProviderInstance.findUnique({ where: { id: providerInstanceId }, select: { tenantId: true } });
-    if (!instance || instance.tenantId !== ctx.tenantId) return NextResponse.json({ error: "Provider instance does not belong to this tenant" }, { status: 403 });
-  }
-
-  // Phase 12.2: Verify resource belongs to this tenant (via capability.tenantId).
-  if (resourceId) {
-    const resource = await db.protocolResource.findUnique({ where: { id: resourceId }, select: { capabilityId: true } });
-    if (resource) {
-      const cap = await db.protocolCapability.findUnique({ where: { id: resource.capabilityId }, select: { tenantId: true } });
-      if (!cap || cap.tenantId !== ctx.tenantId) return NextResponse.json({ error: "Resource does not belong to this tenant" }, { status: 403 });
-    }
-  }
-
+  const requestId = getRequestId(req);
   try {
+    const principal = await resolveApiPrincipal(req, "write");
+    const tenantId = principalTenantId(principal);
+
+    const body = await req.json();
+    const { sessionId, resourceId, providerInstanceId, type, metrics, source, confidence, capturedAt } = body;
+
+    if (!type || !["USAGE", "QUALITY", "AVAILABILITY"].includes(type)) {
+      throw new AppError("validation", "type must be USAGE, QUALITY, or AVAILABILITY", 400, "type must be USAGE, QUALITY, or AVAILABILITY.");
+    }
+
+    if (!metrics || typeof metrics !== "object") {
+      throw new AppError("validation", "metrics object is required", 400, "metrics object is required.");
+    }
+
+    const resolvedSource = source ?? "PROVIDER";
+    if (!isValidSource(resolvedSource)) {
+      throw new AppError(
+        "validation",
+        `Invalid source "${resolvedSource}"`,
+        400,
+        `Invalid source. Must be one of: ADAPTER, DEVICE, PROBE, PROVIDER, DERIVED.`,
+      );
+    }
+
+    // Verify session belongs to this tenant.
+    if (sessionId) {
+      const session = await db.connectivitySession.findUnique({
+        where: { id: sessionId },
+        select: { subjectId: true, entitlementId: true },
+      });
+      if (!session) throw new AppError("not_found", "Session not found", 404, "Session not found.");
+      if (principal.type === "session" && session.subjectId !== principal.userId) {
+        throw new AppError("authorization", "Session does not belong to this user", 403, "Session does not belong to this user.");
+      }
+      if (session.entitlementId) {
+        const ent = await db.connectivityEntitlement.findUnique({ where: { id: session.entitlementId }, select: { tenantId: true } });
+        if (!ent || ent.tenantId !== tenantId) throw new AppError("authorization", "Session entitlement does not belong to this tenant", 403, "Session entitlement does not belong to this tenant.");
+      }
+    }
+
+    // Verify providerInstance belongs to this tenant.
+    if (providerInstanceId) {
+      const instance = await db.connectivityProviderInstance.findUnique({ where: { id: providerInstanceId }, select: { tenantId: true } });
+      if (!instance || instance.tenantId !== tenantId) throw new AppError("authorization", "Provider instance does not belong to this tenant", 403, "Provider instance does not belong to this tenant.");
+    }
+
+    // Verify resource belongs to this tenant (via capability.tenantId).
+    if (resourceId) {
+      const resource = await db.protocolResource.findUnique({ where: { id: resourceId }, select: { capabilityId: true } });
+      if (resource) {
+        const cap = await db.protocolCapability.findUnique({ where: { id: resource.capabilityId }, select: { tenantId: true } });
+        if (!cap || cap.tenantId !== tenantId) throw new AppError("authorization", "Resource does not belong to this tenant", 403, "Resource does not belong to this tenant.");
+      }
+    }
+
     const result = await ingestMeasurement({
       sessionId,
       resourceId,
@@ -83,19 +83,13 @@ export async function POST(req: NextRequest) {
       capturedAt: capturedAt ? new Date(capturedAt) : undefined,
     });
 
-    return NextResponse.json(
-      {
-        measurement: { id: result.measurementId },
-        freshness: result.freshness,
-        health: result.health,
-        eventsEmitted: result.eventsEmitted,
-      },
-      { status: 201 },
-    );
+    return apiSuccessResponse({
+      measurement: { id: result.measurementId },
+      freshness: result.freshness,
+      health: result.health,
+      eventsEmitted: result.eventsEmitted,
+    }, requestId, 201);
   } catch (err) {
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : "ingestion failed" },
-      { status: 400 },
-    );
+    return apiErrorResponse(err, requestId);
   }
 }

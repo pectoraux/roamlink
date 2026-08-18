@@ -38,6 +38,7 @@ import {
   type FulfillmentStatus,
 } from "./fulfillment-state-machine";
 import { generateIdempotencyKey, audit } from "./idempotency";
+import { runIdempotentOperation, hashPayload } from "@/lib/idempotency/claim";
 import { logger } from "@/lib/logger";
 import { AppError, classifyProviderError } from "@/lib/errors";
 import { recordProviderResult } from "@/lib/providers/routing";
@@ -381,15 +382,27 @@ export async function createOrder(input: {
   idempotencyKey: string;
   ip?: string;
 }): Promise<OrderSnapshot> {
-  // Idempotency: return existing order for this key.
-  const existing = await db.order.findUnique({
-    where: { idempotencyKey: input.idempotencyKey },
-    include: { plan: true, esim: true },
-  });
-  if (existing) {
-    return toSnapshot(existing as OrderWithIncludes);
-  }
-
+  // Phase 12.3.7: Migrated to the DB-authoritative idempotency primitive.
+  // The INSERT into IdempotencyOperation is the atomic claim — no
+  // read-then-write window. A concurrent request with the same key loses
+  // the INSERT race, polls for completion, and returns the stored result
+  // (clean replay) instead of receiving a raw P2002 unique-constraint
+  // violation surfaced as an unhandled 500.
+  return runIdempotentOperation<OrderSnapshot>({
+    scope: "createOrder",
+    key: input.idempotencyKey,
+    payloadHash: hashPayload({ planId: input.planId, tenantId: input.tenantId ?? null, distributionOfferId: input.distributionOfferId ?? null }),
+    principal: { type: "session", id: input.userId, tenantId: input.tenantId ?? null },
+    execute: async () => {
+      // Domain-level replay: if the Order row already exists, return it.
+      const existing = await db.order.findUnique({
+        where: { idempotencyKey: input.idempotencyKey },
+        include: { plan: true, esim: true },
+      });
+      if (existing) {
+        return toSnapshot(existing as OrderWithIncludes);
+      }
+  // === BEGIN original createOrder body (preserved verbatim) ===
   const plan = await getCanonicalPlan(input.planId);
   if (!plan) throw new AppError("not_found", "Plan not found", 404, "This plan is no longer available.");
   if (plan.status !== "active") throw new AppError("conflict", "Plan inactive", 409, "This plan is no longer available.");
@@ -478,6 +491,9 @@ export async function createOrder(input: {
     tenantId: input.tenantId ?? null,
   });
   return toSnapshot(order as OrderWithIncludes);
+  // === END original createOrder body ===
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -517,30 +533,60 @@ export async function initiatePayment(input: {
   assertTransition(order.status as OrderStatus, "PAYMENT_PENDING");
 
   const paymentProvider = getPaymentProvider();
-  const intent = await paymentProvider.createPaymentIntent({
-    amountMinor: order.amount,
-    currency: order.currency as Currency,
-    description: `eSIM ${order.plan?.name ?? ""}`,
-    idempotencyKey: input.idempotencyKey,
-    metadata: { orderId: order.id, userId: input.userId },
+
+  // Phase 12.3.7: Migrated payment-row creation to the DB-authoritative
+  // idempotency primitive. The prior `findUnique → create` pattern had a
+  // race: two concurrent requests both saw existing===null and both created
+  // payment intents + rows. Now the INSERT into IdempotencyOperation is the
+  // atomic claim; the payment intent creation happens at most once.
+  const paymentResult = await runIdempotentOperation<{
+    payment: { id: string; providerReference: string };
+    intent: { providerReference: string; clientSecret?: string; nextAction?: { type: "redirect" | "otp" | "none"; url?: string; instructions?: string } };
+  }>({
+    scope: "initiatePayment",
+    key: input.idempotencyKey,
+    payloadHash: hashPayload({ orderId: input.orderId, amount: order.amount }),
+    principal: { type: "session", id: input.userId, tenantId: order.tenantId ?? null },
+    execute: async () => {
+      // Domain-level replay: if the Payment row already exists, return it.
+      const existingPayment = await db.payment.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
+      if (existingPayment) {
+        return {
+          payment: { id: existingPayment.id, providerReference: existingPayment.providerReference },
+          intent: { providerReference: existingPayment.providerReference },
+        };
+      }
+
+      const newIntent = await paymentProvider.createPaymentIntent({
+        amountMinor: order.amount,
+        currency: order.currency as Currency,
+        description: `eSIM ${order.plan?.name ?? ""}`,
+        idempotencyKey: input.idempotencyKey,
+        metadata: { orderId: order.id, userId: input.userId },
+      });
+
+      const created = await db.payment.create({
+        data: {
+          userId: input.userId,
+          orderId: order.id,
+          amount: order.amount,
+          currency: order.currency,
+          status: "pending",
+          provider: paymentProvider.id,
+          providerReference: newIntent.providerReference,
+          idempotencyKey: input.idempotencyKey,
+        },
+      });
+
+      return {
+        payment: { id: created.id, providerReference: newIntent.providerReference },
+        intent: { providerReference: newIntent.providerReference, clientSecret: newIntent.clientSecret, nextAction: newIntent.nextAction },
+      };
+    },
   });
 
-  // Record the payment row (idempotent on idempotencyKey constraint).
-  let payment = await db.payment.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
-  if (!payment) {
-    payment = await db.payment.create({
-      data: {
-        userId: input.userId,
-        orderId: order.id,
-        amount: order.amount,
-        currency: order.currency,
-        status: "pending",
-        provider: paymentProvider.id,
-        providerReference: intent.providerReference,
-        idempotencyKey: input.idempotencyKey,
-      },
-    });
-  }
+  const payment = paymentResult.payment;
+  const intent = paymentResult.intent;
 
   await db.order.update({
     where: { id: order.id },

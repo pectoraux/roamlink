@@ -13,6 +13,7 @@ import { mockPaymentProvider } from "@/lib/payments";
 import { logger } from "@/lib/logger";
 import { AppError } from "@/lib/errors";
 import { audit } from "@/lib/orders/idempotency";
+import { runIdempotentOperation, hashPayload } from "@/lib/idempotency/claim";
 import { notify } from "@/lib/notifications/service";
 import type { Currency } from "@/lib/money";
 
@@ -39,79 +40,92 @@ export async function purchaseTopUp(input: {
   idempotencyKey: string;
   ip?: string;
 }): Promise<{ topUpId: string; dataAddedMB: number; newRemainingMB: number }> {
-  // Idempotency: existing top-up for this key?
-  const existing = await db.topUp.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
-  if (existing) {
-    const esim = await db.esim.findUnique({ where: { id: input.esimId } });
-    return { topUpId: existing.id, dataAddedMB: existing.dataAmount, newRemainingMB: esim?.dataRemaining ?? 0 };
-  }
+  // Phase 12.3.7: Migrated to the DB-authoritative idempotency primitive.
+  // The INSERT into IdempotencyOperation is the atomic claim — no
+  // read-then-write window. A concurrent request with the same key loses the
+  // INSERT race, polls for completion, and returns the stored result (clean
+  // replay) instead of receiving a raw P2002 unique-constraint violation.
+  return runIdempotentOperation({
+    scope: "purchaseTopUp",
+    key: input.idempotencyKey,
+    payloadHash: hashPayload({ esimId: input.esimId, packageId: input.packageId }),
+    principal: { type: "session", id: input.userId, tenantId: null },
+    execute: async () => {
+      // Domain-level replay: if the TopUp row already exists, return it.
+      const existing = await db.topUp.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
+      if (existing) {
+        const esim = await db.esim.findUnique({ where: { id: input.esimId } });
+        return { topUpId: existing.id, dataAddedMB: existing.dataAmount, newRemainingMB: esim?.dataRemaining ?? 0 };
+      }
 
-  const esim = await db.esim.findUnique({ where: { id: input.esimId } });
-  if (!esim || esim.userId !== input.userId) throw new AppError("not_found", "eSIM not found", 404, "eSIM not found.");
-  if (!esim.providerESIMId) throw new AppError("conflict", "eSIM not provisioned", 409, "This eSIM is not provisioned yet.");
+      const esim = await db.esim.findUnique({ where: { id: input.esimId } });
+      if (!esim || esim.userId !== input.userId) throw new AppError("not_found", "eSIM not found", 404, "eSIM not found.");
+      if (!esim.providerESIMId) throw new AppError("conflict", "eSIM not provisioned", 409, "This eSIM is not provisioned yet.");
 
-  const esimProvider = getESIMProvider();
-  const supported = await esimProvider.supportsTopUp(esim.providerESIMId);
-  if (!supported) throw new AppError("conflict", "Top-up not supported", 409, "Top-ups are not supported for this eSIM.");
+      const esimProvider = getESIMProvider();
+      const supported = await esimProvider.supportsTopUp(esim.providerESIMId);
+      if (!supported) throw new AppError("conflict", "Top-up not supported", 409, "Top-ups are not supported for this eSIM.");
 
-  const packages = await esimProvider.getTopUpPackages(esim.providerESIMId);
-  const pkg = packages.find((p) => p.id === input.packageId);
-  if (!pkg) throw new AppError("not_found", "Top-up package not found", 404, "This top-up package is no longer available.");
+      const packages = await esimProvider.getTopUpPackages(esim.providerESIMId);
+      const pkg = packages.find((p) => p.id === input.packageId);
+      if (!pkg) throw new AppError("not_found", "Top-up package not found", 404, "This top-up package is no longer available.");
 
-  // --- Payment (server-side verified) ---
-  const paymentProvider = getPaymentProvider();
-  const intent = await paymentProvider.createPaymentIntent({
-    amountMinor: pkg.priceMinor,
-    currency: pkg.currency as Currency,
-    description: `Top-up ${pkg.name}`,
-    idempotencyKey: `tu_pay_${input.idempotencyKey}`,
-    metadata: { esimId: input.esimId, packageId: input.packageId },
-  });
+      // --- Payment (server-side verified) ---
+      const paymentProvider = getPaymentProvider();
+      const intent = await paymentProvider.createPaymentIntent({
+        amountMinor: pkg.priceMinor,
+        currency: pkg.currency as Currency,
+        description: `Top-up ${pkg.name}`,
+        idempotencyKey: `tu_pay_${input.idempotencyKey}`,
+        metadata: { esimId: input.esimId, packageId: input.packageId },
+      });
 
-  // For mock: confirm immediately, then verify.
-  if (paymentProvider.isMock) {
-    mockPaymentProvider.confirmIntent(intent.providerReference);
-  }
-  const verification = await paymentProvider.verifyPayment({
-    providerReference: intent.providerReference,
-    idempotencyKey: `tu_verify_${input.idempotencyKey}`,
-  });
-  if (verification.status !== "succeeded") {
-    throw new AppError("payment", "Top-up payment failed", 402, "We couldn't process your top-up payment. Please try again.");
-  }
+      // For mock: confirm immediately, then verify.
+      if (paymentProvider.isMock) {
+        mockPaymentProvider.confirmIntent(intent.providerReference);
+      }
+      const verification = await paymentProvider.verifyPayment({
+        providerReference: intent.providerReference,
+        idempotencyKey: `tu_verify_${input.idempotencyKey}`,
+      });
+      if (verification.status !== "succeeded") {
+        throw new AppError("payment", "Top-up payment failed", 402, "We couldn't process your top-up payment. Please try again.");
+      }
 
-  // --- Apply top-up via provider (idempotent) ---
-  const result = await esimProvider.topUp({
-    providerESIMId: esim.providerESIMId,
-    packageId: pkg.id,
-    idempotencyKey: input.idempotencyKey,
-  });
-
-  // Record top-up + update eSIM.
-  const [topUp] = await db.$transaction([
-    db.topUp.create({
-      data: {
-        esimId: input.esimId,
-        userId: input.userId,
-        amount: pkg.priceMinor,
-        currency: pkg.currency,
-        dataAmount: pkg.dataAmountMB,
-        paymentStatus: "succeeded",
-        providerReference: result.providerReference,
+      // --- Apply top-up via provider (idempotent) ---
+      const result = await esimProvider.topUp({
+        providerESIMId: esim.providerESIMId,
+        packageId: pkg.id,
         idempotencyKey: input.idempotencyKey,
-      },
-    }),
-    db.esim.update({
-      where: { id: input.esimId },
-      data: { dataRemaining: { increment: pkg.dataAmountMB }, status: "active" },
-    }),
-    db.usage.create({
-      data: { esimId: input.esimId, dataUsed: 0, dataRemaining: result.newRemainingMB, source: "provider" },
-    }),
-  ]);
+      });
 
-  await audit({ userId: input.userId, action: "topup.purchased", entity: "esim", entityId: input.esimId, ip: input.ip });
-  await notify.topUpSuccessful(input.userId, input.esimId, pkg.dataAmountMB);
-  logger.info("topup.applied", { esimId: input.esimId, packageId: pkg.id, added: pkg.dataAmountMB });
-  return { topUpId: topUp.id, dataAddedMB: pkg.dataAmountMB, newRemainingMB: result.newRemainingMB };
+      // Record top-up + update eSIM.
+      const [topUp] = await db.$transaction([
+        db.topUp.create({
+          data: {
+            esimId: input.esimId,
+            userId: input.userId,
+            amount: pkg.priceMinor,
+            currency: pkg.currency,
+            dataAmount: pkg.dataAmountMB,
+            paymentStatus: "succeeded",
+            providerReference: result.providerReference,
+            idempotencyKey: input.idempotencyKey,
+          },
+        }),
+        db.esim.update({
+          where: { id: input.esimId },
+          data: { dataRemaining: { increment: pkg.dataAmountMB }, status: "active" },
+        }),
+        db.usage.create({
+          data: { esimId: input.esimId, dataUsed: 0, dataRemaining: result.newRemainingMB, source: "provider" },
+        }),
+      ]);
+
+      await audit({ userId: input.userId, action: "topup.purchased", entity: "esim", entityId: input.esimId, ip: input.ip });
+      await notify.topUpSuccessful(input.userId, input.esimId, pkg.dataAmountMB);
+      logger.info("topup.applied", { esimId: input.esimId, packageId: pkg.id, added: pkg.dataAmountMB });
+      return { topUpId: topUp.id, dataAddedMB: pkg.dataAmountMB, newRemainingMB: result.newRemainingMB };
+    },
+  });
 }

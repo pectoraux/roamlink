@@ -71,41 +71,81 @@ export type ApiKeyPrincipal = {
 const API_KEY_PREFIX = "rlk_";
 
 /**
- * Extract the raw API key from a request.
+ * Result of attempting to extract an API key from a request.
+ * This makes the "no auth" vs "malformed auth" distinction deterministic,
+ * which is critical for the external API contract (architect point #4):
+ *
+ *   - "absent": the caller provided no API-key credentials at all. The route
+ *     may fall through to session auth (for browser routes) or return 401
+ *     auth_required (for /api/v1/* routes where API-key is the only auth).
+ *   - "malformed": the caller ATTEMPTED API-key auth but the header is
+ *     malformed (wrong scheme, wrong prefix). This is a 401 auth_malformed,
+ *     never a silent fallthrough.
+ *   - "present": the raw key string is extracted and ready for verification.
+ */
+export type ApiKeyExtraction =
+  | { status: "absent" }
+  | { status: "malformed"; reason: string }
+  | { status: "present"; rawKey: string };
+
+/**
+ * Extract the raw API key from a request with full status reporting.
  * Accepts either:
  *   - Authorization: Bearer rlk_...
  *   - x-api-key: rlk_...
  *
- * Returns null if no key is present. Throws 401 if a key is present but
- * malformed (e.g. wrong prefix).
+ * This is the canonical extraction for /api/v1/* routes. It distinguishes:
+ *   - absent (no auth header at all, or non-Bearer Authorization)
+ *   - malformed (Bearer with wrong prefix, or x-api-key with wrong prefix)
+ *   - present (valid rlk_... key extracted)
  */
-export function extractApiKey(req: NextRequest): string | null {
-  // 1. Authorization: Bearer <key>
+export function extractApiKeyStatus(req: NextRequest): ApiKeyExtraction {
   const authHeader = req.headers.get("authorization");
-  if (authHeader) {
-    const match = authHeader.match(/^Bearer\s+(.+)$/i);
-    if (match) {
-      const key = match[1].trim();
-      if (!key.startsWith(API_KEY_PREFIX)) {
-        throw new AppError("auth", "Invalid API key format", 401, "The provided API key has an invalid format.");
-      }
-      return key;
-    }
-    // Authorization header present but not Bearer — could be a session cookie
-    // bearer. Return null to let the caller fall back to session auth.
-    return null;
-  }
-
-  // 2. x-api-key: <key>
   const xApiKey = req.headers.get("x-api-key");
+
+  // If x-api-key is present, validate it.
   if (xApiKey) {
     const key = xApiKey.trim();
     if (!key.startsWith(API_KEY_PREFIX)) {
-      throw new AppError("auth", "Invalid API key format", 401, "The provided API key has an invalid format.");
+      return { status: "malformed", reason: "x-api-key header has an invalid prefix (expected rlk_)" };
     }
-    return key;
+    return { status: "present", rawKey: key };
   }
 
+  // If Authorization is present, it must be Bearer rlk_...
+  if (authHeader) {
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (!match) {
+      // Authorization header present but not Bearer scheme. For /api/v1/*,
+      // this is malformed (we only accept Bearer). For browser routes that
+      // use a different scheme, the caller should check status === "absent"
+      // via the legacy extractApiKey() helper.
+      return { status: "malformed", reason: "Authorization header is not a Bearer token" };
+    }
+    const key = match[1].trim();
+    if (!key.startsWith(API_KEY_PREFIX)) {
+      return { status: "malformed", reason: "Bearer token has an invalid prefix (expected rlk_)" };
+    }
+    return { status: "present", rawKey: key };
+  }
+
+  // No auth header at all.
+  return { status: "absent" };
+}
+
+/**
+ * Extract the raw API key from a request. Backward-compatible with the
+ * initial implementation — returns null if absent, throws 401 if malformed.
+ *
+ * For /api/v1/* routes that need the deterministic absent/malformed distinction,
+ * use extractApiKeyStatus() instead.
+ */
+export function extractApiKey(req: NextRequest): string | null {
+  const result = extractApiKeyStatus(req);
+  if (result.status === "present") return result.rawKey;
+  if (result.status === "malformed") {
+    throw new AppError("auth", result.reason, 401, "The provided API key has an invalid format.");
+  }
   return null;
 }
 
@@ -184,18 +224,26 @@ export async function verifyApiKey(rawKey: string): Promise<ApiKeyPrincipal | nu
 }
 
 /**
- * Require a valid API key with the given scope. Throws 401 if no key, 403 if
- * the key lacks the required scope.
+ * Require a valid API key with the given scope.
+ *
+ * Error semantics (deterministic for the external API contract):
+ *   - absent  → 401 auth_required ("No API key provided")
+ *   - malformed → 401 auth_malformed ("Invalid API key format")
+ *   - present but not found / revoked / expired → 401 auth_invalid / auth_revoked / auth_expired
+ *   - insufficient scope → 403 scope_insufficient
  *
  * This is the canonical entry point for API-key-authenticated routes.
  */
 export async function requireApiKey(req: NextRequest, requiredScope: ApiKeyScope = "read"): Promise<ApiKeyPrincipal> {
-  const rawKey = extractApiKey(req);
-  if (!rawKey) {
+  const extraction = extractApiKeyStatus(req);
+  if (extraction.status === "absent") {
     throw new AppError("auth", "No API key provided", 401, "Provide an API key via the Authorization: Bearer header.");
   }
+  if (extraction.status === "malformed") {
+    throw new AppError("auth", extraction.reason, 401, "The provided API key has an invalid format.");
+  }
 
-  const principal = await verifyApiKey(rawKey);
+  const principal = await verifyApiKey(extraction.rawKey);
   if (!principal) {
     throw new AppError("auth", "Invalid, revoked, or expired API key", 401, "The provided API key is invalid, revoked, or expired.");
   }

@@ -1,24 +1,33 @@
 /**
  * API route helpers — consistent JSON responses + error handling.
+ *
+ * Phase 12.3.3: errorResponse() now emits the canonical API error envelope:
+ *   { error: { code, message, requestId } }
+ * with a stable code taxonomy and `x-request-id` header. See lib/api/protocol.ts.
+ *
+ * For routes that want full control over the requestId (e.g. extracting it
+ * from the incoming request), import apiErrorResponse from lib/api/protocol
+ * directly and pass the requestId.
  */
 
 import { NextResponse } from "next/server";
-import { AppError, safeErrorMessage } from "@/lib/errors";
-import { logger } from "@/lib/logger";
+import { apiErrorResponse, getRequestId } from "@/lib/api/protocol";
 
 export function json(data: unknown, status = 200) {
   return NextResponse.json(data, { status });
 }
 
-export function errorResponse(err: unknown, status?: number) {
-  if (err instanceof AppError) {
-    return NextResponse.json({ error: safeErrorMessage(err), code: err.errorClass }, { status: status ?? err.statusCode });
-  }
-  logger.error("api.unhandled_error", { error: err instanceof Error ? err.message : String(err) });
-  return NextResponse.json({ error: "Something went wrong. Please try again.", code: "internal" }, { status: status ?? 500 });
+/**
+ * Canonical error response. Emits:
+ *   { error: { code, message, requestId } }
+ * with the `x-request-id` response header.
+ *
+ * If no requestId is supplied, one is generated. For routes with access to the
+ * incoming Request, prefer passing `getRequestId(req)` to correlate the
+ * response to the caller's request ID.
+ */
+export function errorResponse(err: unknown, status?: number, requestId?: string) {
+  return apiErrorResponse(err, requestId ?? getRequestId(), { statusCode: status });
 }
 
-export function getClientIP(req: Request): string | undefined {
-  const fwd = req.headers.get("x-forwarded-for");
-  return fwd?.split(",")[0]?.trim() ?? undefined;
-}
+export { getClientIP } from "./api/request";

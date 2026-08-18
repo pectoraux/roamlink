@@ -364,7 +364,9 @@ describe("Phase 12.2 — Multi-Tenant Security Boundary (DB-backed)", () => {
     try {
       setMockSessionToken(token);
       // Invoke the REAL route handler — not a simulation.
-      const res = await sessionsGET();
+      // Phase 12.3.6: the route now requires a NextRequest for requestId extraction.
+      const req = new NextRequest("http://localhost/api/v1/connectivity/sessions");
+      const res = await sessionsGET(req);
       expect(res.status).toBe(200);
       const body = await res.json();
       const sessionIds: string[] = body.sessions.map((s: { id: string }) => s.id);
@@ -411,7 +413,8 @@ describe("Phase 12.2 — Multi-Tenant Security Boundary (DB-backed)", () => {
       const res = await actionsPOST(req);
       expect(res.status).toBe(403);
       const body = await res.json();
-      expect(body.error).toMatch(/entitlement|tenant/i);
+      // Phase 12.3.3: canonical envelope { error: { code, message, requestId } }.
+      expect(body.error.message).toMatch(/entitlement|tenant/i);
     } finally {
       await db.session.deleteMany({ where: { token } }).catch(() => {});
       await db.connectivitySession.delete({ where: { id: session.id } }).catch(() => {});
@@ -446,7 +449,8 @@ describe("Phase 12.2 — Multi-Tenant Security Boundary (DB-backed)", () => {
       const res = await commerceCustomerPOST(req);
       expect(res.status).toBe(403);
       const body = await res.json();
-      expect(body.error).toMatch(/tenant/i);
+      // Phase 12.3.3: canonical envelope { error: { code, message, requestId } }.
+      expect(body.error.message).toMatch(/tenant/i);
     } finally {
       await db.session.deleteMany({ where: { token } }).catch(() => {});
       await db.resellerProduct.delete({ where: { id: productB.id } }).catch(() => {});
@@ -514,7 +518,9 @@ describe("Phase 12.2 — Multi-Tenant Security Boundary (DB-backed)", () => {
     try {
       setMockSessionToken(token);
       // Invoke the REAL route handler.
-      const res = await sessionsGET();
+      // Phase 12.3.6: the route now requires a NextRequest for requestId extraction.
+      const req = new NextRequest("http://localhost/api/v1/connectivity/sessions");
+      const res = await sessionsGET(req);
       expect(res.status).toBe(200);
       const body = await res.json();
       const returned: Array<{ id: string; entitlementId: string | null }> = body.sessions;

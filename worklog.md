@@ -4959,3 +4959,114 @@ Stage Summary:
   that would have caught the original race.
 - Next: wire requireApiKey() into the external API routes (the v1/connectivity surface and
   commerce routes), then Phase 12.3.3 (canonical error envelope) + 12.3.4 (request correlation).
+
+---
+Task ID: 12.3-adoption
+Agent: Principal Architect (main) — Phase 12.3.3 / 12.3.6 / 12.3.7 Adoption
+Task: Close the three integration gaps the architect identified in the audit of 4568b51: (1) the canonical error envelope is not yet a protocol contract, (2) requireApiKey() is not wired into any route, (3) the real commerce flows (createOrder, initiatePayment, purchaseTopUp) still use the inline findUnique→create race. Implementation order: 12.3.3 (error envelope + requestId) → 12.3.6 (wire API-key into /api/v1/*) → 12.3.7 (migrate commerce idempotency).
+
+Work Log:
+- Fix 1 — Canonical error envelope + request correlation (src/lib/api/protocol.ts, new):
+  - Stable code taxonomy (19 codes): auth_required, auth_invalid, auth_revoked, auth_expired,
+    auth_malformed, forbidden, tenant_forbidden, scope_insufficient, not_found, validation_failed,
+    conflict, idempotency_conflict, idempotency_in_progress, rate_limited, provider_error,
+    payment_failed, provisioning_failed, budget_exceeded, internal_error.
+  - classifyError(errorClass, statusCode, message) maps internal AppError → stable ApiErrorCode.
+    Checks message patterns first (most signal), then status code, then error class.
+  - getRequestId(req): extracts x-request-id header (sanitized) or generates req_<16-byte-hex>.
+  - apiErrorResponse(err, requestId): emits { error: { code, message, requestId, details? } }
+    with x-request-id response header + structured logging. Safe message never leaks internals.
+  - apiSuccessResponse(data, requestId): success with x-request-id header (body = caller's data).
+  - Legacy errorResponse() in src/lib/api.ts now delegates to apiErrorResponse (backward compatible).
+  - getClientIP moved to src/lib/api/request.ts.
+
+- Fix 2 — Deterministic API-key extraction (src/lib/auth/api-key.ts):
+  - New extractApiKeyStatus(req) returns { status: "absent" | "malformed" | "present" }.
+    This makes the "no auth presented" vs "malformed auth attempted" distinction deterministic
+    (architect point #4). For /api/v1/*, a non-Bearer Authorization header is now "malformed"
+    (auth_malformed), not a silent fallthrough.
+  - requireApiKey() updated to use extractApiKeyStatus → deterministic error codes.
+
+- Fix 3 — Unified API principal resolver (src/lib/api/principal.ts, new):
+  - resolveApiPrincipal(req, scope): accepts EITHER API-key OR session auth.
+    extractApiKeyStatus → present → verifyApiKey → ApiKeyPrincipal (tenantId from key).
+    absent → getCurrentUser + requireTenantContext → session principal (tenantId from session).
+  - principalTenantId(principal): the authoritative tenantId for downstream DB queries.
+  - For API-key auth on user-scoped routes (current, intents, policies), a subjectId query/body
+    param is required and verified to belong to the key's tenant (cross-tenant guard).
+
+- Fix 4 — Wired API-key auth into the /api/v1/* surface (6 routes migrated):
+  - sessions GET/POST: resolveApiPrincipal → tenant-scoped DB query (entitlement relation filter).
+  - capabilities GET/POST: tenant-scoped discovery/advertise.
+  - current GET: session auth uses authenticated user; API-key auth requires subjectId param
+    (verified to belong to the key's tenant).
+  - intents GET/POST: same subjectId pattern for API-key auth.
+  - actions POST: session entitlement must belong to principal's tenant.
+  - measurements POST: session/resource/providerInstance tenant verification.
+  - policies GET/POST: subjectId pattern for API-key auth.
+  - commerce/customer POST: migrated to canonical error envelope (apiErrorResponse).
+  All v1 routes now emit { error: { code, message, requestId } } with x-request-id header.
+
+- Fix 5 — Migrated commerce idempotency to runIdempotentOperation (Phase 12.3.7):
+  - createOrder (src/lib/orders/service.ts): the inline findUnique→create is now wrapped in
+    runIdempotentOperation with scope="createOrder", payloadHash={planId, tenantId, distributionOfferId}.
+    Concurrent same-key → exactly one order; conflicting payload → 409 idempotency_conflict.
+  - initiatePayment: the payment-intent creation + payment-row insert is now wrapped in
+    runIdempotentOperation with scope="initiatePayment", payloadHash={orderId, amount}.
+    The paymentProvider.createPaymentIntent side effect now happens at most once per key.
+  - purchaseTopUp (src/lib/usage/topup.ts): the entire topup flow (payment + provider topup +
+    DB transaction) is now wrapped in runIdempotentOperation with scope="purchaseTopUp",
+    payloadHash={esimId, packageId}. Concurrent same-key → exactly one topup.
+  - All three retain domain-level replay (findExisting inside execute) for the case where the
+    IdempotencyOperation record was pruned but the domain row (Order/Payment/TopUp) persists.
+
+- Tests (tests/phase12.3-adoption.test.ts, 16 DB-backed runtime, all PASS):
+  12.3.3 — Canonical error envelope (5 tests):
+    .1  errorResponse emits { error: { code, message, requestId } } envelope
+    .2  requestId extracted from incoming x-request-id header
+    .3  requestId generated when not supplied (req_<hex>)
+    .4  stable code taxonomy — auth_required for no-auth
+    .5  classifyError maps all error classes to stable codes (14 cases)
+  12.3.6 — API-key auth on /api/v1/* routes (8 tests, real route handlers):
+    .1  valid API key → 200, principal's tenantId is authoritative
+    .2  absent auth → 401 auth_required (canonical envelope)
+    .3  malformed auth (wrong prefix) → 401 auth_malformed (deterministic)
+    .4  malformed auth (non-Bearer scheme) → 401 auth_malformed
+    .5  revoked key → 401
+    .6  expired key → 401
+    .7  session auth still works (backward compatible)
+    .8  x-api-key header also accepted
+  12.3.7 — Commerce idempotency migration (3 tests, real service functions):
+    .1  createOrder — concurrent same-key → exactly ONE order (both return same orderId)
+    .2  createOrder — conflicting payload (same key, different plan) → 409
+    .3  createOrder — replay returns stored result, no re-execution
+
+- Phase 12.2 tests updated for the new canonical envelope:
+  - 12.2.10/12.2.11: body.error is now an object { code, message, requestId }, not a string.
+    Updated assertions to body.error.message.
+  - 12.2.9/12.2.12: sessionsGET() now requires a NextRequest param (for requestId extraction).
+    Updated test calls to pass new NextRequest(...).
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS  (updated for canonical envelope)
+  Phase 12.3:       19/19 PASS  (api-protocol primitive tests)
+  Phase 12.3 adoption: 16/16 PASS (new — envelope, API-key on routes, commerce migration)
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 96 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The three adoption gaps are closed:
+  1. Canonical error envelope is a protocol contract: { error: { code, message, requestId } }
+     with a 19-code taxonomy and x-request-id correlation header on every response.
+  2. requireApiKey() is wired into the external /api/v1/* surface (6 routes + commerce/customer).
+     The "no auth" vs "malformed auth" distinction is deterministic (architect point #4).
+     Session auth still works (backward compatible) — the v1 routes accept EITHER auth method.
+  3. The real commerce flows (createOrder, initiatePayment, purchaseTopUp) now use the
+     DB-authoritative runIdempotentOperation primitive. Concurrent same-key requests produce
+     exactly one side effect; the loser polls and returns the stored result (clean replay).
+- The architect's recommended order (12.3.3 → 12.3.6 → 12.3.7) is complete.
+- 12.3.1/12.3.2 primitives are now ADOPTED, not just implemented.
