@@ -1076,4 +1076,111 @@ describe("Phase 11.4 — Execution-Time Intent Authority (DB-backed)", () => {
     await releaseSessionExecutionSlot(fx.sessionId, slotClaim);
     await db.connectivityDecision.deleteMany({ where: { id: { in: [decision.id, execDecision.id] } } }).catch(() => {});
   }, 60_000);
+
+  // =========================================================================
+  // 11.4.10.2 — Exclusive intent-fence ownership: two decisions cannot
+  //            steal the same intent fence.
+  //
+  // Decision A claims the intent fence. Before A completes, Decision B tries
+  // to claim the same intent version. B must NOT overwrite A's active fence.
+  // A's subsequent resource mutation remains authorized. B is rejected.
+  // =========================================================================
+  it("11.4.10.2: exclusive fence — two decisions race for same intent fence → B rejected, A proceeds", async () => {
+    await resetToActiveOnA();
+
+    // 1. Create an active intent.
+    const intent = await createIntent({
+      subjectId: fx.subjectId,
+      rawText: "exclusive-fence intent",
+      capabilityType: "INTERNET",
+      mode: "AUTOMATIC",
+    });
+
+    // 2. Create two decisions in EXECUTING state (simulating concurrent execution).
+    const decisionA = await db.connectivityDecision.create({
+      data: {
+        intentId: intent.intentId,
+        intentVersion: intent.version,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: exclusive A"]),
+        executionState: "EXECUTING",
+        executionClaimId: "claim-A",
+        executionAttemptCount: 1,
+      },
+    });
+    const decisionB = await db.connectivityDecision.create({
+      data: {
+        intentId: intent.intentId,
+        intentVersion: intent.version,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: exclusive B"]),
+        executionState: "EXECUTING",
+        executionClaimId: "claim-B",
+        executionAttemptCount: 1,
+      },
+    });
+
+    // 3. Acquire session slots for both (they'll race — only one wins; that's
+    //    the session-level serialization. For this test, we call the fence
+    //    directly to isolate the intent-fence exclusivity).
+    const { verifyIntentAuthorityAtBoundary, clearIntentExecutionFence } = await import("@/lib/control-plane/intent-authority");
+
+    // 4. Decision A claims the intent fence (intent is ACTIVE, no active fence).
+    const resultA = await verifyIntentAuthorityAtBoundary(
+      decisionA.id,
+      "claim-A",
+      intent.intentId,
+      intent.version,
+    );
+    expect(resultA.authorized).toBe(true);
+    expect(resultA.fenceId).toBeDefined();
+    const fenceIdA = resultA.fenceId!;
+
+    // 5. Decision B tries to claim the same intent fence (intent is ACTIVE,
+    //    but A's fence is active → B must be REJECTED).
+    const resultB = await verifyIntentAuthorityAtBoundary(
+      decisionB.id,
+      "claim-B",
+      intent.intentId,
+      intent.version,
+    );
+
+    // 6. B MUST be rejected — the fence is held by A.
+    expect(resultB.authorized).toBe(false);
+    expect(resultB.reason).toContain("intent-fence-held-by-another-decision");
+
+    // 7. B's decision should be SKIPPED (fenced by claimId).
+    const dbDecisionB = await db.connectivityDecision.findUnique({
+      where: { id: decisionB.id },
+      select: { executionState: true },
+    });
+    expect(dbDecisionB?.executionState).toBe("SKIPPED");
+
+    // 8. The intent's executionFenceId is still A's (B did NOT overwrite it).
+    const dbIntent = await db.connectivityIntentRecord.findUnique({
+      where: { intentId_version: { intentId: intent.intentId, version: intent.version } },
+      select: { executionFenceId: true, executionFenceExpiresAt: true },
+    });
+    expect(dbIntent?.executionFenceId).toBe(fenceIdA);
+
+    // 9. A's fence is still valid — a subsequent verifyIntentExecutionFence
+    //    would pass (A's mutations are still authorized).
+    // (We don't call fencedReserveResource here because we don't have a
+    // session slot set up for A. The fence's persistence is proven by
+    // 11.4.10.1.)
+
+    // Cleanup.
+    await clearIntentExecutionFence(intent.intentId, intent.version, fenceIdA);
+    await db.connectivityDecision.deleteMany({ where: { id: { in: [decisionA.id, decisionB.id] } } }).catch(() => {});
+  }, 60_000);
 });

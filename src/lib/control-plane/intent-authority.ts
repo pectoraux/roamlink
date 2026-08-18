@@ -38,6 +38,17 @@ const DECISION_SKIPPED = "SKIPPED";
  * Duration the intent execution fence is valid. Must cover the full mutation
  * window (reserve → activate → verify → release). Matches the session slot
  * lease + decision execution lease (5 min).
+ *
+ * Phase 11.4.10.2: The intent fence is NOT renewable (unlike the session
+ * slot lease which has a heartbeat). The intent fence expiry is an
+ * EXECUTION SAFETY TIMEOUT — if the mutation takes longer than 5 minutes,
+ * the fence expires and subsequent resource mutations are rejected
+ * (fail-closed). This is intentional: a mutation that takes > 5 minutes is
+ * likely stuck and should be reconciled, not allowed to continue indefinitely.
+ *
+ * The session slot heartbeat (which IS renewable) covers liveness between
+ * mutations. The intent fence covers authority at the mutation boundary.
+ * Both are required.
  */
 const INTENT_EXECUTION_FENCE_LEASE_MS = 5 * 60_000;
 
@@ -92,15 +103,42 @@ export async function verifyIntentAuthorityAtBoundary(
   const fenceExpiresAt = new Date(now.getTime() + INTENT_EXECUTION_FENCE_LEASE_MS);
 
   return await db.$transaction(async (tx) => {
-    // 1. Conditional UPDATE — takes the row lock + evaluates authority.
+    // 1. Conditional UPDATE — takes the row lock + evaluates authority + exclusivity.
+    //    Phase 11.4.10.2: The fence claim is EXCLUSIVE — it requires that no
+    //    other decision currently holds an active execution fence on this exact
+    //    intent version. This prevents two decisions from racing on the same
+    //    intent version and overwriting each other's fence.
+    //
+    //    WHERE:
+    //      intentId + version (exact version bound to the decision)
+    //      status = ACTIVE
+    //      (expiresAt IS NULL OR expiresAt > now)
+    //      (executionFenceId IS NULL OR executionFenceExpiresAt <= now)  ← EXCLUSIVITY
+    //
+    //    If a fence is already active (held by another decision), this UPDATE
+    //    affects 0 rows → rejected. The caller is SKIPPED (not requeued — the
+    //    session slot serializes, so this is a safety check, not a primary
+    //    serialization mechanism).
     const fenceResult = await tx.connectivityIntentRecord.updateMany({
       where: {
         intentId,
         version: intentVersion,
         status: "ACTIVE",
-        OR: [
-          { expiresAt: null },
-          { expiresAt: { gt: now } },
+        AND: [
+          // Intent must be unexpired.
+          {
+            OR: [
+              { expiresAt: null },
+              { expiresAt: { gt: now } },
+            ],
+          },
+          // Phase 11.4.10.2: No active fence held by another decision.
+          {
+            OR: [
+              { executionFenceId: null },
+              { executionFenceExpiresAt: { lt: now } },
+            ],
+          },
         ],
       },
       data: {
@@ -113,7 +151,7 @@ export async function verifyIntentAuthorityAtBoundary(
       // Determine the reason.
       const intent = await tx.connectivityIntentRecord.findUnique({
         where: { intentId_version: { intentId, version: intentVersion } },
-        select: { status: true, expiresAt: true },
+        select: { status: true, expiresAt: true, executionFenceId: true, executionFenceExpiresAt: true },
       });
 
       let reason: string;
@@ -123,6 +161,8 @@ export async function verifyIntentAuthorityAtBoundary(
         reason = `intent-status-${intent.status}`;
       } else if (intent.expiresAt && intent.expiresAt <= now) {
         reason = "intent-expired";
+      } else if (intent.executionFenceId && intent.executionFenceExpiresAt && intent.executionFenceExpiresAt > now) {
+        reason = "intent-fence-held-by-another-decision";
       } else {
         reason = "intent-fence-rejected";
       }
