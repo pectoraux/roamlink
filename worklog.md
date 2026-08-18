@@ -5548,3 +5548,71 @@ Stage Summary:
     reconciliation → fenced ownership
 - 12.3.2.16 proves external op without providerKey → rejected (provider never called).
 - 12.3.2.18 proves external execute returning raw value → rejected by contract.
+
+---
+Task ID: 12.3.2.5
+Agent: Principal Architect (main) — Phase 12.3.2.5 Raw External Return → RECONCILIATION_REQUIRED
+Task: Fix the state-semantics contradiction the architect identified in the audit of 38d8e92. The raw external-return contract violation was persisted as FAILED, but a raw return can happen AFTER the provider side effect has already occurred. FAILED allows a retry with a new key → duplicate payment. The correct terminal state is RECONCILIATION_REQUIRED.
+
+Work Log:
+- Diagnosis (confirmed):
+  The architect's insight: a raw return from external execute() can happen AFTER the provider
+  accepted the payment. The caller just forgot to wrap the result in an OperationOutcome.
+  The contract violation is a programming error, but it does NOT prove the external operation
+  failed. Marking it FAILED allows a retry with a new key, which could create a duplicate payment.
+
+  The distinction:
+    programming error (raw return) ≠ confirmed external failure
+  Therefore:
+    raw return from external execute → RECONCILIATION_REQUIRED (not FAILED)
+
+- Fix (src/lib/idempotency/claim.ts):
+  Changed the raw-external-return branch from:
+    state: "FAILED", completedAt: new Date(), claimExpiresAt: null  (terminal)
+  to:
+    state: "RECONCILIATION_REQUIRED", claimExpiresAt: null  (NOT terminal)
+    (completedAt is NOT set — the operation is pending reconciliation)
+
+  The 500 response to the caller remains (it's a programming error), but the persisted
+  state reflects that the external outcome is UNKNOWN. The providerKey is preserved so
+  a reconciliation worker can query the provider to determine the actual outcome.
+
+- Fix (tests/phase12.3-api-protocol.test.ts — 12.3.2.18 rewritten):
+  OLD: "external execute returns raw value → 500 contract violation, operation FAILED, replay gets stored failure"
+  NEW: "external execute returns raw value → 500, RECONCILIATION_REQUIRED (not FAILED), retry blocked, providerKey preserved"
+
+  The test now asserts:
+    - 500 contract violation response.
+    - state === "RECONCILIATION_REQUIRED" (NOT FAILED).
+    - providerKey is preserved (=== the supplied providerKey).
+    - completedAt is null (NOT terminal — pending reconciliation).
+    - A retry with the SAME key is BLOCKED (409 "outcome unknown, do not retry").
+    - replayExecCount === 0 (not re-executed — the caller is blocked).
+
+- Fix (getIdempotencyOperation):
+  Added `completedAt: true` to the select so tests can assert on the terminal state.
+  Added `completedAt: Date | null` to the IdempotencyClaim type.
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       29/29 PASS
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 106 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The state-semantics contradiction is fixed:
+    raw external return → RECONCILIATION_REQUIRED (not FAILED)
+  The 500 response remains, but the persisted state is UNKNOWN — the provider side
+  effect may have occurred. The providerKey is preserved for reconciliation.
+- The state machine is now fully consistent:
+    SUCCESS                        → COMPLETED
+    CONFIRMED_FAILURE              → FAILED
+    AMBIGUOUS_EXTERNAL_FAILURE     → RECONCILIATION_REQUIRED
+    raw external return            → RECONCILIATION_REQUIRED  (was FAILED — FIXED)
+    external operation             → explicit providerKey required
+    reconciliation                 → fenced ownership

@@ -1072,18 +1072,22 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
     // -------------------------------------------------------------------------
     // 12.3.2.18 — External execute() returns a raw value → 500 contract violation
     //
-    // Phase 12.3.2.4: Strict external contract — execute() MUST return an
-    // OperationOutcome<T> when isExternal is true. A raw return value is a
-    // programming error (the caller forgot to classify the outcome). The
-    // primitive transitions the operation to FAILED with a stored contract
-    // violation and throws 500. A replay with the same key gets the stored
-    // failure (NOT a re-execution).
+    // Phase 12.3.2.5: A raw return can happen AFTER the provider side effect has
+    // already occurred. The provider may have accepted the payment, and the
+    // caller simply forgot to wrap the result in an OperationOutcome. Marking
+    // this as FAILED would be unsafe — a retry with a new key could create a
+    // duplicate payment.
     //
-    // Rationale: forcing the caller to classify SUCCESS / CONFIRMED_FAILURE /
-    // AMBIGUOUS_EXTERNAL_FAILURE at the contract boundary prevents the
-    // ambiguity decision from being silently made by exception classification.
+    // Therefore: raw external return → RECONCILIATION_REQUIRED (NOT FAILED).
+    // The 500 response to the caller remains (it's a programming error),
+    // but the persisted state reflects that the external outcome is UNKNOWN.
+    // The providerKey is preserved so a reconciliation worker can query
+    // the provider to determine the actual outcome.
+    //
+    // A retry with the same key is BLOCKED (409) — the caller must NOT retry
+    // with a new key. A reconciliation worker must resolve the outcome first.
     // -------------------------------------------------------------------------
-    it("12.3.2.18: external execute returns raw value → 500 contract violation, operation FAILED, replay gets stored failure", async () => {
+    it("12.3.2.18: external execute returns raw value → 500, RECONCILIATION_REQUIRED (not FAILED), retry blocked, providerKey preserved", async () => {
       const key = `p123218-${Date.now()}`;
       const scope = "test_external_raw_return_contract_violation";
       const providerKey = `prov_${key}`;
@@ -1105,18 +1109,28 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
       ).rejects.toMatchObject({ statusCode: 500 });
       expect(execCount).toBe(1); // execute WAS called once (the contract violation is detected after the raw return)
 
-      // The operation transitions to FAILED — the contract violation is stored.
+      // Phase 12.3.2.5: The operation transitions to RECONCILIATION_REQUIRED
+      // (NOT FAILED). The external outcome is UNKNOWN — the provider side
+      // effect may have occurred before the raw return.
       const op = await getIdempotencyOperation(scope, key);
       expect(op).not.toBeNull();
-      expect(op!.state).toBe("FAILED");
+      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
       const failure = JSON.parse(op!.failureJson!);
       expect(failure.statusCode).toBe(500);
       expect(failure.errorClass).toBe("internal");
-      // The stored failure mentions the contract violation.
       expect(failure.message).toMatch(/raw value|OperationOutcome|contract violation/i);
 
-      // A replay with the same key gets the STORED failure (500) — it does NOT
-      // re-execute, and it does NOT throw a fresh contract violation.
+      // The providerKey is preserved so a reconciliation worker can query
+      // the provider to determine the actual outcome.
+      expect(op!.providerKey).toBe(providerKey);
+
+      // The operation is NOT terminal (completedAt is null) — it's pending
+      // reconciliation. A reconciliation worker can resolve it.
+      expect(op!.completedAt).toBeNull();
+
+      // A retry with the SAME key is BLOCKED (409) — the caller must NOT retry
+      // with a new key. The outcome is unknown; a retry could duplicate the
+      // side effect.
       let replayExecCount = 0;
       await expect(
         runIdempotentOperation({
@@ -1128,8 +1142,8 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
             return { outcome: "SUCCESS" as const, value: { shouldNotReach: true } };
           },
         }),
-      ).rejects.toMatchObject({ statusCode: 500 });
-      expect(replayExecCount).toBe(0); // not re-executed — replay throws the stored failure
+      ).rejects.toMatchObject({ statusCode: 409 }); // 409 "outcome unknown, do not retry"
+      expect(replayExecCount).toBe(0); // not re-executed — the caller is blocked
 
       // Cleanup.
       await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});

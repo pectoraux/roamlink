@@ -86,6 +86,7 @@ export type IdempotencyClaim = {
   providerKey: string | null;
   reconciledAt: Date | null;
   reconciliationClaimId: string | null;
+  completedAt: Date | null;
 };
 
 export type StoredFailure = {
@@ -396,38 +397,49 @@ export async function runIdempotentOperation<T>(input: {
     if (rawResult && typeof rawResult === "object" && "outcome" in rawResult) {
       outcome = rawResult as OperationOutcome<T>;
     } else if (isExternal) {
-      // Phase 12.3.2.4: External operations MUST return an OperationOutcome.
+      // Phase 12.3.2.5: External operations MUST return an OperationOutcome.
       // A raw return value is a contract violation — the caller must explicitly
       // classify the outcome (SUCCESS / CONFIRMED_FAILURE / AMBIGUOUS_EXTERNAL_FAILURE).
-      // This forces the ambiguity decision to be made at the contract boundary.
+      //
+      // CRITICAL SEMANTICS: A raw return can happen AFTER the provider side
+      // effect has already occurred. The provider may have accepted the payment,
+      // and the caller simply forgot to wrap the result in an OperationOutcome.
+      // Marking this as FAILED would be unsafe — a retry with a new key could
+      // create a duplicate payment. The contract violation is a programming
+      // error, but it does NOT prove the external operation failed.
+      //
+      // Therefore: raw external return → RECONCILIATION_REQUIRED (not FAILED).
+      // The 500 response to the caller remains (it's a programming error),
+      // but the persisted state reflects that the external outcome is UNKNOWN.
+      // The providerKey is preserved so a reconciliation worker can query
+      // the provider to determine the actual outcome.
       stopHeartbeat(leaseCtx);
-      // Transition to FAILED with a contract violation — this is a programming
-      // error, not an external failure. The operation did not complete successfully
-      // (we can't confirm it), and it's the caller's code that's wrong.
       const contractError = new AppError(
         "internal",
         "External execute() returned a raw value instead of an OperationOutcome — contract violation",
         500,
-        "An internal error occurred. The operation's outcome could not be classified.",
+        "An internal error occurred. The operation's outcome could not be classified and is pending reconciliation.",
       );
       const failure = serializeFailure(contractError);
       await db.idempotencyOperation.updateMany({
         where: { scope, key, claimId, state: "IN_PROGRESS" },
         data: {
-          state: "FAILED",
+          // RECONCILIATION_REQUIRED (NOT FAILED): the external outcome is unknown.
+          // The provider may have accepted the side effect before the raw return.
+          state: "RECONCILIATION_REQUIRED",
           failureJson: JSON.stringify(failure),
-          completedAt: new Date(),
+          // Do NOT set completedAt — the operation is not terminal.
+          // Clear the lease so the reclaim worker doesn't double-process it,
+          // but leave it in RECONCILIATION_REQUIRED for a reconciliation worker.
           claimExpiresAt: null,
         },
       }).catch(() => {});
       logger.error("idempotency.external_contract_violation_raw_return", {
         scope, key, claimId, providerKey,
-        message: "External execute() returned a raw value instead of an OperationOutcome. This is a programming error — the caller must explicitly classify the outcome.",
+        message: "External execute() returned a raw value instead of an OperationOutcome. Contract violation — external outcome is UNKNOWN. Transitioned to RECONCILIATION_REQUIRED (not FAILED) because the provider side effect may have occurred.",
       });
       // Mark as already-classified so the catch block below re-throws it
       // directly instead of re-classifying it as an AMBIGUOUS_EXTERNAL_FAILURE.
-      // The contract violation is a programming error, NOT an external failure —
-      // the operation transitions to FAILED (above) and the caller gets a 500.
       (contractError as any)._outcomeClassified = true;
       throw contractError;
     } else {
@@ -928,7 +940,7 @@ export async function getIdempotencyOperation(scope: string, key: string): Promi
     select: {
       scope: true, key: true, state: true, resultJson: true, failureJson: true,
       payloadHash: true, claimId: true, providerKey: true, reconciledAt: true,
-      reconciliationClaimId: true,
+      reconciliationClaimId: true, completedAt: true,
     },
   });
   if (!op) return null;
