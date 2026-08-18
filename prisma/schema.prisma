@@ -2458,6 +2458,12 @@ model ConnectivityIntentRecord {
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
   supersededAt        DateTime?
+  // Phase 11.4.9: Execution-authority fence marker. A conditional UPDATE on
+  // this field (WHERE status=ACTIVE AND expiresAt>now) establishes a DB write
+  // lock at the mutation boundary — a SELECT inside a transaction is NOT a
+  // fence on PostgreSQL. This field is bumped by verifyIntentAuthorityAtBoundary
+  // to take the row lock + evaluate the authority predicate atomically.
+  fenceVersion        Int      @default(0)
 
   @@unique([intentId, version]) // version fencing
   @@index([subjectId])

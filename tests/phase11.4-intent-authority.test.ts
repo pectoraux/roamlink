@@ -796,4 +796,117 @@ describe("Phase 11.4 — Execution-Time Intent Authority (DB-backed)", () => {
     // Cleanup.
     await db.connectivityDecision.deleteMany({ where: { id: { in: [decision.id, fenceDecision.id] } } }).catch(() => {});
   }, 60_000);
+
+  // =========================================================================
+  // 11.4.10 — Real race proof: intent ACTIVE at post-claim check, then
+  //           superseded at mutation-boundary fence → exact SKIPPED, no mutation.
+  //
+  // Uses the test-only intent expiry hook to supersede the intent BETWEEN the
+  // post-claim authority check and the mutation-boundary fence. This proves
+  // the mutation-boundary fence catches the race that a SELECT-based check
+  // would miss.
+  //
+  // The sequence:
+  //   intent ACTIVE → decision claimed → post-claim check ACTIVE →
+  //   session slot acquired → TEST HOOK: intent superseded →
+  //   mutation-boundary authority fence → conditional UPDATE affects 0 rows →
+  //   exact SKIPPED → no action/resource mutation.
+  // =========================================================================
+  it("11.4.10: real race — intent ACTIVE at post-claim check, superseded at mutation fence → exact SKIPPED, no mutation", async () => {
+    await resetToActiveOnA();
+
+    // 1. Create an active intent (no expiry — stays active through post-claim check).
+    const intent = await createIntent({
+      subjectId: fx.subjectId,
+      rawText: "real-race intent",
+      capabilityType: "INTERNET",
+      mode: "AUTOMATIC",
+    });
+
+    // 2. Create a PENDING decision referencing the active intent.
+    const decision = await db.connectivityDecision.create({
+      data: {
+        intentId: intent.intentId,
+        intentVersion: intent.version,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: real race"]),
+        executionState: "PENDING",
+      },
+    });
+
+    // 3. Set up the test-only hook: when verifyIntentAuthorityAtBoundary is
+    //    called (at the mutation boundary, AFTER the post-claim check), supersede
+    //    the intent. This simulates a concurrent supersedeIntent/expireStaleIntents
+    //    happening between the post-claim check and the mutation-boundary fence.
+    const { setIntentExpiryHook, clearIntentExpiryHook } = await import("@/lib/control-plane/intent-authority");
+    setIntentExpiryHook(async (hookIntentId, hookVersion) => {
+      // Supersede the intent — change its status to SUPERSEDED.
+      // This happens AFTER the post-claim check (which saw it as ACTIVE) but
+      // BEFORE the mutation-boundary fence's conditional UPDATE.
+      await db.connectivityIntentRecord.update({
+        where: { intentId_version: { intentId: hookIntentId, version: hookVersion } },
+        data: { status: "SUPERSEDED", supersededAt: new Date() },
+      });
+    });
+
+    try {
+      // 4. Execute the decision.
+      //    a. Claims the decision (intent is ACTIVE).
+      //    b. Post-claim authority check → ACTIVE → passes.
+      //    c. Session slot acquired.
+      //    d. TEST HOOK fires → intent status → SUPERSEDED.
+      //    e. Mutation-boundary fence: conditional UPDATE WHERE status=ACTIVE → 0 rows.
+      //    f. SKIPPED (fenced by claimId).
+      const result = await executeDecision(decision.id);
+
+      // 5. EXACT: SKIPPED. The mutation-boundary fence caught the race.
+      expect(result.executionState).toBe("SKIPPED");
+      expect(result.error).toContain("intent");
+
+      // 6. No action created.
+      const actions = await db.connectivityAction.findMany({ where: { decisionId: decision.id } });
+      expect(actions.length).toBe(0);
+
+      // 7. No resource mutation (session on A, B not reserved).
+      const session = await db.connectivitySession.findUnique({
+        where: { id: fx.sessionId },
+        select: { activeResourceId: true },
+      });
+      expect(session?.activeResourceId).toBe(fx.resourceAId);
+
+      const resB = await db.protocolResource.findUnique({
+        where: { id: fx.resourceBId },
+        select: { state: true, reservedBy: true },
+      });
+      expect(resB?.state).not.toBe("IN_USE");
+      expect(resB?.reservedBy).not.toBe(fx.sessionId);
+
+      // 8. The decision's DB state is SKIPPED (fenced transition).
+      const dbDecision = await db.connectivityDecision.findUnique({
+        where: { id: decision.id },
+        select: { executionState: true },
+      });
+      expect(dbDecision?.executionState).toBe("SKIPPED");
+
+      // 9. The intent's status is SUPERSEDED (the hook changed it).
+      const dbIntent = await db.connectivityIntentRecord.findUnique({
+        where: { intentId_version: { intentId: intent.intentId, version: intent.version } },
+        select: { status: true, fenceVersion: true },
+      });
+      expect(dbIntent?.status).toBe("SUPERSEDED");
+      // fenceVersion should be 0 (the conditional UPDATE affected 0 rows because
+      // status was SUPERSEDED by the hook before the fence ran).
+      expect(dbIntent?.fenceVersion).toBe(0);
+    } finally {
+      clearIntentExpiryHook();
+    }
+
+    // Cleanup.
+    await db.connectivityDecision.deleteMany({ where: { id: decision.id } }).catch(() => {});
+  }, 60_000);
 });
