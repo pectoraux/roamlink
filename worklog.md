@@ -4792,3 +4792,30 @@ Stage Summary:
 - Phase 12.2 now has 12 adversarial runtime tests covering the full tenant boundary, with 4 of them
   (12.2.9–12.2.12) exercising the real production route handlers.
 - Phase 12.2 is now ready to freeze.
+
+---
+Task ID: 12.2-push
+Agent: Principal Architect (main) — Push P0-5 fix to origin/main
+Task: The architect's audit found 706035f was local-only; origin/main still exposed the old take-then-filter implementation. Push the fix and verify it's remotely present.
+
+Work Log:
+- Discovered 4 local commits ahead of origin/main (which was at 22f84b3):
+  - 808f055 (pre-existing from prior session — db + worklog 12.2-p0567 record)
+  - 706035f (P0-5 fix — DB-level tenant scoping + real route tests)
+  - ae18321 (worklog 12.2-p05-final record)
+  - 1a730da (auto-commit adding tool-results/ artifact — JUNK)
+- Dropped 1a730da (git reset --hard ae18321) — it only added a tool Read output dump.
+- Added /tool-results/ to .gitignore to prevent recurrence (commit 1f19956).
+- Pushed all 4 legitimate commits: 22f84b3..1f19956 main -> main.
+- Verified via git fetch + git show origin/main:... that ALL key changes are remotely present:
+  1. Old post-fetch filter (tenantScopedSessions / entitlementIdSet) is GONE (grep count = 0).
+  2. DB-level relation filter IS present: entitlement: { tenantId, userId }.
+  3. Prisma relation ConnectivitySession.entitlement -> ConnectivityEntitlement IS present (with onDelete: SetNull).
+  4. tests/route-test-context.ts IS present.
+  5. 12.2.12 adversarial test IS present (4 references).
+  6. 12.2.9/10/11 invoke the REAL route handlers (sessionsGET(), actionsPOST(req), commerceCustomerPOST(req)).
+
+Stage Summary:
+- origin/main HEAD: 1f19956
+- 706035f (the P0-5 fix) is now on origin/main and remotely verifiable.
+- The architect can now re-audit origin/main and freeze Phase 12.2.
