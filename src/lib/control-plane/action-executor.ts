@@ -28,7 +28,14 @@ import { transitionSessionState } from "./session-manager";
 import { reserveResource, releaseResource, markResourceInUse } from "./capability-registry";
 import { resolveResourceBinding, verifyResourceUsable } from "./kernel-bridge";
 import { assertActiveConnectivityInvariant } from "./invariant-checker";
-import { SlotOwnershipLostError, fencedSessionUpdate } from "./session-execution-slot";
+import {
+  SlotOwnershipLostError,
+  fencedSessionUpdate,
+  fencedTransitionSessionState,
+  fencedReserveResource,
+  fencedMarkResourceInUse,
+  fencedReleaseResource,
+} from "./session-execution-slot";
 
 // Phase 8.5.10: Recovery timing constants
 const RECOVERY_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes — actions EXECUTING longer than this are stale
@@ -228,7 +235,12 @@ export async function executeAction(actionId: string, slotContext?: {
         await slotContext?.verifySlotOwnership();
 
         // 3a. Reserve the target resource
-        const reserveResult = await reserveResource(targetResourceId, session.id);
+        // Phase 11.2.4: DB-authoritative mutation fence. The reservation is
+        // authorized by the currently valid session execution claim (inside a
+        // $transaction). If the slot is invalid, the reservation does NOT happen.
+        const reserveResult = slotContext
+          ? await fencedReserveResource(targetResourceId, session.id, slotContext.claimId)
+          : await reserveResource(targetResourceId, session.id);
         if (!reserveResult.reserved) {
           throw new Error(`Failed to reserve resource ${targetResourceId}: ${reserveResult.reason}`);
         }
@@ -241,11 +253,15 @@ export async function executeAction(actionId: string, slotContext?: {
         });
 
         if (bridgeResult.status === "failed") {
-          await releaseResource(targetResourceId, session.id);
+          await (slotContext
+            ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
+            : releaseResource(targetResourceId, session.id));
           throw new Error(`Kernel bridge failed: ${bridgeResult.error}`);
         }
         if (bridgeResult.status === "reconciliation_required") {
-          await releaseResource(targetResourceId, session.id);
+          await (slotContext
+            ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
+            : releaseResource(targetResourceId, session.id));
           throw new Error(`Kernel bridge requires reconciliation: ${bridgeResult.error}`);
         }
 
@@ -253,22 +269,31 @@ export async function executeAction(actionId: string, slotContext?: {
         await slotContext?.verifySlotOwnership();
 
         // 3c. Mark resource as IN_USE — fail closed
-        const activateResult = await markResourceInUse(targetResourceId, session.id);
+        // Phase 11.2.4: DB-authoritative mutation fence.
+        const activateResult = slotContext
+          ? await fencedMarkResourceInUse(targetResourceId, session.id, slotContext.claimId)
+          : await markResourceInUse(targetResourceId, session.id);
         if (!activateResult.activated) {
-          await releaseResource(targetResourceId, session.id);
+          await (slotContext
+            ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
+            : releaseResource(targetResourceId, session.id));
           throw new Error(`Failed to mark resource IN_USE: ${activateResult.reason}`);
         }
 
         // 3d. Verify via kernel bridge (USABLE | NOT_USABLE | UNKNOWN)
         const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
         if (verifyResult.status === "NOT_USABLE") {
-          await releaseResource(targetResourceId, session.id);
+          await (slotContext
+            ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
+            : releaseResource(targetResourceId, session.id));
           throw new Error(`Resource verification failed: ${verifyResult.reason}`);
         }
 
         // Phase 8.5.9: UNKNOWN → release target, do NOT activate session, RECONCILIATION_REQUIRED
         if (verifyResult.status === "UNKNOWN") {
-          await releaseResource(targetResourceId, session.id);
+          await (slotContext
+            ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
+            : releaseResource(targetResourceId, session.id));
           await transitionActionState(actionId, "RECONCILIATION_REQUIRED", `Verification UNKNOWN: ${verifyResult.reason}`);
           logger.warn("action.activate_unknown_verification", {
             actionId, targetResourceId, reason: verifyResult.reason,
@@ -314,11 +339,24 @@ export async function executeAction(actionId: string, slotContext?: {
         // bug was invisible to static tests and only surfaced when the
         // DB-backed runtime test exercised ACTIVATE from a freshly-created
         // (PLANNED) session.
+        //
+        // Phase 11.2.4: DB-authoritative mutation fence. The state transition
+        // is authorized by the currently valid session execution claim.
         if (session.state === "PLANNED" || session.state === "DISCOVERING" || session.state === "RESERVED") {
           if (session.state === "PLANNED") {
-            await transitionSessionState(session.id, "DISCOVERING");
+            if (slotContext) {
+              const f = await fencedTransitionSessionState(session.id, slotContext.claimId, "DISCOVERING", ["PLANNED"]);
+              if (!f.applied) throw new SlotOwnershipLostError(session.id, slotContext.claimId, "fenced transition DISCOVERING rejected");
+            } else {
+              await transitionSessionState(session.id, "DISCOVERING");
+            }
           }
-          await transitionSessionState(session.id, "ACTIVE");
+          if (slotContext) {
+            const f = await fencedTransitionSessionState(session.id, slotContext.claimId, "ACTIVE", ["DISCOVERING", "RESERVED", "SWITCHING"]);
+            if (!f.applied) throw new SlotOwnershipLostError(session.id, slotContext.claimId, "fenced transition ACTIVE rejected");
+          } else {
+            await transitionSessionState(session.id, "ACTIVE");
+          }
         }
 
         // Phase 8.5.10: Verify the active connectivity invariant
@@ -355,17 +393,29 @@ export async function executeAction(actionId: string, slotContext?: {
         }
 
         const previousResourceId = session.activeResourceId;
+        const revertState = session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE";
 
         // Phase 11.2.2: Verify slot ownership before starting the mutation.
         await slotContext?.verifySlotOwnership();
 
         // 3a. Transition session to SWITCHING
-        await transitionSessionState(session.id, "SWITCHING");
+        // Phase 11.2.4: DB-authoritative mutation fence.
+        if (slotContext) {
+          const f = await fencedTransitionSessionState(session.id, slotContext.claimId, "SWITCHING", ["ACTIVE", "DEGRADED"]);
+          if (!f.applied) throw new SlotOwnershipLostError(session.id, slotContext.claimId, "fenced transition SWITCHING rejected");
+        } else {
+          await transitionSessionState(session.id, "SWITCHING");
+        }
 
         // 3b. Reserve the target resource (ownership-safe)
-        const reserveResult = await reserveResource(targetResourceId, session.id);
+        // Phase 11.2.4: DB-authoritative mutation fence.
+        const reserveResult = slotContext
+          ? await fencedReserveResource(targetResourceId, session.id, slotContext.claimId)
+          : await reserveResource(targetResourceId, session.id);
         if (!reserveResult.reserved) {
-          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          await (slotContext
+            ? fencedTransitionSessionState(session.id, slotContext.claimId, revertState, ["SWITCHING"])
+            : transitionSessionState(session.id, revertState));
           throw new Error(`Failed to reserve target resource ${targetResourceId}: ${reserveResult.reason}`);
         }
 
@@ -377,13 +427,21 @@ export async function executeAction(actionId: string, slotContext?: {
         });
 
         if (bridgeResult.status === "failed") {
-          await releaseResource(targetResourceId, session.id);
-          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          await (slotContext
+            ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
+            : releaseResource(targetResourceId, session.id));
+          await (slotContext
+            ? fencedTransitionSessionState(session.id, slotContext.claimId, revertState, ["SWITCHING"])
+            : transitionSessionState(session.id, revertState));
           throw new Error(`Kernel bridge failed for target: ${bridgeResult.error}`);
         }
         if (bridgeResult.status === "reconciliation_required") {
-          await releaseResource(targetResourceId, session.id);
-          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          await (slotContext
+            ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
+            : releaseResource(targetResourceId, session.id));
+          await (slotContext
+            ? fencedTransitionSessionState(session.id, slotContext.claimId, revertState, ["SWITCHING"])
+            : transitionSessionState(session.id, revertState));
           throw new Error(`Kernel bridge requires reconciliation for target: ${bridgeResult.error}`);
         }
 
@@ -391,25 +449,40 @@ export async function executeAction(actionId: string, slotContext?: {
         await slotContext?.verifySlotOwnership();
 
         // 3d. Mark target as IN_USE — fail closed
-        const activateResult = await markResourceInUse(targetResourceId, session.id);
+        // Phase 11.2.4: DB-authoritative mutation fence.
+        const activateResult = slotContext
+          ? await fencedMarkResourceInUse(targetResourceId, session.id, slotContext.claimId)
+          : await markResourceInUse(targetResourceId, session.id);
         if (!activateResult.activated) {
-          await releaseResource(targetResourceId, session.id);
-          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          await (slotContext
+            ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
+            : releaseResource(targetResourceId, session.id));
+          await (slotContext
+            ? fencedTransitionSessionState(session.id, slotContext.claimId, revertState, ["SWITCHING"])
+            : transitionSessionState(session.id, revertState));
           throw new Error(`Failed to mark target IN_USE: ${activateResult.reason}`);
         }
 
         // 3e. Verify target is usable (USABLE | NOT_USABLE | UNKNOWN)
         const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
         if (verifyResult.status === "NOT_USABLE") {
-          await releaseResource(targetResourceId, session.id);
-          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          await (slotContext
+            ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
+            : releaseResource(targetResourceId, session.id));
+          await (slotContext
+            ? fencedTransitionSessionState(session.id, slotContext.claimId, revertState, ["SWITCHING"])
+            : transitionSessionState(session.id, revertState));
           throw new Error(`Target verification failed: ${verifyResult.reason}`);
         }
         if (verifyResult.status === "UNKNOWN") {
           // Phase 8.5.8: UNKNOWN → RECONCILIATION_REQUIRED (NOT SUCCEEDED)
           // The session stays on the old resource — we don't switch to an unverified target.
-          await releaseResource(targetResourceId, session.id);
-          await transitionSessionState(session.id, session.state === "DEGRADED" ? "DEGRADED" : "ACTIVE");
+          await (slotContext
+            ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId)
+            : releaseResource(targetResourceId, session.id));
+          await (slotContext
+            ? fencedTransitionSessionState(session.id, slotContext.claimId, revertState, ["SWITCHING"])
+            : transitionSessionState(session.id, revertState));
           await transitionActionState(actionId, "RECONCILIATION_REQUIRED", `Switch verification UNKNOWN: ${verifyResult.reason}`);
           logger.warn("action.switch_verification_unknown", {
             actionId, targetResourceId, reason: verifyResult.reason,
@@ -449,7 +522,13 @@ export async function executeAction(actionId: string, slotContext?: {
         }
 
         // 3g. Transition session back to ACTIVE
-        await transitionSessionState(session.id, "ACTIVE");
+        // Phase 11.2.4: DB-authoritative mutation fence.
+        if (slotContext) {
+          const f = await fencedTransitionSessionState(session.id, slotContext.claimId, "ACTIVE", ["SWITCHING"]);
+          if (!f.applied) throw new SlotOwnershipLostError(session.id, slotContext.claimId, "fenced transition ACTIVE rejected");
+        } else {
+          await transitionSessionState(session.id, "ACTIVE");
+        }
 
         // Phase 11.2.2: Verify slot ownership before releasing the old resource
         // (the final mutating stage — must not release old if slot was lost).
@@ -458,9 +537,12 @@ export async function executeAction(actionId: string, slotContext?: {
         // 3g. Release the previous resource (ownership-safe)
         // IMPORTANT: failure here does NOT invalidate the new resource.
         // Phase 8.5.8: Persist a durable reconciliation marker on failure.
+        // Phase 11.2.4: DB-authoritative mutation fence.
         let oldReleaseFailed = false;
         if (previousResourceId && previousResourceId !== targetResourceId) {
-          const releaseResult = await releaseResource(previousResourceId, session.id);
+          const releaseResult = slotContext
+            ? await fencedReleaseResource(previousResourceId, session.id, slotContext.claimId)
+            : await releaseResource(previousResourceId, session.id);
           if (!releaseResult.released) {
             oldReleaseFailed = true;
             logger.warn("action.switch_old_release_failed", {

@@ -211,6 +211,210 @@ export async function fencedSessionUpdate(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 11.2.4: Fenced resource mutations + session-state transitions
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 11.2.4: Verify that the worker still holds the session execution slot.
+ * Used inside fenced resource mutations (reserveResourceFenced, etc.) and
+ * fenced session-state transitions (transitionSessionStateFenced).
+ *
+ * This is a DB read (not a mutation) — it's the authority check inside a
+ * $transaction. If the slot is not held (claimId mismatch or lease expired),
+ * the caller must NOT perform the mutation.
+ *
+ * Returns true if the slot is still held by this claim with a valid lease.
+ */
+export async function verifySlotClaimValid(sessionId: string, claimId: string): Promise<boolean> {
+  const now = new Date();
+  const session = await db.connectivitySession.findUnique({
+    where: { id: sessionId },
+    select: { executionSlotClaimId: true, executionSlotClaimExpiresAt: true },
+  });
+  if (!session) return false;
+  if (session.executionSlotClaimId !== claimId) return false;
+  if (!session.executionSlotClaimExpiresAt || session.executionSlotClaimExpiresAt < now) return false;
+  return true;
+}
+
+/**
+ * Phase 11.2.4: Fenced session-state transition. The transition is authorized
+ * by the currently valid session execution claim — not merely preceded by a
+ * checkpoint. If the slot was lost between the checkpoint and this mutation,
+ * the transition does NOT happen.
+ *
+ * Uses a $transaction: (1) verify the slot claim, (2) perform the state
+ * transition. Both are in one DB transaction — if the slot is invalid, the
+ * transition is skipped.
+ *
+ * Returns { applied: boolean }. If false, the slot was lost.
+ */
+export async function fencedTransitionSessionState(
+  sessionId: string,
+  claimId: string,
+  toState: string,
+  allowedFromStates: string[],
+): Promise<{ applied: boolean; reason?: string }> {
+  const now = new Date();
+
+  // Fenced updateMany: only transition if the slot is held AND the current
+  // state allows the transition. This is a single atomic operation.
+  const result = await db.connectivitySession.updateMany({
+    where: {
+      id: sessionId,
+      executionSlotClaimId: claimId,
+      executionSlotClaimExpiresAt: { gt: now },
+      state: { in: allowedFromStates },
+    },
+    data: {
+      state: toState,
+      lastObservedAt: now,
+    },
+  });
+
+  if (result.count > 0) {
+    logger.info("session.fenced_transition_applied", { sessionId, claimId, toState });
+    return { applied: true };
+  }
+
+  // count=0: either the slot was lost, or the state transition is illegal.
+  // Distinguish for the error message.
+  const slotValid = await verifySlotClaimValid(sessionId, claimId);
+  const reason = !slotValid
+    ? "slot-not-owned-or-expired-at-mutation-boundary"
+    : `illegal-transition-to-${toState}`;
+  logger.error("session.fenced_transition_rejected", { sessionId, claimId, toState, reason });
+  return { applied: false, reason };
+}
+
+/**
+ * Phase 11.2.4: Fenced resource reservation. The reservation is authorized
+ * by the currently valid session execution claim. Uses a $transaction:
+ * (1) verify the slot claim, (2) reserve the resource (AVAILABLE → RESERVED).
+ *
+ * If the slot is invalid, the reservation does NOT happen.
+ *
+ * Returns { reserved: boolean, reason?: string }.
+ */
+export async function fencedReserveResource(
+  resourceId: string,
+  sessionId: string,
+  claimId: string,
+): Promise<{ reserved: boolean; reason?: string }> {
+  return await db.$transaction(async (tx) => {
+    // 1. Verify the session slot claim (authority check).
+    const now = new Date();
+    const session = await tx.connectivitySession.findUnique({
+      where: { id: sessionId },
+      select: { executionSlotClaimId: true, executionSlotClaimExpiresAt: true },
+    });
+    if (!session || session.executionSlotClaimId !== claimId || !session.executionSlotClaimExpiresAt || session.executionSlotClaimExpiresAt < now) {
+      logger.error("session.fenced_reserve_rejected", { resourceId, sessionId, claimId, reason: "slot-not-owned-or-expired" });
+      return { reserved: false, reason: "session-execution-slot-not-held" };
+    }
+
+    // 2. Reserve the resource (AVAILABLE → RESERVED) — within the same transaction.
+    const result = await tx.protocolResource.updateMany({
+      where: { id: resourceId, state: "AVAILABLE" },
+      data: { state: "RESERVED", reservedAt: now, reservedBy: sessionId },
+    });
+
+    if (result.count === 0) {
+      return { reserved: false, reason: "Resource not available or already reserved" };
+    }
+
+    logger.info("resource.fenced_reserved", { resourceId, sessionId, claimId });
+    return { reserved: true };
+  });
+}
+
+/**
+ * Phase 11.2.4: Fenced mark-resource-in-use. The mutation is authorized by
+ * the currently valid session execution claim. Uses a $transaction:
+ * (1) verify the slot claim, (2) mark IN_USE (RESERVED → IN_USE).
+ *
+ * Returns { activated: boolean, reason?: string }.
+ */
+export async function fencedMarkResourceInUse(
+  resourceId: string,
+  sessionId: string,
+  claimId: string,
+): Promise<{ activated: boolean; reason?: string }> {
+  return await db.$transaction(async (tx) => {
+    const now = new Date();
+    const session = await tx.connectivitySession.findUnique({
+      where: { id: sessionId },
+      select: { executionSlotClaimId: true, executionSlotClaimExpiresAt: true },
+    });
+    if (!session || session.executionSlotClaimId !== claimId || !session.executionSlotClaimExpiresAt || session.executionSlotClaimExpiresAt < now) {
+      logger.error("session.fenced_activate_rejected", { resourceId, sessionId, claimId, reason: "slot-not-owned-or-expired" });
+      return { activated: false, reason: "session-execution-slot-not-held" };
+    }
+
+    const result = await tx.protocolResource.updateMany({
+      where: { id: resourceId, reservedBy: sessionId, state: "RESERVED" },
+      data: { state: "IN_USE" },
+    });
+
+    if (result.count === 0) {
+      const resource = await tx.protocolResource.findUnique({
+        where: { id: resourceId },
+        select: { state: true, reservedBy: true },
+      });
+      if (!resource) return { activated: false, reason: "Resource not found" };
+      if (resource.reservedBy !== sessionId) return { activated: false, reason: `Ownership mismatch: reserved by "${resource.reservedBy}"` };
+      return { activated: false, reason: `Resource in state "${resource.state}", expected RESERVED` };
+    }
+
+    logger.info("resource.fenced_marked_in_use", { resourceId, sessionId, claimId });
+    return { activated: true };
+  });
+}
+
+/**
+ * Phase 11.2.4: Fenced resource release. The release is authorized by the
+ * currently valid session execution claim. Uses a $transaction:
+ * (1) verify the slot claim, (2) release the resource (ownership-safe).
+ *
+ * Returns { released: boolean, reason?: string }.
+ */
+export async function fencedReleaseResource(
+  resourceId: string,
+  sessionId: string,
+  claimId: string,
+): Promise<{ released: boolean; reason?: string }> {
+  return await db.$transaction(async (tx) => {
+    const now = new Date();
+    const session = await tx.connectivitySession.findUnique({
+      where: { id: sessionId },
+      select: { executionSlotClaimId: true, executionSlotClaimExpiresAt: true },
+    });
+    if (!session || session.executionSlotClaimId !== claimId || !session.executionSlotClaimExpiresAt || session.executionSlotClaimExpiresAt < now) {
+      logger.error("session.fenced_release_rejected", { resourceId, sessionId, claimId, reason: "slot-not-owned-or-expired" });
+      return { released: false, reason: "session-execution-slot-not-held" };
+    }
+
+    const result = await tx.protocolResource.updateMany({
+      where: { id: resourceId, reservedBy: sessionId },
+      data: { state: "AVAILABLE", reservedAt: null, reservedBy: null },
+    });
+
+    if (result.count === 0) {
+      const resource = await tx.protocolResource.findUnique({
+        where: { id: resourceId },
+        select: { reservedBy: true, state: true },
+      });
+      if (!resource) return { released: false, reason: "Resource not found" };
+      if (resource.reservedBy !== sessionId) return { released: false, reason: `Ownership mismatch: reserved by "${resource.reservedBy}"` };
+      return { released: false, reason: `Resource in state "${resource.state}", cannot release` };
+    }
+
+    logger.info("resource.fenced_released", { resourceId, sessionId, claimId });
+    return { released: true };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Acquire the session execution slot (DB-authoritative fenced)
 // ---------------------------------------------------------------------------
 

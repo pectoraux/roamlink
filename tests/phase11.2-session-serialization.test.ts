@@ -59,6 +59,10 @@ import {
   renewSessionExecutionSlot,
   reclaimExpiredSessionSlots,
   fencedSessionUpdate,
+  fencedTransitionSessionState,
+  fencedReserveResource,
+  fencedMarkResourceInUse,
+  fencedReleaseResource,
   createSlotOwnershipContext,
   SESSION_EXECUTION_SLOT_LEASE_MS,
 } from "@/lib/control-plane/session-execution-slot";
@@ -799,6 +803,123 @@ describe("Phase 11.2 — Session-Level Execution Serialization (DB-backed)", () 
     expect(session?.executionSlotClaimId).toBe(claimB); // B holds the slot, not A
 
     // 8. Worker B can now perform its own fenced mutation (it holds the slot).
+    const fencedB = await fencedSessionUpdate(fx.sessionId, claimB, {
+      lastObservedAt: new Date(),
+    });
+    expect(fencedB.applied).toBe(true);
+
+    // Cleanup.
+    await releaseSessionExecutionSlot(fx.sessionId, claimB);
+  }, 60_000);
+
+  // =========================================================================
+  // 11.2.10 — Every mutation boundary rejected when slot lost.
+  //
+  // Phase 11.2.4: The architect's strongest adversarial test. Proves that
+  // EVERY mutation in the window — not just activeResourceId — is authorized
+  // by the currently valid session execution claim. If the slot is lost, every
+  // mutation boundary is rejected:
+  //   - reserve target
+  //   - mark target IN_USE
+  //   - session state transition
+  //   - activeResourceId update
+  //   - release old resource
+  //
+  // No target becomes orphaned IN_USE. Session state/resource remain coherent.
+  // B's claim remains intact.
+  // =========================================================================
+  it("11.2.10: every mutation boundary rejected when slot lost — no orphaned resources, B intact", async () => {
+    // 1. Worker A acquires the session slot.
+    await db.connectivitySession.update({
+      where: { id: fx.sessionId },
+      data: { executionSlotClaimId: null, executionSlotClaimedAt: null, executionSlotClaimExpiresAt: null },
+    }).catch(() => {});
+
+    const claimA = `fence-all-A-${Date.now()}`;
+    const acquired = await acquireSessionExecutionSlot(fx.sessionId, claimA);
+    expect(acquired.acquired).toBe(true);
+
+    // Ensure resources B and C are AVAILABLE for reservation attempts.
+    await db.protocolResource.update({ where: { id: fx.resourceBId }, data: { state: "AVAILABLE", reservedBy: null, reservedAt: null } }).catch(() => {});
+    await db.protocolResource.update({ where: { id: fx.resourceCId }, data: { state: "AVAILABLE", reservedBy: null, reservedAt: null } }).catch(() => {});
+
+    // 2. Force slot expiry + reclaim.
+    await db.connectivitySession.update({
+      where: { id: fx.sessionId },
+      data: { executionSlotClaimExpiresAt: new Date(Date.now() - 1000) },
+    });
+    await reclaimExpiredSessionSlots();
+
+    // 3. Worker B acquires the slot.
+    const claimB = `fence-all-B-${Date.now()}`;
+    const acquiredB = await acquireSessionExecutionSlot(fx.sessionId, claimB);
+    expect(acquiredB.acquired).toBe(true);
+
+    // 4. Worker A attempts EACH mutation boundary. All MUST be rejected.
+
+    // 4a. reserve target (resourceB) — fencedReserveResource
+    const reserveResult = await fencedReserveResource(fx.resourceBId, fx.sessionId, claimA);
+    expect(reserveResult.reserved).toBe(false);
+    expect(reserveResult.reason).toContain("session-execution-slot-not-held");
+
+    // 4b. mark target IN_USE — fencedMarkResourceInUse (needs RESERVED first,
+    //     but even if we set it up, the fence should reject)
+    await db.protocolResource.update({
+      where: { id: fx.resourceBId },
+      data: { state: "RESERVED", reservedBy: fx.sessionId, reservedAt: new Date() },
+    }).catch(() => {});
+    const activateResult = await fencedMarkResourceInUse(fx.resourceBId, fx.sessionId, claimA);
+    expect(activateResult.activated).toBe(false);
+    expect(activateResult.reason).toContain("session-execution-slot-not-held");
+    // Clean up the manual RESERVED state.
+    await db.protocolResource.update({
+      where: { id: fx.resourceBId },
+      data: { state: "AVAILABLE", reservedBy: null, reservedAt: null },
+    }).catch(() => {});
+
+    // 4c. session state transition — fencedTransitionSessionState
+    const transitionResult = await fencedTransitionSessionState(fx.sessionId, claimA, "SWITCHING", ["ACTIVE"]);
+    expect(transitionResult.applied).toBe(false);
+    expect(transitionResult.reason).toContain("slot-not-owned-or-expired");
+
+    // 4d. activeResourceId update — fencedSessionUpdate
+    const updateResult = await fencedSessionUpdate(fx.sessionId, claimA, {
+      activeResourceId: fx.resourceBId,
+    });
+    expect(updateResult.applied).toBe(false);
+
+    // 4e. release old resource — fencedReleaseResource
+    //     Set up resourceA as if it were reserved by the session.
+    await db.protocolResource.update({
+      where: { id: fx.resourceAId },
+      data: { state: "IN_USE", reservedBy: fx.sessionId, reservedAt: new Date() },
+    }).catch(() => {});
+    const releaseResult = await fencedReleaseResource(fx.resourceAId, fx.sessionId, claimA);
+    expect(releaseResult.released).toBe(false);
+    expect(releaseResult.reason).toContain("session-execution-slot-not-held");
+    // Clean up.
+    await db.protocolResource.update({
+      where: { id: fx.resourceAId },
+      data: { state: "AVAILABLE", reservedBy: null, reservedAt: null },
+    }).catch(() => {});
+
+    // 5. Verify: no target became orphaned IN_USE.
+    const resB = await db.protocolResource.findUnique({ where: { id: fx.resourceBId }, select: { state: true, reservedBy: true } });
+    const resC = await db.protocolResource.findUnique({ where: { id: fx.resourceCId }, select: { state: true, reservedBy: true } });
+    expect(resB?.state).not.toBe("IN_USE");
+    expect(resB?.reservedBy).not.toBe(fx.sessionId);
+    expect(resC?.state).not.toBe("IN_USE");
+
+    // 6. Verify: session state/resource remain coherent.
+    const session = await db.connectivitySession.findUnique({
+      where: { id: fx.sessionId },
+      select: { activeResourceId: true, executionSlotClaimId: true, state: true },
+    });
+    expect(session?.activeResourceId).toBe(fx.resourceAId); // unchanged
+    expect(session?.executionSlotClaimId).toBe(claimB); // B holds the slot
+    expect(session?.state).toBe("ACTIVE"); // unchanged — no SWITCHING transition happened
+
+    // 7. B's claim remains intact. B can perform its own fenced mutation.
     const fencedB = await fencedSessionUpdate(fx.sessionId, claimB, {
       lastObservedAt: new Date(),
     });
