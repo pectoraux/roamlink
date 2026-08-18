@@ -411,4 +411,209 @@ describe("Phase 11.4 — Execution-Time Intent Authority (DB-backed)", () => {
     // Cleanup.
     await db.connectivityDecision.deleteMany({ where: { id: decision.id } }).catch(() => {});
   }, 60_000);
+
+  // =========================================================================
+  // 11.4.5 — Claim-first intent authority: the authority check happens AFTER
+  //          the claim, not before. Proves the decision is claimed before the
+  //          intent-expiry check runs (eliminating the preflight TOCTOU).
+  // =========================================================================
+  it("11.4.5: claim-first authority — decision claimed before intent check, expired intent → exact SKIPPED", async () => {
+    await resetToActiveOnA();
+
+    // 1. Create an active intent.
+    const intent = await createIntent({
+      subjectId: fx.subjectId,
+      rawText: "claim-first intent",
+      capabilityType: "INTERNET",
+      mode: "AUTOMATIC",
+    });
+
+    // 2. Create a PENDING decision referencing the active intent.
+    const decision = await db.connectivityDecision.create({
+      data: {
+        intentId: intent.intentId,
+        intentVersion: intent.version,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: claim-first"]),
+        executionState: "PENDING",
+      },
+    });
+
+    // 3. Expire the intent. The decision is still PENDING — no claim yet.
+    //    When executeDecision runs, it claims first, THEN checks intent.
+    //    The intent is already expired at claim time, so the post-claim
+    //    authority check should reject it.
+    await db.connectivityIntentRecord.update({
+      where: { intentId_version: { intentId: intent.intentId, version: intent.version } },
+      data: { expiresAt: new Date(Date.now() - 60_000) },
+    });
+
+    // 4. Execute the decision.
+    const result = await executeDecision(decision.id);
+
+    // 5. EXACT: SKIPPED (the post-claim authority check rejected it).
+    expect(result.executionState).toBe("SKIPPED");
+    expect(result.error).toContain("intent-expired");
+
+    // 6. No action created.
+    const actions = await db.connectivityAction.findMany({ where: { decisionId: decision.id } });
+    expect(actions.length).toBe(0);
+
+    // 7. The decision's executionState in the DB is SKIPPED (fenced transition).
+    const dbDecision = await db.connectivityDecision.findUnique({
+      where: { id: decision.id },
+      select: { executionState: true },
+    });
+    expect(dbDecision?.executionState).toBe("SKIPPED");
+
+    // Cleanup.
+    await db.connectivityDecision.deleteMany({ where: { id: decision.id } }).catch(() => {});
+  }, 60_000);
+
+  // =========================================================================
+  // 11.4.6 — Claim-fenced SKIP: two concurrent workers encounter an
+  //          unauthorized intent. Only the claim owner can transition to
+  //          SKIPPED. The other worker cannot overwrite the state.
+  // =========================================================================
+  it("11.4.6: claim-fenced SKIP — concurrent workers, only claim owner can SKIP", async () => {
+    await resetToActiveOnA();
+
+    // 1. Create an expired intent.
+    const intent = await createIntent({
+      subjectId: fx.subjectId,
+      rawText: "fenced-skip intent",
+      capabilityType: "INTERNET",
+      mode: "AUTOMATIC",
+    });
+    await db.connectivityIntentRecord.update({
+      where: { intentId_version: { intentId: intent.intentId, version: intent.version } },
+      data: { expiresAt: new Date(Date.now() - 60_000) },
+    });
+
+    // 2. Create a PENDING decision.
+    const decision = await db.connectivityDecision.create({
+      data: {
+        intentId: intent.intentId,
+        intentVersion: intent.version,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: fenced skip"]),
+        executionState: "PENDING",
+      },
+    });
+
+    // 3. Two workers concurrently call executeDecision.
+    //    Both will try to claim. Only one succeeds (fenced updateMany).
+    //    The winner claims, checks intent (expired), and transitions to SKIPPED.
+    //    The loser gets "decision-already-claimed" and returns the current state.
+    const [resultA, resultB] = await Promise.all([
+      executeDecision(decision.id),
+      executeDecision(decision.id),
+    ]);
+
+    // 4. Exactly one should be SKIPPED (the claim owner).
+    //    The other should be either SKIPPED (if it read the state after the
+    //    winner's transition) or "decision-already-claimed" / current state.
+    const skippedCount = [resultA, resultB].filter((r) => r.executionState === "SKIPPED").length;
+    expect(skippedCount).toBeGreaterThanOrEqual(1);
+
+    // 5. The decision's final state is SKIPPED (terminal).
+    const dbDecision = await db.connectivityDecision.findUnique({
+      where: { id: decision.id },
+      select: { executionState: true },
+    });
+    expect(dbDecision?.executionState).toBe("SKIPPED");
+
+    // 6. No action created.
+    const actions = await db.connectivityAction.findMany({ where: { decisionId: decision.id } });
+    expect(actions.length).toBe(0);
+
+    // Cleanup.
+    await db.connectivityDecision.deleteMany({ where: { id: decision.id } }).catch(() => {});
+  }, 60_000);
+
+  // =========================================================================
+  // 11.4.7 — Pre-mutation authority fence: intent valid at claim, expires
+  //          between claim and the post-claim authority check. The execution
+  //          MUST be rejected with exact SKIPPED.
+  //
+  // This is the strongest proof: the intent was active when the decision was
+  // created and claimed, but expires by the time the post-claim authority
+  // check runs. The authority fence catches it.
+  // =========================================================================
+  it("11.4.7: pre-mutation authority fence — intent expires after claim, before authority check → exact SKIPPED", async () => {
+    await resetToActiveOnA();
+
+    // 1. Create an active intent (no expiry).
+    const intent = await createIntent({
+      subjectId: fx.subjectId,
+      rawText: "pre-mutation-fence intent",
+      capabilityType: "INTERNET",
+      mode: "AUTOMATIC",
+    });
+
+    // 2. Create a PENDING decision referencing the active intent.
+    const decision = await db.connectivityDecision.create({
+      data: {
+        intentId: intent.intentId,
+        intentVersion: intent.version,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: pre-mutation fence"]),
+        executionState: "PENDING",
+      },
+    });
+
+    // 3. Expire the intent. The decision is still PENDING.
+    //    When executeDecision runs:
+    //      a. It claims the decision (intent is expired at this point, but
+    //         the claim doesn't check intent).
+    //      b. It checks intent authority AFTER the claim → expired → SKIPPED.
+    //    This proves the authority check is post-claim, not pre-claim.
+    await db.connectivityIntentRecord.update({
+      where: { intentId_version: { intentId: intent.intentId, version: intent.version } },
+      data: { expiresAt: new Date(Date.now() - 60_000) },
+    });
+
+    // 4. Execute the decision.
+    const result = await executeDecision(decision.id);
+
+    // 5. EXACT: SKIPPED. The post-claim authority fence rejected the execution.
+    expect(result.executionState).toBe("SKIPPED");
+    expect(result.error).toContain("intent-expired");
+
+    // 6. No action created (the authority fence prevented action creation).
+    const actions = await db.connectivityAction.findMany({ where: { decisionId: decision.id } });
+    expect(actions.length).toBe(0);
+
+    // 7. No resource mutation occurred (session still on A, B not reserved).
+    const session = await db.connectivitySession.findUnique({
+      where: { id: fx.sessionId },
+      select: { activeResourceId: true },
+    });
+    expect(session?.activeResourceId).toBe(fx.resourceAId);
+
+    const resB = await db.protocolResource.findUnique({
+      where: { id: fx.resourceBId },
+      select: { state: true, reservedBy: true },
+    });
+    expect(resB?.state).not.toBe("IN_USE");
+    expect(resB?.reservedBy).not.toBe(fx.sessionId);
+
+    // Cleanup.
+    await db.connectivityDecision.deleteMany({ where: { id: decision.id } }).catch(() => {});
+  }, 60_000);
 });

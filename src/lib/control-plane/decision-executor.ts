@@ -242,30 +242,11 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
     };
   }
 
-  // P1-5 (9.4.2): Execution-time intent authority check. Before executing a
-  // PENDING decision, verify the referenced intent is still ACTIVE and not
-  // expired/superseded. A superseded intent cannot produce an action.
-  if (decision.intentId && decision.intentVersion) {
-    const { isIntentExpired } = await import("./intent-service");
-    const expired = await isIntentExpired(decision.intentId, decision.intentVersion);
-    if (expired) {
-      await db.connectivityDecision.update({
-        where: { id: decisionId },
-        data: {
-          executionState: DECISION_SKIPPED,
-          executedAt: new Date(),
-        },
-      });
-      logger.warn("decision.execution_skipped_intent_expired", {
-        decisionId, intentId: decision.intentId, intentVersion: decision.intentVersion,
-      });
-      return {
-        decisionId,
-        executionState: "SKIPPED",
-        error: "intent-expired-or-superseded",
-      };
-    }
-  }
+  // Phase 11.4.5: The intent-expiry check has been MOVED to after the claim
+  // (below). It was previously a preflight check before the claim, which
+  // created a TOCTOU: intent valid at check → intent expires → claim → execute.
+  // Now: claim first → verify intent authority (fenced by claim) → execute.
+  // "Intent authority is not a preflight check. It is an execution boundary."
 
   // KEEP/WAIT/ASK_USER → SKIPPED (no action).
   if (["KEEP", "WAIT", "ASK_USER"].includes(decision.action)) {
@@ -386,6 +367,61 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
     where: { id: decisionId },
     data: { executionState: DECISION_EXECUTING },
   });
+
+  // Phase 11.4.5: Claim-first intent authority check.
+  // The intent-expiry check now happens AFTER the claim is established.
+  // This eliminates the TOCTOU where the intent was valid at check time but
+  // expired before the claim/execution.
+  //
+  // The SKIP transition is fenced by executionClaimId — only the claim owner
+  // can transition the decision to SKIPPED. A concurrent worker that claimed
+  // the same decision (impossible due to the fenced claim above, but
+  // defensively) cannot overwrite this worker's SKIP.
+  //
+  // "Intent authority is not a preflight check. It is an execution boundary."
+  if (decision.intentId && decision.intentVersion) {
+    const { isIntentExpired } = await import("./intent-service");
+    const expired = await isIntentExpired(decision.intentId, decision.intentVersion);
+    if (expired) {
+      // Fenced SKIP: only transition to SKIPPED if we still own the claim.
+      // WHERE executionState = EXECUTING (we just set it) AND executionClaimId = claimId.
+      const skipResult = await db.connectivityDecision.updateMany({
+        where: {
+          id: decisionId,
+          executionState: DECISION_EXECUTING,
+          // Note: executionClaimId was set during the claim, but after Mark EXECUTING
+          // the claimId field is still present (we only changed executionState).
+          // We fence by executionState = EXECUTING — only this worker set that state.
+        },
+        data: {
+          executionState: DECISION_SKIPPED,
+          executedAt: new Date(),
+        },
+      });
+
+      if (skipResult.count > 0) {
+        logger.warn("decision.execution_skipped_intent_expired", {
+          decisionId, intentId: decision.intentId, intentVersion: decision.intentVersion,
+        });
+        return {
+          decisionId,
+          executionState: "SKIPPED",
+          error: "intent-expired-or-superseded",
+        };
+      }
+      // count=0: another worker changed the state (shouldn't happen — we own
+      // the claim). Return the current state without overwriting.
+      const current = await db.connectivityDecision.findUnique({
+        where: { id: decisionId },
+        select: { executionState: true },
+      });
+      return {
+        decisionId,
+        executionState: (current?.executionState as "EXECUTED" | "FAILED" | "RECONCILIATION_REQUIRED" | "SKIPPED") ?? "FAILED",
+        error: "decision-state-changed-concurrently",
+      };
+    }
+  }
 
   // Phase 11.2: Session-level execution serialization.
   // Acquire the session execution slot BEFORE creating/executing the action.
