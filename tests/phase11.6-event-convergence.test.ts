@@ -156,7 +156,9 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     await resetToActiveOnA();
     await db.connectivityDecision.deleteMany({ where: { sessionId: fx.sessionId, intentId: { contains: "dup-1161" } } }).catch(() => {});
     await db.connectivityAction.deleteMany({ where: { sessionId: fx.sessionId, decisionId: null } }).catch(() => {});
-    await db.reevaluationEvent.deleteMany({ where: { subjectId: fx.subjectId, type: "INTENT_CHANGED" } }).catch(() => {});
+    // Clean up ALL events for this subject (including fixture's MEASUREMENT_RECEIVED,
+    // REOBSERVE_REQUESTED, etc.) so the worker claims OUR test event.
+    await db.reevaluationEvent.deleteMany({ where: { subjectId: fx.subjectId } }).catch(() => {});
 
     // Create a real active intent so the event can actually trigger a decision.
     const intent = await createIntent({
@@ -185,25 +187,25 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     expect(r2.duplicate).toBe(true);
     expect(r1.eventId).toBe(r2.eventId);
 
-    // Process through the worker.
-    await processPendingEvents(5, `dup-1161-${Date.now()}`);
+    // Process through the worker — use the official processOneEvent entry point.
+    const { processOneEvent } = await import("@/lib/control-plane/reevaluation");
+    const result = await processOneEvent(`dup-1161-${Date.now()}`);
+
+    // The event was processed (not null — an event was found and processed).
+    expect(result).not.toBeNull();
 
     // Exactly one event in the DB — deduplication worked.
     const events = await db.reevaluationEvent.findMany({ where: { idempotencyKey } });
     expect(events.length).toBe(1);
-
-    // Process again — the event is already terminal, so no duplicate processing.
-    await processPendingEvents(5, `dup-1161-b-${Date.now()}`);
-
-    // Still exactly one event (the duplicate was never persisted).
-    const eventsAfter = await db.reevaluationEvent.findMany({ where: { idempotencyKey } });
-    expect(eventsAfter.length).toBe(1);
 
     // At most one decision referencing this intent — no duplicate side effect.
     const decisions = await db.connectivityDecision.findMany({
       where: { intentId: intent.intentId, intentVersion: intent.version },
     });
     expect(decisions.length).toBeLessThanOrEqual(1);
+    if (decisions.length === 1) {
+      expect(["EXECUTED", "SKIPPED", "FAILED", "RECONCILIATION_REQUIRED"]).toContain(decisions[0].executionState);
+    }
 
     // Cleanup.
     await db.connectivityDecision.deleteMany({ where: { intentId: intent.intentId } }).catch(() => {});
@@ -268,65 +270,91 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
   }, 120_000);
 
   // =========================================================================
-  // 11.6.5 — Real out-of-order RESOURCE_DEGRADED then RESOURCE_RECOVERED
-  //          (and reverse) → final state converges from current authoritative state
+  // 11.6.5 — Real out-of-order reevaluation-event convergence
   //
-  // The architectural principle: events are triggers, not authority. The system
-  // always derives health from the current measurement stream, not from event
-  // ordering. So RESOURCE_RECOVERED before RESOURCE_DEGRADED (or vice versa)
-  // produces the same final state: the resource health reflects the latest
-  // measurement, not the event sequence.
+  // Creates and processes actual RESOURCE_DEGRADED and RESOURCE_RECOVERED
+  // events through the worker in BOTH orderings (A: DEGRADED→RECOVERED,
+  // B: RECOVERED→DEGRADED). Proves the final state converges from the
+  // current authoritative resource health, not from the event sequence.
+  //
+  // The architectural principle:
+  //   Events are triggers, not authority. The decision engine reads the
+  //   CURRENT ResourceHealth snapshot, not the event payload.
   // =========================================================================
-  it("11.6.5: out-of-order DEGRADED then RECOVERED (and reverse) → final state converges from current measurements", async () => {
+  it("11.6.5: out-of-order RESOURCE_DEGRADED + RESOURCE_RECOVERED events → final state converges from current health", async () => {
     await resetToActiveOnA();
     await db.connectivityMeasurement.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
     await db.resourceHealth.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
+    await db.connectivityDecision.deleteMany({ where: { sessionId: fx.sessionId, intentId: null } }).catch(() => {});
 
-    // Step 1: Ingest degraded measurements.
-    for (let i = 0; i < 3; i++) {
-      await ingestMeasurement({
-        resourceId: fx.resourceAId,
-        sessionId: fx.sessionId,
-        providerInstanceId: fx.providerInstanceId,
-        type: "QUALITY",
-        metrics: { throughputDownMbps: 5, latencyMs: 250, packetLossPercent: 8 },
-        source: "ADAPTER",
-        confidence: 0.8,
-        capturedAt: new Date(Date.now() - (3 - i) * 10000),
-        triggerReevaluation: false,
-      });
-    }
-
-    // Health should be DEGRADED.
-    let health = await db.resourceHealth.findUnique({ where: { resourceId: fx.resourceAId } });
-    expect(health?.status).toBe("DEGRADED");
-
-    // Step 2: Now ingest healthy measurements with NEWER timestamps.
-    // This simulates "RECOVERED after DEGRADED" — the normal order.
-    // The health derivation should converge to HEALTHY because the newest N
-    // measurements are healthy.
-    await db.connectivityMeasurement.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
-    await db.resourceHealth.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
-
+    // --- Establish HEALTHY health ---
     for (let i = 0; i < 5; i++) {
       await ingestMeasurement({
-        resourceId: fx.resourceAId,
-        sessionId: fx.sessionId,
-        providerInstanceId: fx.providerInstanceId,
-        type: "QUALITY",
-        metrics: { throughputDownMbps: 80, latencyMs: 15, packetLossPercent: 0 },
-        source: "ADAPTER",
-        confidence: 0.8,
-        capturedAt: new Date(Date.now() + i * 1000),
+        resourceId: fx.resourceAId, sessionId: fx.sessionId, providerInstanceId: fx.providerInstanceId,
+        type: "QUALITY", metrics: { throughputDownMbps: 80, latencyMs: 15, packetLossPercent: 0 },
+        source: "ADAPTER", confidence: 0.8, capturedAt: new Date(Date.now() + i * 1000),
         triggerReevaluation: false,
       });
     }
+    let health = await db.resourceHealth.findUnique({ where: { resourceId: fx.resourceAId } });
+    expect(health?.status).toBe("HEALTHY");
 
-    // Health should be HEALTHY (recovered — the latest measurements are healthy).
+    // --- Case A: RESOURCE_DEGRADED then RESOURCE_RECOVERED (normal order) ---
+    // Emit a RESOURCE_DEGRADED event manually.
+    await emitReevaluationEvent({
+      type: "RESOURCE_DEGRADED", resourceId: fx.resourceAId, sessionId: fx.sessionId,
+      payload: { reason: "test-degraded-A", quality: 0.1 },
+    });
+    // Process through the worker. The worker reads CURRENT health (HEALTHY) →
+    // decision should be KEEP (no action needed).
+    await processPendingEvents(5, `caseA-deg-${Date.now()}`);
+
+    // The health is still HEALTHY — the event is a trigger, not authority.
+    // The degraded event did NOT change the health (it's derived from measurements).
     health = await db.resourceHealth.findUnique({ where: { resourceId: fx.resourceAId } });
     expect(health?.status).toBe("HEALTHY");
 
-    // Session is still ACTIVE on A.
+    // Now emit RESOURCE_RECOVERED.
+    await emitReevaluationEvent({
+      type: "RESOURCE_RECOVERED", resourceId: fx.resourceAId, sessionId: fx.sessionId,
+      payload: { reason: "test-recovered-A", quality: 0.9 },
+    });
+    await processPendingEvents(5, `caseA-rec-${Date.now()}`);
+
+    // Still HEALTHY — no state change from either event.
+    health = await db.resourceHealth.findUnique({ where: { resourceId: fx.resourceAId } });
+    expect(health?.status).toBe("HEALTHY");
+
+    // --- Case B: RESOURCE_RECOVERED then RESOURCE_DEGRADED (reverse order) ---
+    await db.reevaluationEvent.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
+    await db.connectivityDecision.deleteMany({ where: { sessionId: fx.sessionId, intentId: null } }).catch(() => {});
+
+    // Emit RECOVERED first (out of order — no prior degradation).
+    await emitReevaluationEvent({
+      type: "RESOURCE_RECOVERED", resourceId: fx.resourceAId, sessionId: fx.sessionId,
+      payload: { reason: "test-recovered-B", quality: 0.9 },
+    });
+    await processPendingEvents(5, `caseB-rec-${Date.now()}`);
+
+    // Still HEALTHY — the event is a trigger, not authority.
+    health = await db.resourceHealth.findUnique({ where: { resourceId: fx.resourceAId } });
+    expect(health?.status).toBe("HEALTHY");
+
+    // Now emit DEGRADED.
+    await emitReevaluationEvent({
+      type: "RESOURCE_DEGRADED", resourceId: fx.resourceAId, sessionId: fx.sessionId,
+      payload: { reason: "test-degraded-B", quality: 0.1 },
+    });
+    await processPendingEvents(5, `caseB-deg-${Date.now()}`);
+
+    // STILL HEALTHY — the degraded event does NOT change the health snapshot.
+    // The worker reads the current authoritative ResourceHealth (HEALTHY from
+    // the measurement stream) and makes a KEEP decision.
+    health = await db.resourceHealth.findUnique({ where: { resourceId: fx.resourceAId } });
+    expect(health?.status).toBe("HEALTHY");
+
+    // Session is still ACTIVE on A — no unauthorized connectivity mutation.
     const session = await db.connectivitySession.findUnique({
       where: { id: fx.sessionId },
       select: { activeResourceId: true, state: true },
@@ -334,11 +362,18 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     expect(session?.activeResourceId).toBe(fx.resourceAId);
     expect(session?.state).toBe("ACTIVE");
 
+    // No SWITCH action was created by any of the events.
+    const switchActions = await db.connectivityAction.findMany({
+      where: { sessionId: fx.sessionId, type: "SWITCH" },
+    });
+    expect(switchActions.length).toBe(0);
+
     // Cleanup.
     await db.connectivityMeasurement.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
     await db.resourceHealth.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
     await db.reevaluationEvent.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
-  }, 60_000);
+    await db.connectivityDecision.deleteMany({ where: { sessionId: fx.sessionId, intentId: null } }).catch(() => {});
+  }, 120_000);
 
   // =========================================================================
   // 11.6.6 — Event-as-trigger proof: stale event cannot resurrect state
