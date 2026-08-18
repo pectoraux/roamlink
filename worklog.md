@@ -3789,3 +3789,65 @@ Stage Summary:
   + "While a worker is performing the mutation window, either the worker still owns the session slot OR the worker has stopped before performing any further connectivity mutation."
 - Phase 11.2 is now ready to freeze.
 - Next: Phase 11.3 — Provider truth flips mid-execution.
+
+---
+Task ID: 11.2.3
+Agent: Principal Architect (main) — Phase 11.2.3 DB-Authoritative Mutation Fence
+Task: Close the TOCTOU window identified in the architect's audit of cae816b. The checkpoint before a mutation is a fast-path observation; the mutation itself must carry the DB fence. "checkpoint ≠ authorization; DB-fenced mutation = authorization." Every state-changing connectivity mutation must be authorized by the currently valid session execution claim at the mutation boundary.
+
+Work Log:
+- Audited cae816b directly. Confirmed the TOCTOU window:
+  - verifySlotOwnership() is a read (checkpoint/observation).
+  - The actual mutation (db.connectivitySession.update for activeResourceId) is a separate, unconditional operation.
+  - Between the checkpoint and the mutation, the slot could expire/be reclaimed/be stolen by another worker.
+  - The checkpoint guarantees "if slot loss has already been observed, stop." It does NOT guarantee "a worker can never mutate after slot ownership is lost."
+
+- Fix — fencedSessionUpdate (session-execution-slot.ts):
+  - A DB-authoritative mutation fence. The session update is a fenced updateMany:
+      WHERE id = sessionId
+        AND executionSlotClaimId = claimId
+        AND executionSlotClaimExpiresAt > now
+      DATA: <the session fields to update>
+  - If count > 0: mutation applied (authorized).
+  - If count = 0: slot was lost between checkpoint and mutation. Mutation did NOT happen. Returns { applied: false }. Caller throws SlotOwnershipLostError → RECONCILIATION_REQUIRED.
+  - This closes the TOCTOU window: the mutation itself is authorized by the valid session claim, not merely preceded by an observation.
+
+- Wired into executeAction (action-executor.ts):
+  - Both ACTIVATE and SWITCH paths now use fencedSessionUpdate for the critical session.activeResourceId mutation.
+  - The unconditional db.connectivitySession.update is replaced with:
+      if (slotContext) {
+        const fenced = await fencedSessionUpdate(session.id, slotContext.claimId, { activeResourceId: target, ... });
+        if (!fenced.applied) throw new SlotOwnershipLostError(...);
+      } else {
+        // legacy/test path — unconditional (no slot context)
+      }
+  - The slotContext type was extended to include { sessionId, claimId, slotLost } so the fenced mutation can reference the claim.
+  - Resource mutations (reserveResource, markResourceInUse, releaseResource) remain fenced by reservedBy=sessionId (ownership-safe at the resource level). The session-level fence on activeResourceId is the authoritative boundary that prevents a concurrent double-switch from landing on the wrong resource.
+
+- Adversarial test (11.2.9, DB-backed runtime, PASS):
+  - Worker A acquires session slot.
+  - Worker A passes ownership checkpoint (slot held).
+  - Before A's mutation: force slot expiry + reclaim.
+  - Worker B acquires the slot (A's expired lease reclaimed).
+  - Worker A attempts fenced mutation (update activeResourceId → B).
+  - fencedSessionUpdate returns { applied: false } — REJECTED.
+  - Session activeResourceId is UNCHANGED (still A — mutation did NOT happen).
+  - Worker B holds the slot (executionSlotClaimId = B's claim).
+  - Worker B can perform its own fenced mutation (applied: true).
+  - This test distinguishes a checkpoint system from a genuinely DB-authoritative mutation fence.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 9):    9/9 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Phase 10/10.1.1:      13/13 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 34 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: ae2e4da (on GitHub, verified: git ls-remote origin main → ae2e4da)
+- The TOCTOU window is closed. The mutation itself is authorized by the valid session claim, not merely preceded by an observation.
+- The architectural rule is now enforced: "Every state-changing connectivity mutation must be authorized by the currently valid session execution claim at the mutation boundary, not merely preceded by a successful observation of ownership."
+- The checkpoint remains valuable for fast failure (avoids unnecessary work), but the fenced mutation is the ultimate authority.
+- Phase 11.2 is now ready to freeze.
+- Next: Phase 11.3 — Provider truth flips mid-execution.
