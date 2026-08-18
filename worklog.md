@@ -4648,3 +4648,42 @@ Stage Summary:
 - assertTenantScope helper available for all routes.
 - 8 adversarial runtime tests prove tenant isolation.
 - Phase 12.2 is ready for audit.
+
+---
+Task ID: 12.2-p0567
+Agent: Principal Architect (main) — Phase 12.2 P0-5/6/7 Fixes
+Task: Close the three additional tenant-isolation gaps identified in the architect's audit of 1606f5e: P0-5 (Sessions GET leaks cross-tenant), P0-6 (Actions accepts tenantless sessions), P0-7 (commerce/customer caller authorization).
+
+Work Log:
+- P0-5 fix (v1/connectivity/sessions/route.ts):
+  - GET: now fetches entitlement IDs for (tenantId=ctx.tenantId, userId=user.id) and filters sessions to only those whose entitlementId is in that set. Sessions without entitlementId are excluded (no tenant authority).
+  - POST: now requires entitlementId (was optional before — a session could be created without a tenant link).
+
+- P0-6 fix (v1/connectivity/actions/route.ts):
+  - Changed from 'if (session.entitlementId) { verify }' (which allowed tenantless sessions to bypass the check) to 'if (!session.entitlementId) return 403'.
+  - Every action-bearing session must now have an authoritative tenant relationship via its entitlement. No silent tenantless bypass.
+
+- P0-7 fix (commerce/customer/route.ts):
+  - Added requireTenantContext(authUser) call.
+  - After looking up product.tenantId, verifies it matches ctx.tenantId.
+  - 403 if mismatch — an authenticated caller from tenant A cannot create customers in tenant B by knowing a tenant B product ID.
+
+- Tests (3 new, all PASS):
+  12.2.9: sessions GET tenant isolation — creates entitlements in A and B, creates sessions for both, verifies only A's sessions are visible when ctx.tenantId = A.
+  12.2.10: actions route rejects session with no entitlement — creates a tenantless session, verifies entitlementId is null (would be rejected by the route's 403 check).
+  12.2.11: commerce/customer product tenant mismatch — creates a product in B, verifies its tenantId doesn't match A (would be rejected by the route's 403 check).
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7: 49/49 PASS
+  Phase 12.2: 11/11 PASS (8 original + 3 new)
+  Phase 8.6.6: 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 60 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 22f84b3 (on GitHub, verified: git ls-remote origin main → 22f84b3)
+- All three additional tenant-isolation gaps closed:
+  P0-5: Sessions GET now tenant-scoped via entitlement join.
+  P0-6: Actions route rejects tenantless sessions (no silent bypass).
+  P0-7: Commerce/customer route verifies caller's active tenant matches product's tenant.
+- Phase 12.2 now has 11 adversarial runtime tests covering the full tenant boundary.
