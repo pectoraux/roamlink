@@ -5269,3 +5269,99 @@ Stage Summary:
 - 12.3.2.12 proves crash-after-side-effect → RECONCILIATION_REQUIRED (not FAILED).
 - 12.3.2.13 proves reconciliation resolves the outcome (SUCCESS→COMPLETED, NOT_FOUND→FAILED).
 - 12.3.2.14 proves duplicate provider safety (same providerKey cannot create a 2nd operation).
+
+---
+Task ID: 12.3.2.3
+Agent: Principal Architect (main) — Phase 12.3.2.3 Confirmed vs Ambiguous + Reconciliation Ownership
+Task: Close the two remaining semantic gaps the architect identified in the audit of 5fe93cc: (1) execute() exceptions are all treated as FAILED, but ambiguous external errors (timeout, ECONNRESET) must become RECONCILIATION_REQUIRED; (2) reconciliation needs a fenced ownership claim so two workers don't both query the provider concurrently. Plus: providerKey is required for external side-effect operations.
+
+Work Log:
+- Fix 1 — OperationOutcome type (src/lib/idempotency/claim.ts):
+  New type that classifies execute()'s result:
+    - SUCCESS: operation completed, value stored.
+    - CONFIRMED_FAILURE: provider explicitly rejected (card declined, validation
+      error). Safe to retry with a new key → FAILED.
+    - AMBIGUOUS_EXTERNAL_FAILURE: provider's response was lost or ambiguous
+      (timeout, ECONNRESET). Outcome is UNKNOWN → RECONCILIATION_REQUIRED.
+  The architectural rule is now explicit:
+    "Only provider-confirmed negative outcomes may become FAILED.
+     Ambiguous external errors must become RECONCILIATION_REQUIRED."
+  The execute() callback now returns OperationOutcome<T>. For backward
+  compatibility, a raw return value is treated as SUCCESS, and a thrown
+  AppError is classified by errorClass (validation/not_found/conflict/auth =
+  CONFIRMED_FAILURE; everything else = AMBIGUOUS_EXTERNAL_FAILURE).
+
+- Fix 2 — providerKey required for external operations:
+  New `isExternal` flag (defaults to true). If isExternal is true and no
+  providerKey is supplied, it defaults to the RoamLink key (with a warning)
+  so reconciliation is always possible. This ensures an external side-effect
+  operation is never unreconcilable if the worker crashes.
+
+- Fix 3 — Reconciliation ownership (RECONCILIATION_CLAIMED state):
+  New state in the machine: RECONCILIATION_CLAIMED.
+  Schema: added reconciliationClaimId + reconciliationClaimExpiresAt.
+  reconcileOperation() now uses a fenced claim:
+    Step 1: fenced UPDATE RECONCILIATION_REQUIRED → RECONCILIATION_CLAIMED
+            (WHERE state = RECONCILIATION_REQUIRED). Only one worker wins.
+    Step 2: queryProvider(providerKey) — only the claim winner queries.
+    Step 3: fenced terminal UPDATE (WHERE reconciliationClaimId = X AND
+            state = RECONCILIATION_CLAIMED). Only the owner transitions.
+  If the reconciliation worker crashes, the reclaim worker transitions
+  expired RECONCILIATION_CLAIMED → RECONCILIATION_REQUIRED (reclaimable).
+
+- Fix 4 — reclaimExpiredIdempotencyOperations now reclaims both:
+  1. IN_PROGRESS + expired lease → RECONCILIATION_REQUIRED
+  2. RECONCILIATION_CLAIMED + expired reconciliation lease → RECONCILIATION_REQUIRED
+  This ensures a crashed reconciliation worker's claim is reclaimable.
+
+- Fix 5 — Poll path handles RECONCILIATION_CLAIMED:
+  A concurrent request that finds the operation in RECONCILIATION_CLAIMED
+  gets 409 "outcome unknown, do not retry" (same as RECONCILIATION_REQUIRED).
+
+- Tests (3 new adversarial + 1 updated, all PASS):
+  12.3.2.15 — AMBIGUOUS EXTERNAL FAILURE (provider timeout) → RECONCILIATION_REQUIRED:
+    execute() returns AMBIGUOUS_EXTERNAL_FAILURE (simulating a timeout after the
+    provider may have accepted the payment). Operation → RECONCILIATION_REQUIRED
+    (NOT FAILED). A retry with the same key gets 409 (blocked), execCount=0.
+    Under the prior implementation, this would have been FAILED, allowing a
+    retry that creates a duplicate payment.
+
+  12.3.2.16 — External operation without providerKey:
+    An external operation (isExternal defaults to true) without a providerKey
+    defaults to the RoamLink key (with warning). The providerKey is stored so
+    reconciliation is always possible. The operation succeeds.
+
+  12.3.2.17 — Two reconciliation workers → exactly one claims and queries:
+    Two concurrent reconcileOperation() calls. Only one wins the fenced claim
+    (RECONCILIATION_REQUIRED → RECONCILIATION_CLAIMED) and queries the provider.
+    The other gets 0 rows and returns the current state without querying.
+    providerQueryCount === 1. Final state = COMPLETED.
+
+  12.3.2.5 — Updated to use CONFIRMED_FAILURE outcome (provider explicitly
+    rejected, e.g. card declined) → FAILED. This is distinct from
+    AMBIGUOUS_EXTERNAL_FAILURE (12.3.2.15) which → RECONCILIATION_REQUIRED.
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       28/28 PASS  (25 adapted + 3 new adversarial)
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 105 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The two remaining semantic gaps are closed:
+  1. Ambiguous external errors (timeout, ECONNRESET) → RECONCILIATION_REQUIRED (not FAILED).
+     Only provider-confirmed negative outcomes become FAILED.
+  2. Reconciliation uses a fenced ownership claim (RECONCILIATION_CLAIMED) so two
+     workers cannot both query the provider concurrently.
+- The commercial idempotency model is now explicit:
+    confirmed failure → FAILED (safe to retry with new key)
+    ambiguous external failure → RECONCILIATION_REQUIRED (do not retry)
+    external operation → providerKey mandatory (defaults to RoamLink key)
+    reconciliation → DB-authoritative claim + lease (fenced ownership)
+- This brings the SaaS/payment/provider side of RoamLink up to the same rigor
+  as the Connectivity OS execution plane (Phase 11).

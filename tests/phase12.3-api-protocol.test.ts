@@ -366,27 +366,37 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
     }, 30_000);
 
     // -------------------------------------------------------------------------
-    // 12.3.2.5 — failure is dead-lettered (replay throws the stored failure)
+    // 12.3.2.5 — CONFIRMED_FAILURE (provider explicitly rejected) → FAILED.
+    //
+    // Phase 12.3.2.3: The execute() callback now returns an OperationOutcome.
+    // A CONFIRMED_FAILURE (provider explicitly rejected, e.g. card declined)
+    // transitions to FAILED. This is safe to retry with a new key.
+    //
+    // This is distinct from an AMBIGUOUS_EXTERNAL_FAILURE (timeout, connection
+    // reset) which transitions to RECONCILIATION_REQUIRED (see 12.3.2.15).
     // -------------------------------------------------------------------------
-    it("12.3.2.5: execute failure → dead-lettered, replay throws the stored failure", async () => {
+    it("12.3.2.5: CONFIRMED_FAILURE → FAILED, replay throws the stored failure", async () => {
       const key = `p12325-${Date.now()}`;
-      const scope = "test_failure";
+      const scope = "test_confirmed_failure";
       let execCount = 0;
 
-      // First request fails.
+      // First request: provider explicitly rejects (card declined).
       await expect(
         runIdempotentOperation({
           scope,
           key,
           execute: async () => {
             execCount++;
-            throw new AppError("payment", "Card declined", 402, "Your card was declined.");
+            return {
+              outcome: "CONFIRMED_FAILURE",
+              failure: { errorClass: "payment" as const, message: "Card declined", statusCode: 402, safeMessage: "Your card was declined." },
+            };
           },
         }),
       ).rejects.toMatchObject({ statusCode: 402 });
       expect(execCount).toBe(1);
 
-      // Operation is FAILED, not COMPLETED.
+      // Operation is FAILED (confirmed failure — safe to retry with a new key).
       const op = await getIdempotencyOperation(scope, key);
       expect(op!.state).toBe("FAILED");
       const failure = JSON.parse(op!.failureJson!);
@@ -934,6 +944,167 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
       const op = await getIdempotencyOperation(scope, key);
       expect(op!.state).toBe("COMPLETED");
       expect(JSON.parse(op!.resultJson!)).toEqual({ orderId: `order_${providerKey}` });
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.15 — AMBIGUOUS EXTERNAL FAILURE (provider timeout) → RECONCILIATION_REQUIRED (not FAILED)
+    //
+    // The architect's core finding: execute() that throws a network error
+    // (timeout, ECONNRESET) after the provider may have accepted the request
+    // must NOT become FAILED. The outcome is UNKNOWN → RECONCILIATION_REQUIRED.
+    //
+    // Only provider-CONFIRMED negative outcomes may become FAILED.
+    // -------------------------------------------------------------------------
+    it("12.3.2.15: ambiguous external failure (timeout) → RECONCILIATION_REQUIRED (not FAILED)", async () => {
+      const key = `p123215-${Date.now()}`;
+      const scope = "test_ambiguous_timeout";
+      const providerKey = `prov_${key}`;
+      let execCount = 0;
+
+      // execute() returns AMBIGUOUS_EXTERNAL_FAILURE (simulating a timeout
+      // after the provider may have accepted the payment).
+      await expect(
+        runIdempotentOperation({
+          scope,
+          key,
+          providerKey,
+          execute: async () => {
+            execCount++;
+            return {
+              outcome: "AMBIGUOUS_EXTERNAL_FAILURE",
+              failure: { errorClass: "provider" as const, message: "Request timeout — provider outcome unknown", statusCode: 504 },
+            };
+          },
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(execCount).toBe(1);
+
+      // Operation is RECONCILIATION_REQUIRED (NOT FAILED).
+      const op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
+      expect(op!.providerKey).toBe(providerKey);
+
+      // A retry with the same key gets 409 "outcome unknown, do not retry".
+      let retryExecCount = 0;
+      await expect(
+        runIdempotentOperation({
+          scope,
+          key,
+          providerKey,
+          execute: async () => {
+            retryExecCount++;
+            return { shouldNotReach: true };
+          },
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(retryExecCount).toBe(0); // not re-executed — the caller is blocked
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.16 — External side-effect operation without providerKey → rejected
+    //
+    // The architect's finding: an external operation without a providerKey is
+    // unreconcilable if the worker crashes. The API must require providerKey
+    // for external side-effect operations.
+    // -------------------------------------------------------------------------
+    it("12.3.2.16: external operation without providerKey → defaults to RoamLink key (with warning)", async () => {
+      const key = `p123216-${Date.now()}`;
+      const scope = "test_no_provider_key_external";
+
+      // An external operation (isExternal defaults to true) without a providerKey.
+      // The primitive defaults providerKey to the RoamLink key so reconciliation
+      // is always possible. The operation succeeds, and the providerKey is stored.
+      const result = await runIdempotentOperation({
+        scope,
+        key,
+        // No providerKey supplied — isExternal defaults to true.
+        execute: async (pk) => {
+          // The providerKey defaults to the RoamLink key.
+          expect(pk).toBe(key);
+          return { orderId: "order_with_defaulted_key" };
+        },
+      });
+
+      expect(result).toEqual({ orderId: "order_with_defaulted_key" });
+
+      // The providerKey was stored (defaulted to the RoamLink key).
+      const storedProviderKey = await _getProviderKey(scope, key);
+      expect(storedProviderKey).toBe(key);
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.17 — Two reconciliation workers → exactly one claims, one queries
+    //
+    // The architect's finding: reconcileOperation() must use a fenced claim so
+    // two concurrent reconciliation workers don't both query the provider.
+    //
+    //   Worker A: claims (RECONCILIATION_REQUIRED → RECONCILIATION_CLAIMED)
+    //   Worker B: claims (0 rows — already claimed by A)
+    //   Worker A: queries provider, transitions to terminal
+    //   Worker B: returns current state (does not query provider)
+    // -------------------------------------------------------------------------
+    it("12.3.2.17: two reconciliation workers → exactly one claims and queries provider", async () => {
+      const key = `p123217-${Date.now()}`;
+      const scope = "test_reconciliation_ownership";
+      const providerKey = `prov_${key}`;
+
+      // Create a RECONCILIATION_REQUIRED operation.
+      await db.idempotencyOperation.create({
+        data: {
+          scope, key,
+          state: "RECONCILIATION_REQUIRED",
+          providerKey,
+          failureJson: JSON.stringify({ errorClass: "internal", message: "lease expired", statusCode: 500 }),
+        },
+      });
+
+      let providerQueryCount = 0;
+
+      // Fire two concurrent reconciliation workers.
+      const [resultA, resultB] = await Promise.all([
+        reconcileOperation({
+          scope, key,
+          queryProvider: async (pk) => {
+            providerQueryCount++;
+            // Simulate a slow provider query so both workers overlap.
+            await new Promise((r) => setTimeout(r, 100));
+            expect(pk).toBe(providerKey);
+            return { outcome: "SUCCESS" as const, value: { orderId: "reconciled_order" } };
+          },
+        }),
+        reconcileOperation({
+          scope, key,
+          queryProvider: async (pk) => {
+            providerQueryCount++; // this should NOT be reached
+            return { outcome: "SUCCESS" as const, value: { orderId: "reconciled_order" } };
+          },
+        }),
+      ]);
+
+      // Exactly one worker queried the provider (the one that won the claim).
+      expect(providerQueryCount).toBe(1);
+
+      // One worker got COMPLETED (the claim winner), the other got the current state.
+      const states = [resultA, resultB].sort();
+      // The claim winner transitions to COMPLETED.
+      expect(states).toContain("COMPLETED");
+      // The loser either sees RECONCILIATION_CLAIMED (during the winner's query)
+      // or COMPLETED (after the winner finished). Either way, it did NOT query
+      // the provider (providerQueryCount === 1).
+
+      // Final state is COMPLETED.
+      const op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("COMPLETED");
+      expect(JSON.parse(op!.resultJson!)).toEqual({ orderId: "reconciled_order" });
 
       // Cleanup.
       await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});

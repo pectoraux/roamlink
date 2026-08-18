@@ -1361,18 +1361,23 @@ model IdempotencyOperation {
   scope           String
   // The idempotency key supplied by the client (or generated). Unique within (scope, key).
   key             String
-  // State machine (Phase 12.3.2.2 — crash-after-side-effect semantics):
-  //   IN_PROGRESS           — claimed, execute() is running (heartbeat active).
-  //   COMPLETED             — execute() succeeded, result stored. Safe to replay.
-  //   FAILED                — execute() threw a CONFIRMED failure (e.g. validation
-  //                           error, provider rejected). Safe to retry with a new key.
-  //   RECONCILIATION_REQUIRED — the worker crashed or the lease expired while
-  //                           execute() was running. The external side effect's
-  //                           outcome is UNKNOWN. The caller MUST NOT retry with a
-  //                           new key — a reconciliation worker must query the
-  //                           provider with the same providerKey to determine the
-  //                           actual outcome before transitioning to COMPLETED
-  //                           or FAILED.
+  // State machine (Phase 12.3.2.3 — crash-after-side-effect + reconciliation ownership):
+  //   IN_PROGRESS             — claimed, execute() is running (heartbeat active).
+  //   COMPLETED               — execute() succeeded or reconciliation confirmed SUCCESS.
+  //                             Result stored. Safe to replay.
+  //   FAILED                  — execute() threw a CONFIRMED failure (provider explicitly
+  //                             rejected, validation error). Safe to retry with a new key.
+  //   RECONCILIATION_REQUIRED — the worker crashed, the lease expired, OR execute()
+  //                             threw an AMBIGUOUS external error (timeout, connection
+  //                             reset). The external side effect's outcome is UNKNOWN.
+  //                             The caller MUST NOT retry with a new key. A reconciliation
+  //                             worker must query the provider with the same providerKey.
+  //   RECONCILIATION_CLAIMED  — a reconciliation worker has claimed the operation and is
+  //                             querying the provider. Prevents concurrent reconciliation.
+  //
+  // Phase 12.3.2.3: Only provider-confirmed negative outcomes may become FAILED.
+  // Ambiguous external errors (timeout, ECONNRESET, lost response) become
+  // RECONCILIATION_REQUIRED — the outcome is unknown, not failed.
   //
   // The distinction between FAILED and RECONCILIATION_REQUIRED is the core of
   // Phase 12.3.2.2: "retryable failure" vs "unknown outcome requiring reconciliation".
@@ -1412,6 +1417,15 @@ model IdempotencyOperation {
   // Phase 12.3.2.2: When the reconciliation worker last queried the provider.
   // Used to avoid hammering the provider on repeated reconciliation cycles.
   reconciledAt    DateTime?
+  // Phase 12.3.2.3: Reconciliation claim ownership. When a reconciliation worker
+  // begins querying the provider, it claims the operation with a fenced UPDATE:
+  //   WHERE state = RECONCILIATION_REQUIRED → state = RECONCILIATION_CLAIMED
+  // This prevents two reconciliation workers from both querying the provider
+  // concurrently (which may have side effects, consume rate limits, or return
+  // inconsistent snapshots). The claim has a lease; a crashed reconciliation
+  // worker's claim is reclaimable after expiry.
+  reconciliationClaimId        String?
+  reconciliationClaimExpiresAt DateTime?
   createdAt       DateTime @default(now())
   completedAt     DateTime?
 
