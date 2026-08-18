@@ -3632,3 +3632,69 @@ Stage Summary:
 - Acceptance invariant #2 proven: "A session cannot have two connectivity mutations executing concurrently."
 - Frozen layers unchanged: entitlement.ts kernel, adapter contract, ranking engine, ledger, reason-code protocol, Phase 10 trust firewall.
 - Next: Phase 11.3 — Provider truth flips mid-execution (inject NOT_USABLE between reserve and verify → session remains on old resource, not stranded mid-switch).
+
+---
+Task ID: 11.2.1
+Agent: Principal Architect (main) — Phase 11.2.1 Renewable Slot Lease + Fenced Busy-Requeue
+Task: Close two lifecycle holes identified in the architect's audit of 0163764: (1) the session slot lease could expire while the mutation was still running, allowing a second worker to acquire the slot; (2) the "session busy" requeue was an unconditional update that could destroy a concurrent worker's claim after lease expiry.
+
+Work Log:
+- Audited 0163764 directly. Confirmed both holes:
+  - Hole 1: SESSION_EXECUTION_SLOT_LEASE_MS = 5 min, fixed, never renewed. A mutation > 5 min → lease expires → cron reclaims → second worker acquires → two mutations concurrent. The invariant "A session execution slot MUST NOT become available while its owner is still performing the mutation window" is violated.
+  - Hole 2: executeDecision's busy-requeue was `db.connectivityDecision.update({ where: { id: decisionId }, data: { executionState: PENDING, ... } })` — unconditional. Race: Worker A (EXECUTING, slot busy) pauses → A's lease expires → reclaim → PENDING → Worker B claims → EXECUTION_CLAIMED → Worker A resumes → unconditional requeue → overwrites B's claim. Same claim-destruction class as 11.1.1.
+
+- Fix 1 — Renewable slot lease (session-execution-slot.ts):
+  - Added renewSessionExecutionSlot(sessionId, claimId): fenced updateMany WHERE executionSlotClaimId = claimId, extends executionSlotClaimExpiresAt to now + SESSION_EXECUTION_SLOT_LEASE_MS. Only the claim owner can renew. Returns { renewed: boolean }. If false, the slot was reclaimed (count=0) — logged as critical error.
+  - Added SESSION_EXECUTION_SLOT_RENEWAL_INTERVAL_MS = 60_000 (1/5 of the 5-min lease).
+  - Wired a heartbeat (setInterval) into executeDecision: started after slot acquire, calls renewSessionExecutionSlot every 60s. Cleared in the finally block (before slot release). If renewal fails, the action's own fencing (idempotencyKey) and the invariant checker provide the recovery boundary.
+
+- Fix 2 — Fenced busy-requeue (decision-executor.ts):
+  - Changed the requeue from unconditional `update` to fenced `updateMany`:
+      WHERE id = decisionId
+        AND executionState = EXECUTING
+        AND executionClaimId = claimId (Worker A's)
+    If count > 0: requeue succeeded (log info).
+    If count = 0: Worker A lost ownership (lease expired, decision reclaimed and re-claimed by Worker B). Log warning ("execution-claim-no-longer-owned-by-this-worker") — do NOT mutate the decision.
+  - The invariant: "Any transition from EXECUTING → PENDING/other state MUST be fenced by the execution claim that owns EXECUTING."
+
+- Bonus fix — reclaimExpiredDecisionClaims now handles EXECUTING state (decision-executor.ts):
+  - Previously reclaim only found EXECUTION_CLAIMED with expired leases. A worker that crashed after marking EXECUTING (but before completing the action) left the decision stuck in EXECUTING forever — claimDecisionForExecution only finds PENDING/EXECUTION_CLAIMED, so no worker could pick it up.
+  - Now the findMany queries BOTH EXECUTION_CLAIMED and EXECUTING with expired leases.
+  - The fenced transitions use the decision's actual state (stateFilter) in the WHERE guard, so the reclaim is correct for both states.
+  - This was necessary for the 11.2.7 test (which sets up EXECUTING with an expired lease and expects reclaim to return it to PENDING).
+
+- Adversarial tests (2 new, both DB-backed runtime, both PASS):
+  11.2.6 PASS — slot lease renewal:
+    Worker A acquires slot. Lease set to near-expiry (1s). Worker A renews (fenced by claimId). Expiry extends to now + 5min (> 60s from now). Worker B attempts acquire — FAILS (renewed lease valid). Worker A releases. Worker B can now acquire. Proves renewal blocks second workers for long-running mutations.
+
+  11.2.7 PASS — busy requeue claim fencing:
+    Worker A claims decision (EXECUTING, claimId='worker-A-claim', attemptCount=1).
+    Session slot held by Worker X.
+    A's decision lease expires (executionClaimExpiresAt set to past).
+    reclaimExpiredDecisionClaims returns it to PENDING (attemptCount < MAX).
+    Worker B claims it (EXECUTION_CLAIMED, claimId='worker-B-claim').
+    Worker A attempts stale requeue (fenced by executionClaimId='worker-A-claim').
+    Assert: stale requeue affects ZERO rows (count=0).
+    Assert: Worker B's claim intact (EXECUTION_CLAIMED, claimId='worker-B-claim').
+    Proves the requeue is fenced — a stale worker cannot destroy a concurrent worker's claim.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 7):    7/7 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Phase 10/10.1.1:      13/13 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 32 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: c05e2e6 (on GitHub, verified: git ls-remote origin main → c05e2e6)
+- Both lifecycle holes closed:
+  - Lease safety for long executions: renewable lease + heartbeat (60s renewal, 5-min lease).
+  - Busy-requeue claim fencing: fenced by executionClaimId (count=0 → skip, don't overwrite).
+- Bonus: reclaimExpiredDecisionClaims now handles EXECUTING state (previously stuck-forever gap).
+- Acceptance invariant #2 now fully proven for long executions:
+  "A session cannot have two connectivity mutations executing concurrently."
+  + "A session execution slot MUST NOT become available while its owner is still performing the mutation window."
+  + "Any transition from EXECUTING → PENDING/other state MUST be fenced by the execution claim that owns EXECUTING."
+- Phase 11.2 is now ready to freeze.
+- Next: Phase 11.3 — Provider truth flips mid-execution.
