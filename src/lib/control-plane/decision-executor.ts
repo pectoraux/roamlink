@@ -32,6 +32,8 @@ import { createAction, executeAction } from "./action-executor";
 import {
   acquireSessionExecutionSlot,
   releaseSessionExecutionSlot,
+  renewSessionExecutionSlot,
+  SESSION_EXECUTION_SLOT_RENEWAL_INTERVAL_MS,
 } from "./session-execution-slot";
 
 // ---------------------------------------------------------------------------
@@ -393,6 +395,7 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
   // This prevents two concurrent SWITCH decisions (A→B and A→C) for the same
   // session from both executing and racing on session.activeResourceId.
   let sessionSlotClaimId: string | null = null;
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   if (decision.sessionId) {
     sessionSlotClaimId = `slot-${decisionId}-${Date.now()}`;
     const slotResult = await acquireSessionExecutionSlot(decision.sessionId, sessionSlotClaimId);
@@ -401,23 +404,68 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
       // return it to PENDING (release the execution claim) so it can be
       // retried on a future worker iteration when the slot is free.
       // The attemptCount stays incremented (the claim did happen).
-      await db.connectivityDecision.update({
-        where: { id: decisionId },
+      //
+      // Phase 11.2.1 (fenced): The requeue MUST be fenced by the execution
+      // claim that owns EXECUTING. An unconditional update would race with a
+      // concurrent worker's claim after lease expiry:
+      //   Worker A holds EXECUTING, slot busy → pauses
+      //   A's decision lease expires → reclaim → PENDING
+      //   Worker B claims → EXECUTION_CLAIMED
+      //   Worker A resumes → unconditional requeue → overwrites B's claim
+      // The fix: fenced updateMany WHERE executionState=EXECUTING AND
+      // executionClaimId = claimId (Worker A's). If count=0, Worker A has lost
+      // ownership and must not mutate the decision.
+      const requeueResult = await db.connectivityDecision.updateMany({
+        where: {
+          id: decisionId,
+          executionState: DECISION_EXECUTING,
+          executionClaimId: claimId, // fenced — only Worker A's claim requeues
+        },
         data: {
           executionState: DECISION_PENDING,
           executionClaimId: null,
           executionClaimedAt: null,
         },
       });
-      logger.info("decision.session_busy_requeued", {
-        decisionId, sessionId: decision.sessionId,
-      });
+      if (requeueResult.count > 0) {
+        logger.info("decision.session_busy_requeued", {
+          decisionId, sessionId: decision.sessionId,
+        });
+      } else {
+        // count=0: Worker A lost ownership (lease expired, decision reclaimed
+        // and re-claimed by another worker). Do NOT mutate the decision —
+        // another worker now owns it.
+        logger.warn("decision.session_busy_requeue_skipped", {
+          decisionId, reason: "execution-claim-no-longer-owned-by-this-worker",
+        });
+      }
       return {
         decisionId,
         executionState: "SESSION_BUSY",
         error: "session-execution-slot-held-by-another-worker",
       };
     }
+
+    // Phase 11.2.1: Start a heartbeat that renews the session slot lease
+    // periodically while the mutation is running. This guarantees the slot
+    // cannot expire mid-mutation — the invariant:
+    //   "A session execution slot MUST NOT become available while its owner
+    //    is still performing the mutation window."
+    // The heartbeat is cleared in the finally block below. If a renewal fails
+    // (slot reclaimed), the action's own fencing (idempotencyKey) and the
+    // invariant checker provide the recovery boundary.
+    heartbeatTimer = setInterval(async () => {
+      if (sessionSlotClaimId && decision.sessionId) {
+        try {
+          await renewSessionExecutionSlot(decision.sessionId, sessionSlotClaimId);
+        } catch (err) {
+          logger.error("decision.slot_heartbeat_error", {
+            decisionId, sessionId: decision.sessionId, claimId: sessionSlotClaimId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }, SESSION_EXECUTION_SLOT_RENEWAL_INTERVAL_MS);
   }
 
   // Create + execute the action. The session slot is released in a finally
@@ -477,6 +525,12 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
     logger.error("decision.execution_error", { decisionId, error: errorMsg });
     return { decisionId, executionState: "FAILED", error: errorMsg };
   } finally {
+    // Phase 11.2.1: Stop the heartbeat first (no more renewals after the
+    // mutation completes).
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
     // Phase 11.2: Release the session execution slot. Fenced by claimId —
     // only the claim owner releases. If the slot was reclaimed after lease
     // expiry (crashed worker), this is a no-op (count=0, safe).
@@ -517,13 +571,18 @@ export async function executeDecision(decisionId: string): Promise<DecisionExecu
 export async function reclaimExpiredDecisionClaims(): Promise<{ reclaimed: number; deadLettered: number }> {
   const now = new Date();
 
-  // Find expired-claim decisions.
+  // Phase 11.2.1: Find expired-claim decisions in BOTH EXECUTION_CLAIMED and
+  // EXECUTING states. A worker that crashes after marking EXECUTING (but before
+  // completing the action) leaves the decision in EXECUTING with an expired
+  // claim. Both states must be reclaimable — otherwise an EXECUTING decision
+  // with an expired lease is stuck forever (no worker can claim it because
+  // claimDecisionForExecution only finds PENDING/EXECUTION_CLAIMED).
   const expired = await db.connectivityDecision.findMany({
     where: {
-      executionState: DECISION_EXECUTION_CLAIMED,
+      executionState: { in: [DECISION_EXECUTION_CLAIMED, DECISION_EXECUTING] },
       executionClaimExpiresAt: { lt: now },
     },
-    select: { id: true, executionAttemptCount: true },
+    select: { id: true, executionAttemptCount: true, executionState: true },
     take: 100,
   });
 
@@ -531,16 +590,17 @@ export async function reclaimExpiredDecisionClaims(): Promise<{ reclaimed: numbe
   let deadLettered = 0;
 
   for (const decision of expired) {
-    // Phase 11.1.1: Fenced transition — only update if still EXECUTION_CLAIMED
-    // with an expired lease. A concurrent worker may have already claimed it
-    // (incrementing attemptCount) or transitioned it to a terminal state.
-    // We must NOT overwrite that.
+    // Phase 11.1.1: Fenced transition — only update if still in the same
+    // non-terminal state with an expired lease. A concurrent worker may have
+    // already changed the state. We must NOT overwrite that.
+    const stateFilter = decision.executionState; // EXECUTION_CLAIMED or EXECUTING
+
     if (decision.executionAttemptCount >= DECISION_MAX_ATTEMPTS) {
       // Phase 11.1: Poison decision — dead-letter, don't retry.
       const result = await db.connectivityDecision.updateMany({
         where: {
           id: decision.id,
-          executionState: DECISION_EXECUTION_CLAIMED, // still claimed (not changed since read)
+          executionState: stateFilter, // still in the same state (not changed since read)
           executionClaimExpiresAt: { lt: now }, // still expired
           executionAttemptCount: { gte: DECISION_MAX_ATTEMPTS }, // still at/over MAX
         },
@@ -555,6 +615,7 @@ export async function reclaimExpiredDecisionClaims(): Promise<{ reclaimed: numbe
           decisionId: decision.id,
           attemptCount: decision.executionAttemptCount,
           maxAttempts: DECISION_MAX_ATTEMPTS,
+          fromState: stateFilter,
         });
       }
       // If count=0: another worker changed the state. Skip — don't overwrite.
@@ -563,7 +624,7 @@ export async function reclaimExpiredDecisionClaims(): Promise<{ reclaimed: numbe
       const result = await db.connectivityDecision.updateMany({
         where: {
           id: decision.id,
-          executionState: DECISION_EXECUTION_CLAIMED, // still claimed
+          executionState: stateFilter, // still in the same state
           executionClaimExpiresAt: { lt: now }, // still expired
           executionAttemptCount: { lt: DECISION_MAX_ATTEMPTS }, // still under MAX
         },

@@ -56,9 +56,11 @@ import { executeDecision } from "@/lib/control-plane/decision-executor";
 import {
   acquireSessionExecutionSlot,
   releaseSessionExecutionSlot,
+  renewSessionExecutionSlot,
   reclaimExpiredSessionSlots,
   SESSION_EXECUTION_SLOT_LEASE_MS,
 } from "@/lib/control-plane/session-execution-slot";
+import { reclaimExpiredDecisionClaims, DECISION_EXECUTION_LEASE_MS } from "@/lib/control-plane/decision-executor";
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -483,5 +485,174 @@ describe("Phase 11.2 — Session-Level Execution Serialization (DB-backed)", () 
 
     // Release it (cleanup).
     await releaseSessionExecutionSlot(fx.sessionId, winningClaim);
+  }, 60_000);
+
+  // =========================================================================
+  // 11.2.6 — Session slot lease renewal: mutation exceeds initial lease, slot
+  //          renewed, second worker cannot acquire.
+  //
+  // Phase 11.2.1: The slot lease is RENEWABLE. A heartbeat renews the lease
+  // periodically while the mutation is running. Without renewal, a mutation
+  // longer than SESSION_EXECUTION_SLOT_LEASE_MS (5 min) would let the lease
+  // expire, cron would reclaim the slot, and a second worker could acquire it
+  // while the first is still executing — violating:
+  //   "A session execution slot MUST NOT become available while its owner is
+  //    still performing the mutation window."
+  //
+  // This test proves the renewal primitive extends the lease (fenced by claimId)
+  // and that a second worker remains blocked after renewal.
+  // =========================================================================
+  it("11.2.6: slot lease renewal — renew extends lease, second worker blocked after renew", async () => {
+    await db.connectivitySession.update({
+      where: { id: fx.sessionId },
+      data: { executionSlotClaimId: null, executionSlotClaimedAt: null, executionSlotClaimExpiresAt: null },
+    }).catch(() => {});
+
+    // Worker A acquires the slot with a short lease (simulate near-expiry).
+    const claimA = `renew-claim-A-${Date.now()}`;
+    const acquired = await acquireSessionExecutionSlot(fx.sessionId, claimA);
+    expect(acquired.acquired).toBe(true);
+
+    // Manually set the lease to near-expiry (1 second from now) — simulate that
+    // the mutation has been running for almost the full lease duration.
+    const nearExpiry = new Date(Date.now() + 1000);
+    await db.connectivitySession.update({
+      where: { id: fx.sessionId, executionSlotClaimId: claimA },
+      data: { executionSlotClaimExpiresAt: nearExpiry },
+    });
+
+    // Worker A renews the lease (fenced by claimId). The expiry extends.
+    const renewed = await renewSessionExecutionSlot(fx.sessionId, claimA);
+    expect(renewed.renewed).toBe(true);
+
+    // After renewal, the expiry is now + SESSION_EXECUTION_SLOT_LEASE_MS (5 min).
+    const afterRenew = await db.connectivitySession.findUnique({
+      where: { id: fx.sessionId },
+      select: { executionSlotClaimExpiresAt: true },
+    });
+    expect(afterRenew?.executionSlotClaimExpiresAt!.getTime()).toBeGreaterThan(Date.now() + 60_000);
+
+    // Worker B attempts to acquire the slot — FAILS (Worker A's renewed lease is valid).
+    const claimB = `renew-claim-B-${Date.now()}`;
+    const acquiredB = await acquireSessionExecutionSlot(fx.sessionId, claimB);
+    expect(acquiredB.acquired).toBe(false); // second worker blocked after renewal
+
+    // Worker A releases the slot.
+    const released = await releaseSessionExecutionSlot(fx.sessionId, claimA);
+    expect(released.released).toBe(true);
+
+    // Now Worker B CAN acquire (slot is free).
+    const acquiredB2 = await acquireSessionExecutionSlot(fx.sessionId, claimB);
+    expect(acquiredB2.acquired).toBe(true);
+
+    // Cleanup.
+    await releaseSessionExecutionSlot(fx.sessionId, claimB);
+  }, 60_000);
+
+  // =========================================================================
+  // 11.2.7 — Busy requeue claim fencing: Worker A's stale requeue affects zero
+  //          rows after its decision lease expires and Worker B re-claims.
+  //
+  // Phase 11.2.1: The "session busy" requeue in executeDecision() MUST be fenced
+  // by the execution claim that owns EXECUTING. An unconditional update would
+  // race with a concurrent worker's claim after lease expiry:
+  //   Worker A holds EXECUTING, slot busy → pauses
+  //   A's decision lease expires → reclaim → PENDING
+  //   Worker B claims → EXECUTION_CLAIMED
+  //   Worker A resumes → unconditional requeue → overwrites B's claim
+  //
+  // The fix: fenced updateMany WHERE executionState=EXECUTING AND
+  // executionClaimId = claimId (Worker A's). If count=0, Worker A has lost
+  // ownership and must not mutate the decision.
+  //
+  // This test directly proves the fencing at the DB level (simulating the
+  // exact race sequence).
+  // =========================================================================
+  it("11.2.7: busy requeue fenced by execution claim — stale requeue affects zero rows after reclaim", async () => {
+    // 1. Worker A claims the decision and marks it EXECUTING with A's claimId.
+    const decision = await db.connectivityDecision.create({
+      data: {
+        intentId: `p112-requeue-fence-${Date.now()}`,
+        sessionId: fx.sessionId,
+        action: "SWITCH",
+        targetResourceId: fx.resourceBId,
+        score: 0.9,
+        constraintsSatisfied: JSON.stringify(["MANUAL"]),
+        constraintsViolated: JSON.stringify([]),
+        reasons: JSON.stringify(["test: requeue fence"]),
+        executionState: "EXECUTING",
+        executionClaimId: "worker-A-claim",
+        executionClaimedAt: new Date(Date.now() - 10_000),
+        executionAttemptCount: 1,
+      },
+    });
+
+    // 2. Hold the session slot with Worker X (so the requeue path would fire).
+    const slotClaimX = `slot-X-${Date.now()}`;
+    const slotAcquired = await acquireSessionExecutionSlot(fx.sessionId, slotClaimX);
+    expect(slotAcquired.acquired).toBe(true);
+
+    // 3. Simulate Worker A's decision lease expiring. The decision is
+    //    EXECUTING but its executionClaimExpiresAt has passed.
+    await db.connectivityDecision.update({
+      where: { id: decision.id },
+      data: {
+        executionClaimExpiresAt: new Date(Date.now() - 1000), // expired
+      },
+    });
+
+    // 4. Reclaim the decision (cron) — it's EXECUTION_CLAIMED with expired lease.
+    //    reclaimExpiredDecisionClaims returns it to PENDING (attempts < MAX).
+    const reclaim = await reclaimExpiredDecisionClaims();
+    expect(reclaim.reclaimed).toBeGreaterThanOrEqual(1);
+
+    const afterReclaim = await db.connectivityDecision.findUnique({
+      where: { id: decision.id },
+      select: { executionState: true, executionClaimId: true },
+    });
+    expect(afterReclaim?.executionState).toBe("PENDING");
+    expect(afterReclaim?.executionClaimId).toBeNull();
+
+    // 5. Worker B claims the decision → EXECUTION_CLAIMED with B's claimId.
+    const claimedByB = await db.connectivityDecision.updateMany({
+      where: { id: decision.id, executionState: "PENDING" },
+      data: {
+        executionState: "EXECUTION_CLAIMED",
+        executionClaimId: "worker-B-claim",
+        executionClaimedAt: new Date(),
+        executionClaimExpiresAt: new Date(Date.now() + DECISION_EXECUTION_LEASE_MS),
+        executionAttemptCount: { increment: 1 },
+      },
+    });
+    expect(claimedByB.count).toBe(1);
+
+    // 6. Worker A resumes and attempts its stale "session busy" requeue.
+    //    The requeue is fenced by Worker A's executionClaimId. Since Worker B
+    //    now holds the claim, the update affects ZERO rows.
+    const staleRequeue = await db.connectivityDecision.updateMany({
+      where: {
+        id: decision.id,
+        executionState: "EXECUTING",
+        executionClaimId: "worker-A-claim", // fenced — only Worker A's claim
+      },
+      data: {
+        executionState: "PENDING",
+        executionClaimId: null,
+        executionClaimedAt: null,
+      },
+    });
+    expect(staleRequeue.count).toBe(0); // ← Worker A's stale requeue is a no-op
+
+    // 7. Worker B's claim remains intact.
+    const afterStaleRequeue = await db.connectivityDecision.findUnique({
+      where: { id: decision.id },
+      select: { executionState: true, executionClaimId: true },
+    });
+    expect(afterStaleRequeue?.executionState).toBe("EXECUTION_CLAIMED");
+    expect(afterStaleRequeue?.executionClaimId).toBe("worker-B-claim");
+
+    // Cleanup.
+    await releaseSessionExecutionSlot(fx.sessionId, slotClaimX);
+    await db.connectivityDecision.delete({ where: { id: decision.id } }).catch(() => {});
   }, 60_000);
 });

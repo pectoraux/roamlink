@@ -46,8 +46,23 @@ import { logger } from "@/lib/logger";
  * reclaimable after this. Matches DECISION_EXECUTION_LEASE_MS (5 min) — the
  * slot must cover the full action execution window (reserve → activate →
  * verify → release old).
+ *
+ * Phase 11.2.1: The lease is RENEWABLE. A heartbeat in executeDecision()
+ * renews the lease periodically (every SESSION_EXECUTION_SLOT_RENEWAL_INTERVAL_MS)
+ * while the mutation is running. This guarantees the slot cannot expire while
+ * its owner is still performing the mutation window — the invariant:
+ *   "A session execution slot MUST NOT become available while its owner is
+ *    still performing the mutation window."
  */
 export const SESSION_EXECUTION_SLOT_LEASE_MS = 5 * 60_000; // 5 minutes
+
+/**
+ * How often the heartbeat renews the slot lease. Must be substantially shorter
+ * than the lease so that a single missed heartbeat doesn't let the lease
+ * expire before the next renewal. 1/5 of the lease — even 4 missed heartbeats
+ * in a row still leave time before expiry.
+ */
+export const SESSION_EXECUTION_SLOT_RENEWAL_INTERVAL_MS = 60_000; // 1 minute (lease is 5 min)
 
 // ---------------------------------------------------------------------------
 // Acquire the session execution slot (DB-authoritative fenced)
@@ -99,6 +114,60 @@ export async function acquireSessionExecutionSlot(
 
   // Slot is held by another worker with a non-expired lease.
   return { acquired: false };
+}
+
+// ---------------------------------------------------------------------------
+// Renew the session execution slot (fenced — only claim owner renews)
+// ---------------------------------------------------------------------------
+
+/**
+ * Renew (extend) the session execution slot's lease. Fenced by
+ * executionSlotClaimId — only the worker holding the claim can renew it.
+ *
+ * Phase 11.2.1: The lease is RENEWABLE. A heartbeat in executeDecision()
+ * calls this periodically while the mutation is running, extending the lease
+ * so it cannot expire mid-mutation. This guarantees:
+ *
+ *   "A session execution slot MUST NOT become available while its owner is
+ *    still performing the mutation window."
+ *
+ * If renewal fails (count=0), the slot was reclaimed after lease expiry
+ * (the worker's heartbeats stopped for > LEASE, or the slot was forcibly
+ * cleared). The caller should log a critical error — the invariant has been
+ * violated and another worker may have acquired the slot. The action's own
+ * fencing (idempotencyKey) and the invariant checker provide the recovery
+ * boundary, but the slot guarantee is lost.
+ *
+ * Returns { renewed: boolean }. If false, the caller no longer holds the slot.
+ */
+export async function renewSessionExecutionSlot(
+  sessionId: string,
+  claimId: string,
+): Promise<{ renewed: boolean }> {
+  const now = new Date();
+  const newExpiresAt = new Date(now.getTime() + SESSION_EXECUTION_SLOT_LEASE_MS);
+
+  const result = await db.connectivitySession.updateMany({
+    where: {
+      id: sessionId,
+      executionSlotClaimId: claimId, // fenced — only the claim owner renews
+    },
+    data: {
+      executionSlotClaimExpiresAt: newExpiresAt,
+    },
+  });
+
+  if (result.count > 0) {
+    logger.info("session.slot_renewed", { sessionId, claimId, newExpiresAt });
+    return { renewed: true };
+  }
+
+  // count=0: the slot was reclaimed after lease expiry (heartbeats stopped for
+  // too long) or forcibly cleared. The caller no longer holds it.
+  logger.error("session.slot_renewal_failed", {
+    sessionId, claimId, reason: "slot-not-held-by-this-claim-or-reclaimed",
+  });
+  return { renewed: false };
 }
 
 // ---------------------------------------------------------------------------
