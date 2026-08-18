@@ -4687,3 +4687,108 @@ Stage Summary:
   P0-6: Actions route rejects tenantless sessions (no silent bypass).
   P0-7: Commerce/customer route verifies caller's active tenant matches product's tenant.
 - Phase 12.2 now has 11 adversarial runtime tests covering the full tenant boundary.
+
+---
+Task ID: 12.2-p05-final
+Agent: Principal Architect (main) — Phase 12.2 P0-5 Final Fix (DB-level tenant scoping)
+Task: Close the P0-5 production correctness/security boundary problem identified in the architect's audit of 22f84b3. The Sessions GET route filtered by tenant AFTER take:20 (fetch-then-filter in application code) — tenant-safe but incorrect for pagination/limit semantics. Rewrite 12.2.9–12.2.11 to invoke the REAL route handlers, and add the adversarial >20-sessions test the architect specified.
+
+Work Log:
+- Diagnosis (confirmed): The prior GET route did:
+    findMany({ where: { subjectId, entitlementId: { not: null } }, orderBy: desc, take: 20 })
+  THEN filtered the 20 fetched rows against ctx.tenantId's entitlement IDs in application code.
+  If the newest 20 sessions were predominantly from tenant B, a tenant-A caller received fewer
+  than 20 valid sessions even when older valid tenant-A sessions existed. Tenant-safe (no leak)
+  but pagination-incorrect.
+
+- Fix 1 — Schema (prisma/schema.prisma):
+  - Added a real Prisma relation ConnectivitySession.entitlement -> ConnectivityEntitlement
+    (was a plain String? with no @relation, unlike ProviderResourceBinding which already had one).
+    onDelete: SetNull preserves session history if an entitlement is deleted (the session becomes
+    tenantless and is excluded from tenant-scoped reads).
+  - Added the back-relation sessions ConnectivitySession[] on ConnectivityEntitlement.
+  - Verified no orphaned sessions existed before adding the FK (0 orphans).
+  - DIRECT_URL set inline for `prisma db push` (the .env doesn't declare it; the schema's
+    directUrl = env("DIRECT_URL") is a Phase 12.1 carryover).
+  - bun run db:generate regenerated the client with the new relation.
+
+- Fix 2 — Sessions GET route (src/app/api/v1/connectivity/sessions/route.ts):
+  - Replaced the fetch-then-filter with a relation filter at the DB query level:
+      where: {
+        subjectId: user.id,
+        entitlement: { tenantId: ctx.tenantId, userId: user.id },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+  - The tenant filter is now part of the database query itself (a JOIN with WHERE conditions on
+    the related entitlement table), applied BEFORE take. There is no post-fetch application-level
+    filtering. This is the authoritative boundary the architect specified:
+      tenant filter -> ordering -> take 20  (NOT  ordering -> take 20 -> tenant filter).
+
+- Fix 3 — Route-test helper (tests/route-test-context.ts, new):
+  - Registers mock.module("next/headers", ...) with a controllable cookie store so route
+    handlers that call getCurrentUser()/cookies() can be invoked DIRECTLY in a test process.
+  - setMockSessionToken(token) injects a controlled esim_session cookie token.
+  - CRITICAL: must be imported FIRST in any test file that invokes route handlers, so the mock
+    is registered before @/lib/auth / @/lib/tenant/context / route handlers load next/headers.
+
+- Fix 4 — Rewrote 12.2.9, 12.2.10, 12.2.11 to invoke the REAL route handlers:
+  - 12.2.9: Sessions GET (real route). Creates entitlements in A and B, sessions for both,
+    sets a mocked session token with activeTenantId=A, invokes the actual GET() handler.
+    Asserts: status 200, only tenant-A sessions returned, tenant-B sessions excluded.
+  - 12.2.10: Actions POST (real route). Creates a tenantless session (entitlementId=null),
+    invokes the actual POST handler with { sessionId, type: "DISCOVER" }. Asserts: 403,
+    error mentions entitlement/tenant.
+  - 12.2.11: Commerce/customer POST (real route). Creates a product in tenant B, invokes
+    the actual POST handler for a tenant-A caller. Asserts: 403, error mentions tenant.
+  - All three now prove the PRODUCTION route, not a simulation of its filtering logic.
+
+- Fix 5 — New adversarial test 12.2.12 (the exact case the architect specified):
+  - 25 tenant-A sessions with createdAt explicitly set 1 minute ago (OLDER).
+  - 25 tenant-B sessions with createdAt set to now+ (NEWER — the newest 25 overall).
+  - Invokes the real GET() handler with activeTenantId=A.
+  - Asserts: status 200, returned.length === 20 (FULL page, not 0/short),
+    every returned session is linked to entA (tenant A), NO tenant-B session leaks through,
+    the 20 newest tenant-A sessions (indices 5..24) are returned, the oldest 5 (indices 0..4) are not.
+  - This would FAIL under the prior buggy implementation (take:20 returns all tenant-B, then
+    filter drops all -> 0 sessions returned despite 25 valid tenant-A sessions existing).
+
+- Fix 6 — Phase 11.5.5 test (required by the new FK relation):
+  - The test corrupted session.entitlementId to "different-entitlement-id" (non-existent).
+    With the new FK constraint, SQLite rejects this (foreign key violation P2003).
+  - Fixed: creates a second REAL entitlement in the same tenant (reusing the original's
+    subscriptionId + capabilityId so all constraints hold), then points the session to it.
+    The binding still points to the original entitlement -> invariant #6
+    (session.entitlementId !== binding.entitlementId) still detects the mismatch.
+  - Added try/finally to restore the session FIRST (so the FK back to the original entitlement
+    is in place), then delete the second entitlement.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 11.4 (all 11):  11/11 PASS
+  Phase 11.5 (all 6):    6/6 PASS (11.5.5 fixed for the new FK)
+  Phase 11.6 (all 5):    5/5 PASS
+  Phase 11.7 (all 1):    1/1 PASS
+  Phase 12.2 (all 12):  12/12 PASS (8 original + 12.2.9/10/11 rewritten + 12.2.12 new)
+  Phase 8.6.6 (all 5):  5/5 PASS
+  Spot check Phase 9.2/9.5.4/10/10.1.1: 31/31 PASS (FK change didn't break session-creating tests)
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready in 849ms, GET / -> 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 61 PASS, 0 FAIL.
+
+- Known debt (unchanged, pre-existing — not introduced by this patch):
+  Phase 9.5.1 A1: BUDGET_CONSTRAINT reasonCode test still fails. Confirmed unchanged.
+
+Stage Summary:
+- HEAD: 706035f
+- The P0-5 production correctness/security boundary problem is closed:
+  - The database query itself constrains the tenant BEFORE take (via the entitlement relation filter).
+  - 12.2.9–12.2.11 now invoke the REAL route handlers (not simulations).
+  - 12.2.12 is the adversarial >20-sessions test the architect specified — it would catch the prior bug.
+- The Phase 11.5.5 invariant test was adapted for the new FK relation (still proves invariant #6).
+- All 8 Phase 11 acceptance invariants remain runtime-proven (44 tests).
+- Phase 12.2 now has 12 adversarial runtime tests covering the full tenant boundary, with 4 of them
+  (12.2.9–12.2.12) exercising the real production route handlers.
+- Phase 12.2 is now ready to freeze.
