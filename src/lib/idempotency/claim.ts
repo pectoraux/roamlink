@@ -609,16 +609,35 @@ export async function runIdempotentOperation<T>(input: {
       }).catch(() => ({ count: 0 }));
 
       if (updated.count === 0) {
-        logger.warn("idempotency.confirmed_failure_not_stored", {
+        // Phase 12.3.2.7: The claim was lost (reclaimed → RECONCILIATION_REQUIRED)
+        // before we could store the CONFIRMED_FAILURE. A stale worker MUST NOT
+        // report a stronger outcome than the DB-authoritative state permits.
+        // The DB says RECONCILIATION_REQUIRED — the caller must NOT believe the
+        // operation definitely failed (that would allow a retry with a new key).
+        // Throw 409 outcome-unknown, NOT the original confirmed failure.
+        logger.error("idempotency.confirmed_failure_claim_lost_thrown", {
           scope, key, claimId,
-          message: "Claim was reclaimed before CONFIRMED_FAILURE could be stored.",
+          message: "Claim was reclaimed before thrown CONFIRMED_FAILURE could be stored. DB state is RECONCILIATION_REQUIRED — stale worker must not report FAILED.",
         });
-      } else {
-        logger.warn("idempotency.operation_failed_confirmed", {
-          scope, key, claimId,
-          errorClass: failure.errorClass, statusCode: failure.statusCode,
-        });
+        const claimLostErr = new AppError(
+          "conflict",
+          "Idempotency claim was lost before confirmed failure could be stored — outcome is unknown",
+          409,
+          "Your request's outcome could not be confirmed. The operation is pending reconciliation — do not retry with a new key.",
+        );
+        (claimLostErr as any)._outcomeClassified = true;
+        throw claimLostErr;
       }
+
+      logger.warn("idempotency.operation_failed_confirmed", {
+        scope, key, claimId,
+        errorClass: failure.errorClass, statusCode: failure.statusCode,
+      });
+
+      // Re-throw the original confirmed failure (the fenced update succeeded).
+      const confirmedErr = new AppError(failure.errorClass, failure.message, failure.statusCode, failure.safeMessage);
+      (confirmedErr as any)._outcomeClassified = true;
+      throw confirmedErr;
     } else {
       // AMBIGUOUS_EXTERNAL_FAILURE → RECONCILIATION_REQUIRED.
       const updated = await db.idempotencyOperation.updateMany({

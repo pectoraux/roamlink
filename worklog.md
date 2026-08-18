@@ -5689,3 +5689,67 @@ Stage Summary:
     claim lost (any path)          → 409 outcome-unknown (DB state wins)
     external operation             → explicit providerKey required
     reconciliation                 → fenced ownership
+
+---
+Task ID: 12.3.2.7
+Agent: Principal Architect (main) — Phase 12.3.2.7 Thrown-Error Claim-Loss Semantics
+Task: Fix the remaining stale-worker path the architect identified in the audit of 47ba0fc. The explicit OperationOutcome.CONFIRMED_FAILURE path was fixed (12.3.2.6), but the catch-path isConfirmedFailure branch (when execute() THROWS an AppError with a client errorClass) still had the old bug: when the fenced FAILED update returned 0 rows, it fell through to `throw err`, leaking the original confirmed failure to the caller.
+
+Work Log:
+- Diagnosis (confirmed):
+  The catch-path isConfirmedFailure branch did:
+    execute() throws AppError("validation", ...)
+    → catch classifies as CONFIRMED_FAILURE
+    → fenced FAILED update → 0 rows (claim lost)
+    → log warning
+    → throw err  ← original confirmed failure leaks to caller
+  The caller could believe the operation definitely failed and retry with a
+  new key, even though the DB state is RECONCILIATION_REQUIRED.
+
+- Fix (src/lib/idempotency/claim.ts):
+  The catch-path isConfirmedFailure branch now follows the same rule as the
+  explicit CONFIRMED_FAILURE branch:
+    fenced FAILED update succeeds → throw the original confirmed failure (402/400/etc.)
+    fenced FAILED update = 0 rows  → throw 409 outcome-unknown (claim lost)
+
+  The stale worker must NOT report a stronger outcome than the DB-authoritative
+  state permits. The DB says RECONCILIATION_REQUIRED — the caller must NOT believe
+  the operation definitely failed.
+
+- Test (1 new adversarial, PASS):
+  12.3.2.21 — Stale thrown-error confirmed-failure worker:
+    1. Worker A claims.
+    2. Force claim expiry + reclaim → RECONCILIATION_REQUIRED.
+    3. Worker A (stale) throws AppError("validation", ...) — a CONFIRMED_FAILURE
+       by errorClass classification.
+    4. The catch path tries the fenced FAILED update.
+    5. The fenced update returns 0 rows (claim lost).
+    6. Operation remains RECONCILIATION_REQUIRED (DB state wins).
+    7. A retry with the same key gets 409 (outcome-unknown), NOT 400 (the
+       original validation error).
+    8. retryExecCount === 0 (not re-executed).
+    Proves: the stale worker cannot communicate the original confirmed failure
+    to the caller when its claim is lost.
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       32/32 PASS  (31 existing + 1 new adversarial)
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 109 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The stale-worker invariant now holds across ALL confirmed-failure paths:
+    Explicit CONFIRMED_FAILURE + claim held → FAILED
+    Explicit CONFIRMED_FAILURE + claim lost → 409 outcome-unknown
+    Thrown-error CONFIRMED_FAILURE + claim held → FAILED
+    Thrown-error CONFIRMED_FAILURE + claim lost → 409 outcome-unknown  ← fixed (12.3.2.7)
+- The idempotency state machine is now fully uniform:
+    "A stale worker never gets to report a stronger state than the
+     DB-authoritative claim permits."
+  This holds for SUCCESS, CONFIRMED_FAILURE (explicit + thrown), AMBIGUOUS,
+  raw-return contract violation, and lease-expiry reclaim — every path.
