@@ -201,14 +201,14 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
 
     // Exactly one decision referencing this intent — the event was processed
     // exactly once. The session is ACTIVE, so isReevaluationNecessary returns
-    // true and makeDecision runs. The decision is ACTIVATE (the session already
-    // has a resource but makeDecision returns ACTIVATE when there are ranked
-    // offers). The decision reaches a terminal state.
+    // true and makeDecision runs. The decision is KEEP (session already ACTIVE
+    // on A with healthy resource — no need to switch). The execution state is
+    // SKIPPED (KEEP/WAIT/ASK_USER decisions are not executed).
     const decisions = await db.connectivityDecision.findMany({
       where: { intentId: intent.intentId, intentVersion: intent.version },
     });
     expect(decisions.length).toBe(1);
-    expect(["EXECUTED", "SKIPPED", "FAILED", "RECONCILIATION_REQUIRED"]).toContain(decisions[0].executionState);
+    expect(decisions[0].executionState).toBe("SKIPPED");
 
     // Cleanup.
     await db.connectivityDecision.deleteMany({ where: { intentId: intent.intentId } }).catch(() => {});
