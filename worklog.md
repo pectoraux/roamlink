@@ -3851,3 +3851,64 @@ Stage Summary:
 - The checkpoint remains valuable for fast failure (avoids unnecessary work), but the fenced mutation is the ultimate authority.
 - Phase 11.2 is now ready to freeze.
 - Next: Phase 11.3 — Provider truth flips mid-execution.
+
+---
+Task ID: 11.2.4
+Agent: Principal Architect (main) — Phase 11.2.4 Fence All Resource + Session-State Mutations
+Task: Close the remaining mutation-window gap identified in the architect's audit of ae2e4da. The DB fence only covered activeResourceId. Resource mutations and session-state transitions remained under reservedBy=sessionId (resource safety, not execution authority). Every state-changing connectivity mutation must be authorized by the currently valid session execution claim at the mutation boundary.
+
+Work Log:
+- Audited ae2e4da directly. Confirmed the gap:
+  - reserveResource, markResourceInUse, releaseResource used reservedBy=sessionId (resource ownership, not execution authority).
+  - transitionSessionState was unconditional.
+  - A worker that lost the session slot could still reserve/mark/release resources and transition session state — violating the architectural rule.
+
+- Fix — fenced resource mutations + session-state transitions (session-execution-slot.ts):
+  - verifySlotClaimValid(sessionId, claimId): DB read authority check (claimId match + lease valid).
+  - fencedTransitionSessionState(sessionId, claimId, toState, allowedFromStates): fenced updateMany WHERE executionSlotClaimId=claimId AND executionSlotClaimExpiresAt>now AND state IN allowedFromStates. Single atomic operation.
+  - fencedReserveResource(resourceId, sessionId, claimId): $transaction: (1) verify slot claim, (2) reserve resource (AVAILABLE→RESERVED). Both in one DB transaction — if slot invalid, reservation does NOT happen.
+  - fencedMarkResourceInUse(resourceId, sessionId, claimId): $transaction: (1) verify slot claim, (2) mark IN_USE (RESERVED→IN_USE).
+  - fencedReleaseResource(resourceId, sessionId, claimId): $transaction: (1) verify slot claim, (2) release resource.
+
+- Wired into executeAction (action-executor.ts):
+  - Both ACTIVATE and SWITCH paths now use the fenced mutations for reserve, markInUse, release, session update, and state transitions.
+  - All cleanup/revert paths also use fenced mutations.
+  - Legacy path (no slotContext) falls back to unconditional mutations for backward compatibility with tests that don't set up a slot.
+
+- The complete mutation window is now DB-fenced at every boundary:
+    acquire slot → checkpoint → fenced reserve → fenced markInUse → verify → fenced session update → fenced state transition → fenced release old → verify convergence → release slot.
+
+- Two layers of safety:
+  Session execution authority (claim fence) → authorizes every mutation
+  Resource ownership (reservedBy) → protects individual resource invariants
+  Both are required.
+
+- Adversarial test (11.2.10, DB-backed runtime, PASS):
+  - Worker A acquires session slot.
+  - Force slot expiry + reclaim. Worker B acquires the slot.
+  - Worker A attempts EACH mutation boundary:
+    - fencedReserveResource → rejected (reason: session-execution-slot-not-held)
+    - fencedMarkResourceInUse → rejected
+    - fencedTransitionSessionState → rejected (reason: slot-not-owned-or-expired)
+    - fencedSessionUpdate → rejected (applied: false)
+    - fencedReleaseResource → rejected
+  - No target became orphaned IN_USE.
+  - Session state/resource remain coherent (activeResourceId unchanged, state=ACTIVE, no SWITCHING transition happened).
+  - B's claim remains intact. B can perform its own fenced mutation.
+  - Proves: the whole architectural rule, not just its most visible mutation.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 10):  10/10 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Phase 10/10.1.1:      13/13 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 35 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: fdd683d (on GitHub, verified: git ls-remote origin main → fdd683d)
+- The complete mutation window is now DB-fenced at every boundary. checkpoint ≠ authorization; DB-fenced mutation = authorization.
+- Two layers of safety: session execution authority (claim fence) + resource ownership (reservedBy). Both required.
+- The architectural rule is fully enforced: "Every state-changing connectivity mutation must be authorized by the currently valid session execution claim at the mutation boundary, not merely preceded by a successful observation of ownership."
+- Phase 11.2 is now ready to freeze.
+- Next: Phase 11.3 — Provider truth flips mid-execution.
