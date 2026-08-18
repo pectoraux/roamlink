@@ -4160,3 +4160,53 @@ Stage Summary:
   race (claimed then expired) → SKIPPED (exact)
 - The prior 9.4.2 P1-5 test's permissive union is replaced by exact assertions.
 - Next: Phase 11.5 — Runtime invariant fail-closed.
+
+---
+Task ID: 11.4.5
+Agent: Principal Architect (main) — Phase 11.4.5 Claim-First Intent Authority
+Task: Close the two TOCTOU issues identified in the architect's audit of a6b68e5: (1) the intent-expiry check happened before the decision claim (preflight), creating a race where intent could expire between check and claim; (2) the SKIP transition was unconditional, so a concurrent worker could overwrite another worker's claim. Move intent authority to an execution boundary (after claim) and fence the SKIP transition.
+
+Work Log:
+- Fix 1 — Move intent-expiry check to AFTER the claim (decision-executor.ts):
+  - Removed the pre-claim intent-expiry check (was at lines 245-268).
+  - Added a post-claim intent-expiry check after "Mark EXECUTING":
+    - The decision is claimed first (fenced updateMany with executionAttemptCount increment).
+    - THEN the intent authority is verified (isIntentExpired).
+    - If expired → fenced SKIP transition (WHERE executionState = EXECUTING).
+    - If count=0 (concurrent state change), return current state without overwriting.
+  - The sequence is now: PENDING → claim (fenced) → EXECUTION_CLAIMED → Mark EXECUTING → verify intent authority → SKIPPED (if expired) OR proceed to action.
+
+- Fix 2 — Fenced SKIP transition:
+  - The SKIP transition uses fenced updateMany: WHERE id = decisionId AND executionState = EXECUTING.
+  - Only the worker that set EXECUTING can transition to SKIPPED.
+  - A concurrent worker cannot overwrite the state (same pattern as 11.1.1/11.1.2).
+
+- Tests (3 new, all DB-backed runtime, all PASS):
+  11.4.5 PASS — claim-first authority: intent expired, decision PENDING. executeDecision claims first, then checks intent (expired) → SKIPPED. No action. DB state = SKIPPED.
+  11.4.6 PASS — claim-fenced SKIP: two concurrent workers, expired intent. Exactly one claims (fenced). Winner transitions to SKIPPED. Loser gets current state. Final DB state = SKIPPED. No action.
+  11.4.7 PASS — pre-mutation authority fence: intent active at decision creation, expired before executeDecision. executeDecision claims (intent already expired), checks authority → SKIPPED. No action. No resource mutation (session on A, B not reserved). Proves the authority check is post-claim, not pre-claim.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 11.4 (all 7):    7/7 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 33 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 3911cfd (on GitHub, verified: git ls-remote origin main → 3911cfd)
+- Both TOCTOU issues closed:
+  1. Intent authority is now an execution boundary (post-claim), not a preflight.
+  2. SKIP transition is fenced by executionState = EXECUTING.
+- The architectural rule is now enforced:
+  "Intent authority is not a preflight check. Intent authority is an execution boundary."
+  claim first → verify intent authority (fenced) → execute (or SKIP)
+- Acceptance invariant #5 fully proven with claim-first authority:
+  "Expired/superseded intent cannot execute."
+  expired intent → SKIPPED (exact, post-claim check)
+  superseded intent → SKIPPED (exact)
+  active intent → EXECUTED (control)
+  race (claimed then expired) → SKIPPED (exact, post-claim authority fence)
+- Next: Phase 11.5 — Runtime invariant fail-closed.
