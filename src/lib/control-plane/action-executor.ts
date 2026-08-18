@@ -298,7 +298,7 @@ export async function executeAction(actionId: string, slotContext?: {
           logger.warn("action.activate_unknown_verification", {
             actionId, targetResourceId, reason: verifyResult.reason,
           });
-          return { status: "failed", error: `Verification UNKNOWN — target released, reconciliation required: ${verifyResult.reason}` };
+          return { status: "reconciliation_required", error: `Verification UNKNOWN — target released, reconciliation required: ${verifyResult.reason}` };
         }
 
         // Phase 11.2.2: Verify slot ownership before updating session (mutating stage).
@@ -487,7 +487,7 @@ export async function executeAction(actionId: string, slotContext?: {
           logger.warn("action.switch_verification_unknown", {
             actionId, targetResourceId, reason: verifyResult.reason,
           });
-          return { status: "failed", error: `Switch verification UNKNOWN — reconciliation required: ${verifyResult.reason}` };
+          return { status: "reconciliation_required", error: `Switch verification UNKNOWN — reconciliation required: ${verifyResult.reason}` };
         }
 
         // Phase 11.2.2: Verify slot ownership before updating session.activeResourceId

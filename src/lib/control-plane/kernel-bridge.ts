@@ -296,7 +296,49 @@ export async function resolveResourceBinding(input: {
 // Verify Resource is Actually Usable — fail-closed
 // ---------------------------------------------------------------------------
 
+/**
+ * Phase 11.3.4: Test-only provider-truth injection hook.
+ *
+ * A test can set this to override verifyResourceUsable's result, simulating
+ * a provider truth flip BETWEEN reserve and verify inside executeAction.
+ * This provides a deterministic injection point (no timing race).
+ *
+ * Usage:
+ *   setProviderTruthOverride((resourceId) => ({ status: "NOT_USABLE", reason: "flipped" }));
+ *   await executeDecision(decisionId); // verify sees NOT_USABLE
+ *   clearProviderTruthOverride();
+ *
+ * The hook is called with the resourceId. If it returns a non-null result,
+ * that result is used instead of the real provider verification. If it
+ * returns null, the real verification proceeds.
+ *
+ * This is a TEST-ONLY hook. It must NEVER be set in production code.
+ */
+type ProviderTruthOverride = (resourceId: string) => VerificationResult | null;
+let providerTruthOverride: ProviderTruthOverride | null = null;
+
+export function setProviderTruthOverride(fn: ProviderTruthOverride): void {
+  providerTruthOverride = fn;
+}
+
+export function clearProviderTruthOverride(): void {
+  providerTruthOverride = null;
+}
+
 export async function verifyResourceUsable(resourceId: string, sessionId: string): Promise<VerificationResult> {
+  // Phase 11.3.4: Test-only injection point. If a test has set an override,
+  // use its result instead of the real provider verification. This simulates
+  // a provider truth flip at the exact boundary between reserve and verify.
+  if (providerTruthOverride) {
+    const overrideResult = providerTruthOverride(resourceId);
+    if (overrideResult !== null) {
+      logger.info("verify.provider_truth_override_applied", {
+        resourceId, status: overrideResult.status, reason: overrideResult.reason,
+      });
+      return overrideResult;
+    }
+  }
+
   const resource = await db.protocolResource.findUnique({
     where: { id: resourceId },
     select: { state: true, reservedBy: true, capabilityId: true, providerBindingId: true },
