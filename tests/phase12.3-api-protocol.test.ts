@@ -44,8 +44,10 @@ import {
   hashPayload,
   reclaimExpiredIdempotencyOperations,
   getIdempotencyOperation,
+  reconcileOperation,
   _testForceLeaseExpiry,
   _getClaimId,
+  _getProviderKey,
 } from "@/lib/idempotency/claim";
 import {
   requireApiKey,
@@ -406,9 +408,9 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
     }, 30_000);
 
     // -------------------------------------------------------------------------
-    // 12.3.2.6 — reclaim expired IN_PROGRESS → FAILED (crashed worker recovery)
+    // 12.3.2.6 — reclaim expired IN_PROGRESS → RECONCILIATION_REQUIRED (Phase 12.3.2.2)
     // -------------------------------------------------------------------------
-    it("12.3.2.6: reclaim expired IN_PROGRESS → FAILED (crashed worker recovery)", async () => {
+    it("12.3.2.6: reclaim expired IN_PROGRESS → RECONCILIATION_REQUIRED (crashed worker, outcome unknown)", async () => {
       const key = `p12326-${Date.now()}`;
       const scope = "test_reclaim";
 
@@ -419,6 +421,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
           key,
           state: "IN_PROGRESS",
           claimExpiresAt: new Date(Date.now() - 1000), // expired 1 second ago
+          providerKey: key, // has a providerKey for reconciliation
         },
       });
 
@@ -426,21 +429,23 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
       const reclaimed = await reclaimExpiredIdempotencyOperations();
       expect(reclaimed).toBeGreaterThanOrEqual(1);
 
-      // Operation is now FAILED.
+      // Phase 12.3.2.2: Operation is now RECONCILIATION_REQUIRED (NOT FAILED).
+      // The external side effect's outcome is unknown — the caller must NOT
+      // retry with a new key. A reconciliation worker must query the provider.
       const op = await getIdempotencyOperation(scope, key);
-      expect(op!.state).toBe("FAILED");
+      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
       const failure = JSON.parse(op!.failureJson!);
       expect(failure.statusCode).toBe(500);
-      expect(failure.message).toMatch(/lease expired/i);
+      expect(failure.message).toMatch(/lease expired|reconciliation|unknown/i);
 
-      // A future request with the same key gets the failure (not a hung poll).
+      // A future request with the same key gets a 409 "outcome unknown, do not retry".
       await expect(
         runIdempotentOperation({
           scope,
           key,
           execute: async () => ({ shouldNotReach: true }),
         }),
-      ).rejects.toMatchObject({ statusCode: 500 });
+      ).rejects.toMatchObject({ statusCode: 409 });
     }, 30_000);
 
     // -------------------------------------------------------------------------
@@ -586,17 +591,19 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
     }, 30_000);
 
     // -------------------------------------------------------------------------
-    // 12.3.2.10 — CRASH RECOVERY:
-    // Heartbeat stops (crash) → lease expires → reclaimer → FAILED.
+    // 12.3.2.10 — CRASH RECOVERY (Phase 12.3.2.2):
+    // Heartbeat stops (crash) → lease expires → reclaimer → RECONCILIATION_REQUIRED.
     //
-    // This proves the reclaim path still works for genuine crashes:
+    // This proves the reclaim path still works for genuine crashes, but now
+    // transitions to RECONCILIATION_REQUIRED (not FAILED) because the external
+    // side effect's outcome is unknown:
     //   Worker A claims.
     //   Heartbeat stops / worker dies.
     //   Lease genuinely expires.
-    //   Reclaimer → FAILED.
-    //   A later retry gets deterministic FAILED/retry semantics.
+    //   Reclaimer → RECONCILIATION_REQUIRED.
+    //   A later retry with the same key gets 409 "outcome unknown, do not retry".
     // -------------------------------------------------------------------------
-    it("12.3.2.10: heartbeat stops (crash) → lease expires → reclaimer → FAILED, retry gets FAILED", async () => {
+    it("12.3.2.10: heartbeat stops (crash) → lease expires → reclaimer → RECONCILIATION_REQUIRED, retry gets 409", async () => {
       const key = `p123210-${Date.now()}`;
       const scope = "test_heartbeat_crash";
       const leaseMs = 2000;
@@ -609,6 +616,7 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
           key,
           state: "IN_PROGRESS",
           claimId,
+          providerKey: key,
           claimExpiresAt: new Date(Date.now() + leaseMs),
         },
       });
@@ -617,16 +625,17 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
       // this manually-created record). Wait for the lease to genuinely expire.
       await new Promise((r) => setTimeout(r, leaseMs + 100));
 
-      // The lease has expired. The reclaimer should now transition to FAILED.
+      // The lease has expired. The reclaimer transitions to RECONCILIATION_REQUIRED.
       const reclaimed = await reclaimExpiredIdempotencyOperations();
       expect(reclaimed).toBeGreaterThanOrEqual(1);
 
       const op = await getIdempotencyOperation(scope, key);
-      expect(op!.state).toBe("FAILED");
+      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
       const failure = JSON.parse(op!.failureJson!);
-      expect(failure.message).toMatch(/lease expired/i);
+      expect(failure.message).toMatch(/lease expired|reconciliation|unknown/i);
 
-      // A later retry with the same key gets the FAILED semantics (not a re-execution).
+      // A later retry with the same key gets 409 "outcome unknown, do not retry"
+      // (NOT a re-execution — the side effect may have succeeded at the provider).
       let execCount = 0;
       await expect(
         runIdempotentOperation({
@@ -637,8 +646,8 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
             return { shouldNotReach: true };
           },
         }),
-      ).rejects.toMatchObject({ statusCode: 500 });
-      expect(execCount).toBe(0); // not re-executed — the FAILED state is returned
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(execCount).toBe(0); // not re-executed — outcome is unknown
 
       // Cleanup.
       await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
@@ -664,27 +673,267 @@ describe("Phase 12.3 — API Platform Protocol (DB-backed)", () => {
           key,
           state: "IN_PROGRESS",
           claimId,
+          providerKey: key,
           claimExpiresAt: new Date(Date.now() - 1000), // already expired
         },
       });
 
-      // Reclaim → FAILED.
+      // Reclaim → RECONCILIATION_REQUIRED (Phase 12.3.2.2).
       await reclaimExpiredIdempotencyOperations();
       const op = await getIdempotencyOperation(scope, key);
-      expect(op!.state).toBe("FAILED");
+      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
 
       // A stale owner tries to complete with the old claimId. The fenced update
       // (WHERE claimId = X AND state = IN_PROGRESS) returns 0 rows because the
-      // state is now FAILED.
+      // state is now RECONCILIATION_REQUIRED.
       const updated = await db.idempotencyOperation.updateMany({
         where: { scope, key, claimId, state: "IN_PROGRESS" },
         data: { state: "COMPLETED", resultJson: JSON.stringify({ stale: true }) },
       });
       expect(updated.count).toBe(0); // KEY ASSERTION: stale owner cannot complete
 
-      // The state is still FAILED (the stale owner's update was a no-op).
+      // The state is still RECONCILIATION_REQUIRED (the stale owner's update was a no-op).
       const op2 = await getIdempotencyOperation(scope, key);
-      expect(op2!.state).toBe("FAILED");
+      expect(op2!.state).toBe("RECONCILIATION_REQUIRED");
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.12 — CRASH AFTER EXTERNAL SIDE EFFECT → RECONCILIATION_REQUIRED (not FAILED)
+    //
+    // The architect's core finding: a worker that crashes AFTER the provider
+    // accepted the payment but BEFORE RoamLink stores COMPLETED must NOT be
+    // marked FAILED. The external outcome is UNKNOWN. Marking it FAILED allows
+    // a retry with a new key, which could create a duplicate payment.
+    //
+    // This test deterministically simulates:
+    //   claim → provider accepts → crash before COMPLETED → reclaim
+    //   Expected: RECONCILIATION_REQUIRED (not FAILED)
+    // -------------------------------------------------------------------------
+    it("12.3.2.12: crash after external side effect → RECONCILIATION_REQUIRED (not FAILED)", async () => {
+      const key = `p123212-${Date.now()}`;
+      const scope = "test_crash_after_side_effect";
+      const providerKey = `prov_${key}`;
+
+      // Simulate: the worker claimed the operation, passed providerKey to the
+      // provider (which accepted), but crashed before storing COMPLETED.
+      // The record is IN_PROGRESS with an expired lease.
+      await db.idempotencyOperation.create({
+        data: {
+          scope,
+          key,
+          state: "IN_PROGRESS",
+          claimId: `crash-${Date.now()}`,
+          providerKey,
+          claimExpiresAt: new Date(Date.now() - 1000), // expired — worker crashed
+        },
+      });
+
+      // The reclaimer transitions to RECONCILIATION_REQUIRED (NOT FAILED).
+      const reclaimed = await reclaimExpiredIdempotencyOperations();
+      expect(reclaimed).toBeGreaterThanOrEqual(1);
+
+      const op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("RECONCILIATION_REQUIRED");
+      // The providerKey is preserved so reconciliation can query the provider.
+      expect(op!.providerKey).toBe(providerKey);
+
+      // A retry with the same key gets 409 "outcome unknown, do not retry".
+      let execCount = 0;
+      await expect(
+        runIdempotentOperation({
+          scope,
+          key,
+          execute: async () => {
+            execCount++;
+            return { shouldNotReach: true };
+          },
+        }),
+      ).rejects.toMatchObject({ statusCode: 409 });
+      expect(execCount).toBe(0); // not re-executed — the caller is blocked
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.13 — RECONCILIATION: provider says SUCCESS → COMPLETED;
+    //                                  provider says FAILED → FAILED
+    //
+    // A RECONCILIATION_REQUIRED operation is resolved by querying the provider
+    // with the SAME providerKey. The provider's answer determines the final state.
+    // -------------------------------------------------------------------------
+    it("12.3.2.13: reconciliation — provider SUCCESS → COMPLETED; provider FAILED → FAILED", async () => {
+      // Case A: provider says SUCCESS.
+      const keyA = `p123213a-${Date.now()}`;
+      const scopeA = "test_reconcile_success";
+      const providerKeyA = `prov_${keyA}`;
+
+      await db.idempotencyOperation.create({
+        data: {
+          scope: scopeA, key: keyA,
+          state: "RECONCILIATION_REQUIRED",
+          providerKey: providerKeyA,
+          failureJson: JSON.stringify({ errorClass: "internal", message: "lease expired", statusCode: 500 }),
+        },
+      });
+
+      // Reconcile: query the provider with the same providerKey.
+      let providerQueryCount = 0;
+      const newStateA = await reconcileOperation({
+        scope: scopeA,
+        key: keyA,
+        queryProvider: async (pk) => {
+          providerQueryCount++;
+          expect(pk).toBe(providerKeyA); // SAME providerKey is used for reconciliation
+          return { outcome: "SUCCESS", value: { orderId: "provider_confirmed_order" } };
+        },
+      });
+
+      expect(newStateA).toBe("COMPLETED");
+      expect(providerQueryCount).toBe(1); // queried exactly once
+
+      const opA = await getIdempotencyOperation(scopeA, keyA);
+      expect(opA!.state).toBe("COMPLETED");
+      expect(JSON.parse(opA!.resultJson!)).toEqual({ orderId: "provider_confirmed_order" });
+      expect(opA!.reconciledAt).not.toBeNull();
+
+      // Case B: provider says NOT_FOUND (the request never reached the provider,
+      // e.g. the worker crashed before sending it).
+      const keyB = `p123213b-${Date.now()}`;
+      const scopeB = "test_reconcile_not_found";
+      const providerKeyB = `prov_${keyB}`;
+
+      await db.idempotencyOperation.create({
+        data: {
+          scope: scopeB, key: keyB,
+          state: "RECONCILIATION_REQUIRED",
+          providerKey: providerKeyB,
+          failureJson: JSON.stringify({ errorClass: "internal", message: "lease expired", statusCode: 500 }),
+        },
+      });
+
+      const newStateB = await reconcileOperation({
+        scope: scopeB,
+        key: keyB,
+        queryProvider: async (pk) => {
+          expect(pk).toBe(providerKeyB);
+          return {
+            outcome: "NOT_FOUND",
+            failure: { errorClass: "not_found" as const, message: "Provider has no record of this operation", statusCode: 404 },
+          };
+        },
+      });
+
+      expect(newStateB).toBe("FAILED");
+
+      const opB = await getIdempotencyOperation(scopeB, keyB);
+      expect(opB!.state).toBe("FAILED");
+      const failureB = JSON.parse(opB!.failureJson!);
+      expect(failureB.errorClass).toBe("not_found");
+
+      // After reconciliation to FAILED, a retry with the same key gets the
+      // stored failure (safe to retry with a new key now — the provider
+      // confirmed it never processed the request).
+      await expect(
+        runIdempotentOperation({
+          scope: scopeB,
+          key: keyB,
+          execute: async () => ({ shouldNotReach: true }),
+        }),
+      ).rejects.toMatchObject({ statusCode: 404 });
+
+      // Cleanup.
+      await db.idempotencyOperation.deleteMany({ where: { scope: scopeA, key: keyA } }).catch(() => {});
+      await db.idempotencyOperation.deleteMany({ where: { scope: scopeB, key: keyB } }).catch(() => {});
+    }, 30_000);
+
+    // -------------------------------------------------------------------------
+    // 12.3.2.14 — DUPLICATE PROVIDER SAFETY: replay/reconciliation with the
+    // same providerKey cannot create a second provider operation.
+    //
+    // The provider deduplicates on the providerKey. RoamLink stores the
+    // providerKey on the IdempotencyOperation record so reconciliation reuses it.
+    // A second call to the provider with the same key returns the SAME result,
+    // not a new operation.
+    // -------------------------------------------------------------------------
+    it("12.3.2.14: duplicate provider safety — same providerKey cannot create a 2nd provider operation", async () => {
+      const key = `p123214-${Date.now()}`;
+      const scope = "test_provider_dedup";
+      const providerKey = `prov_${key}`;
+
+      // Simulate a completed operation where the provider was called with providerKey.
+      let providerCallCount = 0;
+      const providerResults = new Map<string, { orderId: string }>();
+
+      // First call: the provider creates an operation and stores it under providerKey.
+      const firstResult = await runIdempotentOperation({
+        scope,
+        key,
+        providerKey,
+        execute: async (pk) => {
+          providerCallCount++;
+          const result = { orderId: `order_${pk}` };
+          providerResults.set(pk, result); // provider stores the result under the key
+          return result;
+        },
+      });
+
+      expect(providerCallCount).toBe(1);
+      expect(firstResult).toEqual({ orderId: `order_${providerKey}` });
+
+      // Verify the providerKey was stored on the operation record.
+      const storedProviderKey = await _getProviderKey(scope, key);
+      expect(storedProviderKey).toBe(providerKey);
+
+      // Second call (replay): runIdempotentOperation returns the stored result
+      // WITHOUT calling execute() again. The provider is NOT called a second time.
+      const secondResult = await runIdempotentOperation({
+        scope,
+        key,
+        providerKey,
+        execute: async () => {
+          providerCallCount++;
+          return { orderId: "should_not_reach" };
+        },
+      });
+
+      expect(providerCallCount).toBe(1); // still 1 — provider not called again
+      expect(secondResult).toEqual(firstResult); // same result (replayed)
+
+      // Reconciliation safety: if we simulate a crash and reconcile, the
+      // provider is queried with the SAME providerKey. A well-behaved provider
+      // returns the SAME result (it deduplicates on the key).
+      // First, transition to RECONCILIATION_REQUIRED (simulate crash).
+      await db.idempotencyOperation.updateMany({
+        where: { scope, key, state: "COMPLETED" },
+        data: { state: "RECONCILIATION_REQUIRED", resultJson: null },
+      });
+
+      // Reconcile: query the provider with the stored providerKey.
+      let reconcileQueryCount = 0;
+      const reconciledState = await reconcileOperation({
+        scope,
+        key,
+        queryProvider: async (pk) => {
+          reconcileQueryCount++;
+          expect(pk).toBe(providerKey); // SAME providerKey used for reconciliation
+          // The provider returns the SAME result it stored under this key.
+          const stored = providerResults.get(pk);
+          if (stored) return { outcome: "SUCCESS" as const, value: stored };
+          return { outcome: "NOT_FOUND" as const, failure: { errorClass: "not_found" as const, message: "not found", statusCode: 404 } };
+        },
+      });
+
+      expect(reconcileQueryCount).toBe(1);
+      expect(reconciledState).toBe("COMPLETED");
+
+      // The reconciled result matches the original — no duplicate operation was created.
+      const op = await getIdempotencyOperation(scope, key);
+      expect(op!.state).toBe("COMPLETED");
+      expect(JSON.parse(op!.resultJson!)).toEqual({ orderId: `order_${providerKey}` });
 
       // Cleanup.
       await db.idempotencyOperation.deleteMany({ where: { scope, key } }).catch(() => {});

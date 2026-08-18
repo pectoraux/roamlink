@@ -50,7 +50,10 @@ export async function purchaseTopUp(input: {
     key: input.idempotencyKey,
     payloadHash: hashPayload({ esimId: input.esimId, packageId: input.packageId }),
     principal: { type: "session", id: input.userId, tenantId: null },
-    execute: async () => {
+    // Phase 12.3.2.2: providerKey enables reconciliation if the worker crashes
+    // after the topup is applied but before COMPLETED is stored.
+    providerKey: input.idempotencyKey,
+    execute: async (providerKey) => {
       // Domain-level replay: if the TopUp row already exists, return it.
       const existing = await db.topUp.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
       if (existing) {
@@ -76,7 +79,9 @@ export async function purchaseTopUp(input: {
         amountMinor: pkg.priceMinor,
         currency: pkg.currency as Currency,
         description: `Top-up ${pkg.name}`,
-        idempotencyKey: `tu_pay_${input.idempotencyKey}`,
+        // Phase 12.3.2.2: use the providerKey (same as the operation key) so
+        // reconciliation can query the payment provider with this key.
+        idempotencyKey: `tu_pay_${providerKey}`,
         metadata: { esimId: input.esimId, packageId: input.packageId },
       });
 
@@ -86,7 +91,7 @@ export async function purchaseTopUp(input: {
       }
       const verification = await paymentProvider.verifyPayment({
         providerReference: intent.providerReference,
-        idempotencyKey: `tu_verify_${input.idempotencyKey}`,
+        idempotencyKey: `tu_verify_${providerKey}`,
       });
       if (verification.status !== "succeeded") {
         throw new AppError("payment", "Top-up payment failed", 402, "We couldn't process your top-up payment. Please try again.");
@@ -96,7 +101,9 @@ export async function purchaseTopUp(input: {
       const result = await esimProvider.topUp({
         providerESIMId: esim.providerESIMId,
         packageId: pkg.id,
-        idempotencyKey: input.idempotencyKey,
+        // Phase 12.3.2.2: use the same providerKey for the eSIM provider's topup
+        // call so reconciliation can query it.
+        idempotencyKey: providerKey,
       });
 
       // Record top-up + update eSIM.

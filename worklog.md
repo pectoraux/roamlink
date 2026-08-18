@@ -5166,3 +5166,106 @@ Stage Summary:
 - 12.3.2.11 proves a stale owner cannot overwrite the reclaimer's state.
 - The "at most once" guarantee now holds for the full execute() duration, not just
   while the lease remains valid.
+
+---
+Task ID: 12.3.2.2
+Agent: Principal Architect (main) — Phase 12.3.2.2 Crash-After-Side-Effect Semantics
+Task: Fix the deeper semantic problem the architect identified in the audit of 08afb1b. The heartbeat solved live long-running execution, but crash-after-external-side-effect creates an ambiguous state that FAILED misrepresents as retryable. A worker that crashes after the provider accepted a payment but before RoamLink stores COMPLETED must NOT be marked FAILED — the external outcome is UNKNOWN.
+
+Work Log:
+- Diagnosis (confirmed):
+  The architect's insight: RoamLink cannot atomically commit its DB row and an
+  external provider's side effect. The lifecycle:
+    claim → heartbeat → execute(provider accepts payment) → crash → lease expires → reclaim
+  Under the prior implementation, reclaim marked this FAILED. The caller could then
+  retry with a new key, and the provider would receive a SECOND payment. Split-brain.
+
+- Fix 1 — Schema (prisma/schema.prisma):
+  Added two fields to IdempotencyOperation:
+    - providerKey String? — the provider-side idempotency key. Passed to the provider
+      during execute() so the provider deduplicates on it. If the worker crashes,
+      reconciliation queries the provider with THIS key.
+    - reconciledAt DateTime? — when the reconciliation worker last queried the provider.
+  Updated the state comment to document the 4-state machine:
+    IN_PROGRESS | COMPLETED | FAILED | RECONCILIATION_REQUIRED
+
+- Fix 2 — Reclaim transitions to RECONCILIATION_REQUIRED (not FAILED):
+  reclaimExpiredIdempotencyOperations() now transitions IN_PROGRESS → RECONCILIATION_REQUIRED.
+  The failureJson message: "Operation lease expired — external side effect outcome is
+  unknown. Reconciliation required." This is the core semantic change: a reclaimed
+  operation's outcome is UNKNOWN, not failed.
+
+- Fix 3 — reconcileOperation() primitive (src/lib/idempotency/claim.ts):
+  New function that resolves a RECONCILIATION_REQUIRED operation by querying the
+  provider with the SAME providerKey:
+    - provider says SUCCESS → UPDATE state=COMPLETED, resultJson=...
+    - provider says FAILED/NOT_FOUND → UPDATE state=FAILED, failureJson=...
+    - provider says STILL_PENDING → leave as RECONCILIATION_REQUIRED, update reconciledAt
+  The fenced update (WHERE state=RECONCILIATION_REQUIRED) prevents concurrent
+  reconciliation workers from double-applying.
+
+- Fix 4 — runIdempotentOperation accepts providerKey + passes to execute():
+  The execute() callback now receives the providerKey: execute(providerKey).
+  The caller MUST pass this key to the external provider so the provider deduplicates
+  on it. If no providerKey is supplied, it defaults to the RoamLink key.
+  The claim INSERT stores providerKey on the record so reconciliation can use it.
+
+- Fix 5 — Poll path handles RECONCILIATION_REQUIRED:
+  A concurrent request that finds the operation in RECONCILIATION_REQUIRED gets
+  409 "outcome unknown, do not retry" — NOT a re-execution. This blocks the caller
+  from creating a duplicate side effect.
+
+- Fix 6 — Commerce flows updated to pass providerKey:
+  - createOrder: providerKey = input.idempotencyKey
+  - initiatePayment: providerKey passed to paymentProvider.createPaymentIntent
+  - purchaseTopUp: providerKey passed to both createPaymentIntent and esimProvider.topUp
+
+- Tests (3 new adversarial + 3 updated, all PASS):
+  12.3.2.12 — CRASH AFTER EXTERNAL SIDE EFFECT (the architect's core test):
+    Simulates: claim → provider accepts → crash before COMPLETED → reclaim.
+    Expected: RECONCILIATION_REQUIRED (NOT FAILED). The providerKey is preserved.
+    A retry with the same key gets 409 "outcome unknown, do not retry" (execCount=0).
+    Under the prior implementation, this would have been FAILED, allowing a retry
+    that creates a duplicate payment.
+
+  12.3.2.13 — RECONCILIATION (the architect's core test):
+    Case A: RECONCILIATION_REQUIRED → reconcileOperation queries provider with the
+    SAME providerKey → provider says SUCCESS → COMPLETED. resultJson stored.
+    Case B: provider says NOT_FOUND → FAILED. A retry with the same key now gets
+    the stored failure (safe to retry with a new key — the provider confirmed
+    it never processed the request).
+
+  12.3.2.14 — DUPLICATE PROVIDER SAFETY (the architect's core test):
+    First call: provider is called with providerKey, stores result under it.
+    Replay: runIdempotentOperation returns the stored result WITHOUT calling the
+    provider again (providerCallCount stays 1).
+    Reconciliation: simulate crash → reconcileOperation queries provider with the
+    SAME providerKey → provider returns the SAME result (it deduplicates).
+    No duplicate provider operation is ever created.
+
+  Updated tests (12.3.2.6, 12.3.2.10, 12.3.2.11): now assert RECONCILIATION_REQUIRED
+  instead of FAILED, reflecting the new semantics.
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       25/25 PASS  (22 original adapted + 3 new adversarial)
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 102 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The crash-after-side-effect race is FIXED:
+  - Reclaim transitions to RECONCILIATION_REQUIRED (not FAILED).
+  - The providerKey is stored on the operation record and passed to the provider.
+  - reconcileOperation() queries the provider with the SAME key to resolve the outcome.
+  - A retry with the same key is BLOCKED (409) until reconciliation completes.
+- The architectural distinction is now explicit:
+    Lease recovery (heartbeat) ≠ Side-effect outcome recovery (reconciliation).
+  These are different mechanisms, as the architect specified.
+- 12.3.2.12 proves crash-after-side-effect → RECONCILIATION_REQUIRED (not FAILED).
+- 12.3.2.13 proves reconciliation resolves the outcome (SUCCESS→COMPLETED, NOT_FOUND→FAILED).
+- 12.3.2.14 proves duplicate provider safety (same providerKey cannot create a 2nd operation).

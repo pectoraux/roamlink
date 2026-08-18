@@ -1361,12 +1361,26 @@ model IdempotencyOperation {
   scope           String
   // The idempotency key supplied by the client (or generated). Unique within (scope, key).
   key             String
-  // State: IN_PROGRESS | COMPLETED | FAILED
+  // State machine (Phase 12.3.2.2 — crash-after-side-effect semantics):
+  //   IN_PROGRESS           — claimed, execute() is running (heartbeat active).
+  //   COMPLETED             — execute() succeeded, result stored. Safe to replay.
+  //   FAILED                — execute() threw a CONFIRMED failure (e.g. validation
+  //                           error, provider rejected). Safe to retry with a new key.
+  //   RECONCILIATION_REQUIRED — the worker crashed or the lease expired while
+  //                           execute() was running. The external side effect's
+  //                           outcome is UNKNOWN. The caller MUST NOT retry with a
+  //                           new key — a reconciliation worker must query the
+  //                           provider with the same providerKey to determine the
+  //                           actual outcome before transitioning to COMPLETED
+  //                           or FAILED.
+  //
+  // The distinction between FAILED and RECONCILIATION_REQUIRED is the core of
+  // Phase 12.3.2.2: "retryable failure" vs "unknown outcome requiring reconciliation".
   state           String   @default("IN_PROGRESS")
   // The operation's result (JSON-serialized). Present when state = COMPLETED.
   resultJson      String?
   // The operation's failure (JSON-serialized { errorClass, message, statusCode }).
-  // Present when state = FAILED.
+  // Present when state = FAILED or RECONCILIATION_REQUIRED.
   failureJson     String?
   // A SHA-256 hash of the request payload, for conflict detection. If two
   // requests use the same key but different payloads, the second is rejected
@@ -1384,9 +1398,20 @@ model IdempotencyOperation {
   claimId         String?
   // Lease: when this claim expires if still IN_PROGRESS (crashed worker recovery).
   // The heartbeat renews this while execute() runs. A reclaim worker can only
-  // transition to FAILED when this has genuinely expired AND the owner is not
-  // actively renewing it (the fenced renewal uses claimId).
+  // transition to RECONCILIATION_REQUIRED when this has genuinely expired AND
+  // the owner is not actively renewing it (the fenced renewal uses claimId).
   claimExpiresAt  DateTime?
+  // Phase 12.3.2.2: The provider-side idempotency key. When execute() performs
+  // an external side effect (payment, provisioning, topup), the caller MUST
+  // pass this key to the provider so the provider deduplicates on it. If the
+  // worker crashes after the provider accepted the request, the reconciliation
+  // worker queries the provider with THIS key to determine the actual outcome.
+  // If null, the operation has no external side effect (or the caller did not
+  // supply one) and RECONCILIATION_REQUIRED is terminal (no reconciliation possible).
+  providerKey     String?
+  // Phase 12.3.2.2: When the reconciliation worker last queried the provider.
+  // Used to avoid hammering the provider on repeated reconciliation cycles.
+  reconciledAt    DateTime?
   createdAt       DateTime @default(now())
   completedAt     DateTime?
 
@@ -1395,6 +1420,8 @@ model IdempotencyOperation {
   @@index([claimExpiresAt])
   @@index([tenantId])
   @@index([claimId])
+  @@index([providerKey])
+  @@index([reconciledAt])
 }
 
 // ---------------------------------------------------------------------------

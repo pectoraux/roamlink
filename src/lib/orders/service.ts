@@ -393,7 +393,10 @@ export async function createOrder(input: {
     key: input.idempotencyKey,
     payloadHash: hashPayload({ planId: input.planId, tenantId: input.tenantId ?? null, distributionOfferId: input.distributionOfferId ?? null }),
     principal: { type: "session", id: input.userId, tenantId: input.tenantId ?? null },
-    execute: async () => {
+    // Phase 12.3.2.2: providerKey enables reconciliation if the worker crashes
+    // after the order is created but before COMPLETED is stored.
+    providerKey: input.idempotencyKey,
+    execute: async (_providerKey) => {
       // Domain-level replay: if the Order row already exists, return it.
       const existing = await db.order.findUnique({
         where: { idempotencyKey: input.idempotencyKey },
@@ -547,7 +550,10 @@ export async function initiatePayment(input: {
     key: input.idempotencyKey,
     payloadHash: hashPayload({ orderId: input.orderId, amount: order.amount }),
     principal: { type: "session", id: input.userId, tenantId: order.tenantId ?? null },
-    execute: async () => {
+    // Phase 12.3.2.2: providerKey enables reconciliation. If the worker crashes
+    // after the payment intent is created, reconciliation can query the provider.
+    providerKey: input.idempotencyKey,
+    execute: async (providerKey) => {
       // Domain-level replay: if the Payment row already exists, return it.
       const existingPayment = await db.payment.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
       if (existingPayment) {
@@ -561,7 +567,10 @@ export async function initiatePayment(input: {
         amountMinor: order.amount,
         currency: order.currency as Currency,
         description: `eSIM ${order.plan?.name ?? ""}`,
-        idempotencyKey: input.idempotencyKey,
+        // Phase 12.3.2.2: pass the providerKey so the payment provider deduplicates
+        // on it. If the worker crashes, reconciliation can query the provider with
+        // this key to determine the actual outcome.
+        idempotencyKey: providerKey,
         metadata: { orderId: order.id, userId: input.userId },
       });
 
