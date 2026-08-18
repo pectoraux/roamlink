@@ -4426,3 +4426,43 @@ Stage Summary:
   "Broken session/resource/provider convergence cannot be presented as clean ACTIVE."
   Detection → enforcement: the read model fails closed by surfacing RECONCILIATION_REQUIRED.
 - Next: Phase 11.6 — Out-of-order event convergence.
+
+---
+Task ID: 11.6
+Agent: Principal Architect (main) — Phase 11.6 Out-of-Order Event Convergence
+Task: Prove acceptance invariant #7: "Reordered events may affect evaluation timing, but cannot create unauthorized side effects." Events may arrive duplicated, delayed, or out of order — but they must never cause stale state resurrection, unauthorized connectivity mutation, duplicate side effects, or permanent invalid state.
+
+Work Log:
+- Tests (tests/phase11.6-event-convergence.test.ts, 4 DB-backed runtime, all PASS):
+  11.6.1 PASS — duplicate INTENT_CHANGED event (same idempotencyKey): Two events emitted with the same idempotencyKey. The second is deduped. Exactly one event persisted. No duplicate side effect.
+
+  11.6.2 PASS — RESOURCE_RECOVERED before RESOURCE_DEGRADED: A healthy measurement is ingested (no prior degradation). The health derivation is HEALTHY (not RECOVERED — it was never degraded). No illegal activation. Session remains ACTIVE on A. Final state coherent.
+
+  11.6.3 PASS — older INTENT_CHANGED (v1) after v2 supersedes v1: v1 intent created. v2 supersedes v1. An INTENT_CHANGED event for v1 is emitted AFTER v2 (simulating a delayed/out-of-order event). The worker processes the event, calls makeDecision with v1's intentId + v1 version. When the decision is executed, the intent authority fence (Phase 11.4) sees v1 as SUPERSEDED → SKIPPED. No stale resurrection. Session remains ACTIVE on A. This proves the event layer cannot bypass the intent version fencing simply by arriving later.
+
+  11.6.4 PASS — duplicate + out-of-order combination: Two measurements with the same deduplicationKey. The second is deduped. Exactly one measurement persisted. Health is coherent (HEALTHY). Session remains ACTIVE on A. Final state converges.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 11.4 (all 11):  11/11 PASS
+  Phase 11.5 (all 6):    6/6 PASS
+  Phase 11.6 (all 4):    4/4 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 47 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 361c1d6 (on GitHub, verified: git ls-remote origin main → 361c1d6)
+- All 8 Phase 11 acceptance invariants are now proven at runtime:
+  1. A decision cannot execute more than DECISION_MAX_ATTEMPTS times.
+  2. A session cannot have two connectivity mutations executing concurrently.
+  3. A failed transition cannot leave a second resource active/in-use accidentally.
+  4. Provider truth at execution time outranks stale decision assumptions.
+  5. Expired/superseded intent cannot execute.
+  6. Broken session/resource/provider convergence cannot be presented as clean ACTIVE.
+  7. Reordered events may affect evaluation timing, but cannot create unauthorized side effects.
+  8. Every failed/recovered path is auditable.
+- Phase 11 is now ready to freeze as a whole.
+- Next: Stop adding control-plane mechanics until a fresh architecture-wide audit.
