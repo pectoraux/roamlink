@@ -4061,3 +4061,49 @@ Stage Summary:
 - Acceptance invariant #4 proven with deterministic mid-execution proof:
   "Provider truth at execution time outranks stale decision assumptions."
 - Next: Phase 11.4 — Execution-time intent authority (strengthen the 9.4.2 P1-5 test).
+
+---
+Task ID: 11.3.2
+Agent: Principal Architect (main) — Phase 11.3.2 Normalize NOT_USABLE to RECONCILIATION_REQUIRED
+Task: Close the final state-model inconsistency identified in the architect's audit of 969b16f. NOT_USABLE still ended in generic FAILED (via throw → catch → FAILED), while UNKNOWN correctly ended in RECONCILIATION_REQUIRED. The 11.3.4 test accepted the broad union FAILED | RECONCILIATION_REQUIRED. Normalize NOT_USABLE to RECONCILIATION_REQUIRED and tighten the test to exact assertions.
+
+Work Log:
+- Fix (action-executor.ts): Changed the NOT_USABLE branches in both ACTIVATE and SWITCH paths from:
+    throw new Error(...) → catch → FAILED
+  to:
+    transitionActionState(RECONCILIATION_REQUIRED)
+    return { status: "reconciliation_required" }
+  Now both provider-verification failure modes are explicit:
+    NOT_USABLE → RECONCILIATION_REQUIRED (was FAILED)
+    UNKNOWN → RECONCILIATION_REQUIRED (already fixed in 11.3.1)
+  Action state === Decision execution state for both paths.
+
+- The clean semantic rule is now enforced:
+    NOT_USABLE → target released → old resource retained → RECONCILIATION_REQUIRED
+    UNKNOWN → target released → old resource retained → RECONCILIATION_REQUIRED
+  The difference is WHY reconciliation is required, not WHETHER. The error message retains the distinction.
+
+- Test 11.3.4 tightened to exact assertions:
+  - result.executionState === "RECONCILIATION_REQUIRED" (exact, not the broad FAILED | RECONCILIATION_REQUIRED union)
+  - action.state === "RECONCILIATION_REQUIRED" (exact)
+  No broad union, no comments explaining why it's broad.
+
+- Regression (all DB-backed):
+  Phase 11.1 (all 7):    7/7 PASS
+  Phase 11.2 (all 11):  11/11 PASS
+  Phase 11.3 (all 3):    3/3 PASS
+  Phase 8.6.6 (closure): 5/5 PASS
+  Phase 10.1.1:          5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Total: 31 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: 2e0e794 (on GitHub, verified: git ls-remote origin main → 2e0e794)
+- The state-model inconsistency is closed. NOT_USABLE and UNKNOWN both → RECONCILIATION_REQUIRED.
+- Action state === Decision execution state for both provider-verification failure modes.
+- Acceptance invariant #4 fully proven with consistent state model:
+  "Provider truth at execution time outranks stale decision assumptions."
+  NOT_USABLE → RECONCILIATION_REQUIRED (not FAILED)
+  UNKNOWN → RECONCILIATION_REQUIRED
+- Phase 11.3 is now ready to freeze.
+- Next: Phase 11.4 — Execution-time intent authority (strengthen the 9.4.2 P1-5 test).
