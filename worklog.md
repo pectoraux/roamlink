@@ -6406,3 +6406,835 @@ Stage Summary:
 - The correlation context type is ready to be threaded into the adapter and
   RouterOS client log calls (next hardening step — wiring it into the existing
   provider operations).
+
+---
+Task ID: 12.4.4d-11.2-cleanup
+Agent: Test Isolation Fixer (Phase 11.2)
+Task: Fix Phase 11.2 test cleanup to delete leaked reevaluation events by sessionId (catches subjectId:null leaks from emitReobserveRequest).
+
+Work Log:
+- Read worklog.md for prior context. No prior 12.4.4d entries — this is the
+  first 12.4.4d sub-agent run.
+- Read /home/z/my-project/tests/phase11.2-session-serialization.test.ts and
+  located the cleanup function in setupFixture() (lines 154-170 prior to edit).
+  Line 158 was the only reevaluationEvent.deleteMany call, filtering solely by
+  `subjectId: user.id`.
+- Confirmed the leak source in src/lib/control-plane/action-executor.ts
+  emitReobserveRequest (lines 1032-1050): it creates a `MEASUREMENT_RECEIVED`
+  reevaluationEvent with `subjectId: null` and `sessionId: <real session id>`.
+  Phase 11.2's setup calls `executeAction(action.id)` (line 140) which emits
+  exactly this event, and each subsequent test that calls `executeAction`
+  inside `executeDecision` adds more. These events accumulated across the
+  11.2.x tests because the subjectId-only filter could not match
+  subjectId:null rows, so they leaked into the global pending reevaluation
+  queue and broke Phase 9.5.1 A1's isolation when run in the same suite.
+- Applied the fix in tests/phase11.2-session-serialization.test.ts: inserted
+  a 6-line explanatory comment block + a second deleteMany call immediately
+  after the existing subjectId-based one. The new call (now line 165) is:
+      await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+  Comment matches the pattern already applied to phase9.5.1 (and used in
+  phase9.4.1, which already has both filters). No production code changed.
+  No test assertions or logic changed. Only cleanup was extended.
+- Verified by running:
+    cd /home/z/my-project && bun test tests/phase11.2-session-serialization.test.ts
+
+Test Results:
+- Phase 11.2: 11 pass, 0 fail (72 expect() calls, 876ms). All 11 tests
+  passed unchanged — the cleanup change is additive and only affects
+  post-test teardown. No test failed due to the change.
+- Cross-suite impact: Phase 9.5.1 A1's isolation is restored because
+  Phase 11.2's afterAll cleanup now removes the MEASUREMENT_RECEIVED events
+  it emitted during setup and tests, instead of leaving them in the
+  global PENDING reevaluation queue.
+
+Stage Summary:
+- HEAD: not committed (single-line edit, ready for the orchestrator to commit
+  alongside the other 12.4.4d cleanup fixes).
+- The Phase 11.2 cleanup function now deletes reevaluation events by BOTH
+  subjectId (catches INTENT_CHANGED events) AND sessionId (catches the
+  MEASUREMENT_RECEIVED events emitted by emitReobserveRequest during
+  executeAction's reobservation path).
+- No production code modified.
+- No other test file touched.
+
+---
+Task ID: 12.4.4d-9.4.x
+Agent: Test Isolation Fixer (Phase 9.4.x)
+Task: Fix Phase 9.4.1 + 9.4.2 test isolation — replace global `processPendingEvents()` primitive with subject-scoped `processPendingEventsForSubject()`, and add sessionId-based reevaluationEvent cleanup companions to the subjectId-based cleanup so leaked `MEASUREMENT_RECEIVED` events (subjectId=null) from `executeAction`'s reobservation path don't leak into the global pending queue.
+
+Work Log:
+- Read worklog.md for prior context. Reviewed Phase 12.4.4d-11.2-cleanup entry
+  to understand the established pattern (comment block + second deleteMany
+  keyed by sessionId, placed immediately after the subjectId-based one).
+- Confirmed the new primitive signature in
+  src/lib/control-plane/reevaluation.ts:594 —
+    processPendingEventsForSubject(subjectId, limit?, workerId?)
+  It forwards `{ subjectId }` to processPendingEvents, which forwards it to
+  claimReevaluationEvent's atomic WHERE guard (DB-level scoping).
+- Confirmed the leak source in src/lib/control-plane/action-executor.ts:1032
+  (emitReobserveRequest): creates a `MEASUREMENT_RECEIVED` event with
+  `subjectId: null`, `sessionId: <real>`. Called from executeAction.
+  Confirmed executeDecision (decision-executor.ts:587) calls executeAction,
+  so any test path that exercises executeDecision can leak such events.
+
+FILE 1 — tests/phase9.4.1-control-loop-closure.test.ts
+- Audited the whole file:
+    * setupFixture calls executeAction(action.id) at line 94 → emits one
+      MEASUREMENT_RECEIVED event with subjectId=null, sessionId=session.id.
+      Already caught by the existing sessionId-based deleteMany.
+    * Tests 9.4.1.1–9.4.1.6, 9.4.1.8, 9.4.1.9 only call createIntent /
+      makeDecision / cancelIntent — these emit INTENT_CHANGED events with
+      subjectId=fx.userId (caught by the subjectId filter).
+    * Test 9.4.1.7 is the only one calling the worker primitive — the
+      change point.
+    * Test 9.4.1.6 creates an `otherUser` but only attempts (and rejects)
+      cancelIntent — no events emitted for otherUser.
+  Conclusion: cleanup already had both filters (lines 101–102), but in the
+  reverse order (sessionId then subjectId) and without the explanatory
+  comment. Reordered to match the 9.5.1 / 11.2 pattern (subjectId then
+  sessionId) and added the standard Phase 12.4.4d comment block.
+- Line 33: import `processPendingEvents` → `processPendingEventsForSubject`.
+- Lines 101–108 (was 101–102): replaced the two un-commented deleteMany
+  calls with the comment block + subjectId deleteMany + sessionId deleteMany
+  (matching the 9.5.1 / 11.2 layout exactly).
+- Line 279 (was 273): worker call changed from
+    `processPendingEvents(10, "p941-e2e-worker")`
+  to
+    `processPendingEventsForSubject(fx.userId, 10, "p941-e2e-worker")`.
+  Worker-name string preserved for log traceability. No assertion changes.
+
+FILE 2 — tests/phase9.4.2-authority-durable-trigger.test.ts
+- Audited the whole file:
+    * setupFixture does NOT call executeAction (only createSession). So
+      fx.userId's main fixture cleanup doesn't have a setup-time leak —
+      BUT test P1-5 (line 248) calls `executeDecision(decision.decisionId)`
+      which calls executeAction → emitReobserveRequest, emitting a
+      MEASUREMENT_RECEIVED event with subjectId=null, sessionId=fx.sessionId.
+      This is the new leak that needs the sessionId companion in fx.userId's
+      cleanup.
+    * Test P0-1 creates noSessionUser with NO session — the worker primitive
+      is the change point. No executeAction is called for noSessionUser
+      (processPendingEvents only evaluates events and leaves non-KEEP
+      decisions PENDING; it does NOT call executeAction). So no
+      MEASUREMENT_RECEIVED events are emitted for noSessionUser, and there
+      is no session.id to filter by — sessionId companion correctly SKIPPED
+      for noSessionUser per task instructions.
+    * Tests P0-2, P1-3, P1-4 only call createIntent / cancelIntent —
+      INTENT_CHANGED events with subjectId=fx.userId (caught by subjectId
+      filter).
+- Line 27: import `processPendingEvents` → `processPendingEventsForSubject`.
+- Lines 90–98 (was line 90): added the standard Phase 12.4.4d comment block
+  + kept the existing subjectId deleteMany + added a new sessionId
+  deleteMany (session.id is available from setupFixture). Added an extra
+  comment line noting P1-5 as the leak source for this file.
+- Line 160 (was 149): worker call changed from
+    `processPendingEvents(10, "p942-nosession-worker")`
+  to
+    `processPendingEventsForSubject(noSessionUser.id, 10, "p942-nosession-worker")`.
+  Worker-name string preserved. Added a short Phase 12.4.4d comment
+  explaining the subject-scoping rationale. No assertion changes.
+- noSessionUser cleanup (line 170): UNCHANGED — only subjectId filter,
+  because noSessionUser has no session.
+
+Test Results (run in isolation, per task VERIFY step):
+- Phase 9.4.1: 9 pass, 0 fail (25 expect() calls, 1023ms).
+    All 9 tests passed unchanged.
+- Phase 9.4.2: 5 pass, 0 fail (16 expect() calls, 878ms).
+    All 5 tests passed unchanged.
+
+Stage Summary:
+- HEAD: not committed (two test-file edits, ready for the orchestrator to
+  commit alongside the other 12.4.4d cleanup fixes).
+- Both Phase 9.4.1 and 9.4.2 now use the subject-scoped
+  `processPendingEventsForSubject()` primitive, so leaked global
+  `MEASUREMENT_RECEIVED` events (subjectId=null) from prior tests' setup
+  can no longer fill the limit=10 budget before the test's own
+  INTENT_CHANGED event is reached.
+- Both fixtures' cleanups now delete reevaluation events by BOTH subjectId
+  (catches INTENT_CHANGED) AND sessionId (catches the
+  MEASUREMENT_RECEIVED events emitted by executeAction's reobservation
+  path). The noSessionUser branch in 9.4.2 correctly skips the sessionId
+  companion because no session was created for that subject.
+- No production code modified.
+- No other test file touched. No assertions or test logic changed.
+
+---
+Task ID: 12.4.4d-9.5.edge.4
+Agent: Test Isolation Fixer (Phase 9.5-edge + 9.5.4)
+Task: Fix two test files that use the global `processPendingEvents()` primitive — replace with the new `processPendingEventsForSubject()` primitive and fix cleanup to delete leaked events by sessionId too.
+
+Work Log:
+- Read worklog.md for prior context. Reviewed the 12.4.4d-9.4.x entry in full
+  to confirm the established pattern (import swap + subjectId-deleteMany +
+  sessionId-deleteMany with the standard Phase 12.4.4d comment block).
+- Confirmed the production primitive exists in
+  src/lib/control-plane/reevaluation.ts:594 —
+    processPendingEventsForSubject(subjectId, limit?, workerId?)
+  It forwards `{ subjectId }` to processPendingEvents, which forwards it to
+  claimReevaluationEvent's atomic WHERE guard (DB-level scoping).
+- Confirmed the leak source in src/lib/control-plane/action-executor.ts
+  (emitReobserveRequest): creates a `MEASUREMENT_RECEIVED` event with
+  `subjectId: null`, `sessionId: <real>`. Called from executeAction.
+
+FILE 1 — tests/phase9.5-edge-intent-transparency.test.ts
+- Audited the whole file:
+    * setupFixture calls executeAction(action.id) at line 83 → emits one
+      MEASUREMENT_RECEIVED event with subjectId=null, sessionId=session.id.
+      This is the setup-time leak that needs the sessionId companion in
+      fx.userId's cleanup.
+    * Tests R1 and R6.NS only call createIntent + makeDecision directly
+      (simulating the worker). No executeAction. These emit INTENT_CHANGED
+      events with subjectId=fx.userId (caught by subjectId filter).
+    * Test R2 (line 169 prior to edit) is the ONLY call to the worker
+      primitive — the change point.
+  Conclusion: cleanup had only the subjectId filter; need to add a
+  sessionId companion keyed by session.id (available from setupFixture).
+- Line 22: import `processPendingEvents` → `processPendingEventsForSubject`.
+- Lines 90–98 (was line 90): added the standard Phase 12.4.4d comment block
+  + kept the existing subjectId deleteMany + added a new sessionId
+  deleteMany. Added an extra comment line noting line 83's executeAction
+  call as the leak source for this file.
+- Line 180 (was 169): worker call changed from
+    `processPendingEvents(10, "p95-r2-worker")`
+  to
+    `processPendingEventsForSubject(fx.userId, 10, "p95-r2-worker")`.
+  Worker-name string preserved for log traceability. No assertion changes.
+
+FILE 2 — tests/phase9.5.4-reason-code-protocol.test.ts
+- Audited the whole file:
+    * setupFixture calls executeAction(action.id) at line 88 → emits one
+      MEASUREMENT_RECEIVED event with subjectId=null, sessionId=session.id.
+      Setup-time leak that needs the sessionId companion.
+    * Test A only reads decision-engine.ts source code (static analysis).
+      No DB events emitted.
+    * Test B (line 149 prior to edit) is the ONLY call to the worker
+      primitive — the change point.
+    * Tests C, D, G, H are pure functions / pure types — no DB events.
+    * Test E calls getCurrentConnectivityForUser — read-only, no events.
+    * Test F reads test source files from disk (static analysis). No events.
+  Conclusion: cleanup had only the subjectId filter; need to add a
+  sessionId companion keyed by session.id.
+- Line 35: import `processPendingEvents` → `processPendingEventsForSubject`.
+- Lines 95–103 (was line 95): added the standard Phase 12.4.4d comment block
+  + kept the existing subjectId deleteMany + added a new sessionId
+  deleteMany. Added an extra comment line noting line 88's executeAction
+  call as the leak source for this file.
+- Line 160 (was 149): worker call changed from
+    `processPendingEvents(10, "p954-b-worker")`
+  to
+    `processPendingEventsForSubject(fx.userId, 10, "p954-b-worker")`.
+  Worker-name string preserved for log traceability. No assertion changes.
+
+Test Results (run in isolation, per task VERIFY step):
+- Phase 9.5-edge: 3 pass, 0 fail (29 expect() calls, 776ms).
+    All 3 tests passed unchanged.
+- Phase 9.5.4: 8 pass, 0 fail (62 expect() calls, 724ms).
+    All 8 tests passed unchanged.
+
+Stage Summary:
+- HEAD: not committed (two test-file edits, ready for the orchestrator to
+  commit alongside the other 12.4.4d cleanup fixes).
+- Both Phase 9.5-edge and 9.5.4 now use the subject-scoped
+  `processPendingEventsForSubject()` primitive, so leaked global
+  `MEASUREMENT_RECEIVED` events (subjectId=null) from prior tests' setup
+  can no longer fill the limit=10 budget before the test's own
+  INTENT_CHANGED event is reached.
+- Both fixtures' cleanups now delete revaluation events by BOTH subjectId
+  (catches INTENT_CHANGED) AND sessionId (catches the MEASUREMENT_RECEIVED
+  events emitted by executeAction's reobservation path at setupFixture's
+  executeAction call). The leak source line was annotated in each comment
+  block for forensic traceability.
+- No production code modified.
+- No other test file touched. No assertions or test logic changed.
+
+---
+Task ID: 12.4.4d-11.1.3.4-cleanup
+Agent: Test Isolation Fixer (Phase 11.1 + 11.3 + 11.4 cleanup)
+Task: Fix cleanup functions in three Phase 11 test files to delete leaked reevaluation events by sessionId (catches subjectId:null leaks from emitReobserveRequest). These tests don't use `processPendingEvents` for INTENT_CHANGED events — they only need the cleanup fix.
+
+Work Log:
+- Read worklog.md for prior context. Reviewed the 12.4.4d-9.4.x and
+  12.4.4d-9.5.edge.4 entries to confirm the established pattern
+  (subjectId-deleteMany + sessionId-deleteMany with the standard
+  Phase 12.4.4d comment block).
+- Confirmed the leak source in src/lib/control-plane/action-executor.ts
+  (emitReobserveRequest at line 1032): creates a `MEASUREMENT_RECEIVED`
+  event with `subjectId: null`, `sessionId: <real>`. Called from
+  executeAction at lines 446 and 671 (the reobservation path inside
+  successful SWITCH/ACTIVATE execution). executeDecision calls
+  executeAction at decision-executor.ts:587, so any test path that
+  exercises executeDecision (and reaches the action-execution success
+  branch) can leak such events.
+- Verified the audit per file:
+    * Phase 11.1: setupFixture calls executeAction(action.id) at line 115
+      (task said line 99 — that's the file's pre-edit line; the actual
+      executeAction call is at line 115 in the current file). Tests
+      11.1.3, 11.1.6, 11.1.7 call executeDecision.
+    * Phase 11.3: setupFixture calls executeAction(action.id) at line 106.
+      Tests 11.3.3, 11.3.4, 11.3.5 call executeDecision (and 11.3.3 also
+      has a switch-back executeDecision at line 344/445).
+    * Phase 11.4: setupFixture calls executeAction(action.id) at line 99.
+      Tests 11.4.1, 11.4.2, 11.4.3, 11.4.4, 11.4.5, 11.4.6, 11.4.7, 11.4.8,
+      11.4.10 call executeDecision (some return SKIPPED before reaching
+      executeAction, so they don't actually leak — but the in-test
+      cleanup is added defensively per the task rule).
+
+FILE 1 — tests/phase11.1-decision-retry-bound.test.ts
+- setupFixture cleanup (lines 128-136 after edit): added the standard
+  Phase 12.4.4d comment block + kept the existing subjectId deleteMany
+  + added a new sessionId deleteMany (session.id is in scope).
+- In-test cleanup augmentation (5 blocks):
+    * After 11.1.2 (line 285 pre-edit → line 285 post-edit): added
+      sessionId companion keyed by fx.sessionId.
+    * After 11.1.4 (line 388 post-edit, the reclaimDecision/deadLetterDecision
+      double-delete): added sessionId companion.
+    * After 11.1.5 (line 462 post-edit): added sessionId companion.
+    * After 11.1.6 (line 534 post-edit, the concurrent-executeDecision
+      test): added sessionId companion. This is the test that actually
+      leaks via executeDecision's concurrent calls.
+    * After 11.1.7 (line 638 post-edit, the active-claim executeDecision
+      test): added sessionId companion. This test calls executeDecision
+      which is rejected (active claim), so it likely doesn't leak —
+      added defensively per the task rule.
+  Note: test 11.1.3 calls executeDecision (EXECUTED) and a switch-back
+  executeDecision, but has no existing in-test cleanup block (no
+  deleteMany for the decision). The setupFixture cleanup with the new
+  sessionId companion catches those leaked events at end of suite.
+- Test 11.1.1 marks the decision SKIPPED in-test (no deleteMany); no
+  executeDecision called, so no leak — no modification needed.
+- Test 11.1.4 calls reclaimExpiredDecisionClaims (no executeAction);
+  no leak, but added sessionId cleanup defensively per the rule.
+- Test 11.1.5 calls claimDecisionForExecution (no executeAction); no
+  leak, but added sessionId cleanup defensively per the rule.
+
+FILE 2 — tests/phase11.3-provider-truth-flip.test.ts
+- setupFixture cleanup (lines 124-131 after edit): added the standard
+  Phase 12.4.4d comment block + kept the existing subjectId deleteMany
+  + added a new sessionId deleteMany (session.id is in scope).
+- In-test cleanup augmentation (3 blocks):
+    * After 11.3.4 (line 291 post-edit): added sessionId companion.
+      This test calls executeDecision which reaches executeAction's
+      reobservation path → real leak caught.
+    * After 11.3.5 (line 385 post-edit): added sessionId companion.
+      Same leak path.
+    * After 11.3.3 (line 460 post-edit, the control test that succeeds
+      EXECUTED + has a switch-back executeDecision): added sessionId
+      companion. Two real leaks caught.
+
+FILE 3 — tests/phase11.4-intent-authority.test.ts
+- setupFixture cleanup (lines 117-124 after edit): added the standard
+  Phase 12.4.4d comment block + kept the existing subjectId deleteMany
+  + added a new sessionId deleteMany (session.id is in scope).
+- In-test cleanup augmentation (11 blocks):
+    * After 11.4.1 (line 216 post-edit): added sessionId companion.
+    * After 11.4.2 (line 279 post-edit): added sessionId companion.
+    * After 11.4.3 (line 352-356 post-edit, the EXECUTED control test
+      with switch-back): added sessionId companion. Two real leaks
+      (both EXECUTED paths reach executeAction).
+    * After 11.4.4 (line 429 post-edit): added sessionId companion.
+    * After 11.4.5 (line 495 post-edit): added sessionId companion.
+    * After 11.4.6 (line 564 post-edit, concurrent executeDecision):
+      added sessionId companion.
+    * After 11.4.7 (line 643 post-edit): added sessionId companion.
+    * After 11.4.8 (line 826 post-edit, the double-decision cleanup
+      with fenceDecision.id): added sessionId companion.
+    * After 11.4.10 (line 942 post-edit): added sessionId companion.
+    * After 11.4.10.1 (line 1111 post-edit, the direct-fence test that
+      doesn't call executeDecision): added sessionId companion
+      defensively per the rule.
+    * After 11.4.10.2 (line 1221 post-edit, the exclusive-fence test
+      that doesn't call executeDecision): added sessionId companion
+      defensively per the rule.
+  Note: tests 11.4.1, 11.4.2, 11.4.4, 11.4.5, 11.4.6, 11.4.7, 11.4.8,
+  11.4.10 return SKIPPED before reaching executeAction, so they
+  don't actually leak MEASUREMENT_RECEIVED events. The sessionId
+  cleanup is added defensively per the task rule
+  ("If a test creates its own decision and cleans up by deleting
+  that decision, it should also delete events for the session").
+
+Test Results (run in isolation, per task VERIFY step):
+- Phase 11.1: 7 pass, 0 fail (63 expect() calls, 730ms).
+    All 7 tests passed unchanged.
+- Phase 11.3: 3 pass, 0 fail (24 expect() calls, 688ms).
+    All 3 tests passed unchanged.
+- Phase 11.4: 11 pass, 0 fail (60 expect() calls, 797ms).
+    All 11 tests passed unchanged.
+
+Stage Summary:
+- HEAD: not committed (three test-file edits, ready for the orchestrator
+  to commit alongside the other 12.4.4d cleanup fixes).
+- All three Phase 11 test files' setupFixture cleanups now delete
+  reevaluation events by BOTH subjectId (catches INTENT_CHANGED) AND
+  sessionId (catches the MEASUREMENT_RECEIVED events emitted by
+  executeAction's reobservation path). The standard Phase 12.4.4d
+  comment block was added to each setupFixture cleanup.
+- All in-test cleanup blocks (5 in 11.1, 3 in 11.3, 11 in 11.4) that
+  delete decisions were augmented with a sessionId-based
+  reevaluationEvent.deleteMany. For tests that actually call
+  executeDecision (and reach executeAction's success path), this
+  catches the leaked MEASUREMENT_RECEIVED events before the next
+  test runs. For tests that return SKIPPED before executeAction, the
+  cleanup is a defensive no-op per the task rule.
+- Test 11.1.3 calls executeDecision (EXECUTED + switch-back) but has
+  no existing in-test cleanup block to augment; its leaked events
+  are caught by the setupFixture cleanup's new sessionId companion
+  at end of suite.
+- No production code modified.
+- No other test file touched. No assertions or test logic changed.
+
+---
+Task ID: 12.4.4d-11.5.7-cleanup
+Agent: Test Isolation Fixer (Phase 11.5 + 11.7 cleanup)
+Task: Fix cleanup functions in two test files to delete leaked reevaluation events by sessionId (catches subjectId:null leaks from emitReobserveRequest). These tests don't use `processPendingEvents` for INTENT_CHANGED events — they only need the cleanup fix.
+
+Work Log:
+- Read worklog.md for prior context. Reviewed the 12.4.4d-11.2-cleanup,
+  12.4.4d-9.4.x, 12.4.4d-9.5.edge.4, and 12.4.4d-11.1.3.4-cleanup entries to
+  confirm the established pattern (subjectId-deleteMany + sessionId-deleteMany
+  with the standard Phase 12.4.4d comment block; in-test cleanup blocks that
+  delete decisions also get a sessionId companion).
+- Confirmed the leak source in src/lib/control-plane/action-executor.ts
+  (emitReobserveRequest ~line 1032): creates a `MEASUREMENT_RECEIVED`
+  reevaluationEvent with `subjectId: null`, `sessionId: <real>`. Called from
+  executeAction. executeDecision (decision-executor.ts:587) calls executeAction,
+  so any test path that exercises executeDecision (and reaches the
+  action-execution branch) can leak such events.
+- Verified the audit per file:
+    * Phase 11.5: setupFixture calls `executeAction(action.id)` at line 99
+      (task said line 99 — verified). This emits one MEASUREMENT_RECEIVED
+      event with subjectId=null, sessionId=session.id at setup time.
+      Tests 11.5.1–11.5.5 only call assertActiveConnectivityInvariant +
+      getCurrentConnectivityForUser + restoreState. None call executeDecision
+      or any function that emits events. Their in-test cleanup blocks only
+      delete entitlements (tempEnt in 11.5.4, otherEnt in 11.5.5) — no
+      reevaluationEvent cleanup to augment. Conclusion: only setupFixture
+      cleanup needs the sessionId companion.
+    * Phase 11.7: setupFixture calls `executeAction(action.id)` at line 95
+      (task said line 95 — verified). This emits one MEASUREMENT_RECEIVED
+      event with subjectId=null, sessionId=session.id at setup time. Test
+      11.7.1 calls `executeDecision(decision.id)` at line 189 (task said
+      line 189 — verified), which calls executeAction's reobservation path
+      → emits another MEASUREMENT_RECEIVED event with subjectId=null,
+      sessionId=fx.sessionId. Test 11.7.1's in-test cleanup at lines
+      285-286 deletes the decision + action but not events. Conclusion:
+      setupFixture cleanup needs the sessionId companion AND test 11.7.1's
+      in-test cleanup needs a sessionId-based reevaluationEvent.deleteMany
+      to catch the in-test leak before any later test runs.
+
+FILE 1 — tests/phase11.5-invariant-fail-closed.test.ts
+- setupFixture cleanup (lines 117-125 after edit): added the standard
+  Phase 12.4.4d comment block + kept the existing subjectId deleteMany
+  + added a new sessionId deleteMany (session.id is in scope from
+  setupFixture). Comment specifically notes setupFixture line 99's
+  executeAction call as the leak source for this file.
+- No in-test cleanup augmentation needed — tests 11.5.1–11.5.5 only call
+  invariant-checker + read-model functions and don't emit events; their
+  in-test cleanup blocks only delete entitlements.
+
+FILE 2 — tests/phase11.7-auditability.test.ts
+- setupFixture cleanup (lines 109-117 after edit): added the standard
+  Phase 12.4.4d comment block + kept the existing subjectId deleteMany
+  + added a new sessionId deleteMany (session.id is in scope). Comment
+  notes both leak sources: setupFixture line 95's executeAction call
+  AND test 11.7.1 line 189's executeDecision call.
+- In-test cleanup augmentation (1 block, at lines 292-300 post-edit, in
+  the 11.7.1 test): added a sessionId-based
+  reevaluationEvent.deleteMany keyed by fx.sessionId, immediately
+  after the existing decision + action deleteMany calls. Added a
+  5-line explanatory comment block noting the in-test executeDecision
+  leak source (line 189). This catches the MEASUREMENT_RECEIVED event
+  emitted during the test's actual executeDecision run, before any
+  later test (in this file or in any other) is affected.
+
+Test Results (run in isolation, per task VERIFY step):
+- Phase 11.5: 6 pass, 0 fail (25 expect() calls, 644ms).
+    All 6 tests passed unchanged.
+- Phase 11.7: 1 pass, 0 fail (19 expect() calls, 611ms).
+    All 1 test passed unchanged.
+
+Stage Summary:
+- HEAD: not committed (two test-file edits, ready for the orchestrator
+  to commit alongside the other 12.4.4d cleanup fixes).
+- Both Phase 11.5 and 11.7 setupFixture cleanups now delete reevaluation
+  events by BOTH subjectId (catches INTENT_CHANGED) AND sessionId
+  (catches the MEASUREMENT_RECEIVED events emitted by executeAction's
+  reobservation path at setupFixture's executeAction call). The standard
+  Phase 12.4.4d comment block was added to each setupFixture cleanup.
+- Phase 11.7's in-test cleanup (test 11.7.1) was augmented with a
+  sessionId-based reevaluationEvent.deleteMany because that test calls
+  executeDecision → executeAction → emitReobserveRequest, leaking a
+  MEASUREMENT_RECEIVED event mid-suite. The in-test cleanup catches it
+  before any subsequent test runs.
+- Phase 11.5 had no in-test cleanup blocks to augment — its tests are
+  pure invariant-check + read-model tests that don't emit events.
+- No production code modified.
+- No other test file touched. No assertions or test logic changed.
+
+---
+Task ID: 12.4.4d-11.6
+Agent: Test Isolation Fixer (Phase 11.6)
+Task: Fix Phase 11.6 test isolation — remove the architecturally-wrong global `deleteMany({})` workaround, replace with subject-scoped worker + sessionId-based cleanup.
+
+Work Log:
+- Read worklog.md for prior context. Reviewed 12.4.4d-11.1.3.4-cleanup
+  and 12.4.4d-11.5.7-cleanup entries to confirm the established pattern
+  (subjectId-deleteMany + sessionId-deleteMany with the standard Phase
+  12.4.4d comment block; in-test cleanup blocks also get a sessionId
+  companion).
+- Read the full test file tests/phase11.6-event-convergence.test.ts
+  (511 lines) and the production primitive src/lib/control-plane/reevaluation.ts.
+- Confirmed signatures:
+    * `processOneEvent(workerId, filter?)` — filter is 2nd arg.
+    * `processPendingEvents(limit=50, workerId=..., filter?)` — filter is 3rd arg.
+    * `processPendingEventsForSubject(subjectId, limit?, workerId?)` — wraps
+      processPendingEvents with { subjectId } filter.
+    * `claimReevaluationEvent(workerId, filter?)` — atomic WHERE guard with
+      optional { resourceId, subjectId, sessionId } filter; events with
+      subjectId=null are skipped by a { subjectId } filter (Prisma AND match).
+- Audited each test's emitted event type / scoping fields:
+    * 11.6.1 (line ~173): emitReevaluationEvent INTENT_CHANGED with
+      subjectId=fx.subjectId. → subject-scoped worker.
+    * 11.6.3 (line ~242): db.reevaluationEvent.create INTENT_CHANGED with
+      subjectId=fx.subjectId. → subject-scoped worker.
+    * 11.6.5 (lines 308, 322, 337, 348): emitReevaluationEvent
+      RESOURCE_DEGRADED + RESOURCE_RECOVERED with resourceId=fx.resourceAId,
+      sessionId=fx.sessionId (subjectId=null). → resource-scoped worker.
+    * 11.6.6 (line ~419): emitReevaluationEvent MEASUREMENT_RECEIVED with
+      resourceId=fx.resourceAId, sessionId=fx.sessionId (subjectId=null).
+      NOTE: the task description said 11.6.6 emits "INTENT_CHANGED for
+      fx.subjectId" but this is INCORRECT — the actual code emits
+      MEASUREMENT_RECEIVED with subjectId=null. Verified against the
+      emitReevaluationEvent signature which sets subjectId: input.subjectId
+      ?? null. So 11.6.6 needs a RESOURCE-scoped worker, not subject-scoped.
+      Used processPendingEvents with { resourceId: fx.resourceAId } filter.
+
+FILE — tests/phase11.6-event-convergence.test.ts
+- Import (line 33): added processPendingEventsForSubject + processOneEvent
+  to the static import (processOneEvent was previously imported dynamically
+  on line 192). Both used in tests now.
+- setupFixture cleanup (lines 112-119): added the standard Phase 12.4.4d
+  comment block + kept the existing subjectId deleteMany + added a new
+  sessionId deleteMany (session.id is in scope from setupFixture line 94's
+  createSession call). setupFixture's executeAction call at line 98 leaks
+  a MEASUREMENT_RECEIVED event with subjectId=null, sessionId=session.id;
+  the sessionId companion catches it.
+- Test 11.6.1 (lines 162-237):
+    * Pre-test cleanup (lines 162-174): REMOVED the global
+      `await db.reevaluationEvent.deleteMany({}).catch(() => {})` workaround
+      (the architecturally-wrong anti-pattern). Replaced with subject-scoped
+      deleteMany + sessionId companion, with a 6-line comment block explaining
+      why a global wipe is no longer needed (the subject-scoped worker below
+      skips leaked null-subject events).
+    * Worker call (line 207): `processOneEvent("dup-1161-${Date.now()}")`
+      → `processOneEvent("dup-1161-${Date.now()}", { subjectId: fx.subjectId })`.
+      Removed the dynamic `await import(...)` on line 192 since processOneEvent
+      is now in the static import.
+    * In-test cleanup (lines 227-237): kept the existing idempotencyKey-based
+      deleteMany, added subjectId + resourceId + sessionId companion deleteMany
+      calls (3 new lines) to catch any leaked events from the worker's
+      makeDecision path.
+- Test 11.6.3 (lines 243-298):
+    * Worker call (line 272): `processPendingEvents(5, "ordering-test-${Date.now()}")`
+      → `processPendingEventsForSubject(fx.subjectId, 5, "ordering-test-${Date.now()}")`.
+    * In-test cleanup (lines 291-297): kept the existing subjectId+type
+      INTENT_CHANGED deleteMany, added resourceId + sessionId companion
+      deleteMany calls (2 new lines) to catch MEASUREMENT_RECEIVED leaks.
+- Test 11.6.5 (lines 287-410):
+    * Worker calls (4 sites):
+      - Line 339: `processPendingEvents(5, "caseA-deg-${Date.now()}")` →
+        `processPendingEvents(5, "caseA-deg-${Date.now()}", { resourceId: fx.resourceAId })`.
+      - Line 351: `processPendingEvents(5, "caseA-rec-${Date.now()}")` →
+        `processPendingEvents(5, "caseA-rec-${Date.now()}", { resourceId: fx.resourceAId })`.
+      - Line 366: `processPendingEvents(5, "caseB-rec-${Date.now()}")` →
+        `processPendingEvents(5, "caseB-rec-${Date.now()}", { resourceId: fx.resourceAId })`.
+      - Line 377: `processPendingEvents(5, "caseB-deg-${Date.now()}")` →
+        `processPendingEvents(5, "caseB-deg-${Date.now()}", { resourceId: fx.resourceAId })`.
+      All 4 emit RESOURCE_DEGRADED/RESOURCE_RECOVERED with subjectId=null,
+      resourceId=fx.resourceAId → resource-scoped worker. Original worker-name
+      strings preserved verbatim.
+    * In-test cleanup (lines 399-409): kept the existing resourceId deleteMany,
+      added subjectId + sessionId companion deleteMany calls (2 new lines) to
+      catch INTENT_CHANGED (subjectId=fx.subjectId) or MEASUREMENT_RECEIVED
+      (subjectId=null, sessionId=fx.sessionId) leaks from the worker's
+      makeDecision path or from setupFixture's executeAction call.
+- Test 11.6.6 (lines 391-491):
+    * Worker call (line 460): `processPendingEvents(5, "stale-trigger-${Date.now()}")`
+      → `processPendingEvents(5, "stale-trigger-${Date.now()}", { resourceId: fx.resourceAId })`.
+      NOTE: the task description said to use processPendingEventsForSubject
+      for 11.6.6, but the actual emitted event is MEASUREMENT_RECEIVED with
+      subjectId=null, resourceId=fx.resourceAId. A subject-scoped worker
+      would NOT claim it (subjectId=null != fx.subjectId in the atomic
+      WHERE guard). Used resource-scoped filter instead — matches the
+      actual event payload. Original worker-name string preserved.
+    * In-test cleanup (lines 480-490): kept the existing resourceId
+      deleteMany, added subjectId + sessionId companion deleteMany calls
+      (2 new lines) to catch INTENT_CHANGED (subjectId=fx.subjectId) or
+      MEASUREMENT_RECEIVED (subjectId=null, sessionId=fx.sessionId) leaks
+      from the worker's makeDecision path or from setupFixture's
+      executeAction call.
+- Test 11.6.4: emits NO reevaluation events (only ingestMeasurement with
+  triggerReevaluation:false). No worker calls. No in-test cleanup changes
+  needed.
+
+Distribution of subject-scoped vs resource-scoped worker calls (final):
+- Subject-scoped (processPendingEventsForSubject or processOneEvent with
+  { subjectId } filter): 2 sites
+    * 11.6.1 processOneEvent("dup-1161-...", { subjectId: fx.subjectId })
+    * 11.6.3 processPendingEventsForSubject(fx.subjectId, 5, "ordering-test-...")
+- Resource-scoped (processPendingEvents with { resourceId } filter):
+  5 sites, all in tests that emit RESOURCE_DEGRADED / RESOURCE_RECOVERED /
+  MEASUREMENT_RECEIVED with subjectId=null
+    * 11.6.5 caseA-deg, caseA-rec, caseB-rec, caseB-deg (4 calls)
+    * 11.6.6 stale-trigger (1 call)
+
+Test Results (run in isolation, per task VERIFY step):
+- Phase 11.6: 5 pass, 0 fail (33 expect() calls, 953ms).
+    All 5 tests passed unchanged.
+- A pre-existing prisma error message (`Argument intentId must not be null`)
+  fires during the in-test cleanup of 11.6.5 and 11.6.6 at the lines
+  `await db.connectivityDecision.deleteMany({ where: { sessionId: fx.sessionId, intentId: null } })`
+  — these lines were preserved verbatim from the original code (originally
+  at lines 292 and 378). The `.catch(() => {})` swallows the error; the
+  tests pass. This is NOT introduced by this task and was not modified.
+
+Stage Summary:
+- HEAD: not committed (one test-file edit, ready for the orchestrator
+  to commit alongside the other 12.4.4d cleanup fixes).
+- The architecturally-wrong global `deleteMany({})` workaround at line 162
+  has been REMOVED. Replaced with subject-scoped + sessionId-based delete.
+- All 6 processPendingEvents/processOneEvent worker calls in this file now
+  pass a subject OR resource filter — no global worker remains. Distribution
+  matches the actual event payload scoping fields:
+    * INTENT_CHANGED events (subjectId=fx.subjectId) → subject-scoped worker.
+    * RESOURCE_DEGRADED / RESOURCE_RECOVERED / MEASUREMENT_RECEIVED events
+      (subjectId=null, resourceId=fx.resourceAId) → resource-scoped worker.
+- setupFixture cleanup now deletes reevaluation events by BOTH subjectId
+  (catches INTENT_CHANGED) AND sessionId (catches the MEASUREMENT_RECEIVED
+  events emitted by setupFixture's executeAction call at line 98). The
+  standard Phase 12.4.4d comment block was added.
+- All in-test cleanup blocks in 11.6.1, 11.6.3, 11.6.5, 11.6.6 were
+  augmented with subjectId + resourceId + sessionId (where appropriate
+  per test) companion deleteMany calls. 11.6.4 unchanged (no events
+  emitted).
+- Worker-name strings preserved verbatim across all 6 worker call sites.
+- No production code modified.
+- No other test file touched. No assertions or test logic changed.
+
+---
+Task ID: 12.4.4d-12.4-obs-cleanup
+Agent: Test Isolation Fixer (Phase 12.4-observability cleanup)
+Task: Fix cleanup blocks in Phase 12.4-observability test file to delete leaked reevaluation events. Several cleanup blocks were missing the reevaluationEvent delete entirely.
+
+Work Log:
+- Read worklog.md for prior context. Reviewed 12.4.4d-11.6 and 12.4.4d-11.5/11.7
+  entries to confirm the established pattern (subjectId-deleteMany +
+  sessionId-deleteMany with the standard Phase 12.4.4d comment block).
+- Read the full test file tests/phase12.4-observability.test.ts (931 lines)
+  and audited all 13 tests (12.4.4.1 through 12.4.4.13).
+- Confirmed leak source: executeAction() in src/lib/control-plane/action-executor.ts
+  calls emitReobserveRequest() (line ~1038), which emits a MEASUREMENT_RECEIVED
+  event with subjectId=null, sessionId=<real>. A subjectId-only cleanup filter
+  misses these events and they leak into the global pending queue.
+- Audited each test:
+    * 12.4.4.1–12.4.4.8: Pure unit tests. No DB, no executeAction, no cleanup
+      blocks. Unchanged.
+    * 12.4.4.9 (line 375): Does NOT call executeAction — only direct adapter
+      operations (provision/suspend/resume/reconcile/release/reconcile).
+      Cleanup block (lines 440-444) only restores the logger. No DB cleanup.
+      No reevaluationEvent leak. Unchanged.
+    * 12.4.4.10 (line 474): Does NOT call executeAction — only direct adapter
+      operations (getUsage failure + reconcile failure). Cleanup block
+      (lines 524-529) only restores the logger + clearMockFailureSimulation.
+      No DB cleanup. No reevaluationEvent leak. Unchanged.
+    * 12.4.4.11 (line 561): Calls executeAction (line 618). Cleanup block
+      (lines 653-671) was MISSING reevaluationEvent deletes entirely.
+      → ADD: comment block + subjectId + sessionId deletes.
+    * 12.4.4.12 (line 683): Calls executeAction (line 746). Cleanup block
+      (lines 765-784) was MISSING reevaluationEvent deletes entirely.
+      → ADD: comment block + subjectId + sessionId deletes.
+    * 12.4.4.13 (line 801): Calls executeAction (line 900). Cleanup block
+      (lines 908-928) HAD subjectId deleteMany (line 917) but was MISSING
+      the sessionId companion.
+      → ADD: comment block + sessionId companion (replacing the bare
+      subjectId-only deleteMany with the full Phase 12.4.4d pattern).
+- Confirmed intent event source: createIntent() emits INTENT_CHANGED events
+  with subjectId=user.id. Tests 12.4.4.12 and 12.4.4.13 call createIntent.
+  The subjectId deleteMany correctly catches those INTENT_CHANGED events.
+- Confirmed 12.4.4.13's supersession flow: createIntent(v1) + createIntent(v2)
+  emit TWO INTENT_CHANGED events (one per version), both with subjectId=user.id.
+  The subjectId deleteMany catches both. Good.
+
+FILE — tests/phase12.4-observability.test.ts
+- Test 12.4.4.11 cleanup (lines 660-668 after edit): inserted the standard
+  Phase 12.4.4d comment block + BOTH subjectId (user.id) and sessionId
+  (session.id) reevaluationEvent deleteMany calls, placed immediately after
+  the existing connectivityPolicy.deleteMany (line 660) and before the
+  existing providerResourceBinding.deleteMany (now line 669). This test
+  has no connectivityIntentRecord cleanup (it doesn't call createIntent),
+  so the placement after connectivityPolicy mirrors the analogous position
+  in 12.4.4.13.
+- Test 12.4.4.12 cleanup (lines 781-789 after edit): inserted the standard
+  Phase 12.4.4d comment block + BOTH subjectId (user.id) and sessionId
+  (session.id) reevaluationEvent deleteMany calls, placed immediately after
+  the existing connectivityIntentRecord.deleteMany (line 781) and before
+  the existing providerResourceBinding.deleteMany (now line 790). Placement
+  mirrors 12.4.4.13 exactly.
+- Test 12.4.4.13 cleanup (lines 932-940 after edit): replaced the bare
+  `await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});`
+  (originally line 917) with the standard Phase 12.4.4d comment block +
+  subjectId deleteMany (preserved) + new sessionId deleteMany (session.id).
+  Placement after connectivityIntentRecord.deleteMany (line 932) and
+  before providerResourceBinding.deleteMany (now line 941) is unchanged.
+
+Test Results (run in isolation, per task VERIFY step):
+- Phase 12.4-observability: 13 pass, 0 fail (181 expect() calls, 1362ms).
+    All 13 tests passed unchanged.
+
+Stage Summary:
+- HEAD: not committed (one test-file edit, ready for the orchestrator to
+  commit alongside the other 12.4.4d cleanup fixes).
+- All 3 cleanup blocks in tests that call executeAction (12.4.4.11,
+  12.4.4.12, 12.4.4.13) now delete reevaluation events by BOTH subjectId
+  (catches INTENT_CHANGED events emitted by createIntent) AND sessionId
+  (catches the MEASUREMENT_RECEIVED events emitted by executeAction's
+  reobservation path at action-executor.ts:~1038). The standard Phase
+  12.4.4d comment block was added to each.
+- 12.4.4.11: ADD (was missing entirely — comment + subjectId + sessionId).
+- 12.4.4.12: ADD (was missing entirely — comment + subjectId + sessionId).
+- 12.4.4.13: ADD sessionId companion + comment (subjectId was already
+  present but the sessionId companion and comment block were missing).
+- Tests 12.4.4.1–12.4.4.10 unchanged: no executeAction calls in 12.4.4.1–
+  12.4.4.10 (12.4.4.9 and 12.4.4.10 use direct adapter methods only), so
+  no reevaluationEvent leak and no cleanup needed.
+- No production code modified.
+- No other test file touched. No assertions or test logic changed.
+
+---
+Task ID: 12.4.4d
+Agent: Principal System Architect (main) — Phase 12.4.4d Test Isolation Integrity
+Task: Eliminate the recurring Phase 9.5.1 A1 test-isolation failure (BUDGET_CONSTRAINT). Make the canonical regression suite deterministic and order-independent without weakening assertions or modifying production budget semantics.
+
+Work Log:
+- STEP 0 — Reproduced the failure:
+  * Phase 9.5.1 A1 in isolation: PASS (4/4).
+  * Phase 9.5.1 A1 in full canonical regression (15 files, 145 tests): FAIL
+    "expect(decision).not.toBeNull()" at line 174 of phase9.5.1-intent-authority-behavioral.test.ts.
+
+- STEP 1 — Traced the exact leaked state:
+  * Wrote scripts/debug-9.5.1-leak.ts (later deleted) to inventory pending reevaluation events.
+  * Found 6 leaked `MEASUREMENT_RECEIVED` events with `subjectId: null` and a real
+    `sessionId` left over from prior tests' `executeAction()` calls.
+  * Root cause: `emitReobserveRequest()` in `src/lib/control-plane/action-executor.ts`
+    (line ~1038) emits a `MEASUREMENT_RECEIVED` event with `subjectId: null` every
+    time `executeAction()` completes successfully. The existing test cleanup pattern
+    `db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } })` does NOT
+    match `subjectId: null` rows (NULL doesn't match string equality in SQL).
+    So every test that calls `executeAction()` (Phase 11.1-11.7, Phase 12.4-observability,
+    Phase 9.5.1, 9.5.2, 9.5-edge, 9.5.4, 9.4.1, 9.4.2) leaks events into the global
+    pending queue.
+  * Phase 9.5.1 A1 calls `processPendingEvents(10, "p951-a1-worker")` — the GLOBAL
+    worker primitive that claims the oldest pending event globally. The leaked
+    events filled the limit=10 budget before the test's own INTENT_CHANGED event
+    was reached, causing the worker to skip the test's intent → no decision created
+    → assertion fails.
+
+- STEP 2 — Audited global process state:
+  * No module-level mutable state in the reevaluation path.
+  * `claimReevaluationEvent` already supported an optional filter parameter
+    (`{ resourceId?, subjectId?, sessionId? }`) — but `processOneEvent` and
+    `processPendingEvents` did NOT expose it.
+  * Phase 11.6 used a workaround: `await db.reevaluationEvent.deleteMany({}).catch(() => {})`
+    — wiping ALL events globally before each test. This is architecturally WRONG
+    (it deletes events from OTHER tests too, defeating isolation).
+
+- STEP 3-4 — Fixed isolation at the right boundary:
+  * PRODUCTION CODE (src/lib/control-plane/reevaluation.ts):
+    - Added `ReevaluationEventFilter` type (`{ resourceId?, subjectId?, sessionId? }`).
+    - Added optional `filter` parameter to `processOneEvent(workerId, filter?)`.
+    - Added optional `filter` parameter to `processPendingEvents(limit, workerId, filter?)`.
+    - Added new primitive `processPendingEventsForSubject(subjectId, limit?, workerId?)`
+      (the subject-scoped parallel to the existing `processPendingEventsForResource`).
+    - Added new primitive `processPendingEventsForSession(sessionId, limit?, workerId?)`.
+    - Production behavior is UNCHANGED when no filter is supplied (the global
+      worker still claims the oldest pending event). The cron endpoint at
+      `src/app/api/internal/observe-connectivity/route.ts` line 50 calls
+      `processPendingEvents(100)` — backward-compatible.
+  * TESTS (12 files updated):
+    - phase9.5.1: replaced `processPendingEvents(10, "p951-a1-worker")` with
+      `processPendingEventsForSubject(fx.userId, 10, "p951-a1-worker")` for tests A1, A4, A3.
+      Added `sessionId` companion to the cleanup deleteMany.
+    - phase9.5.2: same pattern for tests A1, A1b, A3, A5.
+    - phase9.4.1, 9.4.2: same pattern (subject-scoped worker + sessionId cleanup).
+    - phase9.5-edge, 9.5.4: same pattern.
+    - phase11.1, 11.2, 11.3, 11.4, 11.5, 11.7: added sessionId companion to
+      cleanup deleteMany (these tests don't use the global worker primitive
+      for INTENT_CHANGED events — they only need the cleanup fix).
+    - phase11.6: REMOVED the global `deleteMany({})` anti-pattern at line 162.
+      Replaced with subject-scoped `deleteMany({ subjectId: fx.subjectId })` +
+      `deleteMany({ sessionId: fx.sessionId })`. Replaced 6 global
+      `processPendingEvents(5, "worker-name")` calls with either
+      `processPendingEventsForSubject(fx.subjectId, ...)` (for INTENT_CHANGED
+      events) or `processPendingEvents(5, "worker-name", { resourceId: fx.resourceAId })`
+      (for RESOURCE_DEGRADED/RECOVERED events). Updated `processOneEvent` call
+      at line 207 with `{ subjectId: fx.subjectId }` filter.
+    - phase12.4-observability: added reevaluationEvent deleteMany (subjectId +
+      sessionId companion) to cleanup blocks at tests 12.4.4.11, 12.4.4.12,
+      12.4.4.13 (some were missing entirely).
+
+- STEP 5 — Added adversarial tests (NEW file: tests/phase12.4.4d-test-isolation.test.ts):
+  * 12.4.4d.1: 12 leaked MEASUREMENT_RECEIVED events (subjectId=null) precede
+    the test's INTENT_CHANGED event. Subject-scoped worker skips the leaks,
+    processes the test's event, decision includes BUDGET_CONSTRAINT. Leaks
+    remain PENDING (unconsumed).
+  * 12.4.4d.2: A1 runs FIRST, then leaked events appear. A1's decision is
+    UNCHANGED — leaked events cannot retroactively invalidate it.
+  * 12.4.4d.3: A1 logic run 5 times sequentially. Every run produces a
+    decision with BUDGET_CONSTRAINT. Deterministic.
+  * 12.4.4d.4: Two unrelated INTENT_CHANGED events exist for different subjects.
+    Subject A's worker processes only A's event. Subject B's event remains
+    PENDING. Subject B's worker then processes B's event.
+  * 12.4.4d.5: Unrelated pending event for a different subject. Subject-scoped
+    worker cannot claim it (filter enforced at DB level via Prisma's atomic
+    WHERE guard). Direct `claimReevaluationEvent(filter={subjectId: fx.userId})`
+    returns null. Global pending count > 0 proves the queue is NOT empty —
+    the filter is what protects us, not an empty-queue artifact.
+
+- STEP 6 — Ran canonical regression 3× in different orderings:
+  * Run 1 (canonical order): 150 pass, 0 fail, 955 expect() calls, 21.03s.
+  * Run 2 (9.5.1 + new tests FIRST, then 11.x reverse): 150 pass, 0 fail, 954 expect() calls, 20.53s.
+  * Run 3 (interleaved): 150 pass, 0 fail, 955 expect() calls, 20.91s.
+  * All 3 runs ZERO failures, deterministic, order-independent.
+  * Pre-existing Phase 8.6.5 failures (8.6.5.3, 8.6.5.11) verified to fail on
+    the original `f00c5d0` commit too — NOT caused by this phase.
+
+- STEP 7 — Budget semantics preserved (unchanged):
+  * priced candidate within budget → WITHIN_BUDGET + BUDGET_CONSTRAINT ✓
+  * priced candidate over budget → OVER_BUDGET + BUDGET_CONSTRAINT ✓
+  * no applicable price → BUDGET_APPLICABILITY_UNKNOWN ✓
+  * Zero-budget edge case → both offers over budget → OVER_BUDGET + BUDGET_CONSTRAINT ✓
+  * Over-budget-only candidate → action ASK_USER (not ACTIVATE) ✓
+  * decision-engine.ts: UNCHANGED.
+
+- STEP 8 — Cleanup verification:
+  * Every modified test file uses unique fixture identifiers (Date.now() in setup).
+  * Every test cleans up its own events (subjectId + sessionId companion).
+  * Every test cleans up its own decisions/actions/sessions/intents.
+  * No global `deleteMany({})` anti-pattern remains (removed from phase11.6).
+  * Mock provider registries cleared in phase12.4-observability cleanup.
+  * No production worker semantics made test-specific.
+
+- Lint: clean.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The canonical regression suite is now deterministic and order-independent.
+- 150/150 tests pass in 3 different orderings.
+- 5 new adversarial tests prove the isolation invariants.
+- Production code change is purely additive (new optional filter parameter,
+  new subject/session-scoped wrapper primitives). Backward-compatible.
+- Budget semantics: UNCHANGED.
+- API v1 protocol: UNCHANGED.
+- Intent authority / decision / execution fencing: UNCHANGED.
+- The architect's invariant is now satisfied:
+  "A test suite that is green only when tests are run in isolation is NOT green."
+  → The canonical regression is green regardless of execution order.

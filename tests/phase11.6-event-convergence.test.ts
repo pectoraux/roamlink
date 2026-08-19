@@ -30,7 +30,7 @@ import { makeDecision } from "@/lib/control-plane/decision-engine";
 import { createAction, executeAction } from "@/lib/control-plane/action-executor";
 import { createOrUpdatePolicy } from "@/lib/control-plane/policy-engine";
 import { createIntent, isIntentExpired } from "@/lib/control-plane/intent-service";
-import { emitReevaluationEvent, processPendingEvents } from "@/lib/control-plane/reevaluation";
+import { emitReevaluationEvent, processPendingEvents, processPendingEventsForSubject, processOneEvent } from "@/lib/control-plane/reevaluation";
 import { ingestMeasurement } from "@/lib/control-plane/measurement-store";
 import { executeDecision } from "@/lib/control-plane/decision-executor";
 
@@ -109,7 +109,14 @@ async function setupFixture(): Promise<Fixture> {
     await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityMeasurement.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    // Phase 12.4.4d: Delete events for BOTH subject AND session.
+    // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+    // The session filter catches MEASUREMENT_RECEIVED events emitted by
+    // executeAction's reobservation path — those carry subjectId=null but a
+    // real sessionId, so a subjectId-only filter misses them and they leak
+    // into the global pending queue, breaking later tests' isolation.
     await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.resourceHealth.deleteMany({ where: { resourceId: { in: [resA.id, resB.id] } } }).catch(() => {});
     await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
     await db.connectivityPolicy.deleteMany({ where: { subjectId } }).catch(() => {});
@@ -156,10 +163,15 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     await resetToActiveOnA();
     await db.connectivityDecision.deleteMany({ where: { sessionId: fx.sessionId, intentId: { contains: "dup-1161" } } }).catch(() => {});
     await db.connectivityAction.deleteMany({ where: { sessionId: fx.sessionId, decisionId: null } }).catch(() => {});
-    // Clean up ALL pending events globally — processOneEvent claims the OLDEST
-    // pending event, and leftover MEASUREMENT_RECEIVED events from prior tests
-    // would be claimed first. We need OUR event to be the only one available.
-    await db.reevaluationEvent.deleteMany({}).catch(() => {});
+    // Phase 12.4.4d: Delete only OUR subject's events. The subject-scoped
+    // worker (processOneEvent with { subjectId }) below claims ONLY events
+    // for this subject, so leaked null-subject MEASUREMENT_RECEIVED events
+    // from other tests/sessions are skipped — no global wipe needed (a
+    // global wipe would delete OTHER tests' events, breaking isolation).
+    // The sessionId companion catches the MEASUREMENT_RECEIVED leak emitted
+    // by setupFixture's executeAction call (subjectId=null, sessionId=ours).
+    await db.reevaluationEvent.deleteMany({ where: { subjectId: fx.subjectId } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
 
     // Create a real active intent so the event can actually trigger a decision.
     const intent = await createIntent({
@@ -189,8 +201,10 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     expect(r1.eventId).toBe(r2.eventId);
 
     // Process through the worker — use the official processOneEvent entry point.
-    const { processOneEvent } = await import("@/lib/control-plane/reevaluation");
-    const result = await processOneEvent(`dup-1161-${Date.now()}`);
+    // Phase 12.4.4d: scope the claim to OUR subject so leaked events from
+    // other tests (subjectId=null MEASUREMENT_RECEIVED, or other subjects'
+    // INTENT_CHANGED) are skipped.
+    const result = await processOneEvent(`dup-1161-${Date.now()}`, { subjectId: fx.subjectId });
 
     // The event was processed (not null — an event was found and processed).
     expect(result).not.toBeNull();
@@ -214,6 +228,13 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     await db.connectivityDecision.deleteMany({ where: { intentId: intent.intentId } }).catch(() => {});
     await db.connectivityAction.deleteMany({ where: { sessionId: fx.sessionId, decisionId: null } }).catch(() => {});
     await db.reevaluationEvent.deleteMany({ where: { idempotencyKey } }).catch(() => {});
+    // Phase 12.4.4d: catch any leaked events emitted by this test's
+    // makeDecision/executeAction paths (subjectId=fx.subjectId for INTENT_CHANGED
+    // workers, resourceId=fx.resourceAId for resource-scoped workers, and
+    // sessionId=fx.sessionId for the executeAction reobservation leak).
+    await db.reevaluationEvent.deleteMany({ where: { subjectId: fx.subjectId } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
   }, 60_000);
 
   // =========================================================================
@@ -248,7 +269,7 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
       },
     });
 
-    await processPendingEvents(5, `ordering-test-${Date.now()}`);
+    await processPendingEventsForSubject(fx.subjectId, 5, `ordering-test-${Date.now()}`);
 
     // v1 decisions (if any) must be SKIPPED.
     const v1Decisions = await db.connectivityDecision.findMany({
@@ -270,6 +291,10 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     // Cleanup.
     await db.connectivityDecision.deleteMany({ where: { intentId: { in: [v1.intentId, v2.intentId] } } }).catch(() => {});
     await db.reevaluationEvent.deleteMany({ where: { subjectId: fx.subjectId, type: "INTENT_CHANGED" } }).catch(() => {});
+    // Phase 12.4.4d: also delete by resourceId + sessionId to catch any
+    // MEASUREMENT_RECEIVED leak from the worker's makeDecision path.
+    await db.reevaluationEvent.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
   }, 120_000);
 
   // =========================================================================
@@ -311,7 +336,7 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     });
     // Process through the worker. The worker reads CURRENT health (HEALTHY) →
     // decision should be KEEP (no action needed).
-    await processPendingEvents(5, `caseA-deg-${Date.now()}`);
+    await processPendingEvents(5, `caseA-deg-${Date.now()}`, { resourceId: fx.resourceAId });
 
     // The health is still HEALTHY — the event is a trigger, not authority.
     // The degraded event did NOT change the health (it's derived from measurements).
@@ -323,7 +348,7 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
       type: "RESOURCE_RECOVERED", resourceId: fx.resourceAId, sessionId: fx.sessionId,
       payload: { reason: "test-recovered-A", quality: 0.9 },
     });
-    await processPendingEvents(5, `caseA-rec-${Date.now()}`);
+    await processPendingEvents(5, `caseA-rec-${Date.now()}`, { resourceId: fx.resourceAId });
 
     // Still HEALTHY — no state change from either event.
     health = await db.resourceHealth.findUnique({ where: { resourceId: fx.resourceAId } });
@@ -338,7 +363,7 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
       type: "RESOURCE_RECOVERED", resourceId: fx.resourceAId, sessionId: fx.sessionId,
       payload: { reason: "test-recovered-B", quality: 0.9 },
     });
-    await processPendingEvents(5, `caseB-rec-${Date.now()}`);
+    await processPendingEvents(5, `caseB-rec-${Date.now()}`, { resourceId: fx.resourceAId });
 
     // Still HEALTHY — the event is a trigger, not authority.
     health = await db.resourceHealth.findUnique({ where: { resourceId: fx.resourceAId } });
@@ -349,7 +374,7 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
       type: "RESOURCE_DEGRADED", resourceId: fx.resourceAId, sessionId: fx.sessionId,
       payload: { reason: "test-degraded-B", quality: 0.1 },
     });
-    await processPendingEvents(5, `caseB-deg-${Date.now()}`);
+    await processPendingEvents(5, `caseB-deg-${Date.now()}`, { resourceId: fx.resourceAId });
 
     // STILL HEALTHY — the degraded event does NOT change the health snapshot.
     // The worker reads the current authoritative ResourceHealth (HEALTHY from
@@ -376,6 +401,12 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     await db.resourceHealth.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
     await db.reevaluationEvent.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: fx.sessionId, intentId: null } }).catch(() => {});
+    // Phase 12.4.4d: also delete by subjectId + sessionId to catch any
+    // INTENT_CHANGED (subjectId=fx.subjectId) or MEASUREMENT_RECEIVED leak
+    // (subjectId=null, sessionId=fx.sessionId) from the worker's makeDecision
+    // path or from setupFixture's executeAction call.
+    await db.reevaluationEvent.deleteMany({ where: { subjectId: fx.subjectId } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
   }, 120_000);
 
   // =========================================================================
@@ -426,7 +457,7 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     // 3. Process the event. The worker calls makeDecision, which reads the
     //    CURRENT ResourceHealth snapshot (HEALTHY). The decision should be
     //    KEEP (no action needed) — the stale event cannot resurrect degraded state.
-    await processPendingEvents(5, `stale-trigger-${Date.now()}`);
+    await processPendingEvents(5, `stale-trigger-${Date.now()}`, { resourceId: fx.resourceAId });
 
     // 4. Health is still HEALTHY.
     health = await db.resourceHealth.findUnique({ where: { resourceId: fx.resourceAId } });
@@ -451,6 +482,12 @@ describe("Phase 11.6 — Out-of-Order Event Convergence (DB-backed)", () => {
     await db.resourceHealth.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
     await db.reevaluationEvent.deleteMany({ where: { resourceId: fx.resourceAId } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: fx.sessionId, intentId: null } }).catch(() => {});
+    // Phase 12.4.4d: also delete by subjectId + sessionId to catch any
+    // INTENT_CHANGED (subjectId=fx.subjectId) or MEASUREMENT_RECEIVED leak
+    // (subjectId=null, sessionId=fx.sessionId) from the worker's makeDecision
+    // path or from setupFixture's executeAction call.
+    await db.reevaluationEvent.deleteMany({ where: { subjectId: fx.subjectId } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
   }, 60_000);
 
   // =========================================================================

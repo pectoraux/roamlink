@@ -658,6 +658,14 @@ describe("Phase 12.4.4 — Operational Observability", () => {
       await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
       await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
       await db.connectivityPolicy.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      // Phase 12.4.4d: Delete events for BOTH subject AND session.
+      // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+      // The session filter catches MEASUREMENT_RECEIVED events emitted by
+      // executeAction's reobservation path — those carry subjectId=null but a
+      // real sessionId, so a subjectId-only filter misses them and they leak
+      // into the global pending queue, breaking later tests' isolation.
+      await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
       await db.providerResourceBinding.deleteMany({ where: { entitlementId: ent.id } }).catch(() => {});
       await db.protocolResource.deleteMany({ where: { id: resA.id } }).catch(() => {});
       await db.protocolCapability.deleteMany({ where: { id: capA.id } }).catch(() => {});
@@ -771,6 +779,14 @@ describe("Phase 12.4.4 — Operational Observability", () => {
       await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
       await db.connectivityPolicy.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
       await db.connectivityIntentRecord.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      // Phase 12.4.4d: Delete events for BOTH subject AND session.
+      // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+      // The session filter catches MEASUREMENT_RECEIVED events emitted by
+      // executeAction's reobservation path — those carry subjectId=null but a
+      // real sessionId, so a subjectId-only filter misses them and they leak
+      // into the global pending queue, breaking later tests' isolation.
+      await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
       await db.providerResourceBinding.deleteMany({ where: { entitlementId: ent.id } }).catch(() => {});
       await db.protocolResource.deleteMany({ where: { id: resA.id } }).catch(() => {});
       await db.protocolCapability.deleteMany({ where: { id: capA.id } }).catch(() => {});
@@ -914,7 +930,14 @@ describe("Phase 12.4.4 — Operational Observability", () => {
       await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
       await db.connectivityPolicy.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
       await db.connectivityIntentRecord.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      // Phase 12.4.4d: Delete events for BOTH subject AND session.
+      // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+      // The session filter catches MEASUREMENT_RECEIVED events emitted by
+      // executeAction's reobservation path — those carry subjectId=null but a
+      // real sessionId, so a subjectId-only filter misses them and they leak
+      // into the global pending queue, breaking later tests' isolation.
       await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
       await db.providerResourceBinding.deleteMany({ where: { entitlementId: ent.id } }).catch(() => {});
       await db.protocolResource.deleteMany({ where: { id: resA.id } }).catch(() => {});
       await db.protocolCapability.deleteMany({ where: { id: capA.id } }).catch(() => {});

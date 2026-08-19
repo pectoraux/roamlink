@@ -22,7 +22,7 @@ import { makeDecision } from "@/lib/control-plane/decision-engine";
 import { createAction, executeAction } from "@/lib/control-plane/action-executor";
 import { createOrUpdatePolicy } from "@/lib/control-plane/policy-engine";
 import { createIntent, isIntentExpired } from "@/lib/control-plane/intent-service";
-import { processPendingEvents } from "@/lib/control-plane/reevaluation";
+import { processPendingEventsForSubject } from "@/lib/control-plane/reevaluation";
 import { executePendingDecisions } from "@/lib/control-plane/decision-executor";
 
 type Fixture = {
@@ -125,7 +125,14 @@ async function setupFixture(): Promise<Fixture> {
     await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityMeasurement.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    // Phase 12.4.4d: Delete events for BOTH the subject AND the session.
+    // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+    // The session filter catches MEASUREMENT_RECEIVED events emitted by
+    // executeAction's reobservation path — those carry subjectId=null but a
+    // real sessionId, so a subjectId-only filter misses them and they leak
+    // into the global pending queue, breaking later tests' isolation.
     await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.resourceHealth.deleteMany({ where: { resourceId: { in: [resA.id, resB.id] } } }).catch(() => {});
     await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
     await db.connectivityPolicy.deleteMany({ where: { subjectId } }).catch(() => {});
@@ -162,8 +169,14 @@ describe("Phase 9.5.1 — Intent Authority Behavioral Proof (DB-backed)", () => 
       maxPriceMinor: 500, // $5.00 budget
     });
 
-    // Process the INTENT_CHANGED event through the actual worker
-    await processPendingEvents(10, "p951-a1-worker");
+    // Phase 12.4.4d: Process the INTENT_CHANGED event through a SUBJECT-SCOPED
+    // worker. The global processPendingEvents(limit, workerId) primitive claims
+    // the oldest pending event globally — which would consume leaked events
+    // from prior tests' sessions (subjectId=null, foreign sessionId). Those
+    // leaked events would fill the limit=10 budget before this test's own
+    // INTENT_CHANGED event is reached, causing the assertion below to fail.
+    // The subject-scoped primitive claims ONLY events with subjectId = fx.userId.
+    await processPendingEventsForSubject(fx.userId, 10, "p951-a1-worker");
 
     // Find the decision created from this intent
     const decision = await db.connectivityDecision.findFirst({
@@ -228,8 +241,10 @@ describe("Phase 9.5.1 — Intent Authority Behavioral Proof (DB-backed)", () => 
       maxPriceMinor: 500, // $5.00 budget
     });
 
-    // Process the INTENT_CHANGED event through the worker
-    await processPendingEvents(10, "p951-a4-worker");
+    // Phase 12.4.4d: Subject-scoped worker — only process this test's own
+    // INTENT_CHANGED event. The global primitive would consume leaked events
+    // from prior tests' sessions first (subjectId=null, foreign sessionId).
+    await processPendingEventsForSubject(user.id, 10, "p951-a4-worker");
 
     const decision = await db.connectivityDecision.findFirst({
       where: { intentId: intent.intentId },
@@ -250,7 +265,12 @@ describe("Phase 9.5.1 — Intent Authority Behavioral Proof (DB-backed)", () => 
     await db.connectivityIntentRecord.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
     await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    // Phase 12.4.4d: Clean up events by BOTH subject and session.
+    // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+    // The session filter catches MEASUREMENT_RECEIVED events emitted by
+    // executeAction's reobservation path (subjectId=null, sessionId=session.id).
     await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
     await db.connectivityPolicy.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
     await db.connectivityEntitlement.deleteMany({ where: { id: ent.id } }).catch(() => {});
@@ -348,8 +368,10 @@ describe("Phase 9.5.1 — Intent Authority Behavioral Proof (DB-backed)", () => 
     expect(eventPayload.intentId).toBe(intent.intentId);
     expect(eventPayload.intentVersion).toBe(intent.version);
 
-    // Process the event through the ACTUAL worker (not direct makeDecision)
-    const evalResult = await processPendingEvents(10, "p951-a3-worker");
+    // Phase 12.4.4d: Subject-scoped worker — only process this test's own
+    // INTENT_CHANGED event for fx.userId. The global primitive would consume
+    // leaked events from prior tests first.
+    const evalResult = await processPendingEventsForSubject(fx.userId, 10, "p951-a3-worker");
     expect(evalResult.processed).toBeGreaterThan(0);
 
     // The worker should have created a decision that references the intent

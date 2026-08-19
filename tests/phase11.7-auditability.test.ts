@@ -106,7 +106,15 @@ async function setupFixture(): Promise<Fixture> {
     await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityMeasurement.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    // Phase 12.4.4d: Delete events for BOTH subject AND session.
+    // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+    // The session filter catches MEASUREMENT_RECEIVED events emitted by
+    // executeAction's reobservation path (setupFixture line 95, and the
+    // in-test executeDecision call at line 189) — those carry subjectId=null
+    // but a real sessionId, so a subjectId-only filter misses them and they
+    // leak into the global pending queue, breaking later tests' isolation.
     await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.resourceHealth.deleteMany({ where: { resourceId: { in: [resA.id, resB.id] } } }).catch(() => {});
     await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
     await db.connectivityPolicy.deleteMany({ where: { subjectId } }).catch(() => {});
@@ -284,5 +292,11 @@ describe("Phase 11.7 — End-to-End Auditability (DB-backed)", () => {
     // Cleanup.
     await db.connectivityDecision.deleteMany({ where: { id: decision.id } }).catch(() => {});
     await db.connectivityAction.deleteMany({ where: { sessionId: fx.sessionId, type: "SWITCH" } }).catch(() => {});
+    // Phase 12.4.4d: This test calls executeDecision (line 189), which calls
+    // executeAction's reobservation path → emits a MEASUREMENT_RECEIVED event
+    // with subjectId=null, sessionId=fx.sessionId. The subjectId-only cleanup
+    // in setupFixture cannot match it, so delete by sessionId here to keep
+    // later tests' pending reevaluation queue clean.
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
   }, 120_000);
 });

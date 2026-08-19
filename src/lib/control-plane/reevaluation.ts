@@ -510,11 +510,38 @@ export async function processClaimedEvent(event: ReevaluationEventRow, claimId: 
 // ---------------------------------------------------------------------------
 
 /**
+ * Filter for scoping a worker's claim to a specific subject/session/resource.
+ * Phase 12.4.4d: Test isolation requires that a worker processing INTENT_CHANGED
+ * events for a specific subject does not accidentally claim leaked events from
+ * other tests' sessions (which have subjectId=null but a foreign sessionId).
+ *
+ * The filter is forwarded to claimReevaluationEvent's atomic WHERE guard, so
+ * it is enforced at the DB level — not in application code.
+ */
+export type ReevaluationEventFilter = {
+  resourceId?: string;
+  subjectId?: string;
+  sessionId?: string;
+};
+
+/**
  * Claim and process a single event (one worker iteration). Returns null if no
  * event was available.
+ *
+ * Phase 12.4.4d: An optional filter scopes the claim to a specific subject,
+ * session, or resource. This is the same filter that claimReevaluationEvent
+ * already supported (Phase 8.6.5) — exposed here so that subject-scoped worker
+ * entry points can process only their own events without consuming unrelated
+ * leaked events from prior tests.
+ *
+ * Production behavior is unchanged when no filter is supplied (the global
+ * worker still claims the oldest pending event).
  */
-export async function processOneEvent(workerId: string): Promise<{ result: string; deadLettered: boolean; eventId: string } | null> {
-  const event = await claimReevaluationEvent(workerId);
+export async function processOneEvent(
+  workerId: string,
+  filter?: ReevaluationEventFilter,
+): Promise<{ result: string; deadLettered: boolean; eventId: string } | null> {
+  const event = await claimReevaluationEvent(workerId, filter);
   if (!event) return null;
 
   // The claimId was set on the row by claimReevaluationEvent; re-read it.
@@ -551,14 +578,61 @@ export async function processPendingEventsForResource(resourceId: string): Promi
 }
 
 /**
+ * Process pending re-evaluation events for a specific subject (subject-scoped
+ * worker entry point).
+ *
+ * Phase 12.4.4d: The subject is the natural ownership boundary for INTENT_CHANGED
+ * events — every INTENT_CHANGED event carries a subjectId, and a worker that
+ * processes events for a specific subject should not consume leaked events
+ * from other tests' sessions (which may have subjectId=null). This is the
+ * subject-scoped parallel to processPendingEventsForResource.
+ *
+ * Production usage: the decision-loop cron for a specific subject's intent
+ * re-evaluation. Test usage: isolation between test fixtures that each create
+ * their own subject.
+ */
+export async function processPendingEventsForSubject(
+  subjectId: string,
+  limit = 50,
+  workerId = `worker-subject-${Date.now()}`,
+): Promise<{ processed: number; results: Record<string, number> }> {
+  return processPendingEvents(limit, workerId, { subjectId });
+}
+
+/**
+ * Process pending re-evaluation events for a specific session (session-scoped
+ * worker entry point).
+ *
+ * Phase 12.4.4d: The session is the natural ownership boundary for
+ * MEASUREMENT_RECEIVED events emitted by executeAction's reobservation path —
+ * those events carry subjectId=null but a real sessionId. A session-scoped
+ * worker processes only those events.
+ */
+export async function processPendingEventsForSession(
+  sessionId: string,
+  limit = 50,
+  workerId = `worker-session-${Date.now()}`,
+): Promise<{ processed: number; results: Record<string, number> }> {
+  return processPendingEvents(limit, workerId, { sessionId });
+}
+
+/**
  * Process all pending re-evaluation events (worker entry point). Claims +
  * evaluates events, leaving non-KEEP decisions PENDING for the decision-executor.
+ *
+ * Phase 12.4.4d: An optional filter scopes the worker to a specific subject,
+ * session, or resource. When no filter is supplied, the worker claims the
+ * oldest pending event globally (unchanged production behavior).
  */
-export async function processPendingEvents(limit = 50, workerId = `worker-${Date.now()}`): Promise<{ processed: number; results: Record<string, number> }> {
+export async function processPendingEvents(
+  limit = 50,
+  workerId = `worker-${Date.now()}`,
+  filter?: ReevaluationEventFilter,
+): Promise<{ processed: number; results: Record<string, number> }> {
   const results: Record<string, number> = {};
   let processed = 0;
   for (let i = 0; i < limit; i++) {
-    const res = await processOneEvent(workerId);
+    const res = await processOneEvent(workerId, filter);
     if (!res) break;
     results[res.result] = (results[res.result] ?? 0) + 1;
     processed++;

@@ -32,7 +32,7 @@ import {
   type ReasonCode,
 } from "@roamlink/shared";
 import { createIntent } from "@/lib/control-plane/intent-service";
-import { processPendingEvents } from "@/lib/control-plane/reevaluation";
+import { processPendingEventsForSubject } from "@/lib/control-plane/reevaluation";
 
 type Fixture = {
   userId: string;
@@ -92,7 +92,15 @@ async function setupFixture(): Promise<Fixture> {
     await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityMeasurement.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    // Phase 12.4.4d: Delete events for BOTH subject AND session.
+    // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+    // The session filter catches MEASUREMENT_RECEIVED events emitted by
+    // executeAction's reobservation path — those carry subjectId=null but a
+    // real sessionId, so a subjectId-only filter misses them and they leak
+    // into the global pending queue, breaking later tests' isolation.
+    // (Leak source: setupFixture line 88 calls executeAction(action.id).)
     await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.resourceHealth.deleteMany({ where: { resourceId: resA.id } }).catch(() => {});
     await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
     await db.connectivityPolicy.deleteMany({ where: { subjectId } }).catch(() => {});
@@ -146,7 +154,10 @@ describe("Phase 9.5.4 — Canonical Reason-Code Protocol Contract (DB-backed)", 
       mode: "AUTOMATIC",
     });
 
-    await processPendingEvents(10, "p954-b-worker");
+    // Phase 12.4.4d: subject-scoped worker — claim only events for fx.userId
+    // so leaked global MEASUREMENT_RECEIVED events (subjectId=null) from prior
+    // tests can no longer fill the limit=10 budget before our INTENT_CHANGED.
+    await processPendingEventsForSubject(fx.userId, 10, "p954-b-worker");
 
     const decision = await db.connectivityDecision.findFirst({
       where: { intentId: intent.intentId },

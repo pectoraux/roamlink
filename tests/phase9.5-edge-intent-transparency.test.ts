@@ -19,7 +19,7 @@ import { makeDecision } from "@/lib/control-plane/decision-engine";
 import { createAction, executeAction } from "@/lib/control-plane/action-executor";
 import { createOrUpdatePolicy } from "@/lib/control-plane/policy-engine";
 import { createIntent } from "@/lib/control-plane/intent-service";
-import { processPendingEvents } from "@/lib/control-plane/reevaluation";
+import { processPendingEventsForSubject } from "@/lib/control-plane/reevaluation";
 import { getCurrentConnectivityForUser } from "@/lib/control-plane/current-connectivity";
 
 type Fixture = {
@@ -87,7 +87,15 @@ async function setupFixture(): Promise<Fixture> {
     await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityMeasurement.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    // Phase 12.4.4d: Delete events for BOTH subject AND session.
+    // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+    // The session filter catches MEASUREMENT_RECEIVED events emitted by
+    // executeAction's reobservation path — those carry subjectId=null but a
+    // real sessionId, so a subjectId-only filter misses them and they leak
+    // into the global pending queue, breaking later tests' isolation.
+    // (Leak source: setupFixture line 83 calls executeAction(action.id).)
     await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.resourceHealth.deleteMany({ where: { resourceId: { in: [resA.id, resB.id] } } }).catch(() => {});
     await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
     await db.connectivityPolicy.deleteMany({ where: { subjectId } }).catch(() => {});
@@ -166,7 +174,10 @@ describe("Phase 9.5 — Edge Intent & Operational Transparency (DB-backed)", () 
 
     // Process the INTENT_CHANGED event — the worker should resolve
     // budget.maxMinor from the intent payload and pass it to makeDecision
-    await processPendingEvents(10, "p95-r2-worker");
+    // Phase 12.4.4d: subject-scoped worker — claim only events for fx.userId
+    // so leaked global MEASUREMENT_RECEIVED events (subjectId=null) from prior
+    // tests can no longer fill the limit=10 budget before our INTENT_CHANGED.
+    await processPendingEventsForSubject(fx.userId, 10, "p95-r2-worker");
 
     // The decision should exist and reference the intent
     const decision = await db.connectivityDecision.findFirst({

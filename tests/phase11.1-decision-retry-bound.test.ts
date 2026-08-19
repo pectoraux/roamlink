@@ -126,7 +126,14 @@ async function setupFixture(): Promise<Fixture> {
     await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityMeasurement.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    // Phase 12.4.4d: Delete events for BOTH subject AND session.
+    // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+    // The session filter catches MEASUREMENT_RECEIVED events emitted by
+    // executeAction's reobservation path — those carry subjectId=null but a
+    // real sessionId, so a subjectId-only filter misses them and they leak
+    // into the global pending queue, breaking later tests' isolation.
     await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.resourceHealth.deleteMany({ where: { resourceId: { in: [resA.id, resB.id] } } }).catch(() => {});
     await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
     await db.connectivityPolicy.deleteMany({ where: { subjectId } }).catch(() => {});
@@ -276,6 +283,9 @@ describe("Phase 11.1 — Decision Retry Bound (DB-backed)", () => {
 
     // Cleanup
     await db.connectivityDecision.delete({ where: { id: decision.id } }).catch(() => {});
+    // Phase 12.4.4d: also delete reevaluationEvents leaked by executeDecision
+    // (subjectId=null, sessionId=<real>) so they don't pollute the global queue.
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
   }, 120_000);
 
   // =========================================================================
@@ -379,6 +389,9 @@ describe("Phase 11.1 — Decision Retry Bound (DB-backed)", () => {
 
     // Cleanup
     await db.connectivityDecision.deleteMany({ where: { id: { in: [reclaimDecision.id, deadLetterDecision.id] } } }).catch(() => {});
+    // Phase 12.4.4d: also delete reevaluationEvents leaked by executeDecision
+    // (subjectId=null, sessionId=<real>) so they don't pollute the global queue.
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
   }, 60_000);
 
   // =========================================================================
@@ -447,6 +460,9 @@ describe("Phase 11.1 — Decision Retry Bound (DB-backed)", () => {
 
     // Cleanup
     await db.connectivityDecision.delete({ where: { id: decision.id } }).catch(() => {});
+    // Phase 12.4.4d: also delete reevaluationEvents leaked by executeDecision
+    // (subjectId=null, sessionId=<real>) so they don't pollute the global queue.
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
   }, 60_000);
 
   // =========================================================================
@@ -516,6 +532,9 @@ describe("Phase 11.1 — Decision Retry Bound (DB-backed)", () => {
 
     // Cleanup
     await db.connectivityDecision.delete({ where: { id: decision.id } }).catch(() => {});
+    // Phase 12.4.4d: also delete reevaluationEvents leaked by executeDecision
+    // (subjectId=null, sessionId=<real>) so they don't pollute the global queue.
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
   }, 60_000);
 
   // =========================================================================
@@ -617,5 +636,8 @@ describe("Phase 11.1 — Decision Retry Bound (DB-backed)", () => {
 
     // Cleanup
     await db.connectivityDecision.delete({ where: { id: decision.id } }).catch(() => {});
+    // Phase 12.4.4d: also delete reevaluationEvents leaked by executeDecision
+    // (subjectId=null, sessionId=<real>) so they don't pollute the global queue.
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: fx.sessionId } }).catch(() => {});
   }, 60_000);
 });

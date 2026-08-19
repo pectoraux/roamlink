@@ -30,7 +30,7 @@ import {
   isIntentExpired,
   emitIntentReevaluationEvent,
 } from "@/lib/control-plane/intent-service";
-import { processPendingEvents } from "@/lib/control-plane/reevaluation";
+import { processPendingEventsForSubject } from "@/lib/control-plane/reevaluation";
 import { executePendingDecisions } from "@/lib/control-plane/decision-executor";
 
 type Fixture = {
@@ -98,8 +98,14 @@ async function setupFixture(): Promise<Fixture> {
     await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityMeasurement.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
-    await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    // Phase 12.4.4d: Delete events for BOTH subject AND session.
+    // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+    // The session filter catches MEASUREMENT_RECEIVED events emitted by
+    // executeAction's reobservation path — those carry subjectId=null but a
+    // real sessionId, so a subjectId-only filter misses them and they leak
+    // into the global pending queue, breaking later tests' isolation.
     await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.resourceHealth.deleteMany({ where: { resourceId: { in: [resA.id, resB.id] } } }).catch(() => {});
     await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
     await db.connectivityPolicy.deleteMany({ where: { subjectId } }).catch(() => {});
@@ -270,7 +276,7 @@ describe("Phase 9.4.1 — Intent Control-Loop Closure (DB-backed)", () => {
     expect(payload.intentVersion).toBe(intent.version);
 
     // 3. Process pending events (the reevaluation worker)
-    const evalResult = await processPendingEvents(10, "p941-e2e-worker");
+    const evalResult = await processPendingEventsForSubject(fx.userId, 10, "p941-e2e-worker");
     expect(evalResult.processed).toBeGreaterThan(0);
 
     // 4. Verify the resulting decision references the intent (from the event payload)

@@ -24,7 +24,7 @@ import { makeDecision } from "@/lib/control-plane/decision-engine";
 import { createAction, executeAction } from "@/lib/control-plane/action-executor";
 import { createOrUpdatePolicy } from "@/lib/control-plane/policy-engine";
 import { createIntent, isIntentExpired } from "@/lib/control-plane/intent-service";
-import { processPendingEvents } from "@/lib/control-plane/reevaluation";
+import { processPendingEventsForSubject } from "@/lib/control-plane/reevaluation";
 
 type Fixture = {
   userId: string;
@@ -138,7 +138,12 @@ async function setupFixture(): Promise<Fixture> {
     await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.connectivityMeasurement.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    // Phase 12.4.4d: Delete events for BOTH subject AND session.
+    // The subject filter catches INTENT_CHANGED events (subjectId = user.id).
+    // The session filter catches MEASUREMENT_RECEIVED events emitted by
+    // executeAction's reobservation path (subjectId=null, sessionId=session.id).
     await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
     await db.resourceHealth.deleteMany({ where: { resourceId: { in: [resA.id, resB.id, resC.id] } } }).catch(() => {});
     await db.connectivityOffer2.deleteMany({ where: { id: { in: [offerA.id, offerB.id] } } }).catch(() => {});
     await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
@@ -172,8 +177,10 @@ describe("Phase 9.5.2 — Budget Behavioral Proof + Orphaned Claim Recovery (DB-
       maxPriceMinor: 500,
     });
 
-    // Process the INTENT_CHANGED event through the actual worker
-    await processPendingEvents(10, "p952-a1-worker");
+    // Phase 12.4.4d: Subject-scoped worker — only process this test's own
+    // INTENT_CHANGED event. The global primitive would consume leaked events
+    // from prior tests' sessions first (subjectId=null, foreign sessionId).
+    await processPendingEventsForSubject(fx.userId, 10, "p952-a1-worker");
 
     // Find the decision
     const decision = await db.connectivityDecision.findFirst({
@@ -221,8 +228,8 @@ describe("Phase 9.5.2 — Budget Behavioral Proof + Orphaned Claim Recovery (DB-
         maxPriceMinor: 500,
       });
 
-      // Process the INTENT_CHANGED event through the worker
-      await processPendingEvents(10, "p952b-worker");
+      // Phase 12.4.4d: Subject-scoped worker.
+      await processPendingEventsForSubject(noOfferUser.id, 10, "p952b-worker");
 
       // Find the decision — it should have BUDGET_APPLICABILITY_UNKNOWN
       const decision = await db.connectivityDecision.findFirst({
@@ -302,7 +309,8 @@ describe("Phase 9.5.2 — Budget Behavioral Proof + Orphaned Claim Recovery (DB-
     });
     expect(event).not.toBeNull();
 
-    await processPendingEvents(10, "p952-a3-worker");
+    // Phase 12.4.4d: Subject-scoped worker.
+    await processPendingEventsForSubject(fx.userId, 10, "p952-a3-worker");
 
     const decision = await db.connectivityDecision.findFirst({
       where: { intentId: intent.intentId, intentVersion: intent.version },
@@ -380,7 +388,8 @@ describe("Phase 9.5.2 — Budget Behavioral Proof + Orphaned Claim Recovery (DB-
         maxPriceMinor: 500,
       });
 
-      await processPendingEvents(10, "p955-a5-worker");
+      // Phase 12.4.4d: Subject-scoped worker.
+      await processPendingEventsForSubject(overBudgetUser.id, 10, "p955-a5-worker");
 
       const decision = await db.connectivityDecision.findFirst({
         where: { intentId: intent.intentId },
