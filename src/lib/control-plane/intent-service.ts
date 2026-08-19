@@ -180,6 +180,9 @@ export async function createIntent(input: CreateIntentInput): Promise<IntentResu
     source: input.source,
     deviceId: input.deviceId,
     idempotencyKey: input.idempotencyKey,
+    // Phase 12.4.4c: Pass causality provenance through to the new version.
+    sourceRequestId: input.sourceRequestId,
+    sourceChannel: input.sourceChannel,
   });
 }
 
@@ -197,6 +200,9 @@ async function supersedeIntent(input: {
   source?: string;
   deviceId?: string;
   idempotencyKey?: string;
+  // Phase 12.4.4c: Causality provenance for the new version.
+  sourceRequestId?: string;
+  sourceChannel?: string;
 }): Promise<IntentResult> {
   // P1-4: Idempotency check
   if (input.idempotencyKey) {
@@ -279,6 +285,9 @@ async function supersedeIntent(input: {
           priority: input.priority ?? "NORMAL",
           source: input.source ?? "USER",
           idempotencyKey: input.idempotencyKey ?? null,
+          // Phase 12.4.4c: Persist causality provenance on the new version.
+          sourceRequestId: input.sourceRequestId ?? null,
+          sourceChannel: input.sourceChannel ?? null,
         },
       });
 
