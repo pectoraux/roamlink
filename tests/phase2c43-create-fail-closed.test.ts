@@ -346,4 +346,161 @@ describe("Phase 2C.4.3 — RouterOS Create Fail-Closed", () => {
     expect(source).toContain("Unknown external state");
     expect(source).toContain("Only confirmed absence permits creation");
   }, 10000);
+
+  // -------------------------------------------------------------------------
+  // Phase 12.4.2a.15 — Uncertain PUT + failed reconciliation GET → NO second PUT
+  //
+  // The architect's P0 finding: after an ambiguous PUT outcome (TIMEOUT),
+  // if the reconciliation GET itself fails, the client MUST NOT issue a
+  // second PUT. The external outcome is still unknown — the provider may
+  // have created the resource despite the ambiguous response. A second PUT
+  // could create a duplicate.
+  //
+  // The safe state machine:
+  //   PUT → TIMEOUT
+  //     → reconciliation GET
+  //       ├─ found → converge
+  //       ├─ authoritative 404 → retry PUT (safe)
+  //       └─ GET fails (TIMEOUT/RETRYABLE) → FAIL CLOSED (no second PUT)
+  // -------------------------------------------------------------------------
+  it("12.4.2a.15: PUT timeout + reconciliation GET also fails → NO second PUT, RECONCILIATION_REQUIRED", async () => {
+    const transport = new MockRouterOSTransport();
+
+    // Step 1: Initial GET (lookup) returns empty (resource absent).
+    // Step 2: PUT fails with TIMEOUT.
+    // Step 3: Reconciliation GET also fails with TIMEOUT.
+    // The client must NOT issue a second PUT.
+
+    let putCount = 0;
+    let getCount = 0;
+
+    // Wrap the transport to count operations and control failures.
+    const originalRequest = transport.request.bind(transport);
+
+    // Phase 1: initial GET → empty (absent), PUT → TIMEOUT, reconciliation GET → TIMEOUT
+    let phase: "initial-get" | "put" | "reconcile-get" | "done" = "initial-get";
+
+    transport.request = async (input: any) => {
+      if (input.method === "GET" && input.path.includes("?name=")) {
+        getCount++;
+        if (phase === "initial-get") {
+          phase = "put";
+          return []; // resource absent — proceed to PUT
+        }
+        if (phase === "reconcile-get") {
+          // Reconciliation GET fails with TIMEOUT
+          throw new MikroTikProviderError("TIMEOUT", "Simulated reconciliation GET timeout");
+        }
+        return [];
+      }
+      if (input.method === "PUT") {
+        putCount++;
+        if (phase === "put") {
+          phase = "reconcile-get";
+          throw new MikroTikProviderError("TIMEOUT", "Simulated PUT timeout");
+        }
+        // Any subsequent PUT should not happen
+        throw new Error("UNEXPECTED: second PUT was issued after failed reconciliation GET");
+      }
+      return originalRequest(input);
+    };
+
+    const client = new RouterOSProviderClient(transport, "test-instance");
+
+    // The createResource call should throw (not succeed, not retry PUT).
+    let caughtError: unknown = null;
+    try {
+      await client.createResource({
+        resourceType: "hotspot_user",
+        username: "test-uncertain-create-15",
+        password: "password123",
+        downloadRateLimitBps: 50_000_000,
+        uploadRateLimitBps: 10_000_000,
+      });
+    } catch (err) {
+      caughtError = err;
+    }
+
+    // Assert: an error was thrown (not a successful return).
+    expect(caughtError).not.toBeNull();
+    expect(caughtError).toBeInstanceOf(MikroTikProviderError);
+
+    // Assert: the error is RETRYABLE (not PERMANENT) — the external outcome
+    // is unknown, so the caller should escalate to RECONCILIATION_REQUIRED.
+    const error = caughtError as MikroTikProviderError;
+    expect(error.errorType === "RETRYABLE" || error.errorType === "TIMEOUT").toBe(true);
+
+    // Assert: exactly ONE PUT was issued (the initial attempt).
+    // NO second PUT was issued after the failed reconciliation GET.
+    expect(putCount).toBe(1);
+
+    // Assert: exactly TWO GETs were issued (initial lookup + reconciliation).
+    expect(getCount).toBe(2);
+  }, 30_000);
+
+  // -------------------------------------------------------------------------
+  // Phase 12.4.2a.16 — Uncertain PUT + authoritative 404 → one retry PUT allowed
+  //
+  // The complementary proof: if the reconciliation GET returns an authoritative
+  // 404 / empty result (NOT a transport failure), the resource genuinely does
+  // not exist, and a single retry PUT is safe.
+  // -------------------------------------------------------------------------
+  it("12.4.2a.16: PUT timeout + authoritative 404 → one retry PUT allowed, succeeds", async () => {
+    const transport = new MockRouterOSTransport();
+
+    let putCount = 0;
+
+    // Phase 1: initial GET → empty, PUT → TIMEOUT, reconciliation GET → empty (authoritative 404),
+    // retry PUT → success.
+    let phase: "initial-get" | "put" | "reconcile-get" | "retry-put" = "initial-get";
+
+    const originalRequest = transport.request.bind(transport);
+    transport.request = async (input: any) => {
+      if (input.method === "GET" && input.path.includes("?name=")) {
+        if (phase === "initial-get") {
+          phase = "put";
+          return []; // resource absent
+        }
+        if (phase === "reconcile-get") {
+          phase = "retry-put";
+          return []; // authoritative 404 — resource genuinely absent
+        }
+        return [];
+      }
+      if (input.method === "PUT") {
+        putCount++;
+        if (phase === "put") {
+          phase = "reconcile-get";
+          throw new MikroTikProviderError("TIMEOUT", "Simulated PUT timeout");
+        }
+        if (phase === "retry-put") {
+          // Retry PUT succeeds — use the original transport to create the resource.
+          return originalRequest(input);
+        }
+      }
+      return originalRequest(input);
+    };
+
+    const client = new RouterOSProviderClient(transport, "test-instance");
+
+    const result = await client.createResource({
+      resourceType: "hotspot_user",
+      username: "test-uncertain-create-16",
+      password: "password123",
+      downloadRateLimitBps: 50_000_000,
+      uploadRateLimitBps: 10_000_000,
+    });
+
+    // Assert: the create succeeded (returned a resource).
+    expect(result).toBeDefined();
+    expect(result.username).toBe("test-uncertain-create-16");
+
+    // Assert: exactly TWO PUTs were issued (initial + retry).
+    expect(putCount).toBe(2);
+
+    // Assert: exactly ONE resource exists at the provider (no duplicate).
+    const resources = Array.from(transport.resources.values());
+    const matching = resources.filter((r) => r.name === "test-uncertain-create-16");
+    expect(matching.length).toBe(1);
+  }, 30_000);
 });

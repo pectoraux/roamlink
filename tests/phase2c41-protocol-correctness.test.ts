@@ -322,7 +322,10 @@ describe("Phase 2C.4.1 — RouterOS Protocol Correctness + Client Cache Safety",
     expect(source).toContain("create_uncertain");
     expect(source).toContain("reconcile");
     expect(source).toContain("getResourceByUsername");
-    expect(source).toContain("create_retry_after_reconcile");
+    expect(source).toContain("create_retry_after_authoritative_reconcile");
+    // Phase 12.4.2a.1: verify the fail-closed path for failed reconciliation GET
+    expect(source).toContain("create_reconcile_failed_closed");
+    expect(source).toContain("refusing to retry create");
   }, 10000);
 
   it("Static: transport supports PUT method", async () => {

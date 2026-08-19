@@ -197,6 +197,19 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
 
       // Phase 2C.4.1: Don't blindly retry create on timeout/network error.
       // Instead, reconcile: check if the resource was actually created.
+      //
+      // Phase 12.4.2a.1: After an ambiguous PUT outcome, the reconciliation GET
+      // MUST be authoritative. If the GET itself fails with TIMEOUT/RETRYABLE,
+      // the client MUST NOT issue a second PUT — the external outcome is still
+      // unknown, and a second PUT could create a duplicate resource.
+      //
+      // The safe state machine:
+      //   PUT → TIMEOUT/RETRYABLE
+      //     → reconciliation GET
+      //       ├─ found → converge (return existing resource)
+      //       ├─ authoritative 404/empty → retry PUT (resource genuinely absent)
+      //       └─ GET fails (TIMEOUT/RETRYABLE) → FAIL CLOSED (no second PUT)
+      //         → throw RETRYABLE → caller escalates to RECONCILIATION_REQUIRED
       if (err instanceof MikroTikProviderError && (err.errorType === "TIMEOUT" || err.errorType === "RETRYABLE")) {
         logger.warn("routeros.create_uncertain", {
           username: config.username, instance: this.instanceLabel,
@@ -204,8 +217,34 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
           message: "Create request had uncertain outcome — reconciling via GET before retry.",
         });
 
-        // Reconcile: check if the resource was created despite the error
-        const reconciled = await this.getResourceByUsername(config.username);
+        // Reconcile: check if the resource was created despite the error.
+        // Phase 12.4.2a.1: If the reconciliation GET itself fails, we MUST NOT
+        // issue a second PUT — the external outcome is still unknown. A failed
+        // GET is NOT evidence that the resource is absent.
+        let reconciled: MikroTikResource | null;
+        try {
+          reconciled = await this.getResourceByUsername(config.username);
+        } catch (reconcileErr) {
+          // The reconciliation GET failed — we CANNOT determine whether the
+          // resource was created. Fail closed: do NOT retry the PUT.
+          logger.error("routeros.create_reconcile_failed_closed", {
+            username: config.username, instance: this.instanceLabel,
+            originalError: err.message,
+            reconcileError: reconcileErr instanceof Error ? reconcileErr.message : String(reconcileErr),
+            message: "CRITICAL: Reconciliation GET failed after uncertain PUT — refusing to retry create. External outcome is UNKNOWN.",
+          });
+          // Re-throw as RETRYABLE so the caller escalates to RECONCILIATION_REQUIRED.
+          // The external outcome is unknown — the provider may have created the
+          // resource despite the ambiguous response.
+          if (reconcileErr instanceof MikroTikProviderError) {
+            throw reconcileErr;
+          }
+          throw new MikroTikProviderError(
+            "RETRYABLE",
+            `Create had uncertain outcome AND reconciliation GET failed — external state is UNKNOWN: ${reconcileErr instanceof Error ? reconcileErr.message : String(reconcileErr)}`,
+          );
+        }
+
         if (reconciled) {
           logger.info("routeros.create_reconciled", {
             username: config.username, instance: this.instanceLabel,
@@ -214,9 +253,12 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
           return reconciled;
         }
 
-        // Resource doesn't exist — safe to retry create
-        logger.info("routeros.create_retry_after_reconcile", {
+        // Phase 12.4.2a.1: The reconciliation GET was authoritative (returned
+        // a definitive 404 / empty result, NOT a transport failure). The
+        // resource genuinely does not exist. Safe to retry create.
+        logger.info("routeros.create_retry_after_authoritative_reconcile", {
           username: config.username, instance: this.instanceLabel,
+          message: "Reconciliation GET was authoritative (404/empty) — safe to retry create.",
         });
         const created = await this.transport.request<Record<string, unknown>>({
           method: "PUT",
