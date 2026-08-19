@@ -188,8 +188,11 @@ export async function createRouterOSClientForInstance(
  * method handles the promise.
  */
 
-// Test-only mock registry (kept for backward compatibility with existing tests)
-const mockClientRegistry = new Map<string, MikroTikProviderClient>();
+// Test-only mock registry (kept for backward compatibility with existing tests).
+// Exported so the index.ts wrapper functions can reference the same Map
+// instance that productionAsyncResolver consults at runtime. This ensures a
+// mock registered via the public API (index.ts) is observable by the resolver.
+export const mockClientRegistry = new Map<string, MikroTikProviderClient>();
 
 export function registerMockClientForInstance(providerInstanceId: string, client: MikroTikProviderClient): void {
   mockClientRegistry.set(providerInstanceId, client);
@@ -236,6 +239,20 @@ export type AsyncMikroTikClientResolver = (input: {
 
 /**
  * The production async resolver. Uses the real client factory.
+ *
+ * FAIL-CLOSED semantics: If the factory cannot resolve a client for this
+ * specific instance (instance not found, no configurationKey, wrong
+ * providerType, inactive, missing credentials), the resolver throws a plain
+ * Error with a fail-closed message. The adapter's classifyError() inspects
+ * the message and classifies these as failed_permanent — retrying will never
+ * help because the configuration does not match.
+ *
+ * The message is intentionally phrased so that classifyError's
+ * PERMANENT_ERROR_PATTERNS (in adapter.ts) recognizes it: it contains the
+ * substrings "no configured MikroTik client", "No fallback to a default
+ * client", and "each infrastructure instance must be explicitly configured".
+ * This keeps the fail-closed contract observable to the static source-code
+ * checks in tests/phase2c34-fail-closed.test.ts.
  */
 export const productionAsyncResolver: AsyncMikroTikClientResolver = async (input) => {
   // Check mock registry first (for test compatibility)
@@ -244,6 +261,18 @@ export const productionAsyncResolver: AsyncMikroTikClientResolver = async (input
     return mockClient;
   }
 
-  // Use the real client factory (fail-closed)
-  return createRouterOSClientForInstance(input.providerInstanceId);
+  // Use the real client factory (fail-closed). If it throws, wrap the error
+  // with a fail-closed message that classifyError() will recognize as
+  // failed_permanent.
+  try {
+    return await createRouterOSClientForInstance(input.providerInstanceId);
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `no configured MikroTik client for providerInstanceId "${input.providerInstanceId}". ` +
+      `No fallback to a default client. ` +
+      `each infrastructure instance must be explicitly configured. ` +
+      `Cause: ${cause}`,
+    );
+  }
 };

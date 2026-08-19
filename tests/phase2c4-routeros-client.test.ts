@@ -251,8 +251,10 @@ describe("Phase 2C.4 — Real RouterOS Client", () => {
     expect(p2.status).toBe("success");
     expect(p2.providerResourceId).toBe(p1.providerResourceId);
 
-    // Only one POST (create) should have been made
-    const creates = transport.operationLog.filter((o) => o.method === "POST");
+    // Only one PUT (create) should have been made — the second provision is idempotent
+    // (it goes through getResource and finds the existing resource, no PUT).
+    // (Phase 2C.4.1 protocol: PUT = create per RouterOS REST CRUD convention.)
+    const creates = transport.operationLog.filter((o) => o.method === "PUT");
     expect(creates.length).toBe(1);
 
     clearMockClientRegistry();

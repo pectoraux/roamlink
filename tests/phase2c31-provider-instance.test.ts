@@ -265,10 +265,13 @@ describe("Phase 2C.3.1 — Provider Instance + Client Injection", () => {
     expect(importSource).not.toContain("mock-client");
   }, 10000);
 
-  it("Static: adapter constructor requires a client parameter (no default)", async () => {
+  it("Static: adapter constructor requires a client/resolver parameter (no default)", async () => {
     const fs = await import("fs");
     const source = fs.readFileSync("src/lib/connectivity/providers/mikrotik/adapter.ts", "utf-8");
-    expect(source).toContain("constructor(private readonly client: MikroTikProviderClient)");
+    // Phase 2C.3.3+: the constructor accepts a resolver (sync or async) OR a
+    // plain MikroTikProviderClient (backward compat with 2C.3.1 tests).
+    // The parameter must NOT have a default value — there is no default client.
+    expect(source).toContain("clientResolver: MikroTikClientResolver | AsyncMikroTikClientResolver | MikroTikProviderClient");
     // Must NOT have a default value
     expect(source).not.toContain("= mockMikroTikProviderClient");
   }, 10000);

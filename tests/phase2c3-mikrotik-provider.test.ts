@@ -47,6 +47,8 @@ import {
   setMockFailureSimulation,
   clearMockFailureSimulation,
   clearMockMikroTikResources,
+  registerMockClientForInstance,
+  mockMikroTikProviderClient,
 } from "@/lib/connectivity";
 import { hashPassword } from "@/lib/security";
 import { createTenant, addTenantUser } from "@/lib/tenant/service";
@@ -89,18 +91,28 @@ async function createMikrotikBinding(downloadMbps = 50, uploadMbps = 10) {
   const ent = await createEntitlement({ tenantId, subscriptionId, capabilityType: CAPABILITY_TYPES.INTERNET, capabilitySet: { downloadMbps, uploadMbps }, validFrom: new Date(), userId });
   entitlementIds.push(ent.id);
   await transitionEntitlement({ entitlementId: ent.id, toState: ENTITLEMENT_STATES.ACTIVE });
-  const binding = await createResourceBinding({ entitlementId: ent.id, providerType: "mikrotik", resourceType: "hotspot_user", userId });
+
+  // Phase 12.4.2a: Create a provider instance and register a mock client for it.
+  // The production adapter requires a providerInstanceId on the binding and a
+  // registered mock client to resolve.
+  const pi = await db.connectivityProviderInstance.create({
+    data: { tenantId, providerType: "mikrotik", name: `Test Router ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik" },
+  });
+  // Register the mock MikroTik client for this instance
+  registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+  const binding = await createResourceBinding({ entitlementId: ent.id, providerType: "mikrotik", resourceType: "hotspot_user", providerInstanceId: pi.id, userId });
   bindingIds.push(binding.id);
   const fullEnt = await db.connectivityEntitlement.findUnique({ where: { id: ent.id }, include: { capability: true } });
   const fullBinding = await db.providerResourceBinding.findUnique({ where: { id: binding.id } });
-  return { ent: fullEnt!, binding: fullBinding! };
+  return { ent: fullEnt!, binding: fullBinding!, providerInstanceId: pi.id };
 }
 
 function makeEntInput(ent: any) {
   return { id: ent.id, tenantId: ent.tenantId, subscriptionId: ent.subscriptionId, status: ent.status, capabilityType: ent.capability.type, capabilitySet: JSON.parse(ent.capabilitySet), policy: ent.policy ? JSON.parse(ent.policy) : null, validFrom: ent.validFrom, validUntil: ent.validUntil };
 }
 function makeBindingInput(binding: any, providerResourceId?: string, providerMetadata?: any) {
-  return { id: binding.id, entitlementId: binding.entitlementId, providerType: binding.providerType, providerResourceId: providerResourceId ?? binding.providerResourceId, providerMetadata: providerMetadata ?? (binding.providerMetadata ? JSON.parse(binding.providerMetadata) : null), status: binding.status, provisioningState: binding.provisioningState };
+  return { id: binding.id, entitlementId: binding.entitlementId, providerType: binding.providerType, providerInstanceId: binding.providerInstanceId, providerResourceId: providerResourceId ?? binding.providerResourceId, providerMetadata: providerMetadata ?? (binding.providerMetadata ? JSON.parse(binding.providerMetadata) : null), status: binding.status, provisioningState: binding.provisioningState, providerInstanceConfiguration: null };
 }
 
 describe("Phase 2C.3 — MikroTik Reference Provider", () => {

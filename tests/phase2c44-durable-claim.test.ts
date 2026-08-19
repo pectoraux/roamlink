@@ -171,10 +171,20 @@ describe("Phase 2C.4.4 — Durable Provisioning Claim", () => {
 
     const { binding } = await createBindingWithInstance(inst.id);
 
-    // Manually transition to PROVISIONING (simulate another worker claiming it)
+    // Simulate ANOTHER WORKER that has ACTIVELY claimed the binding:
+    // status=PROVISIONING with an UNEXPIRED lease and a real attemptId.
+    // transitionBinding alone doesn't set the lease — we set it explicitly
+    // to model a real concurrent worker that is currently mid-provisioning.
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.PROVISIONING });
+    await db.providerResourceBinding.update({
+      where: { id: binding.id },
+      data: {
+        provisioningAttemptId: "attempt-other-worker-active",
+        claimExpiresAt: new Date(Date.now() + 5 * 60 * 1000), // 5 minutes in the future
+      },
+    });
 
-    // Now provisionBinding should see PROVISIONING → claim_lost
+    // Now provisionBinding should see PROVISIONING + active lease → claim_lost
     const result = await provisionBinding(binding.id);
     expect(result.status).toBe("claim_lost");
 

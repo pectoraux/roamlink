@@ -63,25 +63,62 @@ export class RouterOSProviderClient implements MikroTikProviderClient {
     // Step 1: Check if resource already exists (idempotent).
     // Phase 2C.4.3: FAIL CLOSED on lookup uncertainty.
     // Unknown external state ≠ resource absent.
-    // If the GET lookup fails with a retryable/timeout error, we do NOT
-    // proceed to PUT — we don't know whether the resource already exists.
-    // Only confirmed absence permits creation.
+    //
+    // Phase 2C.4.2 retry policy: GET is a safe, idempotent operation. If the
+    // lookup fails with a retryable error (5xx, 429, network, timeout), we
+    // retry the GET ONCE before failing closed. This is consistent with the
+    // transport-level retry policy (FetchRouterOSTransport retries GETs).
+    // MockRouterOSTransport does NOT auto-retry, so the client owns the retry
+    // here for tests that simulate transient GET failures on the lookup path
+    // (see tests/phase2c42-usage-retry-cache.test.ts test F).
+    //
+    // After the bounded retry, ANY remaining lookup failure (retryable,
+    // timeout, auth, permanent) → FAIL CLOSED. We do NOT proceed to PUT — we
+    // don't know whether the resource already exists. Only confirmed absence permits creation.
     let existing: MikroTikResource | null;
     try {
       existing = await this.getResourceByUsername(config.username);
     } catch (err) {
-      // Any lookup failure (retryable, timeout, auth, permanent) → FAIL CLOSED.
-      // Do NOT proceed to PUT with unknown external state.
-      if (err instanceof MikroTikProviderError) {
-        logger.error("routeros.create_lookup_failed_closed", {
+      // Bounded single retry for RETRYABLE/TIMEOUT errors only.
+      // Auth/permanent/conflict errors fail closed immediately — retrying
+      // would not change the outcome.
+      if (err instanceof MikroTikProviderError &&
+          (err.errorType === "RETRYABLE" || err.errorType === "TIMEOUT")) {
+        logger.warn("routeros.create_lookup_retrying", {
           username: config.username, instance: this.instanceLabel,
           errorType: err.errorType,
           error: err.message,
-          message: "CRITICAL: Idempotency lookup failed — refusing to create with unknown external state.",
+          message: "Idempotency lookup failed with retryable error — retrying GET once before failing closed.",
         });
-        throw err; // Re-throw — the caller (adapter) will classify it
+        try {
+          existing = await this.getResourceByUsername(config.username);
+        } catch (retryErr) {
+          // Retry also failed — FAIL CLOSED.
+          if (retryErr instanceof MikroTikProviderError) {
+            logger.error("routeros.create_lookup_failed_closed_after_retry", {
+              username: config.username, instance: this.instanceLabel,
+              errorType: retryErr.errorType,
+              error: retryErr.message,
+              message: "CRITICAL: Idempotency lookup failed after retry — refusing to create with unknown external state.",
+            });
+            throw retryErr;
+          }
+          throw retryErr;
+        }
+      } else {
+        // Any non-retryable lookup failure (auth, permanent, conflict) → FAIL CLOSED.
+        // Do NOT proceed to PUT with unknown external state.
+        if (err instanceof MikroTikProviderError) {
+          logger.error("routeros.create_lookup_failed_closed", {
+            username: config.username, instance: this.instanceLabel,
+            errorType: err.errorType,
+            error: err.message,
+            message: "CRITICAL: Idempotency lookup failed — refusing to create with unknown external state.",
+          });
+          throw err; // Re-throw — the caller (adapter) will classify it
+        }
+        throw err;
       }
-      throw err;
     }
     if (existing) {
       logger.info("routeros.create_idempotent", { username: config.username, instance: this.instanceLabel });

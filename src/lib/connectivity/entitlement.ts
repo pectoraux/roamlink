@@ -30,6 +30,22 @@ import { logger } from "@/lib/logger";
 import { audit } from "@/lib/orders/idempotency";
 
 // ---------------------------------------------------------------------------
+// Database provider detection — used to make FOR UPDATE row locks portable.
+// PostgreSQL supports `SELECT ... FOR UPDATE` for explicit row-level locking.
+// SQLite (used in dev/test) does NOT support FOR UPDATE — it returns a syntax
+// error. SQLite uses SERIALIZABLE isolation by default within a transaction,
+// so the explicit lock is unnecessary. The guarded updateMany at the bottom of
+// the reconciliation transaction provides the atomicity guarantee in both
+// providers — the FOR UPDATE is an additional pessimistic lock that PostgreSQL
+// benefits from but SQLite can safely skip.
+// ---------------------------------------------------------------------------
+const DATABASE_URL = process.env.DATABASE_URL ?? "";
+const IS_SQLITE =
+  DATABASE_URL.startsWith("file:") ||
+  DATABASE_URL.startsWith("sqlite:") ||
+  DATABASE_URL.startsWith(":memory:");
+
+// ---------------------------------------------------------------------------
 // Capability Types
 // ---------------------------------------------------------------------------
 
@@ -857,13 +873,22 @@ export async function reconcileBindingWithProvider(bindingId: string): Promise<{
     const decision = mapReconciliationResult(observedBindingStatus, adapterResult);
 
     // Step 5: ATOMIC COMMIT — perform the transition + metadata update in ONE transaction.
-    // Lock the binding row with FOR UPDATE. Verify the status hasn't changed
-    // since we observed it (stale-observation prevention).
+    // Lock the binding row with FOR UPDATE (PostgreSQL only). Verify the status
+    // hasn't changed since we observed it (stale-observation prevention).
+    // SQLite (dev/test) does not support FOR UPDATE — the guarded updateMany
+    // below provides the atomicity guarantee in both providers.
     const txResult = await db.$transaction(async (tx) => {
-      // Lock the binding row
-      const lockedBinding: Array<{ id: string; status: string }> = await tx.$queryRaw`
-        SELECT id, status FROM "ProviderResourceBinding" WHERE id = ${bindingId} FOR UPDATE
-      `;
+      // Lock the binding row (portable: skip FOR UPDATE on SQLite)
+      let lockedBinding: Array<{ id: string; status: string }>;
+      if (IS_SQLITE) {
+        lockedBinding = await tx.$queryRaw`
+          SELECT id, status FROM "ProviderResourceBinding" WHERE id = ${bindingId}
+        `;
+      } else {
+        lockedBinding = await tx.$queryRaw`
+          SELECT id, status FROM "ProviderResourceBinding" WHERE id = ${bindingId} FOR UPDATE
+        `;
+      }
       if (lockedBinding.length === 0) {
         return { committed: false as const, reason: "Binding not found in transaction" };
       }
@@ -1300,7 +1325,19 @@ export async function claimProvisioning(bindingId: string): Promise<{
     return { claimed: false, currentStatus: current.status };
   }
 
-  // Check if the lease has expired
+  // Check if the lease has expired. A null claimExpiresAt is treated as an
+  // EXPIRED lease for backward compatibility with the FAILED → PROVISIONING
+  // retry path (see tests/phase2c44-durable-claim.test.ts test F, and the
+  // reconcileProvisioning worker which calls provisionBinding directly on a
+  // FAILED binding that was transitioned to PROVISIONING).
+  //
+  // In production, a binding that has been finalized (BOUND or FAILED) has its
+  // claimExpiresAt cleared by claimGuardedTransition(). When such a binding is
+  // subsequently transitioned back to PROVISIONING (retry), the lease is null.
+  // Treating null as "expired" allows the retry to claim the binding.
+  //
+  // Tests that simulate an active concurrent worker (test C) must explicitly
+  // set claimExpiresAt to a future time — see the test setup.
   if (current.claimExpiresAt && current.claimExpiresAt > now) {
     // Lease is still active — another worker owns it
     return { claimed: false, currentStatus: current.status };
@@ -1331,7 +1368,7 @@ export async function claimProvisioning(bindingId: string): Promise<{
       // Phase 2C.4.8: condition on the OBSERVED old attemptId (ABA fence).
       // Prisma generates "provisioningAttemptId" = <value> or IS NULL.
       provisioningAttemptId: current.provisioningAttemptId,
-      // Only take over if the lease has expired (or is null — legacy)
+      // Only take over if the lease has expired (or is null — see comment above).
       OR: [
         { claimExpiresAt: { lt: now } },
         { claimExpiresAt: null },

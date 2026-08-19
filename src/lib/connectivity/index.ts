@@ -69,6 +69,9 @@ export { mockConnectivityProvider, MockConnectivityProvider } from "./mock-provi
 
 // Phase 2C.3: MikroTik provider (reference implementation)
 export { MikroTikConnectivityAdapter } from "./providers/mikrotik/adapter";
+// The pre-instantiated adapter instance (registered with the provider registry).
+// Tests import this to test the adapter directly without going through the registry.
+export { mikrotikAdapter as mikrotikConnectivityAdapter } from "./providers/mikrotik";
 export type { MikroTikProviderClient, MikroTikResource, MikroTikResourceConfig, MikroTikErrorType, MikroTikClientResolver } from "./providers/mikrotik/client";
 export { MikroTikProviderError } from "./providers/mikrotik/client";
 export { MockMikroTikProviderClient, mockMikroTikProviderClient, setMockFailureSimulation, clearMockFailureSimulation, clearMockMikroTikResources } from "./providers/mikrotik/mock-client";
