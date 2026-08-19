@@ -67,6 +67,9 @@ export async function POST(req: NextRequest) {
       supersedesIntentId,
       expectedVersion,
       idempotencyKey,
+      // Phase 12.4.4c: Persist the originating request ID for causality tracing.
+      sourceRequestId: requestId,
+      sourceChannel: "api",
     });
 
     if (result.rejected) {

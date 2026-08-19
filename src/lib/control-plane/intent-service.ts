@@ -38,6 +38,15 @@ export type CreateIntentInput = {
   expectedVersion?: number;
   // Phase 9.4.1: Idempotency key for offline-safe creation
   idempotencyKey?: string;
+  // Phase 12.4.4c: Asynchronous causality provenance.
+  // The originating request/event ID — lets operators trace from provider log
+  // back to "which API request caused this connectivity mutation?"
+  // For HTTP: the x-request-id header value.
+  // For device events: the event/observation ID.
+  // For system jobs: the job/operation ID.
+  sourceRequestId?: string;
+  // How this intent was initiated: "api" | "device" | "system" | "commercial".
+  sourceChannel?: string;
 };
 
 export type IntentResult = {
@@ -112,6 +121,9 @@ export async function createIntent(input: CreateIntentInput): Promise<IntentResu
             priority: input.priority ?? "NORMAL",
             source: input.source ?? "USER",
             idempotencyKey: input.idempotencyKey ?? null,
+            // Phase 12.4.4c: Persist causality provenance.
+            sourceRequestId: input.sourceRequestId ?? null,
+            sourceChannel: input.sourceChannel ?? null,
           },
         });
 

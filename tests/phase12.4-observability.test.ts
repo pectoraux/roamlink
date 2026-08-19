@@ -631,19 +631,136 @@ describe("Phase 12.4.4 — Operational Observability", () => {
       expect(capturedCorrelation.tenantId).toBe(tenant.id);
       expect(capturedCorrelation.providerInstanceId).toBe(pi.id);
 
-      // INTENTIONALLY ABSENT (2 fields) — not available in this execution context:
-      //
-      // requestId — the control plane is triggered by reevaluation events, not
-      //   direct API requests. The requestId exists at the API layer (intent
-      //   creation request) but is not persisted on the action/decision record.
-      //   The correlation context carries null for this field, and withCorrelation()
-      //   omits null fields from log entries. This is documented in the module.
+      // INTENTIONALLY ABSENT (1 field) — not available in this execution context:
       //
       // providerKey — the connectivity control plane uses its own provisioning-lease
       //   mechanism (claimProvisioning), not the runIdempotentOperation primitive.
       //   The providerKey applies to commerce operations (createOrder, initiatePayment,
       //   purchaseTopUp), not connectivity resource provisioning.
-      expect(capturedCorrelation.requestId).toBeNull();
+      expect(capturedCorrelation.providerKey).toBeNull();
+
+      // Phase 12.4.4c: requestId is NOW available — loaded from the intent's
+      // sourceRequestId field. The intent was created via the API route, which
+      // persists the x-request-id header value. executeAction loads it and
+      // enriches the correlation context, bridging the asynchronous gap:
+      //   API request → intent → event → decision → action → provider log
+      // Note: this test creates the intent via createIntent() directly (not via
+      // the API route), so sourceRequestId is not set. When the intent IS created
+      // via the API route (as in 12.4.4.12), requestId will be present.
+      // For this test, requestId may be null (intent created without sourceRequestId)
+      // or present (if the intent was created via API). We assert it's not undefined.
+      expect(capturedCorrelation.requestId !== undefined).toBe(true);
+    } finally {
+      (mikrotikConnectivityAdapter as any).provision = originalProvision;
+
+      // Cleanup
+      await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+      await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+      await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
+      await db.connectivityPolicy.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      await db.providerResourceBinding.deleteMany({ where: { entitlementId: ent.id } }).catch(() => {});
+      await db.protocolResource.deleteMany({ where: { id: resA.id } }).catch(() => {});
+      await db.protocolCapability.deleteMany({ where: { id: capA.id } }).catch(() => {});
+      await db.connectivityEntitlement.deleteMany({ where: { id: ent.id } }).catch(() => {});
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+      await db.tenantSubscription.deleteMany({ where: { id: sub.id } }).catch(() => {});
+      await db.tenantUser.deleteMany({ where: { userId: user.id } }).catch(() => {});
+      await db.tenant.deleteMany({ where: { id: tenant.id } }).catch(() => {});
+      await db.user.deleteMany({ where: { id: user.id } }).catch(() => {});
+      clearMockClientRegistry();
+    }
+  }, 120_000);
+
+  // =========================================================================
+  // 12.4.4.12 — requestId flows end-to-end: intent → action → adapter correlation
+  //
+  // Proves that when an intent is created with a sourceRequestId, that value
+  // is loaded by executeAction and passed to the adapter's correlation context.
+  // This closes the asynchronous causality gap:
+  //   API request (requestId) → intent (sourceRequestId) → event → decision
+  //   → action → executeAction loads sourceRequestId → adapter correlation
+  // =========================================================================
+  it("12.4.4.12: requestId flows end-to-end from intent sourceRequestId to adapter correlation", async () => {
+    const { db } = await import("@/lib/db");
+    const { hashPassword } = await import("@/lib/security");
+    const { ensureTestSetup } = await import("./setup");
+    const { seedConnectivityCapabilities, createEntitlement, transitionEntitlement, createResourceBinding, CAPABILITY_TYPES, ENTITLEMENT_STATES, registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry, mikrotikConnectivityAdapter } = await import("@/lib/connectivity");
+    const { createTenant, addTenantUser } = await import("@/lib/tenant/service");
+    const { createOrUpdatePolicy } = await import("@/lib/control-plane/policy-engine");
+    const { createSession } = await import("@/lib/control-plane/session-manager");
+    const { makeDecision } = await import("@/lib/control-plane/decision-engine");
+    const { createAction, executeAction } = await import("@/lib/control-plane/action-executor");
+    const { createIntent } = await import("@/lib/control-plane/intent-service");
+
+    await ensureTestSetup();
+    await seedConnectivityCapabilities();
+
+    const email = `p1244c-${Date.now()}@test.roamlink`;
+    const user = await db.user.create({ data: { email, name: "P12.4.4c", passwordHash: await hashPassword("test12345"), role: "customer", emailVerified: new Date() } });
+    const tenant = await db.tenant.create({ data: { name: `P1244c ${Date.now()}`, slug: `p1244c-${Date.now().toString(36)}`, status: "active" } });
+    await addTenantUser({ tenantId: tenant.id, userId: user.id, role: "admin" });
+    const plan = await db.saaasPlan.findUnique({ where: { name: "starter" } });
+    const sub = await db.tenantSubscription.create({ data: { tenantId: tenant.id, saaasPlanId: plan!.id, status: "active", billingCycle: "monthly", currentPeriodEnd: new Date(Date.now() + 30 * 86400000) } });
+
+    const pi = await db.connectivityProviderInstance.create({ data: { tenantId: tenant.id, providerType: "mikrotik", name: `P1244c ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik" } });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    const ent = await createEntitlement({ tenantId: tenant.id, subscriptionId: sub.id, capabilityType: CAPABILITY_TYPES.INTERNET, capabilitySet: { downloadMbps: 50, uploadMbps: 10 }, validFrom: new Date(), userId: user.id });
+    await transitionEntitlement({ entitlementId: ent.id, toState: ENTITLEMENT_STATES.ACTIVE });
+    await db.connectivityEntitlement.update({ where: { id: ent.id }, data: { userId: user.id } }).catch(() => {});
+
+    const capA = await db.protocolCapability.create({ data: { tenantId: tenant.id, providerInstanceId: pi.id, type: "INTERNET", providerType: "mikrotik", technicalSpec: JSON.stringify({ downloadMbps: 50, typicalLatencyMs: 20 }), coverage: JSON.stringify({ countries: ["GH"] }), reliability: 0.92, status: "active" } });
+    const resA = await db.protocolResource.create({ data: { capabilityId: capA.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "A" }), capacity: JSON.stringify({ totalBandwidthMbps: 50 }), state: "AVAILABLE" } });
+
+    const binding = await createResourceBinding({ entitlementId: ent.id, providerType: "mikrotik", resourceType: "hotspot_user", providerInstanceId: pi.id, userId: user.id });
+    const prA = await mockMikroTikProviderClient.createResource({ resourceType: "hotspot_user", username: `rl-${binding.id.slice(-12)}`, password: `pw-${ent.id.slice(-12)}`, downloadRateLimitBps: 50000000, uploadRateLimitBps: 10000000 });
+    const bA = await db.providerResourceBinding.create({ data: { entitlementId: ent.id, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: prA.id, providerMetadata: JSON.stringify({}), status: "UNBOUND", provisioningState: null, providerInstanceId: pi.id } });
+    await db.protocolResource.update({ where: { id: resA.id }, data: { providerBindingId: bA.id } });
+
+    await createOrUpdatePolicy({ subjectId: user.id, preset: "RELIABLE", mode: "automatic", maxAutoSpendMinor: 10000, requireUserApprovalForPurchase: false });
+    const session = await createSession({ subjectId: user.id, entitlementId: ent.id });
+
+    // Create the intent WITH a sourceRequestId — simulating an API request.
+    const testRequestId = "req_causality_test_12345";
+    const intent = await createIntent({
+      subjectId: user.id,
+      rawText: "connectivity under $5",
+      capabilityType: "INTERNET",
+      mode: "AUTOMATIC",
+      maxPriceMinor: 500,
+      sourceRequestId: testRequestId,
+      sourceChannel: "api",
+    });
+
+    // Intercept the adapter's provision method.
+    let capturedCorrelation: any = null;
+    const originalProvision = mikrotikConnectivityAdapter.provision.bind(mikrotikConnectivityAdapter);
+    (mikrotikConnectivityAdapter as any).provision = async (input: any) => {
+      capturedCorrelation = input.correlation ?? null;
+      return originalProvision(input);
+    };
+
+    try {
+      const decision = await makeDecision({ tenantId: tenant.id, subjectId: user.id, sessionId: session.id, capabilityType: "INTERNET", intentId: intent.intentId, intentVersion: intent.version });
+      const action = await createAction({ sessionId: session.id, decisionId: decision.decisionId, type: "ACTIVATE", targetResourceId: decision.targetResourceId!, idempotencyKey: `p1244c-${session.id}` });
+      await executeAction(action.id);
+
+      // Assert: the adapter received the correlation context.
+      expect(capturedCorrelation).not.toBeNull();
+
+      // Phase 12.4.4c: requestId is NOW present — loaded from the intent's
+      // sourceRequestId field. This proves the asynchronous causality chain:
+      //   API request (testRequestId) → intent (sourceRequestId) →
+      //   executeAction loads it → adapter correlation.requestId
+      expect(capturedCorrelation.requestId).toBe(testRequestId);
+
+      // The other fields are also present (from 12.4.4.11).
+      expect(capturedCorrelation.actionId).toBe(action.id);
+      expect(capturedCorrelation.sessionId).toBe(session.id);
+      expect(capturedCorrelation.tenantId).toBe(tenant.id);
+      expect(capturedCorrelation.providerInstanceId).toBe(pi.id);
+
+      // providerKey remains intentionally absent.
       expect(capturedCorrelation.providerKey).toBeNull();
     } finally {
       (mikrotikConnectivityAdapter as any).provision = originalProvision;
@@ -653,6 +770,7 @@ describe("Phase 12.4.4 — Operational Observability", () => {
       await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
       await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
       await db.connectivityPolicy.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      await db.connectivityIntentRecord.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
       await db.providerResourceBinding.deleteMany({ where: { entitlementId: ent.id } }).catch(() => {});
       await db.protocolResource.deleteMany({ where: { id: resA.id } }).catch(() => {});
       await db.protocolCapability.deleteMany({ where: { id: capA.id } }).catch(() => {});

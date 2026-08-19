@@ -39,13 +39,11 @@
  *   providerInstanceId ✅  — enriched from ProtocolCapability.providerInstanceId
  *   providerResourceId ✅  — enriched from bridge result
  *   bindingId         ✅  — enriched from bridge result
- *   requestId         ⛔  — intentionally absent: the control plane is triggered
- *                           by reevaluation events, not direct API requests.
- *                           The requestId exists at the API layer (the intent
- *                           creation request), but is not persisted on the
- *                           intent/decision/action record. A future enhancement
- *                           could persist it, but the current architecture
- *                           processes intents asynchronously via events.
+ *   requestId         ✅  — loaded from the intent's sourceRequestId field
+ *                           (Phase 12.4.4c). The API request that created the
+ *                           intent is persisted on ConnectivityIntentRecord.
+ *                           executeAction loads it and enriches the correlation.
+ *                           For non-HTTP triggers, this is the event/job ID.
  *   providerKey       ⛔  — intentionally absent: the connectivity control plane
  *                           uses its own provisioning-lease mechanism
  *                           (claimProvisioning, not runIdempotentOperation).

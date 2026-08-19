@@ -2617,11 +2617,27 @@ model ConnectivityIntentRecord {
   executionFenceId      String?
   executionFenceExpiresAt DateTime?
 
+  // Phase 12.4.4c: Asynchronous causality provenance.
+  // The control plane is event-driven — intents are created via API requests,
+  // processed asynchronously via reevaluation events, and executed as decisions
+  // + actions. Without persisting the originating request's correlation, the
+  // provider log cannot trace back to "which API request caused this mutation?"
+  //
+  // sourceRequestId: the x-request-id from the API request that created/superseded
+  //   this intent. For non-HTTP triggers (device events, system jobs), this is
+  //   the event/job ID instead. null = unknown (legacy or internal trigger).
+  // sourceChannel: "api" | "device" | "system" | "commercial" — how this intent
+  //   was initiated. Lets operators distinguish user-driven vs system-driven
+  //   connectivity changes.
+  sourceRequestId     String?
+  sourceChannel        String?
+
   @@unique([intentId, version]) // version fencing
   @@index([subjectId])
   @@index([intentId])
   @@index([status])
   @@index([expiresAt])
+  @@index([sourceRequestId])
 }
 
 // ---------------------------------------------------------------------------

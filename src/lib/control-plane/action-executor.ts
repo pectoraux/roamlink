@@ -237,6 +237,35 @@ export async function executeAction(actionId: string, slotContext?: {
       decisionId: action.decisionId ?? null,
     });
 
+    // Phase 12.4.4c: Load the intent's sourceRequestId for causality tracing.
+    // This bridges the asynchronous gap: API request → intent → event → decision
+    // → action → provider. The intent carries the originating request's ID.
+    //
+    // The action doesn't directly store intentId — it references a decision,
+    // which stores intentId. Load the decision to get intentId, then load the
+    // intent record to get sourceRequestId.
+    let intentIdForCausality: string | null = action.intentId ?? null;
+    if (!intentIdForCausality && action.decisionId) {
+      const decision = await db.connectivityDecision.findUnique({
+        where: { id: action.decisionId },
+        select: { intentId: true },
+      });
+      intentIdForCausality = decision?.intentId ?? null;
+    }
+    if (intentIdForCausality) {
+      const intentRecord = await db.connectivityIntentRecord.findFirst({
+        where: { intentId: intentIdForCausality, status: { in: ["ACTIVE", "FULFILLED"] } },
+        orderBy: { version: "desc" },
+        select: { sourceRequestId: true, sourceChannel: true },
+      });
+      if (intentRecord?.sourceRequestId) {
+        correlation = createCorrelationContext({
+          ...correlation,
+          requestId: intentRecord.sourceRequestId,
+        });
+      }
+    }
+
     if (!targetResourceId) {
       throw new Error("SWITCH/ACTIVATE action requires targetResourceId");
     }
