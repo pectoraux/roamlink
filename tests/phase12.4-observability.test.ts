@@ -620,16 +620,31 @@ describe("Phase 12.4.4 — Operational Observability", () => {
       // Assert: the adapter received the correlation context.
       expect(capturedCorrelation).not.toBeNull();
 
-      // Phase 12.4.4b.2: Assert the FULL correlation chain.
-      // From the execution boundary.
+      // Phase 12.4.4b.3: Assert the FULL correlation contract — 8 present + 2 intentionally absent.
+      //
+      // PRESENT (8 fields) — available in the connectivity control-plane execution path:
       expect(capturedCorrelation.actionId).toBe(action.id);
       expect(capturedCorrelation.sessionId).toBe(session.id);
       if (action.intentId) expect(capturedCorrelation.intentId).toBe(action.intentId);
       if (action.decisionId) expect(capturedCorrelation.decisionId).toBe(action.decisionId);
-
       // Enriched from the kernel bridge (capability data).
       expect(capturedCorrelation.tenantId).toBe(tenant.id);
       expect(capturedCorrelation.providerInstanceId).toBe(pi.id);
+
+      // INTENTIONALLY ABSENT (2 fields) — not available in this execution context:
+      //
+      // requestId — the control plane is triggered by reevaluation events, not
+      //   direct API requests. The requestId exists at the API layer (intent
+      //   creation request) but is not persisted on the action/decision record.
+      //   The correlation context carries null for this field, and withCorrelation()
+      //   omits null fields from log entries. This is documented in the module.
+      //
+      // providerKey — the connectivity control plane uses its own provisioning-lease
+      //   mechanism (claimProvisioning), not the runIdempotentOperation primitive.
+      //   The providerKey applies to commerce operations (createOrder, initiatePayment,
+      //   purchaseTopUp), not connectivity resource provisioning.
+      expect(capturedCorrelation.requestId).toBeNull();
+      expect(capturedCorrelation.providerKey).toBeNull();
     } finally {
       (mikrotikConnectivityAdapter as any).provision = originalProvision;
 

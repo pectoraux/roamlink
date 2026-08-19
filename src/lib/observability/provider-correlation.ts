@@ -22,6 +22,44 @@
  *
  * Every provider operation should log enough of this chain to reconstruct an
  * incident trail without manually joining database tables.
+ *
+ * FIELD AVAILABILITY BY EXECUTION CONTEXT (Phase 12.4.4b.3)
+ * ========================================================
+ *
+ * The ten correlation fields have different availability depending on which
+ * execution path initiates the provider operation. This is NOT a deficiency —
+ * it reflects the fundamental architecture:
+ *
+ * Connectivity control plane (executeAction → kernel-bridge → adapter):
+ *   actionId          ✅  — from the ConnectivityAction record
+ *   sessionId         ✅  — from the ConnectivitySession
+ *   intentId          ✅  — from the action's intent link
+ *   decisionId        ✅  — from the action's decision link
+ *   tenantId          ✅  — enriched from ProtocolCapability.tenantId
+ *   providerInstanceId ✅  — enriched from ProtocolCapability.providerInstanceId
+ *   providerResourceId ✅  — enriched from bridge result
+ *   bindingId         ✅  — enriched from bridge result
+ *   requestId         ⛔  — intentionally absent: the control plane is triggered
+ *                           by reevaluation events, not direct API requests.
+ *                           The requestId exists at the API layer (the intent
+ *                           creation request), but is not persisted on the
+ *                           intent/decision/action record. A future enhancement
+ *                           could persist it, but the current architecture
+ *                           processes intents asynchronously via events.
+ *   providerKey       ⛔  — intentionally absent: the connectivity control plane
+ *                           uses its own provisioning-lease mechanism
+ *                           (claimProvisioning, not runIdempotentOperation).
+ *                           The providerKey is the idempotency primitive's
+ *                           external correlation key — it applies to commerce
+ *                           operations (createOrder, initiatePayment, purchaseTopUp),
+ *                           not connectivity resource provisioning.
+ *
+ * Commerce operations (createOrder, initiatePayment, purchaseTopUp):
+ *   providerKey       ✅  — from runIdempotentOperation
+ *   requestId         ✅  — from the API route's getRequestId(req)
+ *   tenantId          ✅  — from the principal context
+ *   All control-plane fields (actionId, sessionId, etc.) — ⛔ intentionally
+ *   absent: commerce operations are not connectivity control-plane actions.
  */
 
 import { db } from "@/lib/db";
