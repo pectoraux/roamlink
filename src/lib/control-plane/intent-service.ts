@@ -47,6 +47,12 @@ export type CreateIntentInput = {
   sourceRequestId?: string;
   // How this intent was initiated: "api" | "device" | "system" | "commercial".
   sourceChannel?: string;
+  // Phase 12.4.4e (P0-1): Authoritative tenant ownership for this intent.
+  // The API route resolves this from resolveApiPrincipal (the caller's tenantId
+  // is authoritative — cannot be overridden). Persisting it on the intent record
+  // eliminates the "latest entitlement for user" shortcut in incident lookup,
+  // which was unsafe for users belonging to multiple tenants.
+  tenantId?: string;
 };
 
 export type IntentResult = {
@@ -124,6 +130,8 @@ export async function createIntent(input: CreateIntentInput): Promise<IntentResu
             // Phase 12.4.4c: Persist causality provenance.
             sourceRequestId: input.sourceRequestId ?? null,
             sourceChannel: input.sourceChannel ?? null,
+            // Phase 12.4.4e (P0-1): Persist authoritative tenant ownership.
+            tenantId: input.tenantId ?? null,
           },
         });
 
@@ -183,6 +191,8 @@ export async function createIntent(input: CreateIntentInput): Promise<IntentResu
     // Phase 12.4.4c: Pass causality provenance through to the new version.
     sourceRequestId: input.sourceRequestId,
     sourceChannel: input.sourceChannel,
+    // Phase 12.4.4e (P0-1): Pass authoritative tenant ownership.
+    tenantId: input.tenantId,
   });
 }
 
@@ -203,6 +213,8 @@ async function supersedeIntent(input: {
   // Phase 12.4.4c: Causality provenance for the new version.
   sourceRequestId?: string;
   sourceChannel?: string;
+  // Phase 12.4.4e (P0-1): Authoritative tenant ownership for the new version.
+  tenantId?: string;
 }): Promise<IntentResult> {
   // P1-4: Idempotency check
   if (input.idempotencyKey) {
@@ -288,6 +300,8 @@ async function supersedeIntent(input: {
           // Phase 12.4.4c: Persist causality provenance on the new version.
           sourceRequestId: input.sourceRequestId ?? null,
           sourceChannel: input.sourceChannel ?? null,
+          // Phase 12.4.4e (P0-1): Persist authoritative tenant ownership.
+          tenantId: input.tenantId ?? null,
         },
       });
 

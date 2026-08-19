@@ -70,6 +70,9 @@ export async function POST(req: NextRequest) {
       // Phase 12.4.4c: Persist the originating request ID for causality tracing.
       sourceRequestId: requestId,
       sourceChannel: "api",
+      // Phase 12.4.4e (P0-1): Persist authoritative tenant ownership.
+      // The principal's tenantId is authoritative — the caller cannot override it.
+      tenantId: principal.tenantId,
     });
 
     if (result.rejected) {

@@ -40,7 +40,7 @@ import { MikroTikProviderError } from "./client";
 import type { AsyncMikroTikClientResolver } from "./client-factory";
 import type { ProviderCorrelationContext } from "../../../observability/provider-correlation";
 import { withCorrelation } from "../../../observability/provider-correlation";
-import { recordProviderOperation } from "../../../observability/incident-lookup";
+import { startProviderOperation, completeProviderOperation } from "../../../observability/incident-lookup";
 import { logger } from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
@@ -232,7 +232,40 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     correlation?: ProviderCorrelationContext;
   }): Promise<ProvisionResult> {
     const ctx = input.correlation ?? {};
-    const startedAt = new Date();
+
+    // Phase 12.4.4e (P0-2): durable STARTED → terminal audit lifecycle.
+    // startProviderOperation is called BEFORE the provider mutation so that
+    // if the process crashes mid-operation, an operator can identify the
+    // incomplete operation by its STARTED state.
+    // tenantId is REQUIRED (P0-3): if ctx.tenantId is null (direct adapter
+    // call without control-plane context), skip audit recording entirely.
+    const auditBase = ctx.tenantId ? {
+      operation: "provision" as const,
+      bindingId: input.binding.id,
+      providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
+      providerType: "mikrotik",
+      tenantId: ctx.tenantId,
+      requestId: ctx.requestId ?? null,
+      intentId: ctx.intentId ?? null,
+      decisionId: ctx.decisionId ?? null,
+      actionId: ctx.actionId ?? null,
+      sessionId: ctx.sessionId ?? null,
+      providerKey: ctx.providerKey ?? null,
+    } : null;
+
+    const opRecordId = auditBase
+      ? await startProviderOperation({
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId ?? null,
+        })
+      : null;
+    if (!auditBase) {
+      logger.warn("provider_operation.skipped_no_tenant", {
+        operation: "provision",
+        bindingId: input.binding.id,
+      });
+    }
+
     try {
       const client = await this.resolveClient(input.binding);
       // If the binding already has a providerResourceId, it's idempotent — return it.
@@ -243,24 +276,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
             bindingId: input.binding.id,
             username: input.binding.providerResourceId,
           }));
-          // Phase 12.4.4e: record the idempotent-replay operation for audit.
-          await recordProviderOperation({
-            operation: "provision",
-            outcome: "success",
-            providerResourceId: existing.id,
-            bindingId: input.binding.id,
-            providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-            providerType: "mikrotik",
-            tenantId: ctx.tenantId ?? null,
-            requestId: ctx.requestId ?? null,
-            intentId: ctx.intentId ?? null,
-            decisionId: ctx.decisionId ?? null,
-            actionId: ctx.actionId ?? null,
-            sessionId: ctx.sessionId ?? null,
-            outcomeDetail: { idempotent: true, providerResourceId: existing.id },
-            startedAt,
-            completedAt: new Date(),
-          });
+          // Phase 12.4.4e (P0-2): terminal update with SUCCEEDED outcome.
+          if (auditBase) {
+            await completeProviderOperation(opRecordId, {
+              ...auditBase,
+              providerResourceId: existing.id,
+              outcome: "SUCCEEDED",
+              outcomeDetail: { idempotent: true, providerResourceId: existing.id },
+            });
+          }
           return {
             status: "success",
             providerResourceId: existing.id,
@@ -285,24 +309,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
         resourceType: resource.resourceType,
       }));
 
-      // Phase 12.4.4e: record the provision operation for audit.
-      await recordProviderOperation({
-        operation: "provision",
-        outcome: "success",
-        providerResourceId: resource.id,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { resourceType: resource.resourceType },
-        startedAt,
-        completedAt: new Date(),
-      });
+      // Phase 12.4.4e (P0-2): terminal update with SUCCEEDED outcome.
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: resource.id,
+          outcome: "SUCCEEDED",
+          outcomeDetail: { resourceType: resource.resourceType },
+        });
+      }
 
       return {
         status: "success",
@@ -321,25 +336,17 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
         error: classified.error,
         classification: classified.status,
       }));
-      // Phase 12.4.4e: record the failed provision operation.
-      await recordProviderOperation({
-        operation: "provision",
-        outcome: classified.status === "failed_permanent" ? "failed_permanent"
-          : classified.status === "failed_retryable" ? "failed_retryable"
-          : "ambiguous",
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { error: classified.error, classification: classified.status },
-        startedAt,
-        completedAt: new Date(),
-      });
+      // Phase 12.4.4e (P0-2): terminal update with FAILED outcome.
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId ?? null,
+          outcome: classified.status === "failed_permanent" ? "FAILED_PERMANENT"
+            : classified.status === "failed_retryable" ? "FAILED_RETRYABLE"
+            : "AMBIGUOUS",
+          outcomeDetail: { error: classified.error, classification: classified.status },
+        });
+      }
       return {
         status: classified.status,
         error: classified.error,
@@ -353,25 +360,48 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
     const ctx = input.correlation ?? {};
-    const startedAt = new Date();
-    if (!input.binding.providerResourceId) {
-      // Phase 12.4.4e: record the permanent failure (no resource to suspend).
-      await recordProviderOperation({
+
+    // Phase 12.4.4e (P0-2): durable STARTED → terminal audit lifecycle.
+    // tenantId is REQUIRED (P0-3): if ctx.tenantId is null (direct adapter
+    // call without control-plane context), skip audit recording entirely.
+    const auditBase = ctx.tenantId ? {
+      operation: "suspend" as const,
+      bindingId: input.binding.id,
+      providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
+      providerType: "mikrotik",
+      tenantId: ctx.tenantId,
+      requestId: ctx.requestId ?? null,
+      intentId: ctx.intentId ?? null,
+      decisionId: ctx.decisionId ?? null,
+      actionId: ctx.actionId ?? null,
+      sessionId: ctx.sessionId ?? null,
+      providerKey: ctx.providerKey ?? null,
+    } : null;
+
+    const opRecordId = auditBase
+      ? await startProviderOperation({
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId ?? null,
+        })
+      : null;
+    if (!auditBase) {
+      logger.warn("provider_operation.skipped_no_tenant", {
         operation: "suspend",
-        outcome: "failed_permanent",
         bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { error: "No providerResourceId on binding" },
-        startedAt,
-        completedAt: new Date(),
       });
+    }
+
+    if (!input.binding.providerResourceId) {
+      // Phase 12.4.4e (P0-2): terminal update with FAILED_PERMANENT outcome
+      // (no resource to suspend).
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: null,
+          outcome: "FAILED_PERMANENT",
+          outcomeDetail: { error: "No providerResourceId on binding" },
+        });
+      }
       return { status: "failed_permanent", error: "No providerResourceId on binding" };
     }
 
@@ -381,47 +411,29 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       logger.info("mikrotik.suspended", withCorrelation(ctx, {
         bindingId: input.binding.id, providerResourceId: input.binding.providerResourceId,
       }));
-      await recordProviderOperation({
-        operation: "suspend",
-        outcome: "success",
-        providerResourceId: input.binding.providerResourceId,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+          outcome: "SUCCEEDED",
+        });
+      }
       return { status: "success" };
     } catch (err) {
       const classified = classifyError(err);
       logger.error("mikrotik.suspend_failed", withCorrelation(ctx, {
         bindingId: input.binding.id, error: classified.error, classification: classified.status,
       }));
-      await recordProviderOperation({
-        operation: "suspend",
-        outcome: classified.status === "failed_permanent" ? "failed_permanent"
-          : classified.status === "failed_retryable" ? "failed_retryable"
-          : "ambiguous",
-        providerResourceId: input.binding.providerResourceId,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { error: classified.error, classification: classified.status },
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+          outcome: classified.status === "failed_permanent" ? "FAILED_PERMANENT"
+            : classified.status === "failed_retryable" ? "FAILED_RETRYABLE"
+            : "AMBIGUOUS",
+          outcomeDetail: { error: classified.error, classification: classified.status },
+        });
+      }
       return { status: classified.status, error: classified.error };
     }
   }
@@ -432,24 +444,48 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
     const ctx = input.correlation ?? {};
-    const startedAt = new Date();
-    if (!input.binding.providerResourceId) {
-      await recordProviderOperation({
+
+    // Phase 12.4.4e (P0-2): durable STARTED → terminal audit lifecycle.
+    // tenantId is REQUIRED (P0-3): if ctx.tenantId is null (direct adapter
+    // call without control-plane context), skip audit recording entirely.
+    const auditBase = ctx.tenantId ? {
+      operation: "resume" as const,
+      bindingId: input.binding.id,
+      providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
+      providerType: "mikrotik",
+      tenantId: ctx.tenantId,
+      requestId: ctx.requestId ?? null,
+      intentId: ctx.intentId ?? null,
+      decisionId: ctx.decisionId ?? null,
+      actionId: ctx.actionId ?? null,
+      sessionId: ctx.sessionId ?? null,
+      providerKey: ctx.providerKey ?? null,
+    } : null;
+
+    const opRecordId = auditBase
+      ? await startProviderOperation({
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId ?? null,
+        })
+      : null;
+    if (!auditBase) {
+      logger.warn("provider_operation.skipped_no_tenant", {
         operation: "resume",
-        outcome: "failed_permanent",
         bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { error: "No providerResourceId on binding" },
-        startedAt,
-        completedAt: new Date(),
       });
+    }
+
+    if (!input.binding.providerResourceId) {
+      // Phase 12.4.4e (P0-2): terminal update with FAILED_PERMANENT outcome
+      // (no resource to resume).
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: null,
+          outcome: "FAILED_PERMANENT",
+          outcomeDetail: { error: "No providerResourceId on binding" },
+        });
+      }
       return { status: "failed_permanent", error: "No providerResourceId on binding" };
     }
 
@@ -459,47 +495,29 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       logger.info("mikrotik.resumed", withCorrelation(ctx, {
         bindingId: input.binding.id, providerResourceId: input.binding.providerResourceId,
       }));
-      await recordProviderOperation({
-        operation: "resume",
-        outcome: "success",
-        providerResourceId: input.binding.providerResourceId,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+          outcome: "SUCCEEDED",
+        });
+      }
       return { status: "success" };
     } catch (err) {
       const classified = classifyError(err);
       logger.error("mikrotik.resume_failed", withCorrelation(ctx, {
         bindingId: input.binding.id, error: classified.error, classification: classified.status,
       }));
-      await recordProviderOperation({
-        operation: "resume",
-        outcome: classified.status === "failed_permanent" ? "failed_permanent"
-          : classified.status === "failed_retryable" ? "failed_retryable"
-          : "ambiguous",
-        providerResourceId: input.binding.providerResourceId,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { error: classified.error, classification: classified.status },
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+          outcome: classified.status === "failed_permanent" ? "FAILED_PERMANENT"
+            : classified.status === "failed_retryable" ? "FAILED_RETRYABLE"
+            : "AMBIGUOUS",
+          outcomeDetail: { error: classified.error, classification: classified.status },
+        });
+      }
       return { status: classified.status, error: classified.error };
     }
   }
@@ -510,25 +528,47 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
     const ctx = input.correlation ?? {};
-    const startedAt = new Date();
-    if (!input.binding.providerResourceId) {
-      // Already released — idempotent. Record as success (no-op).
-      await recordProviderOperation({
+
+    // Phase 12.4.4e (P0-2): durable STARTED → terminal audit lifecycle.
+    // tenantId is REQUIRED (P0-3): if ctx.tenantId is null (direct adapter
+    // call without control-plane context), skip audit recording entirely.
+    const auditBase = ctx.tenantId ? {
+      operation: "release" as const,
+      bindingId: input.binding.id,
+      providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
+      providerType: "mikrotik",
+      tenantId: ctx.tenantId,
+      requestId: ctx.requestId ?? null,
+      intentId: ctx.intentId ?? null,
+      decisionId: ctx.decisionId ?? null,
+      actionId: ctx.actionId ?? null,
+      sessionId: ctx.sessionId ?? null,
+      providerKey: ctx.providerKey ?? null,
+    } : null;
+
+    const opRecordId = auditBase
+      ? await startProviderOperation({
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId ?? null,
+        })
+      : null;
+    if (!auditBase) {
+      logger.warn("provider_operation.skipped_no_tenant", {
         operation: "release",
-        outcome: "success",
         bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { idempotent: true, detail: "No providerResourceId — already released" },
-        startedAt,
-        completedAt: new Date(),
       });
+    }
+
+    if (!input.binding.providerResourceId) {
+      // Already released — idempotent. Terminal update with SUCCEEDED outcome (no-op).
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: null,
+          outcome: "SUCCEEDED",
+          outcomeDetail: { idempotent: true, detail: "No providerResourceId — already released" },
+        });
+      }
       return { status: "success" };
     }
 
@@ -538,47 +578,29 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       logger.info("mikrotik.released", withCorrelation(ctx, {
         bindingId: input.binding.id, providerResourceId: input.binding.providerResourceId,
       }));
-      await recordProviderOperation({
-        operation: "release",
-        outcome: "success",
-        providerResourceId: input.binding.providerResourceId,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+          outcome: "SUCCEEDED",
+        });
+      }
       return { status: "success" };
     } catch (err) {
       const classified = classifyError(err);
       logger.error("mikrotik.release_failed", withCorrelation(ctx, {
         bindingId: input.binding.id, error: classified.error, classification: classified.status,
       }));
-      await recordProviderOperation({
-        operation: "release",
-        outcome: classified.status === "failed_permanent" ? "failed_permanent"
-          : classified.status === "failed_retryable" ? "failed_retryable"
-          : "ambiguous",
-        providerResourceId: input.binding.providerResourceId,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { error: classified.error, classification: classified.status },
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+          outcome: classified.status === "failed_permanent" ? "FAILED_PERMANENT"
+            : classified.status === "failed_retryable" ? "FAILED_RETRYABLE"
+            : "AMBIGUOUS",
+          outcomeDetail: { error: classified.error, classification: classified.status },
+        });
+      }
       return { status: classified.status, error: classified.error };
     }
   }
@@ -589,36 +611,68 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     binding: ProviderResourceBindingInput;
   }): Promise<UsageMetrics | undefined> {
     const ctx = input.correlation ?? {};
-    const startedAt = new Date();
     if (!input.binding.providerResourceId) return undefined;
+
+    // Phase 12.4.4e (P0-2): durable STARTED → terminal audit lifecycle.
+    // tenantId is REQUIRED (P0-3): if ctx.tenantId is null (direct adapter
+    // call without control-plane context), skip audit recording entirely.
+    const auditBase = ctx.tenantId ? {
+      operation: "getUsage" as const,
+      bindingId: input.binding.id,
+      providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
+      providerType: "mikrotik",
+      tenantId: ctx.tenantId,
+      requestId: ctx.requestId ?? null,
+      intentId: ctx.intentId ?? null,
+      decisionId: ctx.decisionId ?? null,
+      actionId: ctx.actionId ?? null,
+      sessionId: ctx.sessionId ?? null,
+      providerKey: ctx.providerKey ?? null,
+    } : null;
+
+    const opRecordId = auditBase
+      ? await startProviderOperation({
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+        })
+      : null;
+    if (!auditBase) {
+      logger.warn("provider_operation.skipped_no_tenant", {
+        operation: "getUsage",
+        bindingId: input.binding.id,
+      });
+    }
 
     try {
       const client = await this.resolveClient(input.binding);
       const usage = await client.getResourceUsage(input.binding.providerResourceId);
-      if (!usage) return undefined;
+      if (!usage) {
+        // Phase 12.4.4e (P0-2): terminal update — provider returned no usage data.
+        // The operation itself succeeded; the result is "no usage available."
+        if (auditBase) {
+          await completeProviderOperation(opRecordId, {
+            ...auditBase,
+            providerResourceId: input.binding.providerResourceId,
+            outcome: "SUCCEEDED",
+            outcomeDetail: { detail: "Provider returned no usage data" },
+          });
+        }
+        return undefined;
+      }
 
-      await recordProviderOperation({
-        operation: "getUsage",
-        outcome: "success",
-        providerResourceId: input.binding.providerResourceId,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: {
-          downloadBytes: usage.downloadBytes,
-          uploadBytes: usage.uploadBytes,
-          sessionDurationSeconds: usage.sessionDurationSeconds,
-          isActive: usage.isActive,
-        },
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+          outcome: "SUCCEEDED",
+          outcomeDetail: {
+            downloadBytes: usage.downloadBytes,
+            uploadBytes: usage.uploadBytes,
+            sessionDurationSeconds: usage.sessionDurationSeconds,
+            isActive: usage.isActive,
+          },
+        });
+      }
 
       return {
         downloadBytes: usage.downloadBytes,
@@ -633,25 +687,16 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       logger.warn("mikrotik.getUsage_failed", withCorrelation(ctx, {
         bindingId: input.binding.id, error: classified.error,
       }));
-      await recordProviderOperation({
-        operation: "getUsage",
-        outcome: classified.status === "failed_permanent" ? "failed_permanent"
-          : classified.status === "failed_retryable" ? "failed_retryable"
-          : "ambiguous",
-        providerResourceId: input.binding.providerResourceId,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { error: classified.error, classification: classified.status },
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+          outcome: classified.status === "failed_permanent" ? "FAILED_PERMANENT"
+            : classified.status === "failed_retryable" ? "FAILED_RETRYABLE"
+            : "AMBIGUOUS",
+          outcomeDetail: { error: classified.error, classification: classified.status },
+        });
+      }
       return undefined;
     }
   }
@@ -662,26 +707,48 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     binding: ProviderResourceBindingInput;
   }): Promise<ReconciliationResult> {
     const ctx = input.correlation ?? {};
-    const startedAt = new Date();
+
+    // Phase 12.4.4e (P0-2): durable STARTED → terminal audit lifecycle.
+    // tenantId is REQUIRED (P0-3): if ctx.tenantId is null (direct adapter
+    // call without control-plane context), skip audit recording entirely.
+    const auditBase = ctx.tenantId ? {
+      operation: "reconcile" as const,
+      bindingId: input.binding.id,
+      providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
+      providerType: "mikrotik",
+      tenantId: ctx.tenantId,
+      requestId: ctx.requestId ?? null,
+      intentId: ctx.intentId ?? null,
+      decisionId: ctx.decisionId ?? null,
+      actionId: ctx.actionId ?? null,
+      sessionId: ctx.sessionId ?? null,
+      providerKey: ctx.providerKey ?? null,
+    } : null;
+
+    const opRecordId = auditBase
+      ? await startProviderOperation({
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId ?? null,
+        })
+      : null;
+    if (!auditBase) {
+      logger.warn("provider_operation.skipped_no_tenant", {
+        operation: "reconcile",
+        bindingId: input.binding.id,
+      });
+    }
+
     if (!input.binding.providerResourceId) {
       // No resource provisioned yet — in sync (nothing to reconcile)
-      await recordProviderOperation({
-        operation: "reconcile",
-        outcome: "success",
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { observedState: "not_found", detail: "No providerResourceId — not yet provisioned" },
-        reconciliationState: "in_sync",
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: null,
+          outcome: "SUCCEEDED",
+          outcomeDetail: { observedState: "not_found", detail: "No providerResourceId — not yet provisioned" },
+          reconciliationState: "in_sync",
+        });
+      }
       return {
         status: "in_sync",
         observedState: "not_found",
@@ -697,24 +764,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
         logger.warn("mikrotik.reconcile_resource_missing", withCorrelation(ctx, {
           bindingId: input.binding.id, providerResourceId: input.binding.providerResourceId,
         }));
-        await recordProviderOperation({
-          operation: "reconcile",
-          outcome: "success",
-          providerResourceId: input.binding.providerResourceId,
-          bindingId: input.binding.id,
-          providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-          providerType: "mikrotik",
-          tenantId: ctx.tenantId ?? null,
-          requestId: ctx.requestId ?? null,
-          intentId: ctx.intentId ?? null,
-          decisionId: ctx.decisionId ?? null,
-          actionId: ctx.actionId ?? null,
-          sessionId: ctx.sessionId ?? null,
-          outcomeDetail: { observedState: "not_found", recommendedBindingState: "FAILED" },
-          reconciliationState: "resource_missing",
-          startedAt,
-          completedAt: new Date(),
-        });
+        if (auditBase) {
+          await completeProviderOperation(opRecordId, {
+            ...auditBase,
+            providerResourceId: input.binding.providerResourceId,
+            outcome: "SUCCEEDED",
+            outcomeDetail: { observedState: "not_found", recommendedBindingState: "FAILED" },
+            reconciliationState: "resource_missing",
+          });
+        }
         return {
           status: "resource_missing",
           observedState: "not_found",
@@ -730,24 +788,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
         logger.info("mikrotik.reconcile_in_sync", withCorrelation(ctx, {
           bindingId: input.binding.id, observedState: "active",
         }));
-        await recordProviderOperation({
-          operation: "reconcile",
-          outcome: "success",
-          providerResourceId: input.binding.providerResourceId,
-          bindingId: input.binding.id,
-          providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-          providerType: "mikrotik",
-          tenantId: ctx.tenantId ?? null,
-          requestId: ctx.requestId ?? null,
-          intentId: ctx.intentId ?? null,
-          decisionId: ctx.decisionId ?? null,
-          actionId: ctx.actionId ?? null,
-          sessionId: ctx.sessionId ?? null,
-          outcomeDetail: { observedState: "active", bindingStatus },
-          reconciliationState: "in_sync",
-          startedAt,
-          completedAt: new Date(),
-        });
+        if (auditBase) {
+          await completeProviderOperation(opRecordId, {
+            ...auditBase,
+            providerResourceId: input.binding.providerResourceId,
+            outcome: "SUCCEEDED",
+            outcomeDetail: { observedState: "active", bindingStatus },
+            reconciliationState: "in_sync",
+          });
+        }
         return {
           status: "in_sync",
           observedState: "active",
@@ -759,24 +808,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
         logger.warn("mikrotik.reconcile_drift", withCorrelation(ctx, {
           bindingId: input.binding.id, observedState: "inactive", bindingStatus,
         }));
-        await recordProviderOperation({
-          operation: "reconcile",
-          outcome: "success",
-          providerResourceId: input.binding.providerResourceId,
-          bindingId: input.binding.id,
-          providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-          providerType: "mikrotik",
-          tenantId: ctx.tenantId ?? null,
-          requestId: ctx.requestId ?? null,
-          intentId: ctx.intentId ?? null,
-          decisionId: ctx.decisionId ?? null,
-          actionId: ctx.actionId ?? null,
-          sessionId: ctx.sessionId ?? null,
-          outcomeDetail: { observedState: "inactive", bindingStatus, recommendedBindingState: "DEGRADED" },
-          reconciliationState: "drift_detected",
-          startedAt,
-          completedAt: new Date(),
-        });
+        if (auditBase) {
+          await completeProviderOperation(opRecordId, {
+            ...auditBase,
+            providerResourceId: input.binding.providerResourceId,
+            outcome: "SUCCEEDED",
+            outcomeDetail: { observedState: "inactive", bindingStatus, recommendedBindingState: "DEGRADED" },
+            reconciliationState: "drift_detected",
+          });
+        }
         return {
           status: "drift_detected",
           observedState: "inactive",
@@ -786,24 +826,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       }
 
       if (!resource.isActive && bindingStatus === "DEGRADED") {
-        await recordProviderOperation({
-          operation: "reconcile",
-          outcome: "success",
-          providerResourceId: input.binding.providerResourceId,
-          bindingId: input.binding.id,
-          providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-          providerType: "mikrotik",
-          tenantId: ctx.tenantId ?? null,
-          requestId: ctx.requestId ?? null,
-          intentId: ctx.intentId ?? null,
-          decisionId: ctx.decisionId ?? null,
-          actionId: ctx.actionId ?? null,
-          sessionId: ctx.sessionId ?? null,
-          outcomeDetail: { observedState: "inactive", bindingStatus: "DEGRADED" },
-          reconciliationState: "in_sync",
-          startedAt,
-          completedAt: new Date(),
-        });
+        if (auditBase) {
+          await completeProviderOperation(opRecordId, {
+            ...auditBase,
+            providerResourceId: input.binding.providerResourceId,
+            outcome: "SUCCEEDED",
+            outcomeDetail: { observedState: "inactive", bindingStatus: "DEGRADED" },
+            reconciliationState: "in_sync",
+          });
+        }
         return {
           status: "in_sync",
           observedState: "inactive",
@@ -812,24 +843,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       }
 
       // Default: in sync
-      await recordProviderOperation({
-        operation: "reconcile",
-        outcome: "success",
-        providerResourceId: input.binding.providerResourceId,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { observedState: resource.isActive ? "active" : "inactive", bindingStatus },
-        reconciliationState: "in_sync",
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+          outcome: "SUCCEEDED",
+          outcomeDetail: { observedState: resource.isActive ? "active" : "inactive", bindingStatus },
+          reconciliationState: "in_sync",
+        });
+      }
       return {
         status: "in_sync",
         observedState: resource.isActive ? "active" : "inactive",
@@ -840,26 +862,17 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       logger.error("mikrotik.reconcile_failed", withCorrelation(ctx, {
         bindingId: input.binding.id, error: classified.error, classification: classified.status,
       }));
-      await recordProviderOperation({
-        operation: "reconcile",
-        outcome: classified.status === "failed_permanent" ? "failed_permanent"
-          : classified.status === "failed_retryable" ? "failed_retryable"
-          : "ambiguous",
-        providerResourceId: input.binding.providerResourceId,
-        bindingId: input.binding.id,
-        providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
-        providerType: "mikrotik",
-        tenantId: ctx.tenantId ?? null,
-        requestId: ctx.requestId ?? null,
-        intentId: ctx.intentId ?? null,
-        decisionId: ctx.decisionId ?? null,
-        actionId: ctx.actionId ?? null,
-        sessionId: ctx.sessionId ?? null,
-        outcomeDetail: { error: classified.error, classification: classified.status },
-        reconciliationState: classified.status,
-        startedAt,
-        completedAt: new Date(),
-      });
+      if (auditBase) {
+        await completeProviderOperation(opRecordId, {
+          ...auditBase,
+          providerResourceId: input.binding.providerResourceId,
+          outcome: classified.status === "failed_permanent" ? "FAILED_PERMANENT"
+            : classified.status === "failed_retryable" ? "FAILED_RETRYABLE"
+            : "AMBIGUOUS",
+          outcomeDetail: { error: classified.error, classification: classified.status },
+          reconciliationState: classified.status,
+        });
+      }
       return {
         status: classified.status,
         details: classified.error,

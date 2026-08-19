@@ -2632,12 +2632,30 @@ model ConnectivityIntentRecord {
   sourceRequestId     String?
   sourceChannel        String?
 
+  // Phase 12.4.4e (P0-1): Authoritative tenant ownership for this intent version.
+  //
+  // BEFORE this field, incident lookup by requestId/intentId resolved tenant
+  // ownership via "latest entitlement for user" — which is unsafe for users
+  // belonging to multiple tenants (Tenant B's newer entitlement would shadow
+  // Tenant A's incident).
+  //
+  // With this field, the intent record carries its OWN authoritative tenantId,
+  // set at creation time from the API principal's tenantId. Incident lookup
+  // resolves tenant ownership directly from this field — no "latest entitlement"
+  // shortcut.
+  //
+  // Nullable for backward compat with legacy intent records created before
+  // Phase 12.4.4e. For legacy records, lookup falls back to the authoritative
+  // decision→session→entitlement→tenant chain (NOT "latest entitlement").
+  tenantId             String?
+
   @@unique([intentId, version]) // version fencing
   @@index([subjectId])
   @@index([intentId])
   @@index([status])
   @@index([expiresAt])
   @@index([sourceRequestId])
+  @@index([tenantId])
 }
 
 // ---------------------------------------------------------------------------
@@ -2679,24 +2697,41 @@ model ConnectivityIntentRecord {
 //   - It is NEVER used by the control plane to make decisions. The control
 //     plane reads its own authoritative state (binding, session, intent).
 //
+// DURABLE LIFECYCLE (Phase 12.4.4e P0-2):
+//   The record is NOT fire-and-forget. It follows a durable lifecycle:
+//
+//     STARTED (created BEFORE the provider mutation)
+//       ↓
+//     provider mutation executes
+//       ↓
+//     SUCCEEDED | FAILED_PERMANENT | FAILED_RETRYABLE | AMBIGUOUS
+//       (terminal update AFTER the provider result)
+//
+//   If the process crashes after the provider mutation but before the terminal
+//   update, the record remains STARTED. An operator can identify incomplete
+//   operations and investigate manually. The audit layer NEVER auto-retries
+//   or triggers reconciliation — it is observational only.
+//
+//   If the terminal update itself fails (DB write error), the provider result
+//   remains authoritative — the control-plane execution does NOT become FAILED
+//   merely because the audit write failed. The record stays STARTED and is
+//   recoverable/reconcilable.
+//
 // Safety:
 //   - No credentials, secrets, tokens, API keys, or passwords are stored.
 //   - Only correlation identifiers + outcome + classification.
-//   - The adapter writes via a fire-and-forget helper (failures are logged
-//     but never block the operation).
 //
-// Tenant authority:
-//   - tenantId is required on every record. The adapter resolves it from the
-//     correlation context (enriched from ProtocolCapability.tenantId by
-//     executeAction → kernel-bridge).
-//   - For operations initiated outside the control plane (rare — e.g., direct
-//     adapter test calls), tenantId may be null. Those records are visible
-//     only to platform-level operators (CRON_SECRET), not tenant-scoped API.
+// Tenant authority (Phase 12.4.4e P0-3):
+//   tenantId is REQUIRED on every record. The adapter resolves it from the
+//   correlation context (enriched from ProtocolCapability.tenantId by
+//   executeAction → kernel-bridge). There is no legitimate production need for
+//   tenantless provider operation records — every production provider operation
+//   is initiated by the control plane, which always has a tenantId.
 //
 // Lookup keys (Phase 12.4.4e):
 //   - requestId     — the originating API request (intent.sourceRequestId)
 //   - actionId      — the control-plane action that caused this operation
-//   - tenantId      — tenant scope (always present for control-plane ops)
+//   - tenantId      — tenant scope (required)
 //   - providerInstanceId — which infrastructure endpoint
 //   - providerResourceId — which provider-side resource
 //   - bindingId     — which binding
@@ -2707,9 +2742,27 @@ model ProviderOperationRecord {
   id              String   @id @default(cuid())
   // Operation type: "provision" | "suspend" | "resume" | "release" | "getUsage" | "reconcile"
   operation       String
-  // Outcome: "success" | "failed_permanent" | "failed_retryable" | "ambiguous"
-  // (mirrors the adapter's OperationOutcome classification from Phase 12.3.2.3)
-  outcome         String
+  // Lifecycle state (Phase 12.4.4e P0-2):
+  //   STARTED           — record created BEFORE the provider mutation. The
+  //                       operation is in progress (or the process crashed
+  //                       before the terminal update — see DURABLE LIFECYCLE above).
+  //   SUCCEEDED         — provider mutation succeeded. Terminal.
+  //   FAILED_PERMANENT  — provider returned a permanent failure (auth, config).
+  //                       Terminal. NOT retryable.
+  //   FAILED_RETRYABLE  — provider returned a transient failure (timeout, 5xx).
+  //                       Terminal. Retryable.
+  //   AMBIGUOUS         — provider outcome is unknown (crash after mutation,
+  //                       lost response). Terminal. Requires reconciliation.
+  //   RECONCILIATION_REQUIRED — the adapter explicitly classified this as
+  //                       requiring reconciliation (e.g., uncertain create
+  //                       safety from Phase 12.4.2a.1). Terminal.
+  state           String   @default("STARTED")
+  // Outcome detail — only present in terminal states. JSON:
+  //   { errorClass, message, statusCode, retryable }
+  // Never contains credentials. The message is the adapter's safe classification
+  // summary, NOT the raw provider response (which may contain secrets).
+  outcome         String?
+  outcomeDetail   String?
   // The provider's own resource identifier (e.g., RouterOS hotspot user ID)
   providerResourceId String?
   // The provider-neutral binding (link to ProviderResourceBinding)
@@ -2718,8 +2771,10 @@ model ProviderOperationRecord {
   providerInstanceId String?
   // The provider type (mikrotik, mock, esim, etc.) — selects the adapter class
   providerType    String?
-  // Tenant scope (authoritative — resolved from correlation context)
-  tenantId        String?
+  // Tenant scope (REQUIRED — Phase 12.4.4e P0-3). The adapter resolves it
+  // from the correlation context. There is no legitimate production need for
+  // tenantless records.
+  tenantId        String
   // Correlation chain (Phase 12.4.4 — full incident trail)
   requestId       String?
   intentId        String?
@@ -2729,10 +2784,6 @@ model ProviderOperationRecord {
   // External idempotency correlation (commerce ops only — control-plane ops
   // use provisioning-lease, not providerKey, per Phase 12.4.4b.3)
   providerKey     String?
-  // Outcome classification detail (JSON: { errorClass, message, statusCode, retryable })
-  // Never contains credentials. The message is the adapter's safe classification
-  // summary, NOT the raw provider response (which may contain secrets).
-  outcomeDetail   String?
   // Reconciliation state at the time of the operation (snapshot)
   reconciliationState String?
   // Timestamps
@@ -2740,6 +2791,7 @@ model ProviderOperationRecord {
   completedAt     DateTime?
 
   @@index([tenantId])
+  @@index([state])
   @@index([requestId])
   @@index([actionId])
   @@index([providerInstanceId])

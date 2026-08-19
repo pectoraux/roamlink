@@ -7561,3 +7561,296 @@ Stage Summary:
   modifies state. It is NOT a second control plane.
 - 10 adversarial tests prove the lookup contract + tenant isolation.
 - 161/161 tests pass in 3 different orderings — deterministic.
+
+---
+Task ID: 12.4.4e-P0-2-adapter
+Agent: Adapter Refactor Agent — MikroTik durable lifecycle
+Task: Refactor the MikroTik adapter to use the new durable STARTED → terminal lifecycle for ProviderOperationRecord. Replace the fire-and-forget recordProviderOperation({...}) calls AFTER the operation with startProviderOperation(input) BEFORE the mutation + completeProviderOperation(recordId, {...}) AFTER the mutation. Enforce tenantId-required contract (skip audit recording if ctx.tenantId is null).
+
+Work Log:
+
+- STEP 0 — Context review:
+  * Read worklog.md Phase 12.4.4e entry — understood the prior fire-and-forget
+    audit recording contract (recordProviderOperation called AFTER the
+    operation completes).
+  * Read src/lib/observability/incident-lookup.ts (lines 856-1055) — confirmed
+    the new lifecycle primitives:
+      - startProviderOperation(input) → string | null (STARTED record ID)
+        Returns null on insert failure (best-effort: logs warn, does NOT
+        throw — the provider operation proceeds).
+      - completeProviderOperation(recordId, input) → void
+        Updates the STARTED record with the terminal outcome. If recordId is
+        null (STARTED failed), creates a terminal record directly. Best-effort
+        (logs warn, does NOT throw — the provider result is already
+        authoritative).
+      - recordProviderOperation(input) — DEPRECATED wrapper that calls
+        completeProviderOperation(null, input). Kept for backward compat with
+        tests that directly record a terminal operation.
+  * Confirmed ProviderOperationRecordInput.tenantId is now non-nullable
+    (line 887: "REQUIRED (Phase 12.4.4e P0-3)").
+
+- STEP 1 — Import update (adapter.ts line 43):
+  * Replaced: `import { recordProviderOperation } from "../../../observability/incident-lookup";`
+  * With:     `import { startProviderOperation, completeProviderOperation } from "../../../observability/incident-lookup";`
+  * Legacy `recordProviderOperation` is no longer referenced from the adapter.
+
+- STEP 2 — Refactored provision() (lines 229-355):
+  * Replaced the single `startedAt = new Date()` + 3 recordProviderOperation
+    calls (idempotent-replay / new-resource / failure) with:
+      - An `auditBase` object capturing the constant correlation fields
+        (operation, bindingId, providerInstanceId, providerType, tenantId,
+        requestId, intentId, decisionId, actionId, sessionId, providerKey).
+        `auditBase` is null when ctx.tenantId is null (the P0-3 fallback —
+        skip audit recording entirely).
+      - A startProviderOperation call BEFORE the provider mutation (returns
+        opRecordId, or null if STARTED insert failed or auditBase is null).
+      - A `logger.warn("provider_operation.skipped_no_tenant", ...)` when
+        auditBase is null (the P0-3 skip path — does NOT pass null tenantId).
+      - 3 completeProviderOperation calls at the 3 return points (idempotent
+        replay → SUCCEEDED, new resource → SUCCEEDED, catch →
+        FAILED_PERMANENT/FAILED_RETRYABLE/AMBIGUOUS).
+  * Removed `const startedAt = new Date()` and `completedAt: new Date()` —
+    startProviderOperation/completeProviderOperation set them automatically.
+
+- STEP 3 — Refactored suspend() (lines 357-439):
+  * Same auditBase + startProviderOperation + completeProviderOperation
+    pattern.
+  * Moved the `if (!input.binding.providerResourceId) {...}` early-return
+    AFTER the startProviderOperation call (so a STARTED record is created
+    before the no-resource permanent failure, then completed with
+    FAILED_PERMANENT outcome).
+  * 3 completeProviderOperation calls: no-resource early-return →
+    FAILED_PERMANENT, success → SUCCEEDED, catch → FAILED_*.
+
+- STEP 4 — Refactored resume() (lines 441-523):
+  * Same pattern as suspend().
+
+- STEP 5 — Refactored release() (lines 525-606):
+  * Same pattern. The no-resource early-return is now recorded as
+    SUCCEEDED (idempotent no-op) — matching the original behavior.
+
+- STEP 6 — Refactored getUsage() (lines 608-702):
+  * Same pattern, with one nuance:
+      - The first early-return `if (!input.binding.providerResourceId)
+        return undefined;` is preserved BEFORE startProviderOperation (no
+        audit recording for that path — matches the original behavior).
+      - The second early-return `if (!usage) return undefined;` is INSIDE
+        the try block AFTER startProviderOperation. The new code calls
+        completeProviderOperation with outcome SUCCEEDED at this point —
+        closing the STARTED record rather than leaving it dangling.
+        The operation succeeded; the provider returned "no usage data."
+
+- STEP 7 — Refactored reconcile() (lines 704-882):
+  * The most complex function — 7 return points (6 success paths + 1 catch).
+  * All 6 reconcile success/early-return paths use outcome "SUCCEEDED":
+      - No providerResourceId → SUCCEEDED, reconciliationState "in_sync"
+      - Resource missing → SUCCEEDED, reconciliationState "resource_missing"
+      - Active + BOUND/PROVISIONING → SUCCEEDED, "in_sync"
+      - Inactive + BOUND → SUCCEEDED, "drift_detected"
+      - Inactive + DEGRADED → SUCCEEDED, "in_sync"
+      - Default → SUCCEEDED, "in_sync"
+  * The catch block uses FAILED_PERMANENT/FAILED_RETRYABLE/AMBIGUOUS +
+    reconciliationState = classified.status (preserved from original).
+  * Per the task's OUTCOME MAPPING rule: reconcile returns resource_missing
+    or drift_detected → SUCCEEDED (the reconcile operation itself
+    succeeded — it returned a result). Only use FAILED_* if the reconcile
+    threw an error.
+
+- STEP 8 — Outcome state mapping (architect's P0-2 contract):
+  * All adapter audit calls now use the uppercase ProviderOperationState
+    values:
+      - success → "SUCCEEDED"
+      - failed_permanent → "FAILED_PERMANENT"
+      - failed_retryable → "FAILED_RETRYABLE"
+      - ambiguous → "AMBIGUOUS"
+  * ReconciliationState values (in_sync, resource_missing, drift_detected,
+    failed_permanent, failed_retryable) are preserved verbatim from the
+    original code — they are the binding's reconciliation state, distinct
+    from the operation outcome.
+
+- STEP 9 — Guardrails honored:
+  * The adapter's return values (ProvisionResult, ActionResult,
+    UsageMetrics, ReconciliationResult) are UNCHANGED — verified by
+    14/14 phase12.4-observability tests still passing.
+  * The `withCorrelation` logging calls (logger.info/warn/error with
+    "mikrotik.*" messages) are UNCHANGED — verified by tests 12.4.4.7,
+    12.4.4.9, 12.4.4.10 which assert on log entry correlation fields.
+  * The error classification semantics (classifyError) are UNCHANGED.
+  * The early-return paths (no providerResourceId, no usage data) preserve
+    their original return values.
+  * No new dependencies added. No other files touched. The new
+    `provider_operation.skipped_no_tenant` warn is a new structured log
+    entry (not a withCorrelation call) — added to surface the P0-3
+    fallback path for operators.
+  * Removed all `const startedAt = new Date()` and `completedAt: new Date()`
+    references — the new lifecycle primitives set them automatically.
+
+- STEP 10 — Lint + tests:
+  * `bun run lint` → clean (no errors, no warnings).
+  * `bun test tests/phase12.4-observability.test.ts` → 14 pass, 0 fail,
+    197 expect() calls, 1.77s.
+  * `bun test tests/phase12.4.4e-incident-lookup.test.ts` → 10 pass,
+    0 fail, 68 expect() calls, 1.25s (the deprecated recordProviderOperation
+    wrapper is still used by test 12.4.4e.7 for synthetic test setup; it
+    still works because it's a thin wrapper over
+    completeProviderOperation(null, input)).
+  * `bunx tsc --noEmit` → only 1 pre-existing error in
+    apps/mobile/app/login.tsx (unrelated to this task — confirmed by
+    running tsc on a stash of my changes; the error exists in the
+    baseline).
+
+Stage Summary:
+- HEAD: (to be committed)
+- Files changed: src/lib/connectivity/providers/mikrotik/adapter.ts
+  (392 insertions, 379 deletions — net +13 lines due to the auditBase
+  pattern's explicit field list per operation).
+- The MikroTik adapter now uses the durable STARTED → terminal audit
+  lifecycle. A crash between startProviderOperation and
+  completeProviderOperation leaves a STARTED record that an operator can
+  identify as an incomplete operation.
+- The P0-3 contract (tenantId is required on every record) is enforced:
+  if ctx.tenantId is null, the adapter skips both start and complete
+  (logs a warn) — it never passes null tenantId to the audit primitives.
+- The P0-2 contract (STARTED insert failure does NOT block the provider
+  operation; terminal update failure does NOT affect the provider result)
+  is honored by delegating to startProviderOperation and
+  completeProviderOperation, both of which are best-effort (catch + log
+  warn, never throw).
+- 14/14 phase12.4-observability tests still pass — the adapter's contract
+  with the control plane (return values, log entries, error semantics)
+  is unchanged.
+- Lint: clean.
+
+---
+Task ID: 12.4.4e-integrity
+Agent: Principal System Architect + Connectivity Platform Architect (main) — Phase 12.4.4e Integrity Fix
+Task: Fix three P0 integrity gaps in the incident lookup: (1) tenant resolution via "latest entitlement for user" was unsafe for multi-tenant users, (2) provider operation audit was fire-and-forget (lossy on crash), (3) tenantId contract was inconsistent (nullable despite docs saying "required").
+
+Work Log:
+
+- STEP 1 — Direct audit at 7c64fea:
+  * ConnectivityIntentRecord: had subjectId + sourceRequestId + sourceChannel, but NO tenantId.
+    Incident lookup by requestId/intentId resolved tenant via:
+      ConnectivityIntentRecord.subjectId → ConnectivityEntitlement.findFirst({ userId, orderBy: createdAt desc })
+    This is "latest entitlement for user" — UNSAFE for multi-tenant users.
+  * ProviderOperationRecord: fire-and-forget (recordProviderOperation after the operation).
+    If the INSERT failed, the audit record disappeared. If the process crashed after the
+    provider mutation but before the INSERT, there was no record at all.
+  * ProviderOperationRecord.tenantId was String? (nullable), contradicting the doc comment
+    "tenantId is required on every record."
+  * ProviderOperationRecord had no lifecycle state — just an "outcome" field set at write time.
+
+- STEP 2 — P0-1 fix: Exact authoritative tenant resolution.
+  * Schema: Added `tenantId String?` to ConnectivityIntentRecord (nullable for backward compat).
+    Added `@@index([tenantId])`.
+  * intent-service.ts: CreateIntentInput now accepts `tenantId?`. createIntent() and
+    supersedeIntent() persist `tenantId` on new intent records.
+  * API route (intents/route.ts POST): passes `principal.tenantId` to createIntent().
+    The principal's tenantId is authoritative — caller cannot override it.
+  * incident-lookup.ts resolveTenantForKey(): REWROTE to use exact authoritative relationships:
+    - requestId → intent.tenantId (authoritative). Legacy fallback: decision→session→entitlement.
+    - intentId → intent.tenantId (authoritative). Same legacy fallback.
+    - decisionId → session.entitlementId → tenantId (exact session). Fallback: intent.tenantId.
+    - actionId → session.entitlementId → tenantId (exact session).
+    - providerResourceId → binding.entitlement.tenantId WHERE entitlement.tenantId = callerTenantId
+      (tenant-aware — providerResourceId can be shared across tenants).
+    - bindingId → binding.entitlementId → tenantId (exact binding).
+    - providerKey → IdempotencyOperation.tenantId (authoritative).
+  * resolveTenantViaDecisionChain() helper: walks EXACT decision→session→entitlement chain
+    (NOT "latest entitlement for user"). Used for legacy intent records without tenantId.
+
+- STEP 3 — P0-2 fix: Durable provider operation lifecycle.
+  * Schema: Added `state String @default("STARTED")` to ProviderOperationRecord.
+    Changed `outcome String` to `outcome String?` (nullable until terminal update).
+    Added `@@index([state])`.
+  * incident-lookup.ts: New lifecycle functions:
+    - startProviderOperation(input) → creates a STARTED record BEFORE the provider mutation.
+      Returns recordId (or null if insert failed). Never throws — provider operation proceeds.
+    - completeProviderOperation(recordId, input) → updates the STARTED record with the
+      terminal outcome. If recordId is null (STARTED failed) or the update affects 0 rows,
+      creates a terminal record directly (fallthrough). Never throws — provider result
+      remains authoritative.
+    - recordProviderOperation() deprecated wrapper (calls completeProviderOperation(null, input)).
+  * MikroTik adapter: refactored all 6 operations (provision, suspend, resume, release,
+    getUsage, reconcile) to use startProviderOperation BEFORE + completeProviderOperation AFTER.
+    6 start + 22 complete calls total. Adapter return values unchanged.
+
+- STEP 4 — P0-3 fix: tenantId required.
+  * Schema: Changed ProviderOperationRecord.tenantId from `String?` to `String` (required).
+  * ProviderOperationRecordInput: tenantId is now `string` (not nullable).
+  * Adapter: builds an `auditBase` that is `null` when `ctx.tenantId` is null. When null,
+    both start and complete are SKIPPED and a `provider_operation.skipped_no_tenant` warn
+    is logged. The adapter NEVER passes null tenantId to the audit primitives.
+
+- STEP 5 — Crash semantics (12.4.4e.13):
+  * STARTED record survives crash. Incident lookup returns it with state="STARTED",
+    outcome=null, completedAt=null. The record is NOT reported as FAILED.
+  * The audit layer did NOT trigger a duplicate mutation — there is only ONE record
+    for the actionId.
+
+- STEP 6 — Audit write failure semantics (12.4.4e.14):
+  * If the terminal update fails (record gone, 0 rows updated), completeProviderOperation
+    falls through to create a new terminal record. The provider result is NOT affected.
+  * The outcome is "SUCCEEDED" (matching the provider result), NOT "FAILED".
+  * The control-plane execution does NOT become FAILED merely because the audit write failed.
+
+- STEP 7 — Adversarial tests (6 new, tests/phase12.4.4e-incident-lookup.test.ts):
+  * 12.4.4e.9: multi-tenant user — A incident resolves to A even if B has newest entitlement.
+    (Proves "latest entitlement for user" shortcut is gone.)
+  * 12.4.4e.10: multi-tenant user — A cannot resolve B requestId.
+  * 12.4.4e.11: shared providerResourceId — tenant-aware resolution via exact binding.
+    Two bindings with SAME providerResourceId in different tenants. A sees A's, B sees B's.
+    A fake tenant gets 404.
+  * 12.4.4e.12: intent v1 (tenant A) + v2 (tenant B) — exact version tenant resolution.
+    v1 lookup from A resolves, from B → 404. v2 lookup from B resolves, from A → 404.
+  * 12.4.4e.13: STARTED record survives crash — incident lookup returns STARTED (not FAILED).
+    No duplicate mutation triggered.
+  * 12.4.4e.14: terminal audit write failure — provider result stays authoritative.
+    Record stays STARTED (or a new terminal record is created via fallthrough).
+    Outcome is NOT fabricated as FAILED.
+
+- STEP 8 — No second source of truth:
+  * ProviderOperationRecord is observational only. It is NEVER read by:
+    - the decision engine (makeDecision)
+    - the action executor (executeAction)
+    - the intent service (createIntent)
+    - the session manager
+    - the entitlement kernel
+    - the ranking engine
+    - the idempotency layer
+    - the reconciliation cron
+  * The only readers are: lookupIncident() (read-only query) and the API route.
+  * The only writers are: startProviderOperation() and completeProviderOperation()
+    (called by the adapter, never by the control plane's decision-making code).
+  * ProviderOperationRecord does NOT store resource state, session state, binding state,
+    decision authority, or execution authority. Those remain on their respective tables.
+
+- STEP 9 — Regression (3 runs, 3 different orderings):
+  * Run 1 (canonical): 167 pass, 0 fail, 1075 expect() calls, 22.80s.
+  * Run 2 (reverse): 167 pass, 0 fail, 1075 expect() calls, 23.31s.
+  * Run 3 (interleaved): 167 pass, 0 fail, 1075 expect() calls, 23.21s.
+  * +6 tests from Phase 12.4.4e integrity = 167 total (was 161).
+  * ZERO new failures. ZERO regressions.
+
+- Lint: clean.
+- Dev server: 200, no errors.
+
+Stage Summary:
+- HEAD: (to be committed)
+- P0-1 FIXED: tenant resolution uses exact authoritative relationships. No "latest
+  entitlement for user" shortcut. Multi-tenant users cannot cross-resolve.
+- P0-2 FIXED: provider operation audit is durable (STARTED → terminal lifecycle).
+  Crash after mutation leaves STARTED record (recoverable, not FAILED).
+  Audit write failure does NOT forge a provider failure.
+- P0-3 FIXED: tenantId is required (String, non-nullable). Adapter skips audit
+  recording when tenantId is null (logs warn, does not pass null).
+- The intent causality model is now fully authoritative:
+    intent.tenantId (set at creation from API principal)
+      → exact intent version
+        → exact decision
+          → exact action
+            → exact session
+              → exact binding
+                → exact provider resource
+                  → provider operation records (STARTED → terminal)
+- 167/167 tests pass in 3 different orderings — deterministic.

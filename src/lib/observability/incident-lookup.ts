@@ -118,7 +118,8 @@ export type IncidentResult = {
   providerOperations: Array<{
     id: string;
     operation: string;
-    outcome: string;
+    state: string;
+    outcome: string | null;
     providerResourceId: string | null;
     bindingId: string | null;
     providerInstanceId: string | null;
@@ -142,6 +143,39 @@ export type IncidentResult = {
  * if the object exists AND belongs to a tenant; returns null if the object
  * does not exist OR is tenantless.
  *
+ * Phase 12.4.4e (P0-1) — EXACT AUTHORITATIVE RELATIONSHIPS:
+ *
+ * This function NEVER uses "latest entitlement for user" to resolve tenant
+ * ownership. That shortcut was unsafe for users belonging to multiple tenants
+ * (Tenant B's newer entitlement would shadow Tenant A's incident).
+ *
+ * Instead, each key resolves through its EXACT authoritative relationship:
+ *
+ *   requestId     → ConnectivityIntentRecord.sourceRequestId
+ *                   → intent.tenantId (Phase 12.4.4e P0-1 field, authoritative)
+ *                   Fallback (legacy records without tenantId):
+ *                     → decision for this intent → session → entitlement → tenantId
+ *                     (NOT "latest entitlement for user")
+ *
+ *   intentId      → ConnectivityIntentRecord.tenantId (authoritative)
+ *                   Same fallback as requestId for legacy records.
+ *
+ *   decisionId    → decision.sessionId → session.entitlementId → entitlement.tenantId
+ *                   (EXACT session, not "latest entitlement for user")
+ *                   Fallback (decision without session):
+ *                     → decision.intentId → intent.tenantId (authoritative)
+ *
+ *   actionId      → action.sessionId → session.entitlementId → entitlement.tenantId
+ *                   (EXACT session)
+ *
+ *   providerResourceId → ProviderResourceBinding.entitlementId → entitlement.tenantId
+ *                        (EXACT binding, not "latest")
+ *
+ *   bindingId     → ProviderResourceBinding.entitlementId → entitlement.tenantId
+ *                   (EXACT binding)
+ *
+ *   providerKey   → IdempotencyOperation.tenantId (authoritative, set at claim time)
+ *
  * This is the SECURITY-CRITICAL function: it ensures Tenant A cannot
  * discover Tenant B state by guessing an identifier. The caller's
  * tenantId is then compared to the resolved tenantId — if they don't
@@ -150,87 +184,92 @@ export type IncidentResult = {
  */
 async function resolveTenantForKey(
   key: IncidentLookupKey,
+  callerTenantId: string,
 ): Promise<{ tenantId: string | null; matched: boolean }> {
   switch (key.kind) {
     case "requestId": {
-      // The requestId is the sourceRequestId on ConnectivityIntentRecord.
-      // The owning tenant is the intent's subject's tenant (via entitlement).
-      // An intent may belong to a subject whose entitlement is in any tenant —
-      // we resolve from the intent record's subject → entitlement → tenant.
+      // Phase 12.4.4e (P0-1): Resolve via the EXACT intent record carrying
+      // this sourceRequestId — use intent.tenantId (authoritative).
       const intent = await db.connectivityIntentRecord.findFirst({
         where: { sourceRequestId: key.value },
-        orderBy: { createdAt: "desc" },
-        select: { subjectId: true },
+        orderBy: { version: "desc" },
+        select: { tenantId: true, intentId: true, subjectId: true },
       });
       if (!intent) return { tenantId: null, matched: false };
-      // Resolve the subject's tenant from their entitlement (most recent active).
-      const ent = await db.connectivityEntitlement.findFirst({
-        where: { userId: intent.subjectId },
-        orderBy: { createdAt: "desc" },
-        select: { tenantId: true },
-      });
-      return { tenantId: ent?.tenantId ?? null, matched: true };
+      // If the intent has an authoritative tenantId, use it.
+      if (intent.tenantId) return { tenantId: intent.tenantId, matched: true };
+      // Legacy fallback: resolve via decision → session → entitlement (exact).
+      // This is NOT "latest entitlement for user" — it's the EXACT session
+      // that the decision was made for.
+      const tenantFromChain = await resolveTenantViaDecisionChain(intent.intentId);
+      return { tenantId: tenantFromChain, matched: true };
     }
 
     case "intentId": {
-      // Intent versions are tenant-owned via subject → entitlement → tenant.
+      // Phase 12.4.4e (P0-1): Resolve via the EXACT intent version — use
+      // intent.tenantId (authoritative).
       const where = key.version !== undefined
         ? { intentId: key.value, version: key.version }
         : { intentId: key.value };
       const intent = await db.connectivityIntentRecord.findFirst({
         where,
         orderBy: { version: "desc" },
-        select: { subjectId: true },
+        select: { tenantId: true, intentId: true },
       });
       if (!intent) return { tenantId: null, matched: false };
-      const ent = await db.connectivityEntitlement.findFirst({
-        where: { userId: intent.subjectId },
-        orderBy: { createdAt: "desc" },
-        select: { tenantId: true },
-      });
-      return { tenantId: ent?.tenantId ?? null, matched: true };
+      if (intent.tenantId) return { tenantId: intent.tenantId, matched: true };
+      // Legacy fallback: resolve via decision → session → entitlement (exact).
+      const tenantFromChain = await resolveTenantViaDecisionChain(intent.intentId);
+      return { tenantId: tenantFromChain, matched: true };
     }
 
     case "decisionId": {
-      // Decision → session → entitlement → tenant.
+      // Phase 12.4.4e (P0-1): decision → session → entitlement → tenant (EXACT).
       const decision = await db.connectivityDecision.findUnique({
         where: { id: key.value },
-        select: { sessionId: true },
+        select: { sessionId: true, intentId: true, intentVersion: true },
       });
-      if (!decision || !decision.sessionId) {
-        // Decision without session — resolve via intent → subject → entitlement.
-        const d = await db.connectivityDecision.findUnique({
-          where: { id: key.value },
-          select: { intentId: true },
+      if (!decision) return { tenantId: null, matched: false };
+      // Primary path: decision → session → entitlement → tenant (exact).
+      if (decision.sessionId) {
+        const session = await db.connectivitySession.findUnique({
+          where: { id: decision.sessionId },
+          select: { entitlementId: true },
         });
-        if (!d) return { tenantId: null, matched: false };
-        const intent = await db.connectivityIntentRecord.findFirst({
-          where: { intentId: d.intentId },
-          orderBy: { version: "desc" },
-          select: { subjectId: true },
-        });
-        if (!intent) return { tenantId: null, matched: false };
-        const ent = await db.connectivityEntitlement.findFirst({
-          where: { userId: intent.subjectId },
-          orderBy: { createdAt: "desc" },
-          select: { tenantId: true },
-        });
-        return { tenantId: ent?.tenantId ?? null, matched: true };
+        if (session?.entitlementId) {
+          const ent = await db.connectivityEntitlement.findUnique({
+            where: { id: session.entitlementId },
+            select: { tenantId: true },
+          });
+          if (ent?.tenantId) return { tenantId: ent.tenantId, matched: true };
+        }
       }
-      const session = await db.connectivitySession.findUnique({
-        where: { id: decision.sessionId },
-        select: { entitlementId: true },
-      });
-      if (!session?.entitlementId) return { tenantId: null, matched: true };
-      const ent = await db.connectivityEntitlement.findUnique({
-        where: { id: session.entitlementId },
-        select: { tenantId: true },
-      });
-      return { tenantId: ent?.tenantId ?? null, matched: true };
+      // Fallback: decision → intent.tenantId (authoritative, Phase 12.4.4e).
+      if (decision.intentId) {
+        // Use the EXACT intent version from the decision (Phase 12.4.4c.3 invariant).
+        if (decision.intentVersion != null) {
+          const intent = await db.connectivityIntentRecord.findUnique({
+            where: { intentId_version: { intentId: decision.intentId, version: decision.intentVersion } },
+            select: { tenantId: true },
+          });
+          if (intent?.tenantId) return { tenantId: intent.tenantId, matched: true };
+        } else {
+          const intent = await db.connectivityIntentRecord.findFirst({
+            where: { intentId: decision.intentId },
+            orderBy: { version: "desc" },
+            select: { tenantId: true },
+          });
+          if (intent?.tenantId) return { tenantId: intent.tenantId, matched: true };
+        }
+        // Final fallback: resolve via the decision chain (exact session/entitlement).
+        const tenantFromChain = await resolveTenantViaDecisionChain(decision.intentId);
+        return { tenantId: tenantFromChain, matched: true };
+      }
+      return { tenantId: null, matched: true };
     }
 
     case "actionId": {
-      // Action → session → entitlement → tenant.
+      // action → session → entitlement → tenant (EXACT).
       const action = await db.connectivityAction.findUnique({
         where: { id: key.value },
         select: { sessionId: true },
@@ -249,25 +288,29 @@ async function resolveTenantForKey(
     }
 
     case "providerResourceId": {
-      // providerResourceId is on ProviderResourceBinding. The binding's
-      // entitlement carries the tenant. Note: providerResourceId is NOT
-      // tenant authority — it is provider-side and may collide across
-      // providers. We resolve via the binding's entitlement.
+      // Phase 12.4.4e (P0-1, 12.4.4e.11): providerResourceId can be SHARED
+      // across tenants (two bindings in different tenants can have the same
+      // providerResourceId — e.g., the provider reuses a username). We must
+      // resolve via the EXACT binding that belongs to the CALLER's tenant.
+      //
+      // We query for bindings with this providerResourceId WHERE the binding's
+      // entitlement belongs to the caller's tenant. If found, return the
+      // caller's tenantId. If not found, return null (not found — safe 404).
       const binding = await db.providerResourceBinding.findFirst({
-        where: { providerResourceId: key.value },
+        where: {
+          providerResourceId: key.value,
+          entitlement: { tenantId: callerTenantId },
+        },
         orderBy: { createdAt: "desc" },
         select: { entitlementId: true },
       });
       if (!binding) return { tenantId: null, matched: false };
-      const ent = await db.connectivityEntitlement.findUnique({
-        where: { id: binding.entitlementId },
-        select: { tenantId: true },
-      });
-      return { tenantId: ent?.tenantId ?? null, matched: true };
+      // The binding belongs to the caller's tenant — return callerTenantId.
+      return { tenantId: callerTenantId, matched: true };
     }
 
     case "bindingId": {
-      // Binding → entitlement → tenant.
+      // binding → entitlement → tenant (EXACT).
       const binding = await db.providerResourceBinding.findUnique({
         where: { id: key.value },
         select: { entitlementId: true },
@@ -281,8 +324,7 @@ async function resolveTenantForKey(
     }
 
     case "providerKey": {
-      // providerKey is on IdempotencyOperation. The operation's tenantId
-      // is authoritative (set when the claim was acquired).
+      // providerKey → IdempotencyOperation.tenantId (authoritative).
       const op = await db.idempotencyOperation.findFirst({
         where: { providerKey: key.value },
         orderBy: { createdAt: "desc" },
@@ -292,6 +334,35 @@ async function resolveTenantForKey(
       return { tenantId: op.tenantId, matched: true };
     }
   }
+}
+
+/**
+ * Legacy fallback: resolve tenant via the EXACT decision → session → entitlement
+ * chain for a given intentId. This is used for intent records created before
+ * Phase 12.4.4e (which don't have a tenantId field).
+ *
+ * This is NOT "latest entitlement for user" — it walks the EXACT decision and
+ * session that were created for this intent. If no decision exists yet, the
+ * tenant cannot be resolved authoritatively (returns null → 404).
+ */
+async function resolveTenantViaDecisionChain(intentId: string): Promise<string | null> {
+  // Find the most recent decision for this exact intentId.
+  const decision = await db.connectivityDecision.findFirst({
+    where: { intentId },
+    orderBy: { createdAt: "desc" },
+    select: { sessionId: true },
+  });
+  if (!decision?.sessionId) return null;
+  const session = await db.connectivitySession.findUnique({
+    where: { id: decision.sessionId },
+    select: { entitlementId: true },
+  });
+  if (!session?.entitlementId) return null;
+  const ent = await db.connectivityEntitlement.findUnique({
+    where: { id: session.entitlementId },
+    select: { tenantId: true },
+  });
+  return ent?.tenantId ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +388,7 @@ export async function lookupIncident(
   callerTenantId: string,
 ): Promise<IncidentResult> {
   // Step 1: Resolve the owning tenant for the lookup key.
-  const { tenantId: owningTenantId, matched } = await resolveTenantForKey(key);
+  const { tenantId: owningTenantId, matched } = await resolveTenantForKey(key, callerTenantId);
 
   // Step 2: Tenant boundary. If the object doesn't exist OR belongs to a
   // different tenant, return 404. The error message is intentionally
@@ -524,9 +595,15 @@ export async function lookupIncident(
     case "bindingId": {
       // These keys map to a binding. From the binding, we resolve the
       // entitlement → session → decision → intent chain (if any).
+      // Phase 12.4.4e.11: For providerResourceId, filter by the caller's
+      // tenant via the entitlement relation — providerResourceId can be
+      // shared across tenants.
       const binding = key.kind === "providerResourceId"
         ? await db.providerResourceBinding.findFirst({
-            where: { providerResourceId: key.value },
+            where: {
+              providerResourceId: key.value,
+              entitlement: { tenantId: callerTenantId },
+            },
             orderBy: { createdAt: "desc" },
           })
         : await db.providerResourceBinding.findUnique({
@@ -687,6 +764,7 @@ export async function lookupIncident(
   const providerOperations = providerOps.map((op) => ({
     id: op.id,
     operation: op.operation,
+    state: op.state,
     outcome: op.outcome,
     providerResourceId: op.providerResourceId,
     bindingId: op.bindingId,
@@ -788,76 +866,201 @@ function safeParseStringArray(s: string): string[] | null {
 }
 
 // ---------------------------------------------------------------------------
-// Provider operation recorder (write path — used by the adapter)
+// Provider operation lifecycle (Phase 12.4.4e P0-2 — durable audit)
 // ---------------------------------------------------------------------------
+
+/**
+ * Lifecycle states for a provider operation record.
+ *
+ *   STARTED           — record created BEFORE the provider mutation. The
+ *                       operation is in progress (or the process crashed
+ *                       before the terminal update).
+ *   SUCCEEDED         — provider mutation succeeded. Terminal.
+ *   FAILED_PERMANENT  — provider returned a permanent failure. Terminal.
+ *   FAILED_RETRYABLE  — provider returned a transient failure. Terminal.
+ *   AMBIGUOUS         — provider outcome is unknown. Terminal. Requires reconciliation.
+ *   RECONCILIATION_REQUIRED — adapter explicitly classified this as requiring
+ *                       reconciliation. Terminal.
+ */
+export type ProviderOperationState =
+  | "STARTED"
+  | "SUCCEEDED"
+  | "FAILED_PERMANENT"
+  | "FAILED_RETRYABLE"
+  | "AMBIGUOUS"
+  | "RECONCILIATION_REQUIRED";
 
 export type ProviderOperationRecordInput = {
   operation: "provision" | "suspend" | "resume" | "release" | "getUsage" | "reconcile";
-  outcome: "success" | "failed_permanent" | "failed_retryable" | "ambiguous";
   providerResourceId?: string | null;
   bindingId?: string | null;
   providerInstanceId?: string | null;
   providerType?: string | null;
-  tenantId?: string | null;
+  tenantId: string; // REQUIRED (Phase 12.4.4e P0-3)
   requestId?: string | null;
   intentId?: string | null;
   decisionId?: string | null;
   actionId?: string | null;
   sessionId?: string | null;
   providerKey?: string | null;
-  outcomeDetail?: Record<string, unknown> | null;
   reconciliationState?: string | null;
-  startedAt?: Date;
-  completedAt?: Date;
 };
 
 /**
- * Persist a provider operation record. This is FIRE-AND-FORGET — the caller
- * (the adapter) never blocks on this write. Failures are logged but do not
- * propagate. The audit trail is best-effort: a missing record does not
- * affect the control plane's correctness (the binding's authoritative state
- * is on ProviderResourceBinding, not here).
+ * Phase 12.4.4e (P0-2): Create a durable STARTED record BEFORE the provider
+ * mutation. This ensures that if the process crashes after the provider
+ * mutation but before the terminal update, the record remains STARTED and
+ * an operator can identify the incomplete operation.
  *
- * This is the SMALLEST architectural addition required to make provider
- * execution history auditable. It is NOT a duplicate event store — it does
- * not drive reevaluation, decision-making, or reconciliation. It is purely
- * a read-only audit surface.
+ * Returns the record ID so the adapter can later call completeProviderOperation()
+ * with the terminal outcome.
+ *
+ * FAILURES HERE DO NOT BLOCK THE PROVIDER OPERATION:
+ *   If the STARTED insert fails (DB error), the provider operation still
+ *   proceeds — we log the audit failure but do NOT throw. The provider result
+ *   remains authoritative. The audit trail is best-effort for the STARTED
+ *   record; the terminal update (if it succeeds) will still create a complete
+ *   record. If both STARTED and terminal fail, the operation is unrecorded —
+ *   but the control plane's authoritative state (binding/session) is unaffected.
  */
-export async function recordProviderOperation(
+export async function startProviderOperation(
   input: ProviderOperationRecordInput,
-): Promise<void> {
+): Promise<string | null> {
   try {
-    await db.providerOperationRecord.create({
+    const record = await db.providerOperationRecord.create({
       data: {
         operation: input.operation,
-        outcome: input.outcome,
+        state: "STARTED",
         providerResourceId: input.providerResourceId ?? null,
         bindingId: input.bindingId ?? null,
         providerInstanceId: input.providerInstanceId ?? null,
         providerType: input.providerType ?? null,
-        tenantId: input.tenantId ?? null,
+        tenantId: input.tenantId,
         requestId: input.requestId ?? null,
         intentId: input.intentId ?? null,
         decisionId: input.decisionId ?? null,
         actionId: input.actionId ?? null,
         sessionId: input.sessionId ?? null,
         providerKey: input.providerKey ?? null,
-        outcomeDetail: input.outcomeDetail ? JSON.stringify(input.outcomeDetail) : null,
         reconciliationState: input.reconciliationState ?? null,
-        startedAt: input.startedAt ?? new Date(),
-        completedAt: input.completedAt ?? new Date(),
+        startedAt: new Date(),
+      },
+    });
+    return record.id;
+  } catch (err) {
+    // Best-effort: log but do NOT throw. The provider operation proceeds.
+    const { logger } = await import("@/lib/logger");
+    logger.warn("provider_operation.start_failed", {
+      operation: input.operation,
+      bindingId: input.bindingId,
+      actionId: input.actionId,
+      tenantId: input.tenantId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * Phase 12.4.4e (P0-2): Update a STARTED record with the terminal outcome.
+ *
+ * If the recordId is null (STARTED insert failed), this function attempts
+ * to create a terminal record directly (so the audit trail still captures
+ * the outcome, even without the STARTED predecessor).
+ *
+ * FAILURES HERE DO NOT AFFECT THE PROVIDER RESULT:
+ *   The caller has already received the provider's result (success/failure).
+ *   If this terminal update fails (DB error), the provider result remains
+ *   authoritative — the control-plane execution does NOT become FAILED merely
+ *   because the audit write failed. The record stays STARTED (if the STARTED
+ *   insert succeeded) and is recoverable/reconcilable.
+ */
+export async function completeProviderOperation(
+  recordId: string | null,
+  input: ProviderOperationRecordInput & {
+    outcome: ProviderOperationState;
+    outcomeDetail?: Record<string, unknown> | null;
+    providerResourceId?: string | null;
+    reconciliationState?: string | null;
+  },
+): Promise<void> {
+  const completedAt = new Date();
+  try {
+    if (recordId) {
+      // Update the existing STARTED record with the terminal outcome.
+      const updated = await db.providerOperationRecord.updateMany({
+        where: { id: recordId, state: "STARTED" },
+        data: {
+          state: input.outcome,
+          outcome: input.outcome,
+          outcomeDetail: input.outcomeDetail ? JSON.stringify(input.outcomeDetail) : null,
+          providerResourceId: input.providerResourceId ?? null,
+          reconciliationState: input.reconciliationState ?? null,
+          completedAt,
+        },
+      });
+      if (updated.count > 0) return;
+      // If count=0, the record was no longer STARTED (already completed by
+      // a concurrent call? unlikely). Fall through to create a new terminal record.
+    }
+    // No recordId (STARTED failed) OR update affected 0 rows — create a
+    // terminal record directly. This ensures the audit trail captures the
+    // outcome even if the STARTED insert failed.
+    await db.providerOperationRecord.create({
+      data: {
+        operation: input.operation,
+        state: input.outcome,
+        outcome: input.outcome,
+        outcomeDetail: input.outcomeDetail ? JSON.stringify(input.outcomeDetail) : null,
+        providerResourceId: input.providerResourceId ?? null,
+        bindingId: input.bindingId ?? null,
+        providerInstanceId: input.providerInstanceId ?? null,
+        providerType: input.providerType ?? null,
+        tenantId: input.tenantId,
+        requestId: input.requestId ?? null,
+        intentId: input.intentId ?? null,
+        decisionId: input.decisionId ?? null,
+        actionId: input.actionId ?? null,
+        sessionId: input.sessionId ?? null,
+        providerKey: input.providerKey ?? null,
+        reconciliationState: input.reconciliationState ?? null,
+        startedAt: completedAt,
+        completedAt,
       },
     });
   } catch (err) {
-    // Best-effort — never let the audit trail break the operation.
-    // Logged at warn level so operators can see if the audit trail is degraded.
+    // Best-effort: log but do NOT throw. The provider result is already
+    // authoritative. The record stays STARTED (if the STARTED insert succeeded)
+    // and is recoverable/reconcilable by an operator.
     const { logger } = await import("@/lib/logger");
-    logger.warn("provider_operation.record_failed", {
+    logger.warn("provider_operation.complete_failed", {
+      recordId,
       operation: input.operation,
       outcome: input.outcome,
       bindingId: input.bindingId,
       actionId: input.actionId,
+      tenantId: input.tenantId,
       error: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy recorder — DEPRECATED, kept for backward compat with tests that
+// call recordProviderOperation directly. New code should use
+// startProviderOperation + completeProviderOperation.
+// ---------------------------------------------------------------------------
+
+/**
+ * @deprecated Use startProviderOperation + completeProviderOperation instead.
+ * This function is kept for backward compat with tests that directly record
+ * a terminal operation without the STARTED lifecycle.
+ */
+export async function recordProviderOperation(
+  input: ProviderOperationRecordInput & {
+    outcome: ProviderOperationState;
+    outcomeDetail?: Record<string, unknown> | null;
+  },
+): Promise<void> {
+  await completeProviderOperation(null, input);
 }
