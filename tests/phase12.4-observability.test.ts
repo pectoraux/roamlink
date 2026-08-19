@@ -950,4 +950,215 @@ describe("Phase 12.4.4 — Operational Observability", () => {
       clearMockClientRegistry();
     }
   }, 120_000);
+
+  // =========================================================================
+  // 12.4.4.14 — Stale decision retains original request causality
+  //
+  // Phase 12.4.4c.3 (P0): The intent-version causality lookup must follow the
+  // EXACT (intentId, intentVersion) referenced by the decision — NOT the
+  // latest ACTIVE version of the intent.
+  //
+  // The bug this prevents:
+  //   API request A → intent v1 (sourceRequestId=req_A) → decision D1(v1)
+  //   D1 sits in PENDING (awaiting execution)
+  //   API request B → supersedes → intent v2 (sourceRequestId=req_B)
+  //   D1 finally executes
+  //     OLD (buggy): executeAction loads "latest ACTIVE" intent → finds v2
+  //                  → provider log gets req_B  ❌ (wrong request)
+  //     NEW (correct): executeAction loads decision.intentVersion (1) exactly
+  //                  → finds v1 → provider log gets req_A  ✅
+  //
+  // The architect's invariant:
+  //   "Correlation provenance must follow the exact intent version referenced
+  //    by the decision, not the current version of that intent."
+  //
+  // Test flow:
+  //   1. Create v1 with sourceRequestId = req_v1.
+  //   2. Create decision D1 referencing (intentId, version=1).
+  //   3. Supersede v1 → v2 with sourceRequestId = req_v2.
+  //   4. Execute D1 (the STALE decision referencing v1).
+  //   5. Assert provider correlation.requestId === req_v1 (the original request).
+  //   6. Assert it is NOT req_v2 (the superseding request).
+  //   7. Sanity: v2.sourceRequestId is still req_v2 (not corrupted by D1's execution).
+  // =========================================================================
+  it("12.4.4.14: stale decision retains original request causality (D1(v1) → req_v1, not req_v2)", async () => {
+    const { db } = await import("@/lib/db");
+    const { hashPassword } = await import("@/lib/security");
+    const { ensureTestSetup } = await import("./setup");
+    const { seedConnectivityCapabilities, createEntitlement, transitionEntitlement, createResourceBinding, CAPABILITY_TYPES, ENTITLEMENT_STATES, registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry, mikrotikConnectivityAdapter } = await import("@/lib/connectivity");
+    const { createTenant, addTenantUser } = await import("@/lib/tenant/service");
+    const { createOrUpdatePolicy } = await import("@/lib/control-plane/policy-engine");
+    const { createSession } = await import("@/lib/control-plane/session-manager");
+    const { makeDecision } = await import("@/lib/control-plane/decision-engine");
+    const { createAction, executeAction } = await import("@/lib/control-plane/action-executor");
+    const { createIntent } = await import("@/lib/control-plane/intent-service");
+
+    await ensureTestSetup();
+    await seedConnectivityCapabilities();
+
+    const email = `p1244c14-${Date.now()}@test.roamlink`;
+    const user = await db.user.create({ data: { email, name: "P12.4.4c.14", passwordHash: await hashPassword("test12345"), role: "customer", emailVerified: new Date() } });
+    const tenant = await db.tenant.create({ data: { name: `P1244c14 ${Date.now()}`, slug: `p1244c14-${Date.now().toString(36)}`, status: "active" } });
+    await addTenantUser({ tenantId: tenant.id, userId: user.id, role: "admin" });
+    const plan = await db.saaasPlan.findUnique({ where: { name: "starter" } });
+    const sub = await db.tenantSubscription.create({ data: { tenantId: tenant.id, saaasPlanId: plan!.id, status: "active", billingCycle: "monthly", currentPeriodEnd: new Date(Date.now() + 30 * 86400000) } });
+
+    const pi = await db.connectivityProviderInstance.create({ data: { tenantId: tenant.id, providerType: "mikrotik", name: `P1244c14 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik" } });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    const ent = await createEntitlement({ tenantId: tenant.id, subscriptionId: sub.id, capabilityType: CAPABILITY_TYPES.INTERNET, capabilitySet: { downloadMbps: 50, uploadMbps: 10 }, validFrom: new Date(), userId: user.id });
+    await transitionEntitlement({ entitlementId: ent.id, toState: ENTITLEMENT_STATES.ACTIVE });
+    await db.connectivityEntitlement.update({ where: { id: ent.id }, data: { userId: user.id } }).catch(() => {});
+
+    // Two resources so both v1 and v2 can produce distinct ACTIVATE decisions
+    // targeting different resources without conflicting on the IN_USE constraint.
+    const capA = await db.protocolCapability.create({ data: { tenantId: tenant.id, providerInstanceId: pi.id, type: "INTERNET", providerType: "mikrotik", technicalSpec: JSON.stringify({ downloadMbps: 50, typicalLatencyMs: 20 }), coverage: JSON.stringify({ countries: ["GH"] }), reliability: 0.92, status: "active" } });
+    const resA = await db.protocolResource.create({ data: { capabilityId: capA.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "A" }), capacity: JSON.stringify({ totalBandwidthMbps: 50 }), state: "AVAILABLE" } });
+    const capB = await db.protocolCapability.create({ data: { tenantId: tenant.id, providerInstanceId: pi.id, type: "INTERNET", providerType: "mikrotik", technicalSpec: JSON.stringify({ downloadMbps: 80, typicalLatencyMs: 15 }), coverage: JSON.stringify({ countries: ["GH"] }), reliability: 0.94, status: "active" } });
+    const resB = await db.protocolResource.create({ data: { capabilityId: capB.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "B" }), capacity: JSON.stringify({ totalBandwidthMbps: 80 }), state: "AVAILABLE" } });
+
+    const bindingA = await createResourceBinding({ entitlementId: ent.id, providerType: "mikrotik", resourceType: "hotspot_user", providerInstanceId: pi.id, userId: user.id });
+    const prA = await mockMikroTikProviderClient.createResource({ resourceType: "hotspot_user", username: `rl-${bindingA.id.slice(-12)}`, password: `pw-${ent.id.slice(-12)}`, downloadRateLimitBps: 50000000, uploadRateLimitBps: 10000000 });
+    const bA = await db.providerResourceBinding.create({ data: { entitlementId: ent.id, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: prA.id, providerMetadata: JSON.stringify({}), status: "UNBOUND", provisioningState: null, providerInstanceId: pi.id } });
+    await db.protocolResource.update({ where: { id: resA.id }, data: { providerBindingId: bA.id } });
+    const bindingB = await createResourceBinding({ entitlementId: ent.id, providerType: "mikrotik", resourceType: "hotspot_user", providerInstanceId: pi.id, userId: user.id });
+    const prB = await mockMikroTikProviderClient.createResource({ resourceType: "hotspot_user", username: `rl-${bindingB.id.slice(-12)}`, password: `pw-${ent.id.slice(-12)}`, downloadRateLimitBps: 80000000, uploadRateLimitBps: 10000000 });
+    const bB = await db.providerResourceBinding.create({ data: { entitlementId: ent.id, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: prB.id, providerMetadata: JSON.stringify({}), status: "UNBOUND", provisioningState: null, providerInstanceId: pi.id } });
+    await db.protocolResource.update({ where: { id: resB.id }, data: { providerBindingId: bB.id } });
+
+    await createOrUpdatePolicy({ subjectId: user.id, preset: "RELIABLE", mode: "automatic", maxAutoSpendMinor: 10000, requireUserApprovalForPurchase: false });
+    const session = await createSession({ subjectId: user.id, entitlementId: ent.id });
+
+    // Step 1: Create intent v1 with sourceRequestId = req_v1.
+    const reqV1 = "req_stale_decision_v1";
+    const v1 = await createIntent({
+      subjectId: user.id,
+      rawText: "v1 connectivity (stale decision test)",
+      capabilityType: "INTERNET",
+      mode: "AUTOMATIC",
+      maxPriceMinor: 500,
+      sourceRequestId: reqV1,
+      sourceChannel: "api",
+    });
+    expect(v1.version).toBe(1);
+
+    // Step 2: Create decision D1 referencing v1's (intentId, version=1).
+    // We do NOT execute D1 yet — it sits PENDING while the intent is superseded.
+    const decisionV1 = await makeDecision({
+      tenantId: tenant.id,
+      subjectId: user.id,
+      sessionId: session.id,
+      capabilityType: "INTERNET",
+      intentId: v1.intentId,
+      intentVersion: 1,
+      maxPriceMinor: 500,
+    });
+    // Persisted decision must reference v1.
+    const persistedDecisionV1 = await db.connectivityDecision.findUnique({
+      where: { id: decisionV1.decisionId },
+      select: { intentId: true, intentVersion: true },
+    });
+    expect(persistedDecisionV1?.intentId).toBe(v1.intentId);
+    expect(persistedDecisionV1?.intentVersion).toBe(1);
+
+    // Step 3: Supersede v1 → v2 with sourceRequestId = req_v2 (different).
+    const reqV2 = "req_stale_decision_v2";
+    const v2 = await createIntent({
+      subjectId: user.id,
+      supersedesIntentId: v1.intentId,
+      expectedVersion: 1,
+      rawText: "v2 connectivity (stale decision test)",
+      capabilityType: "INTERNET",
+      mode: "AUTOMATIC",
+      maxPriceMinor: 800,
+      sourceRequestId: reqV2,
+      sourceChannel: "api",
+    });
+    expect(v2.version).toBe(2);
+    expect(v2.rejected).toBeUndefined();
+
+    // Sanity: v1 is SUPERSEDED, v2 is ACTIVE.
+    const v1Record = await db.connectivityIntentRecord.findUnique({
+      where: { intentId_version: { intentId: v1.intentId, version: 1 } },
+      select: { status: true, sourceRequestId: true },
+    });
+    expect(v1Record?.status).toBe("SUPERSEDED");
+    expect(v1Record?.sourceRequestId).toBe(reqV1);
+    const v2Record = await db.connectivityIntentRecord.findUnique({
+      where: { intentId_version: { intentId: v1.intentId, version: 2 } },
+      select: { status: true, sourceRequestId: true },
+    });
+    expect(v2Record?.status).toBe("ACTIVE");
+    expect(v2Record?.sourceRequestId).toBe(reqV2);
+
+    // Step 4: Intercept the adapter's provision method to capture the correlation
+    // context that executeAction passes downstream.
+    let capturedCorrelation: any = null;
+    const originalProvision = mikrotikConnectivityAdapter.provision.bind(mikrotikConnectivityAdapter);
+    (mikrotikConnectivityAdapter as any).provision = async (input: any) => {
+      capturedCorrelation = input.correlation ?? null;
+      return originalProvision(input);
+    };
+
+    try {
+      // Step 4 (continued): NOW execute D1 — the STALE decision referencing v1.
+      // v2 is the current ACTIVE version, but D1 was caused by v1 / req_v1.
+      const action = await createAction({
+        sessionId: session.id,
+        decisionId: decisionV1.decisionId,
+        type: "ACTIVATE",
+        targetResourceId: decisionV1.targetResourceId!,
+        idempotencyKey: `p1244c14-${session.id}`,
+      });
+      await executeAction(action.id);
+
+      // Step 5: Assert provider correlation.requestId === req_v1 (the ORIGINAL
+      // request that caused D1). NOT req_v2 (the superseding request).
+      expect(capturedCorrelation).not.toBeNull();
+      expect(capturedCorrelation.requestId).toBe(reqV1);
+
+      // Step 6: Assert it is NOT req_v2.
+      expect(capturedCorrelation.requestId).not.toBe(reqV2);
+
+      // Step 7: Sanity — v2.sourceRequestId is still req_v2 (not corrupted by
+      // D1's execution). The lookup did NOT mutate any intent record.
+      const v2RecordAfter = await db.connectivityIntentRecord.findUnique({
+        where: { intentId_version: { intentId: v1.intentId, version: 2 } },
+        select: { sourceRequestId: true, status: true },
+      });
+      expect(v2RecordAfter?.sourceRequestId).toBe(reqV2);
+      expect(v2RecordAfter?.status).toBe("ACTIVE");
+
+      // Step 8: Sanity — v1.sourceRequestId is still req_v1 (D1 correctly loaded
+      // v1's sourceRequestId, not v2's).
+      const v1RecordAfter = await db.connectivityIntentRecord.findUnique({
+        where: { intentId_version: { intentId: v1.intentId, version: 1 } },
+        select: { sourceRequestId: true, status: true },
+      });
+      expect(v1RecordAfter?.sourceRequestId).toBe(reqV1);
+      expect(v1RecordAfter?.status).toBe("SUPERSEDED");
+    } finally {
+      (mikrotikConnectivityAdapter as any).provision = originalProvision;
+
+      // Cleanup
+      await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+      await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+      await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
+      await db.connectivityPolicy.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      await db.connectivityIntentRecord.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      // Phase 12.4.4d: Delete events for BOTH subject AND session.
+      await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      await db.reevaluationEvent.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+      await db.providerResourceBinding.deleteMany({ where: { id: { in: [bA.id, bB.id] } } }).catch(() => {});
+      await db.protocolResource.deleteMany({ where: { id: { in: [resA.id, resB.id] } } }).catch(() => {});
+      await db.protocolCapability.deleteMany({ where: { id: { in: [capA.id, capB.id] } } }).catch(() => {});
+      await db.connectivityEntitlement.deleteMany({ where: { id: ent.id } }).catch(() => {});
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+      await db.tenantSubscription.deleteMany({ where: { id: sub.id } }).catch(() => {});
+      await db.tenantUser.deleteMany({ where: { userId: user.id } }).catch(() => {});
+      await db.tenant.deleteMany({ where: { id: tenant.id } }).catch(() => {});
+      await db.user.deleteMany({ where: { id: user.id } }).catch(() => {});
+      clearMockClientRegistry();
+    }
+  }, 120_000);
 });

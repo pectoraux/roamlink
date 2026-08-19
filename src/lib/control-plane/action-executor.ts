@@ -242,22 +242,67 @@ export async function executeAction(actionId: string, slotContext?: {
     // → action → provider. The intent carries the originating request's ID.
     //
     // The action doesn't directly store intentId — it references a decision,
-    // which stores intentId. Load the decision to get intentId, then load the
-    // intent record to get sourceRequestId.
+    // which stores intentId + intentVersion. Load the decision to get the
+    // EXACT (intentId, intentVersion) pair, then load that specific intent
+    // version record to get sourceRequestId.
+    //
+    // Phase 12.4.4c.3 (P0): The lookup MUST be by the decision's exact
+    // (intentId, intentVersion) — NOT by "latest ACTIVE version" of the intent.
+    // The decision references a specific intent version; using a later version's
+    // sourceRequestId would attribute the wrong request to this action.
+    //
+    // Example of the bug this prevents:
+    //   API request A → intent v1 (sourceRequestId=req_A) → decision D1(v1)
+    //   API request B → supersedes → intent v2 (sourceRequestId=req_B)
+    //   D1 executes → must load v1 (req_A), NOT v2 (req_B)
+    //
+    // The architect's invariant:
+    //   "Correlation provenance must follow the exact intent version referenced
+    //    by the decision, not the current version of that intent."
     let intentIdForCausality: string | null = action.intentId ?? null;
-    if (!intentIdForCausality && action.decisionId) {
+    let intentVersionForCausality: number | null = null;
+    if (action.decisionId) {
       const decision = await db.connectivityDecision.findUnique({
         where: { id: action.decisionId },
-        select: { intentId: true },
+        select: { intentId: true, intentVersion: true },
       });
-      intentIdForCausality = decision?.intentId ?? null;
+      // Prefer the decision's intentId/intentVersion when available (authority).
+      // Fall back to action.intentId only if the decision is missing.
+      if (decision) {
+        if (decision.intentId) intentIdForCausality = decision.intentId;
+        if (typeof decision.intentVersion === "number") {
+          intentVersionForCausality = decision.intentVersion;
+        }
+      }
     }
     if (intentIdForCausality) {
-      const intentRecord = await db.connectivityIntentRecord.findFirst({
-        where: { intentId: intentIdForCausality, status: { in: ["ACTIVE", "FULFILLED"] } },
-        orderBy: { version: "desc" },
-        select: { sourceRequestId: true, sourceChannel: true },
-      });
+      // Use the EXACT (intentId, intentVersion) when both are present.
+      // This is the version-safe lookup — it cannot be misled by a subsequent
+      // supersession that creates a newer ACTIVE version with a different
+      // sourceRequestId.
+      const intentRecord = intentVersionForCausality !== null
+        ? await db.connectivityIntentRecord.findUnique({
+            where: {
+              intentId_version: {
+                intentId: intentIdForCausality,
+                version: intentVersionForCausality,
+              },
+            },
+            select: { sourceRequestId: true, sourceChannel: true },
+          })
+        : // Fallback: action.intentId without a decision's version pin.
+          // This path is only used when the action was created without a
+          // decision (rare — direct API action). In that case there is no
+          // version authority to consult, so we look up the latest ACTIVE
+          // version of the intent.
+          await db.connectivityIntentRecord.findFirst({
+            where: {
+              intentId: intentIdForCausality,
+              status: { in: ["ACTIVE", "FULFILLED"] },
+            },
+            orderBy: { version: "desc" },
+            select: { sourceRequestId: true, sourceChannel: true },
+          });
       if (intentRecord?.sourceRequestId) {
         correlation = createCorrelationContext({
           ...correlation,

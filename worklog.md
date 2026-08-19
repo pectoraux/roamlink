@@ -7238,3 +7238,108 @@ Stage Summary:
 - The architect's invariant is now satisfied:
   "A test suite that is green only when tests are run in isolation is NOT green."
   → The canonical regression is green regardless of execution order.
+
+---
+Task ID: 12.4.4c.3
+Agent: Principal System Architect (main) — Phase 12.4.4c.3 Stale-Decision Causality Fix
+Task: Fix the P0 causality bug in executeAction's intent-version lookup. The decision carries both intentId AND intentVersion, but executeAction was loading the LATEST ACTIVE version of the intent — which could be a superseded version with a different sourceRequestId. Add adversarial test 12.4.4.14 proving stale decisions retain the ORIGINAL request's causality, not the current version's.
+
+Work Log:
+- STEP 1 — Audited the existing implementation:
+  In src/lib/control-plane/action-executor.ts (Phase 12.4.4c, lines 240-267):
+    let intentIdForCausality = action.intentId ?? null;
+    if (!intentIdForCausality && action.decisionId) {
+      const decision = await db.connectivityDecision.findUnique({
+        where: { id: action.decisionId },
+        select: { intentId: true },  // ← only intentId, NOT intentVersion
+      });
+      intentIdForCausality = decision?.intentId ?? null;
+    }
+    if (intentIdForCausality) {
+      const intentRecord = await db.connectivityIntentRecord.findFirst({
+        where: { intentId: intentIdForCausality, status: { in: ["ACTIVE", "FULFILLED"] } },
+        orderBy: { version: "desc" },  // ← BUG: gets LATEST ACTIVE, not decision's version
+        select: { sourceRequestId: true, sourceChannel: true },
+      });
+      // ...
+    }
+
+  This is wrong because:
+    API request A → intent v1 (sourceRequestId=req_A) → decision D1(v1)
+    API request B → supersedes → intent v2 (sourceRequestId=req_B)
+    D1 executes → executeAction loads "latest ACTIVE" → finds v2
+                 → provider log gets req_B  ❌ (wrong request)
+
+  The decision already carries intentId AND intentVersion. The lookup MUST
+  use both, not just intentId + "latest version".
+
+- STEP 2 — Fixed the lookup (src/lib/control-plane/action-executor.ts):
+  * Now loads BOTH decision.intentId AND decision.intentVersion (added
+    intentVersion to the findUnique select clause).
+  * When intentVersion is present (the normal case — decisions always carry
+    intentVersion), uses db.connectivityIntentRecord.findUnique() with the
+    exact (intentId_version) compound unique key — this is the version-safe
+    lookup. It CANNOT be misled by a subsequent supersession.
+  * Fallback path (action.intentId without a decision's version pin) is
+    preserved for the rare case of direct API actions without a decision.
+    In that case there is no version authority, so the latest ACTIVE version
+    is the only sensible choice.
+  * Added extensive comments explaining:
+    - The architect's invariant: "Correlation provenance must follow the
+      exact intent version referenced by the decision, not the current
+      version of that intent."
+    - The bug this prevents (concrete example with v1/v2 supersession).
+    - Why the fallback path exists (direct API actions).
+
+- STEP 3 — Added adversarial test 12.4.4.14 (tests/phase12.4-observability.test.ts):
+  Phase 12.4.4.14 — Stale decision retains original request causality.
+
+  Test flow:
+    1. Create intent v1 with sourceRequestId = req_v1.
+    2. Create decision D1 referencing (intentId, version=1) — D1 sits PENDING.
+    3. Supersede v1 → v2 with sourceRequestId = req_v2.
+    4. NOW execute D1 — the STALE decision referencing v1.
+    5. Assert provider correlation.requestId === req_v1 (the ORIGINAL request).
+    6. Assert it is NOT req_v2 (the superseding request).
+    7. Sanity: v2.sourceRequestId is still req_v2 (not corrupted by D1's execution).
+    8. Sanity: v1.sourceRequestId is still req_v1 (D1 correctly loaded v1's).
+
+  Verified the test FAILS with the OLD buggy implementation (reverted the
+  production fix, ran the test → FAIL at "expect(capturedCorrelation.requestId).toBe(reqV1)"
+  because the old code loaded v2 → req_v2 instead of v1 → req_v1).
+  Verified the test PASSES with the new fix.
+
+  This is the adversarial proof that 12.4.4.13 alone could not provide —
+  12.4.4.13 only proves the CURRENT v2 path; 12.4.4.14 proves the STALE
+  v1 decision retains v1's causality.
+
+- STEP 4 — Verified 12.4.4.13 still passes (it does — the new code handles
+  both the fresh path and the stale path correctly).
+
+- STEP 5 — Ran full canonical regression 3× in different orderings:
+  * Run 1 (canonical order): 151 pass, 0 fail, 971 expect() calls, 21.63s.
+  * Run 2 (reverse order): 151 pass, 0 fail, 971 expect() calls, 21.39s.
+  * Run 3 (interleaved): 151 pass, 0 fail, 970 expect() calls, 21.30s.
+  * All 3 runs ZERO failures, deterministic, order-independent.
+  * +1 test from Phase 12.4.4c.2 (12.4.4.14) = 151 total (was 150).
+
+- Lint: clean.
+- Dev server: 200, no errors.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The architect's invariant is now satisfied:
+  "Correlation provenance must follow the exact intent version referenced by
+   the decision, not the current version of that intent."
+- The intent-version causality lookup is now aligned with the existing
+  intent-version authority fence (Phase 11.4):
+    decision
+      ↕ exact intent version
+    intent provenance
+      ↓
+    provider correlation
+- The causality model is now:
+    v1 ← req_A → D1(v1) → executes → provider log req_A  ✅
+    v2 ← req_B → D2(v2) → executes → provider log req_B  ✅
+  (NOT: D1(v1) executes → provider log req_B ❌)
+- 12.4.4c.2 is now ready to be CLOSED.
