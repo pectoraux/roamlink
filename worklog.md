@@ -7343,3 +7343,221 @@ Stage Summary:
     v2 ← req_B → D2(v2) → executes → provider log req_B  ✅
   (NOT: D1(v1) executes → provider log req_B ❌)
 - 12.4.4c.2 is now ready to be CLOSED.
+
+---
+Task ID: 12.4.4e
+Agent: Principal System Architect + Connectivity Platform Architect (main) — Phase 12.4.4e Incident Lookup
+Task: Turn the existing correlation infrastructure into a read-only operational investigation surface. Tenant-scoped, version-safe, no duplicate authority, no credential leaks.
+
+Work Log:
+
+- STEP 0 — Direct audit at 1bee5d1:
+  Inventory of correlation IDs and where they are persisted:
+    requestId         → ConnectivityIntentRecord.sourceRequestId (Phase 12.4.4c)
+                       + IdempotencyOperation.tenantId/principalId (commerce ops only)
+    sourceChannel     → ConnectivityIntentRecord.sourceChannel (Phase 12.4.4c)
+    intentId          → ConnectivityIntentRecord.intentId (stable across versions)
+    intentVersion     → ConnectivityIntentRecord.version + ConnectivityDecision.intentVersion
+    decisionId        → ConnectivityDecision.id (PK)
+    actionId          → ConnectivityAction.id (PK)
+    sessionId         → ConnectivitySession.id (PK)
+    tenantId          → ConnectivityEntitlement.tenantId + ConnectivityProviderInstance.tenantId
+                       + ProtocolCapability.tenantId + IdempotencyOperation.tenantId
+    providerInstanceId → ConnectivityProviderInstance.id (PK)
+    providerResourceId → ProviderResourceBinding.providerResourceId
+    bindingId         → ProviderResourceBinding.id (PK)
+    providerKey       → IdempotencyOperation.providerKey (commerce ops only — control-plane
+                       ops use provisioning-lease per Phase 12.4.4b.3)
+
+  Status of each field:
+    DESIGNED     ✅ (Phase 12.4.4 — full correlation chain documented)
+    IMPLEMENTED  ✅ (Phase 12.4.4b/c — executeAction threads correlation to adapter)
+    PERSISTED    ✅ (all fields stored on their respective records)
+    QUERYABLE    ❌ (before this phase — no read-only lookup surface existed)
+    TESTED       ❌ (before this phase — no adversarial lookup tests existed)
+
+  Provider operation history:
+    NOT PERSISTED before this phase. The adapter emitted structured logs
+    (logger.info with withCorrelation) but logs roll off and are not
+    queryable by tenant/scope. The IdempotencyOperation table captured
+    commerce-side outcomes (payment/topup) but NOT adapter connectivity
+    operations (provision/suspend/resume/release/getUsage/reconcile).
+
+- STEP 1-3 — Designed the incident lookup model (src/lib/observability/incident-lookup.ts):
+  * Read-only service: lookupIncident(key, callerTenantId) → IncidentResult
+  * Causal chain reconstruction:
+      request → intent version → decision → action → session → binding
+              → provider resource → provider operation records
+  * EXACT intent version (Phase 12.4.4c.3 invariant):
+      uses findUnique({ where: { intentId_version: { intentId, version } } })
+      — NOT "latest active" version. Stale decisions retain their original
+      request's causality.
+  * Stable result contract (IncidentResult type):
+      { incident, intent, decision, action, session, provider, providerOperations }
+      Each field is nullable — null means "not available for this incident,"
+      never fabricated.
+  * NO FABRICATION: if a field is unavailable (e.g., intent without sourceRequestId,
+    action without decisionId), it's null. The contract is honest.
+
+- STEP 2 — Tenant authority:
+  * resolveTenantForKey() resolves the owning tenant for each lookup key by
+    walking authoritative DB relationships:
+      requestId → ConnectivityIntentRecord.sourceRequestId → subjectId
+                → ConnectivityEntitlement (most recent) → tenantId
+      intentId → ConnectivityIntentRecord.subjectId → ConnectivityEntitlement → tenantId
+      decisionId → ConnectivityDecision.sessionId → ConnectivitySession.entitlementId
+                → ConnectivityEntitlement.tenantId
+      actionId → ConnectivityAction.sessionId → ConnectivitySession.entitlementId
+              → ConnectivityEntitlement.tenantId
+      providerResourceId → ProviderResourceBinding.entitlementId → tenantId
+      bindingId → ProviderResourceBinding.entitlementId → ConnectivityEntitlement.tenantId
+      providerKey → IdempotencyOperation.tenantId
+  * Tenant boundary enforced at the lookup level:
+      if (owningTenantId !== callerTenantId) → throw 404 "not found"
+  * NO tenant-existence leak:
+      the 404 error message is "No incident found for this identifier."
+      (does NOT contain "tenant" — verified by test 12.4.4e.8).
+  * Provider identifiers are NOT tenant authority:
+      providerResourceId is resolved via the binding's entitlement, not used
+      directly as a tenant scope (it could collide across providers).
+
+- STEP 4 — Provider operation history (smallest architectural addition):
+  * Added new model: ProviderOperationRecord (prisma/schema.prisma)
+  * Fields: id, operation, outcome, providerResourceId, bindingId,
+    providerInstanceId, providerType, tenantId, requestId, intentId,
+    decisionId, actionId, sessionId, providerKey, outcomeDetail (JSON),
+    reconciliationState, startedAt, completedAt.
+  * SAFETY: NO credentials, secrets, tokens, API keys, passwords stored.
+    Only correlation identifiers + outcome + classification. outcomeDetail
+    contains the adapter's safe classification summary (errorClass, message,
+    statusCode, retryable) — NOT the raw provider response.
+  * FIRE-AND-FORGET: recordProviderOperation() never throws — failures are
+    logged at warn level but do not block the operation. The audit trail is
+    best-effort: a missing record does not affect the control plane's
+    correctness (the binding's authoritative state is on ProviderResourceBinding,
+    not here).
+  * Wired into the MikroTik adapter (all 6 operations: provision, suspend,
+    resume, release, getUsage, reconcile). Each operation records:
+      - operation type
+      - outcome (success | failed_permanent | failed_retryable | ambiguous)
+      - providerResourceId (if available)
+      - bindingId, providerInstanceId, providerType
+      - tenantId (from correlation context)
+      - requestId, intentId, decisionId, actionId, sessionId (from correlation)
+      - outcomeDetail (JSON: error/classification/usage metrics)
+      - reconciliationState (snapshot at operation time)
+
+- STEP 5 — Incident lookup API (src/app/api/v1/connectivity/incidents/route.ts):
+  * GET /api/v1/connectivity/incidents?<key>=<value>
+  * AUTHENTICATED: requires resolveApiPrincipal (API key OR session auth).
+  * TENANT-SCOPED: caller's tenantId is authoritative — cannot be overridden.
+  * READ-ONLY: never executes, retries, or modifies state.
+  * CANONICAL ERROR ENVELOPE: apiV1ErrorResponse emits { error: { code, message, requestId } }.
+  * VERSION CONTRACT: apiV1SuccessResponse attaches X-API-Version + X-API-Stable.
+  * Supported query keys: requestId, intentId (with optional &version=),
+    decisionId, actionId, providerResourceId, bindingId, providerKey.
+  * Validates: exactly one key supplied, value sanitized (alphanumeric + _ -),
+    length 1-256. Multiple keys → 400 validation_failed. No key → 400.
+  * version parameter: positive integer (validated).
+
+- STEP 6 — Adversarial tests (tests/phase12.4.4e-incident-lookup.test.ts, 10 tests):
+  * 12.4.4e.1: lookup by requestId returns complete causal chain
+      (incident + intent + decision + action + session + provider + providerOperations).
+  * 12.4.4e.2: lookup by actionId returns the same chain (proves the chain
+      can be reconstructed from any starting key).
+  * 12.4.4e.3: lookup by decisionId preserves EXACT intent version (not latest).
+  * 12.4.4e.4: Tenant A cannot retrieve Tenant B incident by requestId → 404.
+  * 12.4.4e.5: Tenant A cannot retrieve Tenant B incident by providerResourceId → 404.
+      (Also proves Tenant B CAN look up its own providerResourceId.)
+  * 12.4.4e.6: superseded intent — D1(v1) → req_A, D2(v2) → req_B.
+      Lookup of D1 returns v1+reqA, lookup of D2 returns v2+reqB.
+      The lookup preserves the EXACT intent version, not "latest active."
+  * 12.4.4e.7: provider failure incident returns persisted failure classification
+      + reconciliation state. Proves recordProviderOperation wrote a durable
+      record with outcomeDetail (error, classification, statusCode) and
+      reconciliationState = RECONCILIATION_REQUIRED.
+  * 12.4.4e.8: unknown identifier returns safe 404 — verified for 4 key types
+      (requestId, decisionId, actionId, bindingId). The error message does
+      NOT contain "tenant" (no tenant-existence leak).
+  * Real route handler tests (2):
+      - GET /api/v1/connectivity/incidents?requestId=... → 200 with full chain.
+        Verifies x-request-id, X-API-Version, X-API-Stable headers.
+      - Cross-tenant lookup via real route → 404 with canonical envelope
+        { error: { code: "not_found", message: "...", requestId: "..." } }.
+        The message does NOT contain "tenant".
+
+- STEP 7 — Indexes (only justified ones, no speculation):
+  ProviderOperationRecord indexes added:
+    @@index([tenantId])         — primary tenant-scoped query filter
+    @@index([requestId])        — lookup by requestId
+    @@index([actionId])         — lookup by actionId
+    @@index([providerInstanceId]) — scoped operational views
+    @@index([providerResourceId]) — lookup by providerResourceId
+    @@index([bindingId])        — lookup by bindingId
+    @@index([providerKey])      — lookup by providerKey (commerce ops)
+    @@index([startedAt])        — time-ordered history queries
+  No indexes added to existing tables — all lookup keys already had indexes
+  (ConnectivityIntentRecord.sourceRequestId was indexed in Phase 12.4.4c;
+  ConnectivityDecision.intentId, ConnectivityAction.sessionId/decisionId were
+  already indexed; ProviderResourceBinding.id is the PK).
+
+- STEP 8 — Read-only verification:
+  * lookupIncident() does NOT import any control-plane mutation primitive.
+  * recordProviderOperation() is the ONLY write path, and it only writes to
+    ProviderOperationRecord — never to ConnectivityDecision, ConnectivityAction,
+    ConnectivityIntentRecord, ConnectivitySession, ProviderResourceBinding,
+    ConnectivityEntitlement, IdempotencyOperation, or any other authoritative
+    control-plane table.
+  * The API route handler only calls lookupIncident — it never calls
+    executeAction, makeDecision, createIntent, or any mutation primitive.
+  * The ProviderOperationRecord table is NOT read by any control-plane
+    decision-making code. It is purely a read-only audit surface.
+
+- STEP 9 — Regression (3 runs, 3 different orderings):
+  * Run 1 (canonical): 161 pass, 0 fail, 1038 expect() calls, 21.53s.
+  * Run 2 (reverse): 161 pass, 0 fail, 1038 expect() calls, 21.87s.
+  * Run 3 (interleaved): 161 pass, 0 fail, 1039 expect() calls, 21.85s.
+  * +10 tests from Phase 12.4.4e = 161 total (was 151).
+  * ZERO new failures. ZERO regressions.
+
+- Lint: clean.
+- Dev server: 200, no errors.
+
+- Security considerations:
+  * No credentials, secrets, tokens, API keys, or passwords are stored in
+    ProviderOperationRecord. Only correlation identifiers + outcome classification.
+  * The 404 error message for cross-tenant / unknown lookups is intentionally
+    generic — does NOT disclose whether the object exists under another tenant.
+  * Tenant authority is resolved from authoritative DB relationships
+    (entitlement.tenantId, intentRecord.subjectId → entitlement), NOT from
+    caller-supplied fields.
+  * The API route requires authentication (resolveApiPrincipal) — no
+    unauthenticated access.
+
+- Remaining observability gaps:
+  * The mock provider (mockConnectivityProvider) does NOT yet record operations
+    to ProviderOperationRecord — only the MikroTik adapter does. The mock is
+    used in unit tests; production traffic uses the MikroTik adapter. Adding
+    mock recording is a future hardening step (low priority — mock is test-only).
+  * ProviderOperationRecord does not yet capture the adapter's RECONCILE
+    outcome for non-MikroTik providers. The contract is provider-neutral —
+    other adapters can call recordProviderOperation() when they're hardened.
+  * No time-bounded retention policy for ProviderOperationRecord yet. As
+    volume grows, a future cleanup cron should prune records older than N days.
+    This is a Phase 12.4.5 production-readiness concern.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The incident lookup surface is operational:
+    GET /api/v1/connectivity/incidents?<key>=<value>
+  → returns the complete causal chain (request → intent version → decision
+    → action → session → binding → provider → provider operations).
+- Tenant isolation is enforced at the lookup level — cross-tenant lookups
+  return safe 404 with no tenant-existence leak.
+- Exact intent version is preserved (Phase 12.4.4c.3 invariant holds).
+- Provider operation history is now persisted (ProviderOperationRecord) —
+  the smallest architectural addition required for auditability.
+- The operational view is READ-ONLY — it never executes, retries, or
+  modifies state. It is NOT a second control plane.
+- 10 adversarial tests prove the lookup contract + tenant isolation.
+- 161/161 tests pass in 3 different orderings — deterministic.

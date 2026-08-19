@@ -2654,3 +2654,97 @@ model ConnectivityIntentRecord {
 //        → ReevaluationEvent → Decision → Action
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// Phase 12.4.4e — Provider Operation Audit Record
+//
+// A DURABLE, QUERYABLE record of every provider-side operation performed by
+// the adapter. This is NOT a second control plane — it is a read-only audit
+// trail that lets operators reconstruct what the provider actually did, when,
+// with what outcome, and on behalf of which request.
+//
+// Why this exists (and not just structured logs):
+//   - Structured logs roll off and are not queryable by tenant/scope.
+//   - The IdempotencyOperation table captures the OUTCOME of commerce-side
+//     external operations (payment, topup), not the adapter's connectivity
+//     operations (provision, suspend, resume, release, getUsage, reconcile).
+//   - Without a persisted record, an operator investigating "did the router
+//     actually get the PUT for request X?" has no authoritative answer.
+//
+// What this is NOT:
+//   - It is NOT a duplicate event store. It does not drive reevaluation.
+//   - It is NOT the source of truth for binding state (ProviderResourceBinding
+//     is). It records the OPERATION — what was attempted, what the provider
+//     returned, what classification the adapter assigned.
+//   - It is NEVER used by the control plane to make decisions. The control
+//     plane reads its own authoritative state (binding, session, intent).
+//
+// Safety:
+//   - No credentials, secrets, tokens, API keys, or passwords are stored.
+//   - Only correlation identifiers + outcome + classification.
+//   - The adapter writes via a fire-and-forget helper (failures are logged
+//     but never block the operation).
+//
+// Tenant authority:
+//   - tenantId is required on every record. The adapter resolves it from the
+//     correlation context (enriched from ProtocolCapability.tenantId by
+//     executeAction → kernel-bridge).
+//   - For operations initiated outside the control plane (rare — e.g., direct
+//     adapter test calls), tenantId may be null. Those records are visible
+//     only to platform-level operators (CRON_SECRET), not tenant-scoped API.
+//
+// Lookup keys (Phase 12.4.4e):
+//   - requestId     — the originating API request (intent.sourceRequestId)
+//   - actionId      — the control-plane action that caused this operation
+//   - tenantId      — tenant scope (always present for control-plane ops)
+//   - providerInstanceId — which infrastructure endpoint
+//   - providerResourceId — which provider-side resource
+//   - bindingId     — which binding
+//   - providerKey    — the external idempotency key (commerce ops only)
+// ---------------------------------------------------------------------------
+
+model ProviderOperationRecord {
+  id              String   @id @default(cuid())
+  // Operation type: "provision" | "suspend" | "resume" | "release" | "getUsage" | "reconcile"
+  operation       String
+  // Outcome: "success" | "failed_permanent" | "failed_retryable" | "ambiguous"
+  // (mirrors the adapter's OperationOutcome classification from Phase 12.3.2.3)
+  outcome         String
+  // The provider's own resource identifier (e.g., RouterOS hotspot user ID)
+  providerResourceId String?
+  // The provider-neutral binding (link to ProviderResourceBinding)
+  bindingId       String?
+  // The infrastructure instance
+  providerInstanceId String?
+  // The provider type (mikrotik, mock, esim, etc.) — selects the adapter class
+  providerType    String?
+  // Tenant scope (authoritative — resolved from correlation context)
+  tenantId        String?
+  // Correlation chain (Phase 12.4.4 — full incident trail)
+  requestId       String?
+  intentId        String?
+  decisionId      String?
+  actionId        String?
+  sessionId       String?
+  // External idempotency correlation (commerce ops only — control-plane ops
+  // use provisioning-lease, not providerKey, per Phase 12.4.4b.3)
+  providerKey     String?
+  // Outcome classification detail (JSON: { errorClass, message, statusCode, retryable })
+  // Never contains credentials. The message is the adapter's safe classification
+  // summary, NOT the raw provider response (which may contain secrets).
+  outcomeDetail   String?
+  // Reconciliation state at the time of the operation (snapshot)
+  reconciliationState String?
+  // Timestamps
+  startedAt       DateTime @default(now())
+  completedAt     DateTime?
+
+  @@index([tenantId])
+  @@index([requestId])
+  @@index([actionId])
+  @@index([providerInstanceId])
+  @@index([providerResourceId])
+  @@index([bindingId])
+  @@index([providerKey])
+  @@index([startedAt])
+}
