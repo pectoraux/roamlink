@@ -85,6 +85,13 @@ export async function resolveResourceBinding(input: {
   const providerType = capability.providerType;
   const providerInstanceId = capability.providerInstanceId;
 
+  // Phase 12.4.4b.2: Enrich the correlation context with authoritative data
+  // from the loaded resource/capability BEFORE calling provisionBinding or
+  // reconcileProvisioning. This ensures the adapter receives the full chain.
+  const enrichedCorrelation = input.correlation
+    ? { ...input.correlation, tenantId, providerInstanceId }
+    : undefined;
+
   // If the resource has a linked binding, validate it before using
   if (resource.providerBindingId) {
     const existingBinding = await db.providerResourceBinding.findUnique({
@@ -131,7 +138,7 @@ export async function resolveResourceBinding(input: {
 
       // Reconcile via the frozen kernel
       try {
-        const reconResult = await reconcileProvisioning(existingBinding.id, input.correlation);
+        const reconResult = await reconcileProvisioning(existingBinding.id, enrichedCorrelation);
         if (reconResult.status === "failed") {
           return {
             status: "reconciliation_required",
@@ -201,7 +208,7 @@ export async function resolveResourceBinding(input: {
     }).catch(() => {});
 
     try {
-      const reconResult = await reconcileProvisioning(binding.id, input.correlation);
+      const reconResult = await reconcileProvisioning(binding.id, enrichedCorrelation);
       if (reconResult.status === "failed") {
         return {
           status: "reconciliation_required",
@@ -261,7 +268,7 @@ export async function resolveResourceBinding(input: {
       userId: input.subjectId,
     });
 
-    const provisionResult = await provisionBinding(binding.id, input.correlation);
+    const provisionResult = await provisionBinding(binding.id, enrichedCorrelation);
 
     if (provisionResult.status === "success" || provisionResult.status === "already_provisioned") {
       await db.protocolResource.update({
@@ -328,7 +335,7 @@ export function clearProviderTruthOverride(): void {
   providerTruthOverride = null;
 }
 
-export async function verifyResourceUsable(resourceId: string, sessionId: string): Promise<VerificationResult> {
+export async function verifyResourceUsable(resourceId: string, sessionId: string, correlation?: ProviderCorrelationContext): Promise<VerificationResult> {
   // Phase 11.3.4: Test-only injection point. If a test has set an override,
   // use its result instead of the real provider verification. This simulates
   // a provider truth flip at the exact boundary between reserve and verify.
@@ -362,7 +369,7 @@ export async function verifyResourceUsable(resourceId: string, sessionId: string
   // If the resource has a linked binding, verify via kernel reconcile
   if (resource.providerBindingId) {
     try {
-      const reconResult = await reconcileProvisioning(resource.providerBindingId);
+      const reconResult = await reconcileProvisioning(resource.providerBindingId, correlation);
       if (reconResult.status === "failed") {
         return {
           status: "NOT_USABLE",
@@ -401,7 +408,7 @@ export async function verifyResourceUsable(resourceId: string, sessionId: string
 
     if (binding) {
       try {
-        const reconResult = await reconcileProvisioning(binding.id, input.correlation);
+        const reconResult = await reconcileProvisioning(binding.id, enrichedCorrelation);
         if (reconResult.status === "failed") {
           return {
             status: "NOT_USABLE",

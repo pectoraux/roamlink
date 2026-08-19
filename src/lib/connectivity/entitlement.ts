@@ -2150,7 +2150,7 @@ export async function reconcileProvisioning(bindingId: string, correlation?: imp
   });
 
   try {
-    const result = await provisionBinding(bindingId);
+    const result = await provisionBinding(bindingId, correlation);
 
     if (result.status === "success") {
       // Check whether we bound an existing resource or created a new one.

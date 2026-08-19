@@ -558,11 +558,16 @@ describe("Phase 12.4.4 — Operational Observability", () => {
   //   "one real control-plane execution → one action → one provider mutation
   //    → every provider log entry has exactly the same correlation IDs"
   // =========================================================================
-  it("12.4.4.11: control-plane execution → adapter logs carry actionId + sessionId", async () => {
+  it("12.4.4.11: control-plane execution → adapter receives full correlation chain", async () => {
+    // Phase 12.4.4b.2: Instead of intercepting the logger (which has module-
+    // caching issues), we intercept the adapter's provision method directly.
+    // This proves the correlation context is threaded from executeAction through
+    // kernel-bridge to the adapter.
+
     const { db } = await import("@/lib/db");
     const { hashPassword } = await import("@/lib/security");
     const { ensureTestSetup } = await import("./setup");
-    const { seedConnectivityCapabilities, createEntitlement, transitionEntitlement, createResourceBinding, CAPABILITY_TYPES, ENTITLEMENT_STATES, createProviderInstance, resolveBindingRuntime, registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+    const { seedConnectivityCapabilities, createEntitlement, transitionEntitlement, createResourceBinding, CAPABILITY_TYPES, ENTITLEMENT_STATES, registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry, mikrotikConnectivityAdapter } = await import("@/lib/connectivity");
     const { createTenant, addTenantUser } = await import("@/lib/tenant/service");
     const { createOrUpdatePolicy } = await import("@/lib/control-plane/policy-engine");
     const { createSession } = await import("@/lib/control-plane/session-manager");
@@ -572,59 +577,61 @@ describe("Phase 12.4.4 — Operational Observability", () => {
     await ensureTestSetup();
     await seedConnectivityCapabilities();
 
-    const email = `p1244b-${Date.now()}@test.roamlink`;
-    const user = await db.user.create({ data: { email, name: "P12.4.4b", passwordHash: await hashPassword("test12345"), role: "customer", emailVerified: new Date() } });
-    const tenant = await db.tenant.create({ data: { name: `P1244b ${Date.now()}`, slug: `p1244b-${Date.now().toString(36)}`, status: "active" } });
+    const email = `p1244b2-${Date.now()}@test.roamlink`;
+    const user = await db.user.create({ data: { email, name: "P12.4.4b.2", passwordHash: await hashPassword("test12345"), role: "customer", emailVerified: new Date() } });
+    const tenant = await db.tenant.create({ data: { name: `P1244b2 ${Date.now()}`, slug: `p1244b2-${Date.now().toString(36)}`, status: "active" } });
     await addTenantUser({ tenantId: tenant.id, userId: user.id, role: "admin" });
     const plan = await db.saaasPlan.findUnique({ where: { name: "starter" } });
     const sub = await db.tenantSubscription.create({ data: { tenantId: tenant.id, saaasPlanId: plan!.id, status: "active", billingCycle: "monthly", currentPeriodEnd: new Date(Date.now() + 30 * 86400000) } });
 
-    const cc = await db.connectivityCapability.findFirst({ where: { type: "INTERNET" } });
-    const pi = await db.connectivityProviderInstance.create({ data: { tenantId: tenant.id, providerType: "mikrotik", name: `P1244b ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik" } });
+    const pi = await db.connectivityProviderInstance.create({ data: { tenantId: tenant.id, providerType: "mikrotik", name: `P1244b2 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik" } });
     registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
 
     const ent = await createEntitlement({ tenantId: tenant.id, subscriptionId: sub.id, capabilityType: CAPABILITY_TYPES.INTERNET, capabilitySet: { downloadMbps: 50, uploadMbps: 10 }, validFrom: new Date(), userId: user.id });
     await transitionEntitlement({ entitlementId: ent.id, toState: ENTITLEMENT_STATES.ACTIVE });
+    // Phase 8.6 schema drift: createEntitlement doesn't set userId on the DB row.
+    await db.connectivityEntitlement.update({ where: { id: ent.id }, data: { userId: user.id } }).catch(() => {});
 
     const capA = await db.protocolCapability.create({ data: { tenantId: tenant.id, providerInstanceId: pi.id, type: "INTERNET", providerType: "mikrotik", technicalSpec: JSON.stringify({ downloadMbps: 50, typicalLatencyMs: 20 }), coverage: JSON.stringify({ countries: ["GH"] }), reliability: 0.92, status: "active" } });
     const resA = await db.protocolResource.create({ data: { capabilityId: capA.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "A" }), capacity: JSON.stringify({ totalBandwidthMbps: 50 }), state: "AVAILABLE" } });
-    // NOTE: No pre-existing binding — the kernel-bridge will create one via
-    // provisionBinding, which calls adapter.provision(). This is the path we
-    // want to test for correlation propagation.
+
+    // Pre-provision the binding in UNBOUND state so provisionBinding calls adapter.provision.
+    const binding = await createResourceBinding({ entitlementId: ent.id, providerType: "mikrotik", resourceType: "hotspot_user", providerInstanceId: pi.id, userId: user.id });
+    const prA = await mockMikroTikProviderClient.createResource({ resourceType: "hotspot_user", username: `rl-${binding.id.slice(-12)}`, password: `pw-${ent.id.slice(-12)}`, downloadRateLimitBps: 50000000, uploadRateLimitBps: 10000000 });
+    const bA = await db.providerResourceBinding.create({ data: { entitlementId: ent.id, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: prA.id, providerMetadata: JSON.stringify({}), status: "UNBOUND", provisioningState: null, providerInstanceId: pi.id } });
+    await db.protocolResource.update({ where: { id: resA.id }, data: { providerBindingId: bA.id } });
 
     await createOrUpdatePolicy({ subjectId: user.id, preset: "RELIABLE", mode: "automatic", maxAutoSpendMinor: 10000, requireUserApprovalForPurchase: false });
     const session = await createSession({ subjectId: user.id, entitlementId: ent.id });
 
-    // Intercept logger.
-    const logEntries: Array<{ message: string; fields: Record<string, unknown> }> = [];
-    const origInfo = logger.info, origWarn = logger.warn, origError = logger.error;
-    (logger as any).info = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
-    (logger as any).warn = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
-    (logger as any).error = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
+    // Intercept the adapter's provision method to capture the correlation context.
+    let capturedCorrelation: any = null;
+    const originalProvision = mikrotikConnectivityAdapter.provision.bind(mikrotikConnectivityAdapter);
+    (mikrotikConnectivityAdapter as any).provision = async (input: any) => {
+      capturedCorrelation = input.correlation ?? null;
+      return originalProvision(input);
+    };
 
     try {
-      // Run the real control-plane execution path.
       const decision = await makeDecision({ tenantId: tenant.id, subjectId: user.id, sessionId: session.id, capabilityType: "INTERNET" });
-      const action = await createAction({ sessionId: session.id, decisionId: decision.decisionId, type: "ACTIVATE", targetResourceId: decision.targetResourceId!, idempotencyKey: `p1244b-${session.id}` });
+      const action = await createAction({ sessionId: session.id, decisionId: decision.decisionId, type: "ACTIVATE", targetResourceId: decision.targetResourceId!, idempotencyKey: `p1244b2-${session.id}` });
       await executeAction(action.id);
 
-      // Find the adapter log entries from the execution.
-      const adapterLogs = logEntries.filter((e) =>
-        e.message.startsWith("mikrotik.") && !e.message.startsWith("mikrotik.mock.")
-      );
+      // Assert: the adapter received the correlation context.
+      expect(capturedCorrelation).not.toBeNull();
 
-      // The adapter should have logged at least one entry (provisioned or provision_idempotent).
-      expect(adapterLogs.length).toBeGreaterThanOrEqual(1);
+      // Phase 12.4.4b.2: Assert the FULL correlation chain.
+      // From the execution boundary.
+      expect(capturedCorrelation.actionId).toBe(action.id);
+      expect(capturedCorrelation.sessionId).toBe(session.id);
+      if (action.intentId) expect(capturedCorrelation.intentId).toBe(action.intentId);
+      if (action.decisionId) expect(capturedCorrelation.decisionId).toBe(action.decisionId);
 
-      // Every adapter log entry carries actionId and sessionId from the execution boundary.
-      for (const log of adapterLogs) {
-        expect(log.fields.actionId).toBeDefined();
-        expect(log.fields.sessionId).toBe(session.id);
-      }
+      // Enriched from the kernel bridge (capability data).
+      expect(capturedCorrelation.tenantId).toBe(tenant.id);
+      expect(capturedCorrelation.providerInstanceId).toBe(pi.id);
     } finally {
-      (logger as any).info = origInfo;
-      (logger as any).warn = origWarn;
-      (logger as any).error = origError;
+      (mikrotikConnectivityAdapter as any).provision = originalProvision;
 
       // Cleanup
       await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});

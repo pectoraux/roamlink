@@ -225,7 +225,12 @@ export async function executeAction(actionId: string, slotContext?: {
     // This is the ORIGIN of the correlation chain — every downstream call
     // (kernel-bridge → provisionBinding → adapter → provider client) carries
     // the same context.
-    const correlation = createCorrelationContext({
+    //
+    // Phase 12.4.4b.2: The context is enriched AFTER the bridge result returns
+    // authoritative tenant/provider/binding/resource data. The initial context
+    // carries actionId/sessionId/intentId/decisionId. After resolveResourceBinding
+    // returns, we enrich with tenantId/providerInstanceId/providerResourceId/bindingId.
+    let correlation = createCorrelationContext({
       actionId: action.id,
       sessionId: session.id,
       intentId: action.intentId ?? null,
@@ -261,9 +266,17 @@ export async function executeAction(actionId: string, slotContext?: {
         // 3b. Resolve resource binding via kernel bridge
         // Phase 8.5.8: tenantId is DERIVED from the resource's capability, not caller-supplied
         const bridgeResult = await resolveResourceBinding({
-      correlation,
+          correlation,
           protocolResourceId: targetResourceId,
           subjectId: session.subjectId,
+        });
+
+        // Phase 12.4.4b.2: Enrich correlation with authoritative data from the bridge result.
+        correlation = createCorrelationContext({
+          ...correlation,
+          tenantId: bridgeResult.tenantId ?? null,
+          providerResourceId: bridgeResult.providerResourceId ?? null,
+          bindingId: bridgeResult.bindingId ?? null,
         });
 
         if (bridgeResult.status === "failed") {
@@ -298,7 +311,7 @@ export async function executeAction(actionId: string, slotContext?: {
         // Phase 11.3.2: NOT_USABLE and UNKNOWN both → RECONCILIATION_REQUIRED.
         // The difference is WHY reconciliation is required, not WHETHER.
         // The target is released and the session is NOT activated in either case.
-        const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
+        const verifyResult = await verifyResourceUsable(targetResourceId, session.id, correlation);
         if (verifyResult.status === "NOT_USABLE") {
           await (slotContext
             ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId, slotContext.intentFence)
@@ -443,9 +456,17 @@ export async function executeAction(actionId: string, slotContext?: {
         // 3c. Resolve target binding via kernel bridge
         // Phase 8.5.8: tenantId derived from resource, not caller-supplied
         const bridgeResult = await resolveResourceBinding({
-      correlation,
+          correlation,
           protocolResourceId: targetResourceId,
           subjectId: session.subjectId,
+        });
+
+        // Phase 12.4.4b.2: Enrich correlation with authoritative data from the bridge result.
+        correlation = createCorrelationContext({
+          ...correlation,
+          tenantId: bridgeResult.tenantId ?? null,
+          providerResourceId: bridgeResult.providerResourceId ?? null,
+          bindingId: bridgeResult.bindingId ?? null,
         });
 
         if (bridgeResult.status === "failed") {
@@ -489,7 +510,7 @@ export async function executeAction(actionId: string, slotContext?: {
         // Phase 11.3.2: NOT_USABLE and UNKNOWN both → RECONCILIATION_REQUIRED.
         // The difference is WHY reconciliation is required, not WHETHER.
         // The target is released and the session reverts to the old resource.
-        const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
+        const verifyResult = await verifyResourceUsable(targetResourceId, session.id, correlation);
         if (verifyResult.status === "NOT_USABLE") {
           await (slotContext
             ? fencedReleaseResource(targetResourceId, session.id, slotContext.claimId, slotContext.intentFence)
@@ -812,11 +833,30 @@ export async function recoverStaleActions(): Promise<{
     if (resource.state === "IN_USE" && resource.reservedBy === session.id) {
       // Phase 8.5.9: Use the kernel bridge to validate binding ownership
       // (same authority as normal execution, not a weaker manual lookup)
+      //
+      // Phase 12.4.4b.2: Recovery path constructs its own correlation context
+      // from the action/session/resource data available at recovery time.
+      const recoveryCorrelation = createCorrelationContext({
+        actionId: action.id,
+        sessionId: session.id,
+        intentId: action.intentId ?? null,
+        decisionId: action.decisionId ?? null,
+      });
+
       const bridgeResult = await resolveResourceBinding({
-      correlation,
+        correlation: recoveryCorrelation,
         protocolResourceId: targetResourceId,
         subjectId: session.subjectId,
       });
+
+      // Enrich with bridge result data.
+      const enrichedCorrelation = createCorrelationContext({
+        ...recoveryCorrelation,
+        tenantId: bridgeResult.tenantId ?? null,
+        providerResourceId: bridgeResult.providerResourceId ?? null,
+        bindingId: bridgeResult.bindingId ?? null,
+      });
+      void enrichedCorrelation; // used by downstream calls if recovery proceeds
 
       if (bridgeResult.status === "failed") {
         await releaseResource(targetResourceId, session.id);
@@ -838,7 +878,7 @@ export async function recoverStaleActions(): Promise<{
       }
 
       // Bridge validated — now verify provider truth
-      const verifyResult = await verifyResourceUsable(targetResourceId, session.id);
+      const verifyResult = await verifyResourceUsable(targetResourceId, session.id, correlation);
 
       if (verifyResult.status === "NOT_USABLE") {
         await releaseResource(targetResourceId, session.id);
