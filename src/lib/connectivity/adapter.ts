@@ -125,26 +125,32 @@ export interface ConnectivityProviderAdapter {
   provision(input: {
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
+    /** Phase 12.4.4a: Correlation context for operator observability. */
+    correlation?: import("../observability/provider-correlation").ProviderCorrelationContext;
   }): Promise<ProvisionResult>;
 
   suspend(input: {
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
+    correlation?: import("../observability/provider-correlation").ProviderCorrelationContext;
   }): Promise<ActionResult>;
 
   resume(input: {
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
+    correlation?: import("../observability/provider-correlation").ProviderCorrelationContext;
   }): Promise<ActionResult>;
 
   release(input: {
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
+    correlation?: import("../observability/provider-correlation").ProviderCorrelationContext;
   }): Promise<ActionResult>;
 
   getUsage(input: {
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
+    correlation?: import("../observability/provider-correlation").ProviderCorrelationContext;
   }): Promise<UsageMetrics | undefined>;
 
   /**
@@ -162,5 +168,6 @@ export interface ConnectivityProviderAdapter {
   reconcile(input: {
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
+    correlation?: import("../observability/provider-correlation").ProviderCorrelationContext;
   }): Promise<ReconciliationResult>;
 }

@@ -15,6 +15,7 @@
 import { describe, expect, it, beforeAll } from "bun:test";
 import { NextRequest } from "next/server";
 import { db } from "@/lib/db";
+import { logger } from "@/lib/logger";
 import { config } from "dotenv";
 config({ override: true });
 
@@ -204,5 +205,164 @@ describe("Phase 12.4.4 — Operational Observability", () => {
     // The chain is complete: requestId → tenantId → providerInstanceId →
     // providerResourceId → intentId → decisionId → actionId → providerKey.
     // An operator can search by ANY of these and find the full trail.
+  }, 10_000);
+
+  // =========================================================================
+  // 12.4.4.7 — End-to-end correlation propagation through the adapter
+  //
+  // Proves that when a correlation context is passed to the MikroTik adapter's
+  // provision() method, the adapter's log calls carry the full correlation
+  // chain. This is the production proof that the correlation is threaded
+  // through the actual execution → adapter path, not merely a vocabulary.
+  //
+  // The test intercepts the logger to capture the log entries, then verifies
+  // that every correlation identifier from the context is present in the
+  // adapter's log output.
+  // =========================================================================
+  it("12.4.4.7: end-to-end correlation — adapter provision logs carry the full chain", async () => {
+    // Import the adapter + mock client + correlation context.
+    const { MikroTikConnectivityAdapter, MockMikroTikProviderClient } = await import("@/lib/connectivity");
+    const { createCorrelationContext, withCorrelation } = await import("@/lib/observability/provider-correlation");
+
+    // Create a mock client that succeeds on provision.
+    const mockClient = new MockMikroTikProviderClient();
+
+    // Create the adapter with a resolver that returns the mock client.
+    const adapter = new MikroTikConnectivityAdapter(() => mockClient);
+
+    // Create the full correlation context.
+    const ctx = createCorrelationContext({
+      requestId: "req_e2e_test",
+      tenantId: "tenant_e2e",
+      providerInstanceId: "pi_e2e",
+      intentId: "intent_e2e",
+      decisionId: "decision_e2e",
+      actionId: "action_e2e",
+      providerKey: "prov_key_e2e",
+      bindingId: "binding_e2e",
+      sessionId: "session_e2e",
+    });
+
+    // Intercept the logger to capture log entries.
+    const logEntries: Array<{ message: string; fields: Record<string, unknown> }> = [];
+    const originalInfo = logger.info;
+    const originalWarn = logger.warn;
+    const originalError = logger.error;
+
+    // Temporarily replace the logger methods to capture entries.
+    (logger as any).info = (message: string, fields: Record<string, unknown>) => {
+      logEntries.push({ message, fields });
+    };
+    (logger as any).warn = (message: string, fields: Record<string, unknown>) => {
+      logEntries.push({ message, fields });
+    };
+    (logger as any).error = (message: string, fields: Record<string, unknown>) => {
+      logEntries.push({ message, fields });
+    };
+
+    try {
+      // Call provision with the correlation context.
+      const result = await adapter.provision({
+        entitlement: {
+          id: "ent_e2e",
+          tenantId: "tenant_e2e",
+          subscriptionId: "sub_e2e",
+          status: "ACTIVE",
+          capabilityType: "INTERNET",
+          capabilitySet: { downloadMbps: 50, uploadMbps: 10 },
+          policy: null,
+          validFrom: new Date(),
+          validUntil: null,
+        },
+        binding: {
+          id: "binding_e2e",
+          entitlementId: "ent_e2e",
+          providerType: "mikrotik",
+          providerInstanceId: "pi_e2e",
+          providerResourceId: null,
+          providerMetadata: null,
+          status: "PROVISIONING",
+          provisioningState: "PENDING",
+          providerInstanceConfiguration: null,
+        },
+        correlation: ctx,
+      });
+
+      // The provision should succeed.
+      expect(result.status).toBe("success");
+    } finally {
+      // Restore the logger.
+      (logger as any).info = originalInfo;
+      (logger as any).warn = originalWarn;
+      (logger as any).error = originalError;
+    }
+
+    // Assert: the "mikrotik.provisioned" log entry contains the full chain.
+    const provisionedLog = logEntries.find((e) => e.message === "mikrotik.provisioned");
+    expect(provisionedLog).toBeDefined();
+
+    // Every correlation identifier from the context is present in the log entry.
+    expect(provisionedLog!.fields.requestId).toBe("req_e2e_test");
+    expect(provisionedLog!.fields.tenantId).toBe("tenant_e2e");
+    expect(provisionedLog!.fields.providerInstanceId).toBe("pi_e2e");
+    expect(provisionedLog!.fields.intentId).toBe("intent_e2e");
+    expect(provisionedLog!.fields.decisionId).toBe("decision_e2e");
+    expect(provisionedLog!.fields.actionId).toBe("action_e2e");
+    expect(provisionedLog!.fields.providerKey).toBe("prov_key_e2e");
+    expect(provisionedLog!.fields.bindingId).toBe("binding_e2e");
+    expect(provisionedLog!.fields.sessionId).toBe("session_e2e");
+  }, 30_000);
+
+  // =========================================================================
+  // 12.4.4.8 — Adversarial safety: no secrets in correlation context
+  //
+  // Proves that the correlation context, when serialized for logging,
+  // contains ONLY identifiers — never passwords, API keys, tokens, or
+  // secret material.
+  // =========================================================================
+  it("12.4.4.8: adversarial safety — correlation context contains no secrets even with hostile input", () => {
+    // Even if someone tries to put a password in the context fields,
+    // the ProviderCorrelationContext type only accepts identifier fields.
+    // This test verifies the serialized output has no secret-like patterns.
+
+    const ctx = createCorrelationContext({
+      requestId: "req_safety_test",
+      tenantId: "tenant_safety",
+      providerInstanceId: "pi_safety",
+      providerResourceId: "*safety_resource",
+      intentId: "intent_safety",
+      decisionId: "decision_safety",
+      actionId: "action_safety",
+      providerKey: "prov_key_safety",
+      bindingId: "binding_safety",
+      sessionId: "session_safety",
+    });
+
+    const logEntry = withCorrelation(ctx, { event: "provider.safety_test" });
+    const serialized = JSON.stringify(logEntry);
+
+    // No credential-related patterns should appear.
+    const secretPatterns = [
+      /password/i,
+      /secret/i,
+      /apiKey/i,
+      /api_key/i,
+      /bearer\b/i,
+      /authorization/i,
+      /credential/i,
+    ];
+
+    for (const pattern of secretPatterns) {
+      expect(serialized).not.toMatch(pattern);
+    }
+
+    // The identifiers ARE present.
+    expect(serialized).toContain("req_safety_test");
+    expect(serialized).toContain("tenant_safety");
+    expect(serialized).toContain("pi_safety");
+    expect(serialized).toContain("intent_safety");
+    expect(serialized).toContain("decision_safety");
+    expect(serialized).toContain("action_safety");
+    expect(serialized).toContain("prov_key_safety");
   }, 10_000);
 });

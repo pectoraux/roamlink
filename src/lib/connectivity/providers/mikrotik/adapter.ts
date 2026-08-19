@@ -38,6 +38,8 @@ import type {
 import type { MikroTikProviderClient, MikroTikResourceConfig, MikroTikClientResolver } from "./client";
 import { MikroTikProviderError } from "./client";
 import type { AsyncMikroTikClientResolver } from "./client-factory";
+import type { ProviderCorrelationContext } from "../../../observability/provider-correlation";
+import { withCorrelation } from "../../../observability/provider-correlation";
 import { logger } from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
@@ -226,17 +228,19 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
   async provision(input: {
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
+    correlation?: ProviderCorrelationContext;
   }): Promise<ProvisionResult> {
+    const ctx = input.correlation ?? {};
     try {
       const client = await this.resolveClient(input.binding);
       // If the binding already has a providerResourceId, it's idempotent — return it.
       if (input.binding.providerResourceId) {
         const existing = await client.getResource(input.binding.providerResourceId);
         if (existing) {
-          logger.info("mikrotik.provision_idempotent", {
+          logger.info("mikrotik.provision_idempotent", withCorrelation(ctx, {
             bindingId: input.binding.id,
             username: input.binding.providerResourceId,
-          });
+          }));
           return {
             status: "success",
             providerResourceId: existing.id,
@@ -249,17 +253,17 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
           };
         }
         // Resource was deleted at the provider — re-create
-        logger.info("mikrotik.provision_recreate", { bindingId: input.binding.id });
+        logger.info("mikrotik.provision_recreate", withCorrelation(ctx, { bindingId: input.binding.id }));
       }
 
       const config = mapCapabilityToMikroTikConfig(input.entitlement, input.binding);
       const resource = await client.createResource(config);
 
-      logger.info("mikrotik.provisioned", {
+      logger.info("mikrotik.provisioned", withCorrelation(ctx, {
         bindingId: input.binding.id,
         username: resource.id,
         resourceType: resource.resourceType,
-      });
+      }));
 
       return {
         status: "success",
@@ -273,11 +277,11 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       };
     } catch (err) {
       const classified = classifyError(err);
-      logger.error("mikrotik.provision_failed", {
+      logger.error("mikrotik.provision_failed", withCorrelation(ctx, {
         bindingId: input.binding.id,
         error: classified.error,
         classification: classified.status,
-      });
+      }));
       return {
         status: classified.status,
         error: classified.error,
@@ -286,6 +290,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
   }
 
   async suspend(input: {
+    correlation?: ProviderCorrelationContext;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
@@ -304,6 +309,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
   }
 
   async resume(input: {
+    correlation?: ProviderCorrelationContext;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
@@ -322,6 +328,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
   }
 
   async release(input: {
+    correlation?: ProviderCorrelationContext;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
@@ -341,6 +348,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
   }
 
   async getUsage(input: {
+    correlation?: ProviderCorrelationContext;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<UsageMetrics | undefined> {
@@ -370,6 +378,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
   }
 
   async reconcile(input: {
+    correlation?: ProviderCorrelationContext;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ReconciliationResult> {

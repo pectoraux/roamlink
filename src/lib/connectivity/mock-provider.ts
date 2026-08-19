@@ -23,6 +23,7 @@ export class MockConnectivityProvider implements ConnectivityProviderAdapter {
   readonly label = "Mock Connectivity Provider (Development)";
 
   async provision(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ProvisionResult> {
@@ -50,6 +51,7 @@ export class MockConnectivityProvider implements ConnectivityProviderAdapter {
   }
 
   async suspend(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
@@ -62,6 +64,7 @@ export class MockConnectivityProvider implements ConnectivityProviderAdapter {
   }
 
   async resume(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
@@ -74,6 +77,7 @@ export class MockConnectivityProvider implements ConnectivityProviderAdapter {
   }
 
   async release(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
@@ -85,6 +89,7 @@ export class MockConnectivityProvider implements ConnectivityProviderAdapter {
   }
 
   async getUsage(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<UsageMetrics | undefined> {
@@ -104,6 +109,7 @@ export class MockConnectivityProvider implements ConnectivityProviderAdapter {
   }
 
   async reconcile(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ReconciliationResult> {

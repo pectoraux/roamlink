@@ -105,6 +105,7 @@ export class EsimConnectivityAdapter implements ConnectivityProviderAdapter {
   }
 
   async provision(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ProvisionResult> {
@@ -157,6 +158,7 @@ export class EsimConnectivityAdapter implements ConnectivityProviderAdapter {
   }
 
   async suspend(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
@@ -174,6 +176,7 @@ export class EsimConnectivityAdapter implements ConnectivityProviderAdapter {
   }
 
   async resume(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
@@ -191,6 +194,7 @@ export class EsimConnectivityAdapter implements ConnectivityProviderAdapter {
   }
 
   async release(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
@@ -208,6 +212,7 @@ export class EsimConnectivityAdapter implements ConnectivityProviderAdapter {
   }
 
   async getUsage(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<UsageMetrics | undefined> {
@@ -228,6 +233,7 @@ export class EsimConnectivityAdapter implements ConnectivityProviderAdapter {
   }
 
   async reconcile(input: {
+    correlation?: any;
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ReconciliationResult> {
