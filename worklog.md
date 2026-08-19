@@ -7854,3 +7854,127 @@ Stage Summary:
                 → exact provider resource
                   → provider operation records (STARTED → terminal)
 - 167/167 tests pass in 3 different orderings — deterministic.
+
+---
+Task ID: 12.4.4e.1
+Agent: Principal System Architect (main) — Phase 12.4.4e.1 Durable Provider Operation Identity
+Task: Fix the P0 duplicate-record fallback in completeProviderOperation. When the terminal UPDATE fails, the code created a NEW terminal ProviderOperationRecord, violating the ONE-mutation-ONE-record invariant. Enforce durable operation identity via the generated ProviderOperationRecord.id.
+
+Work Log:
+
+- STEP 0 — Direct audit at c50c376:
+  Read src/lib/observability/incident-lookup.ts completeProviderOperation().
+  CONFIRMED: lines 1006-1030 contained the duplicate-record fallback:
+    if (recordId) { ... if (updated.count > 0) return; }
+    // No recordId OR update affected 0 rows — create a terminal record directly.
+    await db.providerOperationRecord.create({ ... });
+  This produces TWO records for ONE mutation (STARTED + terminal), destroying
+  operation identity and making incident lookup ambiguous.
+
+- STEP 1 — Operation identity:
+  The generated ProviderOperationRecord.id (returned by startProviderOperation)
+  is the DURABLE IDENTITY of the provider operation attempt. Every terminal
+  transition MUST update that exact record. NEVER create a second record.
+
+- STEP 2 — Fixed completeProviderOperation (4 cases):
+  Case 1: recordId is null (STARTED insert failed).
+    → Do NOT create a terminal record. Emit high-severity audit-write failure.
+    → Return. The operation is unrecorded — control plane authoritative state
+      (binding/session) is unaffected.
+  Case 2: recordId present, conditional terminal update (WHERE id=recordId AND state=STARTED)
+    affects >0 rows.
+    → Success. STARTED → terminal. Return.
+  Case 3: UPDATE affects 0 rows. Re-read the record:
+    - If missing (deleted): do NOT fabricate. Emit high-severity failure. Return.
+    - If still STARTED (transient failure): preserve STARTED. Emit failure. Return.
+    - If already terminal (concurrent worker / recovery): DB state wins. Do NOT
+      overwrite. Emit info log. Return.
+  Case 4: UPDATE throws (DB error). Do NOT create duplicate. Emit failure. Return.
+  The provider result is NEVER converted to a fake failure.
+
+- STEP 3 — Provider truth preserved:
+  The provider result (success/failure) is determined by the adapter's actual
+  provider call. Audit persistence failure NEVER rewrites it. The control-plane
+  execution does NOT become FAILED merely because the audit write failed.
+
+- STEP 4 — STARTED recovery path:
+  STARTED records that survive beyond a reasonable threshold are exposed as
+  operator incidents via lookupIncident(). The incident lookup treats STARTED
+  as a legitimate operational state ("operation attempted / outcome not yet
+  durably finalized") — NOT as FAILED or SUCCESS.
+  No automatic provider mutation retries from the audit subsystem. An operator
+  or future reconciliation worker can query the provider truth and call
+  completeProviderOperation(recordId, terminalOutcome) — the SAME record is
+  updated, no duplicate. (Test 12.4.4e.16 proves this.)
+
+- STEP 5 — Adversarial tests (4 new, tests/phase12.4.4e-incident-lookup.test.ts):
+  12.4.4e.15: terminal UPDATE fails (record already terminal) → exactly ONE
+    record, DB state wins, loser doesn't overwrite, no duplicate.
+  12.4.4e.16: STARTED record later reconciled → SAME record updated
+    (STARTED→SUCCEEDED), no second audit record.
+  12.4.4e.17: concurrent completion (two workers, different outcomes) →
+    exactly one wins, no duplicate, loser doesn't overwrite winner.
+  12.4.4e.18: provider succeeds + audit persistence fails → provider result
+    stays SUCCESS, execution NOT FAILED, audit SUCCEEDED, no second op triggered.
+
+- STEP 6 — Tenant isolation regression:
+  All 6 prior tests (12.4.4e.9-14) continue to pass. Test 12.4.4e.14 was
+  updated to match the new correct behavior (no duplicate terminal record
+  created when STARTED is missing — the record count is 0, not 1).
+
+- STEP 7 — Incident lookup:
+  lookupIncident() already exposes STARTED correctly:
+    state: "STARTED"
+    outcome: null
+    completedAt: null
+  The lookup does NOT interpret STARTED as FAILED or SUCCESS. It exposes
+  enough information for operator investigation (operation, startedAt, provider
+  identifiers, correlation identifiers, state, outcome if known, reconciliation
+  state if known). No secrets.
+
+- STEP 8 — No second control plane:
+  ProviderOperationRecord is observational only. It is NEVER read by:
+    - the decision engine (makeDecision)
+    - the action executor (executeAction)
+    - the intent service (createIntent)
+    - the session manager
+    - the entitlement kernel
+    - the ranking engine
+    - the idempotency layer
+    - the reconciliation cron
+  The only readers are lookupIncident() (read-only query) and the API route.
+  The only writers are startProviderOperation() and completeProviderOperation()
+  (called by the adapter, never by the control plane's decision-making code).
+
+- STEP 9 — Schema / concurrency:
+  The DB-authoritative fence is the conditional updateMany:
+    WHERE id = recordId AND state = "STARTED"
+  This is a read-then-update anti-pattern? NO — it's a single atomic UPDATE
+  with a WHERE guard. Prisma's updateMany is a single SQL statement. Two
+  concurrent workers cannot both transition the same STARTED record — only
+  the first affects >0 rows; the second gets 0 rows and falls to Case 3.
+  No uniqueness constraint on requestId/actionId/providerResourceId/providerKey
+  (those are NOT unique per operation — the safe identity is the generated id).
+
+- STEP 10 — Regression (3 runs, 3 different orderings):
+  Run 1 (canonical): 171 pass, 0 fail, 1101 expect() calls, 23.08s.
+  Run 2 (reverse): 171 pass, 0 fail, 1101 expect() calls, 23.38s.
+  Run 3 (interleaved): 171 pass, 0 fail, 1101 expect() calls, 22.97s.
+  +4 tests from Phase 12.4.4e.1 = 171 total (was 167).
+  ZERO new failures. ZERO regressions.
+
+- Lint: clean.
+- Dev server: 200, no errors.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The ONE-mutation-ONE-record invariant is now enforced:
+    ONE provider mutation → ONE ProviderOperationRecord
+  The generated ProviderOperationRecord.id is the durable identity. Every
+  terminal transition updates that exact record. No duplicate is ever created.
+- Terminal write failure → preserve STARTED (or DB-state-wins if already terminal).
+- Provider result is NEVER rewritten by audit failure.
+- STARTED is a legitimate recoverable state (operator incident, not FAILED).
+- Concurrent completion is DB-authoritative (first updateMany wins, loser no-ops).
+- The audit subsystem NEVER triggers provider mutations or retries.
+- 171/171 tests pass in 3 different orderings — deterministic.

@@ -984,28 +984,141 @@ export async function completeProviderOperation(
     reconciliationState?: string | null;
   },
 ): Promise<void> {
+  const { logger } = await import("@/lib/logger");
   const completedAt = new Date();
+
+  // Phase 12.4.4e.1 — DURABLE OPERATION IDENTITY:
+  // ONE provider mutation = ONE ProviderOperationRecord. The generated
+  // ProviderOperationRecord.id is the durable identity of the operation
+  // attempt. NEVER create a second record as a fallback.
+  //
+  // Case 1: No STARTED record exists (startProviderOperation returned null).
+  // Do NOT create a terminal record — that would be a SECOND operation identity.
+  if (!recordId) {
+    logger.error("provider_operation.complete_no_started_record", {
+      operation: input.operation,
+      outcome: input.outcome,
+      bindingId: input.bindingId,
+      actionId: input.actionId,
+      tenantId: input.tenantId,
+      reason: "STARTED insert failed earlier; cannot create a terminal record without a STARTED predecessor (would violate ONE-mutation-ONE-record invariant)",
+    });
+    return;
+  }
+
   try {
-    if (recordId) {
-      // Update the existing STARTED record with the terminal outcome.
-      const updated = await db.providerOperationRecord.updateMany({
-        where: { id: recordId, state: "STARTED" },
-        data: {
-          state: input.outcome,
-          outcome: input.outcome,
-          outcomeDetail: input.outcomeDetail ? JSON.stringify(input.outcomeDetail) : null,
-          providerResourceId: input.providerResourceId ?? null,
-          reconciliationState: input.reconciliationState ?? null,
-          completedAt,
-        },
-      });
-      if (updated.count > 0) return;
-      // If count=0, the record was no longer STARTED (already completed by
-      // a concurrent call? unlikely). Fall through to create a new terminal record.
+    // Case 2: Conditional terminal update — DB-authoritative fence.
+    // Only the worker holding the STARTED record can transition it.
+    const updated = await db.providerOperationRecord.updateMany({
+      where: { id: recordId, state: "STARTED" },
+      data: {
+        state: input.outcome,
+        outcome: input.outcome,
+        outcomeDetail: input.outcomeDetail ? JSON.stringify(input.outcomeDetail) : null,
+        providerResourceId: input.providerResourceId ?? null,
+        reconciliationState: input.reconciliationState ?? null,
+        completedAt,
+      },
+    });
+
+    if (updated.count > 0) {
+      // Success — the record transitioned STARTED → terminal.
+      return;
     }
-    // No recordId (STARTED failed) OR update affected 0 rows — create a
-    // terminal record directly. This ensures the audit trail captures the
-    // outcome even if the STARTED insert failed.
+
+    // Case 3: UPDATE affected 0 rows. Re-read the record to determine its
+    // current state. Do NOT create a duplicate.
+    const existing = await db.providerOperationRecord.findUnique({
+      where: { id: recordId },
+      select: { state: true, outcome: true },
+    });
+
+    if (!existing) {
+      // The record was deleted (should not happen in production). Do NOT
+      // fabricate a second operation.
+      logger.error("provider_operation.complete_record_missing", {
+        recordId,
+        operation: input.operation,
+        outcome: input.outcome,
+        bindingId: input.bindingId,
+        actionId: input.actionId,
+        tenantId: input.tenantId,
+        reason: "STARTED record not found during terminal update; refusing to create a duplicate (would violate ONE-mutation-ONE-record invariant)",
+      });
+      return;
+    }
+
+    if (existing.state === "STARTED") {
+      // The record is still STARTED — the update failed transiently.
+      // Preserve STARTED. Do NOT create a duplicate.
+      logger.error("provider_operation.complete_update_zero_rows_started", {
+        recordId,
+        operation: input.operation,
+        attemptedOutcome: input.outcome,
+        currentState: existing.state,
+        bindingId: input.bindingId,
+        actionId: input.actionId,
+        tenantId: input.tenantId,
+        reason: "terminal UPDATE affected 0 rows; record is still STARTED; preserving STARTED (no duplicate created)",
+      });
+      return;
+    }
+
+    // The record is already terminal (completed by a concurrent worker or a
+    // recovery path). DB state wins. Do NOT overwrite.
+    logger.info("provider_operation.complete_already_terminal", {
+      recordId,
+      operation: input.operation,
+      attemptedOutcome: input.outcome,
+      currentState: existing.state,
+      currentOutcome: existing.outcome,
+      reason: "record already terminal; DB state wins; no overwrite",
+    });
+    return;
+  } catch (err) {
+    // Case 4: The UPDATE itself threw (DB error). Do NOT create a duplicate.
+    // The record stays STARTED (if it exists) and is recoverable/reconcilable.
+    logger.error("provider_operation.complete_update_threw", {
+      recordId,
+      operation: input.operation,
+      outcome: input.outcome,
+      bindingId: input.bindingId,
+      actionId: input.actionId,
+      tenantId: input.tenantId,
+      error: err instanceof Error ? err.message : String(err),
+      reason: "terminal UPDATE threw; preserving STARTED (no duplicate created); provider result remains authoritative",
+    });
+    return;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy recorder — DEPRECATED, kept for backward compat with tests that
+// call recordProviderOperation directly. New code should use
+// startProviderOperation + completeProviderOperation.
+// ---------------------------------------------------------------------------
+
+/**
+ * @deprecated Use startProviderOperation + completeProviderOperation instead.
+ *
+ * This function is kept for backward compat with tests that need to create a
+ * SYNTHETIC terminal record directly (e.g., 12.4.4e.7 which simulates a failed
+ * provider operation for incident-lookup testing). It does NOT go through the
+ * STARTED lifecycle — it directly inserts a terminal record.
+ *
+ * Production code MUST NOT call this. Production code uses the
+ * startProviderOperation + completeProviderOperation lifecycle, which
+ * enforces the ONE-mutation-ONE-record invariant.
+ */
+export async function recordProviderOperation(
+  input: ProviderOperationRecordInput & {
+    outcome: ProviderOperationState;
+    outcomeDetail?: Record<string, unknown> | null;
+  },
+): Promise<void> {
+  const { logger } = await import("@/lib/logger");
+  const now = new Date();
+  try {
     await db.providerOperationRecord.create({
       data: {
         operation: input.operation,
@@ -1024,17 +1137,12 @@ export async function completeProviderOperation(
         sessionId: input.sessionId ?? null,
         providerKey: input.providerKey ?? null,
         reconciliationState: input.reconciliationState ?? null,
-        startedAt: completedAt,
-        completedAt,
+        startedAt: now,
+        completedAt: now,
       },
     });
   } catch (err) {
-    // Best-effort: log but do NOT throw. The provider result is already
-    // authoritative. The record stays STARTED (if the STARTED insert succeeded)
-    // and is recoverable/reconcilable by an operator.
-    const { logger } = await import("@/lib/logger");
-    logger.warn("provider_operation.complete_failed", {
-      recordId,
+    logger.warn("provider_operation.record_failed", {
       operation: input.operation,
       outcome: input.outcome,
       bindingId: input.bindingId,
@@ -1043,24 +1151,4 @@ export async function completeProviderOperation(
       error: err instanceof Error ? err.message : String(err),
     });
   }
-}
-
-// ---------------------------------------------------------------------------
-// Legacy recorder — DEPRECATED, kept for backward compat with tests that
-// call recordProviderOperation directly. New code should use
-// startProviderOperation + completeProviderOperation.
-// ---------------------------------------------------------------------------
-
-/**
- * @deprecated Use startProviderOperation + completeProviderOperation instead.
- * This function is kept for backward compat with tests that directly record
- * a terminal operation without the STARTED lifecycle.
- */
-export async function recordProviderOperation(
-  input: ProviderOperationRecordInput & {
-    outcome: ProviderOperationState;
-    outcomeDetail?: Record<string, unknown> | null;
-  },
-): Promise<void> {
-  await completeProviderOperation(null, input);
 }
