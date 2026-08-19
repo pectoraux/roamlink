@@ -60,6 +60,7 @@ import { NextResponse } from "next/server";
 import { AppError, safeErrorMessage } from "@/lib/errors";
 import { logger } from "@/lib/logger";
 import { randomBytes } from "crypto";
+import { CURRENT_API_VERSION } from "@/lib/api/version";
 
 // ---------------------------------------------------------------------------
 // Stable error code taxonomy
@@ -258,4 +259,42 @@ export function apiSuccessResponse(data: unknown, requestId: string, status = 20
     status,
     headers: { [REQUEST_ID_HEADER]: requestId },
   });
+}
+
+/**
+ * Phase 12.3.5: Build a canonical v1 success response that ALWAYS carries the
+ * version contract headers (X-API-Version + X-API-Stable) in addition to the
+ * x-request-id header. This is the canonical success response for ALL /api/v1/*
+ * routes — it prevents routes from accidentally omitting the version headers.
+ *
+ * Every /api/v1/* route MUST use this helper (or apiV1ErrorResponse) instead
+ * of the plain apiSuccessResponse/apiErrorResponse, so the version contract is
+ * enforced at the response boundary.
+ */
+export function apiV1SuccessResponse(data: unknown, requestId: string, status = 200): NextResponse {
+  return NextResponse.json(data, {
+    status,
+    headers: {
+      [REQUEST_ID_HEADER]: requestId,
+      "X-API-Version": String(CURRENT_API_VERSION),
+      "X-API-Stable": "true",
+    },
+  });
+}
+
+/**
+ * Phase 12.3.5: Build a canonical v1 error response that ALWAYS carries the
+ * version contract headers. This is the canonical error response for ALL
+ * /api/v1/* routes.
+ */
+export function apiV1ErrorResponse(
+  err: unknown,
+  requestId: string,
+  options?: { statusCode?: number; details?: Record<string, unknown> },
+): NextResponse {
+  const res = apiErrorResponse(err, requestId, options);
+  // Attach the version contract headers to the error response.
+  res.headers.set("X-API-Version", String(CURRENT_API_VERSION));
+  res.headers.set("X-API-Stable", "true");
+  return res;
 }

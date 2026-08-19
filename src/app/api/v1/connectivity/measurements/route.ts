@@ -9,7 +9,7 @@
 
 import { NextRequest } from "next/server";
 import { resolveApiPrincipal, principalTenantId } from "@/lib/api/principal";
-import { getRequestId, apiErrorResponse, apiSuccessResponse } from "@/lib/api/protocol";
+import { getRequestId, apiV1ErrorResponse, apiV1SuccessResponse } from "@/lib/api/protocol";
 import { ingestMeasurement, isValidSource } from "@/lib/control-plane/measurement-store";
 import { db } from "@/lib/db";
 import { AppError } from "@/lib/errors";
@@ -83,13 +83,13 @@ export async function POST(req: NextRequest) {
       capturedAt: capturedAt ? new Date(capturedAt) : undefined,
     });
 
-    return apiSuccessResponse({
+    return apiV1SuccessResponse({
       measurement: { id: result.measurementId },
       freshness: result.freshness,
       health: result.health,
       eventsEmitted: result.eventsEmitted,
     }, requestId, 201);
   } catch (err) {
-    return apiErrorResponse(err, requestId);
+    return apiV1ErrorResponse(err, requestId);
   }
 }

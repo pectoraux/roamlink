@@ -8,7 +8,7 @@
 
 import { NextRequest } from "next/server";
 import { resolveApiPrincipal, principalTenantId } from "@/lib/api/principal";
-import { getRequestId, apiErrorResponse, apiSuccessResponse } from "@/lib/api/protocol";
+import { getRequestId, apiV1ErrorResponse, apiV1SuccessResponse } from "@/lib/api/protocol";
 import { advertiseCapability, discoverCapabilities } from "@/lib/control-plane/capability-registry";
 import { AppError } from "@/lib/errors";
 
@@ -34,9 +34,9 @@ export async function GET(req: NextRequest) {
       minReliability,
     });
 
-    return apiSuccessResponse({ capabilities }, requestId);
+    return apiV1SuccessResponse({ capabilities }, requestId);
   } catch (err) {
-    return apiErrorResponse(err, requestId);
+    return apiV1ErrorResponse(err, requestId);
   }
 }
 
@@ -66,8 +66,8 @@ export async function POST(req: NextRequest) {
       metering,
     });
 
-    return apiSuccessResponse({ capability: result }, requestId, 201);
+    return apiV1SuccessResponse({ capability: result }, requestId, 201);
   } catch (err) {
-    return apiErrorResponse(err, requestId);
+    return apiV1ErrorResponse(err, requestId);
   }
 }

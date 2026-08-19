@@ -15,7 +15,7 @@
 
 import { NextRequest } from "next/server";
 import { resolveApiPrincipal } from "@/lib/api/principal";
-import { getRequestId, apiErrorResponse, apiSuccessResponse } from "@/lib/api/protocol";
+import { getRequestId, apiV1ErrorResponse, apiV1SuccessResponse } from "@/lib/api/protocol";
 import { createIntent, getActiveIntent, emitIntentReevaluationEvent } from "@/lib/control-plane/intent-service";
 import { db } from "@/lib/db";
 import { AppError } from "@/lib/errors";
@@ -77,9 +77,9 @@ export async function POST(req: NextRequest) {
     // Emit reevaluation signal (does NOT directly invoke action executor)
     await emitIntentReevaluationEvent(result.intentId, result.version, subjectId);
 
-    return apiSuccessResponse(result, requestId, result.version === 1 ? 201 : 200);
+    return apiV1SuccessResponse(result, requestId, result.version === 1 ? 201 : 200);
   } catch (err) {
-    return apiErrorResponse(err, requestId);
+    return apiV1ErrorResponse(err, requestId);
   }
 }
 
@@ -108,10 +108,10 @@ export async function GET(req: NextRequest) {
 
     const intent = await getActiveIntent(subjectId);
     if (!intent) {
-      return apiSuccessResponse({ intent: null }, requestId);
+      return apiV1SuccessResponse({ intent: null }, requestId);
     }
 
-    return apiSuccessResponse({
+    return apiV1SuccessResponse({
       intent: {
         intentId: intent.intentId,
         version: intent.version,
@@ -122,6 +122,6 @@ export async function GET(req: NextRequest) {
       },
     }, requestId);
   } catch (err) {
-    return apiErrorResponse(err, requestId);
+    return apiV1ErrorResponse(err, requestId);
   }
 }

@@ -5897,3 +5897,138 @@ Stage Summary:
     12.3.7  Migrate commerce idempotency          ✅
 - Phase 12.3 is now ready for a fresh architecture audit before freezing.
 - Known maintenance item outside this freeze: Phase 9.5.1 A1 (BUDGET_CONSTRAINT).
+
+---
+Task ID: 12.3.5-wire
+Agent: Route updater (subagent)
+Task: Wire apiV1SuccessResponse/apiV1ErrorResponse into all /api/v1/* routes.
+
+Work Log:
+- Read the new helpers in src/lib/api/protocol.ts (apiV1SuccessResponse /
+  apiV1ErrorResponse) — they wrap the canonical envelope and additionally
+  set X-API-Version: 1 + X-API-Stable: true headers on every response.
+- Audited the 12 /api/v1/* route files to understand which were already on the
+  try/catch + canonical-helper pattern (8 of them) and which used NextResponse.json
+  directly (edge/* routes and intents/[intentId]).
+- Updated the 8 routes that already used apiSuccessResponse/apiErrorResponse to
+  swap the imports + call sites to the v1 variants (no behavior change beyond
+  the added version headers):
+    * src/app/api/v1/version/route.ts
+    * src/app/api/v1/connectivity/measurements/route.ts
+    * src/app/api/v1/connectivity/capabilities/route.ts
+    * src/app/api/v1/connectivity/current/route.ts
+    * src/app/api/v1/connectivity/sessions/route.ts
+    * src/app/api/v1/connectivity/policies/route.ts
+    * src/app/api/v1/connectivity/intents/route.ts
+    * src/app/api/v1/connectivity/actions/route.ts
+  For version/route.ts the response is now built with apiV1SuccessResponse
+  and the existing versionHeaders()/deprecationHeaders() overlay is preserved
+  (it is now redundant for the version headers, but still authoritative for the
+  RFC 7231 deprecation headers when a version is ever deprecated).
+- Refactored the 4 routes that used NextResponse.json directly to use the v1
+  helpers with a top-level try/catch. Each early-return error case was converted
+  to a `throw new AppError(...)` so the canonical error envelope is emitted by
+  the catch handler:
+    * src/app/api/v1/connectivity/intents/[intentId]/route.ts (GET + POST):
+        - Unauthorized → AppError("auth", ..., 401)
+        - cancel/supersede rejected → AppError("conflict", ..., 409 or 400)
+        - invalid action → AppError("validation", ..., 400)
+    * src/app/api/v1/connectivity/edge/devices/route.ts (POST):
+        - Unauthorized + 3 validation cases → AppError throws.
+    * src/app/api/v1/connectivity/edge/observations/route.ts (POST):
+        - Unauthorized + 3 validation cases → AppError throws.
+        - ingestEdgeObservationBatch plain-Error catch is preserved as an inner
+          try/catch that re-throws as AppError("authorization", ..., 403) for
+          ownership/impersonation errors, AppError("validation", ..., 400)
+          otherwise — keeps the prior status-code semantics.
+    * src/app/api/v1/connectivity/edge/policy-context/route.ts (GET + POST):
+        - Unauthorized + validation + device-ownership + no-device cases →
+          AppError throws.
+        - Stale-context 409 response KEEPS its structured
+          `{ ok: false, rejected: "stale", reason, currentObservedAt }` body
+          (via apiV1SuccessResponse(..., 409)) — the mobile client keys off
+          `rejected: "stale"` to back off; it is NOT a canonical error
+          envelope.
+- All business logic (auth checks, DB queries, validation, idempotency,
+  timestamp fencing, base-policy override rules) is preserved verbatim — only
+  the response wrapping changed.
+- Ran `bun run lint` — clean (eslint . exit 0, no warnings/errors).
+- Ran the 3 specified test files:
+    bun test tests/phase12.3-version-contract.test.ts \
+              tests/phase12.3-adoption.test.ts \
+              tests/phase12.3-api-protocol.test.ts
+  Result: 56 pass, 0 fail, 221 expect() calls. (Includes the 12.3.5.2 /
+  12.3.5.3 / 12.3.5.8 tests that now see X-API-Version + X-API-Stable on every
+  v1 response.)
+
+Stage Summary:
+- The /api/v1/* version contract is now ENFORCED at the route boundary: every
+  success and error response from every v1 route carries X-API-Version: 1 and
+  X-API-Stable: true (plus the x-request-id correlation header).
+- All 12 /api/v1/* route files now go through apiV1SuccessResponse /
+  apiV1ErrorResponse — no route emits a raw NextResponse.json anymore.
+- The 4 routes that previously bypassed the canonical envelope (edge/* and
+  intents/[intentId]) now emit the canonical { error: { code, message,
+  requestId } } envelope on errors, with stable taxonomy codes
+  (auth_required, validation_failed, forbidden, not_found, conflict).
+- Phase 12.3.5.8 (real v1 route response includes version headers) now passes
+  for real on the capabilities route — previously the test documented the
+  contract without enforcing it.
+- No behavior change to happy-path response bodies or status codes; only error
+  responses from the 4 refactored routes changed shape (to the canonical
+  envelope) and all v1 responses gained the two version headers.
+
+---
+Task ID: 12.3.5-enforce
+Agent: Principal Architect (main) — Phase 12.3.5 Route-Level Version Enforcement
+Task: Fix the P0 the architect identified in the audit of f78d3a7. The version contract was documented but NOT enforced at the /api/v1/* route boundary — the v1 routes didn't attach X-API-Version or X-API-Stable headers.
+
+Work Log:
+- Fix 1 — New v1 response helpers (src/lib/api/protocol.ts):
+  - apiV1SuccessResponse(data, requestId, status?) — like apiSuccessResponse but
+    ALWAYS attaches X-API-Version: 1 + X-API-Stable: true.
+  - apiV1ErrorResponse(err, requestId, options?) — like apiErrorResponse but
+    ALWAYS attaches X-API-Version: 1 + X-API-Stable: true.
+  These prevent routes from accidentally omitting the version headers.
+
+- Fix 2 — All 12 /api/v1/* routes updated to use the v1 helpers (subagent):
+  8 simple swaps (existing try/catch + renamed helpers):
+    version, measurements, capabilities, current, sessions, policies,
+    intents, actions.
+  4 refactors (NextResponse.json → try/catch + v1 helpers + AppError):
+    intents/[intentId], edge/devices, edge/observations, edge/policy-context.
+  All business logic preserved — only the response wrapping changed.
+
+- Fix 3 — Tests updated + 2 new adversarial (tests/phase12.3-version-contract.test.ts):
+  12.3.5.8 (updated): real v1 route (capabilities) now asserts X-API-Version + X-API-Stable on success.
+  12.3.2.9 (new): GET /api/v1/connectivity/sessions → X-API-Version: 1, X-API-Stable: true.
+  12.3.5.10 (new): EVERY v1 route carries version headers on BOTH success and error responses.
+    Tests: capabilities (401), sessions (401), version (200), current (401) — all have the headers.
+
+- Live verification:
+  curl -sI http://localhost:3000/api/v1/version → x-api-version: 1, x-api-stable: true
+  curl -sI http://localhost:3000/api/v1/connectivity/sessions (401) → x-api-version: 1, x-api-stable: true
+  The version headers are present on BOTH success and error responses across the v1 surface.
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       32/32 PASS
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 12.3.5:      10/10 PASS  (8 original + 12.3.5.9 + 12.3.5.10 new)
+  Phase 8.6.6:        5/5 PASS
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, version headers present on all v1 routes.
+  Verified via Agent Browser — no runtime/console errors.
+  Total tracked regression: 119 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The version contract is now ENFORCED at the route boundary:
+    Every /api/v1/* response (success AND error) carries:
+      X-API-Version: 1
+      X-API-Stable: true
+      x-request-id: <correlation>
+  The apiV1SuccessResponse / apiV1ErrorResponse helpers prevent routes from
+  accidentally omitting the version headers.
+- Phase 12.3.5 is now ready to freeze.

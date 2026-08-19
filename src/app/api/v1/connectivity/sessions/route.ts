@@ -13,7 +13,7 @@
 
 import { NextRequest } from "next/server";
 import { resolveApiPrincipal, principalTenantId } from "@/lib/api/principal";
-import { getRequestId, apiErrorResponse, apiSuccessResponse } from "@/lib/api/protocol";
+import { getRequestId, apiV1ErrorResponse, apiV1SuccessResponse } from "@/lib/api/protocol";
 import { createSession } from "@/lib/control-plane/session-manager";
 import { db } from "@/lib/db";
 import { AppError } from "@/lib/errors";
@@ -47,9 +47,9 @@ export async function GET(req: NextRequest) {
       },
     });
 
-    return apiSuccessResponse({ sessions }, requestId);
+    return apiV1SuccessResponse({ sessions }, requestId);
   } catch (err) {
-    return apiErrorResponse(err, requestId);
+    return apiV1ErrorResponse(err, requestId);
   }
 }
 
@@ -88,8 +88,8 @@ export async function POST(req: NextRequest) {
       policyId,
     });
 
-    return apiSuccessResponse({ session }, requestId, 201);
+    return apiV1SuccessResponse({ session }, requestId, 201);
   } catch (err) {
-    return apiErrorResponse(err, requestId);
+    return apiV1ErrorResponse(err, requestId);
   }
 }

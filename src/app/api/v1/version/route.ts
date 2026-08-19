@@ -13,7 +13,7 @@
  */
 
 import { NextRequest } from "next/server";
-import { getRequestId, apiErrorResponse, apiSuccessResponse } from "@/lib/api/protocol";
+import { getRequestId, apiV1ErrorResponse, apiV1SuccessResponse } from "@/lib/api/protocol";
 import {
   CURRENT_API_VERSION,
   SUPPORTED_API_VERSIONS,
@@ -50,13 +50,14 @@ export async function GET(req: NextRequest) {
     };
 
     // Attach the version headers to the success response.
-    const res = apiSuccessResponse(body, requestId);
-    // Add the version headers.
+    const res = apiV1SuccessResponse(body, requestId);
+    // Add the deprecation headers (version headers are already attached by
+    // apiV1SuccessResponse; deprecationHeaders returns {} when not deprecated).
     for (const [key, value] of Object.entries(headers)) {
       res.headers.set(key, value);
     }
     return res;
   } catch (err) {
-    return apiErrorResponse(err, requestId);
+    return apiV1ErrorResponse(err, requestId);
   }
 }

@@ -9,7 +9,7 @@
 
 import { NextRequest } from "next/server";
 import { resolveApiPrincipal } from "@/lib/api/principal";
-import { getRequestId, apiErrorResponse, apiSuccessResponse } from "@/lib/api/protocol";
+import { getRequestId, apiV1ErrorResponse, apiV1SuccessResponse } from "@/lib/api/protocol";
 import { createOrUpdatePolicy, getPolicy, POLICY_PRESETS } from "@/lib/control-plane/policy-engine";
 import { db } from "@/lib/db";
 import { AppError } from "@/lib/errors";
@@ -39,9 +39,9 @@ export async function GET(req: NextRequest) {
     const subjectId = await resolveSubjectId(principal, req.nextUrl.searchParams.get("subjectId"));
 
     const policy = await getPolicy(subjectId);
-    return apiSuccessResponse({ policy, availablePresets: Object.keys(POLICY_PRESETS) }, requestId);
+    return apiV1SuccessResponse({ policy, availablePresets: Object.keys(POLICY_PRESETS) }, requestId);
   } catch (err) {
-    return apiErrorResponse(err, requestId);
+    return apiV1ErrorResponse(err, requestId);
   }
 }
 
@@ -66,8 +66,8 @@ export async function POST(req: NextRequest) {
       neverInterruptActiveCall,
     });
 
-    return apiSuccessResponse({ policy: result }, requestId, 201);
+    return apiV1SuccessResponse({ policy: result }, requestId, 201);
   } catch (err) {
-    return apiErrorResponse(err, requestId);
+    return apiV1ErrorResponse(err, requestId);
   }
 }
