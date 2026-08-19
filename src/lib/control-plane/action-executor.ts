@@ -28,6 +28,7 @@ import { transitionSessionState } from "./session-manager";
 import { reserveResource, releaseResource, markResourceInUse } from "./capability-registry";
 import { resolveResourceBinding, verifyResourceUsable } from "./kernel-bridge";
 import { assertActiveConnectivityInvariant } from "./invariant-checker";
+import { createCorrelationContext, type ProviderCorrelationContext } from "@/lib/observability/provider-correlation";
 import {
   SlotOwnershipLostError,
   fencedSessionUpdate,
@@ -220,6 +221,17 @@ export async function executeAction(actionId: string, slotContext?: {
     const session = action.session;
     const targetResourceId = action.targetResourceId;
 
+    // Phase 12.4.4b: Construct the correlation context at the execution boundary.
+    // This is the ORIGIN of the correlation chain — every downstream call
+    // (kernel-bridge → provisionBinding → adapter → provider client) carries
+    // the same context.
+    const correlation = createCorrelationContext({
+      actionId: action.id,
+      sessionId: session.id,
+      intentId: action.intentId ?? null,
+      decisionId: action.decisionId ?? null,
+    });
+
     if (!targetResourceId) {
       throw new Error("SWITCH/ACTIVATE action requires targetResourceId");
     }
@@ -249,6 +261,7 @@ export async function executeAction(actionId: string, slotContext?: {
         // 3b. Resolve resource binding via kernel bridge
         // Phase 8.5.8: tenantId is DERIVED from the resource's capability, not caller-supplied
         const bridgeResult = await resolveResourceBinding({
+      correlation,
           protocolResourceId: targetResourceId,
           subjectId: session.subjectId,
         });
@@ -430,6 +443,7 @@ export async function executeAction(actionId: string, slotContext?: {
         // 3c. Resolve target binding via kernel bridge
         // Phase 8.5.8: tenantId derived from resource, not caller-supplied
         const bridgeResult = await resolveResourceBinding({
+      correlation,
           protocolResourceId: targetResourceId,
           subjectId: session.subjectId,
         });
@@ -799,6 +813,7 @@ export async function recoverStaleActions(): Promise<{
       // Phase 8.5.9: Use the kernel bridge to validate binding ownership
       // (same authority as normal execution, not a weaker manual lookup)
       const bridgeResult = await resolveResourceBinding({
+      correlation,
         protocolResourceId: targetResourceId,
         subjectId: session.subjectId,
       });

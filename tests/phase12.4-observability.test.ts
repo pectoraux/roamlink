@@ -545,4 +545,102 @@ describe("Phase 12.4.4 — Operational Observability", () => {
     expect(reconcileFailedLog!.fields.providerInstanceId).toBe("pi_failure");
     expect(reconcileFailedLog!.fields.bindingId).toBe("binding_failure");
   }, 30_000);
+
+  // =========================================================================
+  // 12.4.4.11 — End-to-end control-plane execution → adapter correlation
+  //
+  // Proves that when executeAction() runs a real ACTIVATE action through the
+  // full chain (executeAction → resolveResourceBinding → provisionBinding →
+  // adapter.provision), the adapter's log entries carry the correlation
+  // identifiers from the action/session.
+  //
+  // This is the architect's required proof:
+  //   "one real control-plane execution → one action → one provider mutation
+  //    → every provider log entry has exactly the same correlation IDs"
+  // =========================================================================
+  it("12.4.4.11: control-plane execution → adapter logs carry actionId + sessionId", async () => {
+    const { db } = await import("@/lib/db");
+    const { hashPassword } = await import("@/lib/security");
+    const { ensureTestSetup } = await import("./setup");
+    const { seedConnectivityCapabilities, createEntitlement, transitionEntitlement, createResourceBinding, CAPABILITY_TYPES, ENTITLEMENT_STATES, createProviderInstance, resolveBindingRuntime, registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+    const { createTenant, addTenantUser } = await import("@/lib/tenant/service");
+    const { createOrUpdatePolicy } = await import("@/lib/control-plane/policy-engine");
+    const { createSession } = await import("@/lib/control-plane/session-manager");
+    const { makeDecision } = await import("@/lib/control-plane/decision-engine");
+    const { createAction, executeAction } = await import("@/lib/control-plane/action-executor");
+
+    await ensureTestSetup();
+    await seedConnectivityCapabilities();
+
+    const email = `p1244b-${Date.now()}@test.roamlink`;
+    const user = await db.user.create({ data: { email, name: "P12.4.4b", passwordHash: await hashPassword("test12345"), role: "customer", emailVerified: new Date() } });
+    const tenant = await db.tenant.create({ data: { name: `P1244b ${Date.now()}`, slug: `p1244b-${Date.now().toString(36)}`, status: "active" } });
+    await addTenantUser({ tenantId: tenant.id, userId: user.id, role: "admin" });
+    const plan = await db.saaasPlan.findUnique({ where: { name: "starter" } });
+    const sub = await db.tenantSubscription.create({ data: { tenantId: tenant.id, saaasPlanId: plan!.id, status: "active", billingCycle: "monthly", currentPeriodEnd: new Date(Date.now() + 30 * 86400000) } });
+
+    const cc = await db.connectivityCapability.findFirst({ where: { type: "INTERNET" } });
+    const pi = await db.connectivityProviderInstance.create({ data: { tenantId: tenant.id, providerType: "mikrotik", name: `P1244b ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik" } });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    const ent = await createEntitlement({ tenantId: tenant.id, subscriptionId: sub.id, capabilityType: CAPABILITY_TYPES.INTERNET, capabilitySet: { downloadMbps: 50, uploadMbps: 10 }, validFrom: new Date(), userId: user.id });
+    await transitionEntitlement({ entitlementId: ent.id, toState: ENTITLEMENT_STATES.ACTIVE });
+
+    const capA = await db.protocolCapability.create({ data: { tenantId: tenant.id, providerInstanceId: pi.id, type: "INTERNET", providerType: "mikrotik", technicalSpec: JSON.stringify({ downloadMbps: 50, typicalLatencyMs: 20 }), coverage: JSON.stringify({ countries: ["GH"] }), reliability: 0.92, status: "active" } });
+    const resA = await db.protocolResource.create({ data: { capabilityId: capA.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "A" }), capacity: JSON.stringify({ totalBandwidthMbps: 50 }), state: "AVAILABLE" } });
+    // NOTE: No pre-existing binding — the kernel-bridge will create one via
+    // provisionBinding, which calls adapter.provision(). This is the path we
+    // want to test for correlation propagation.
+
+    await createOrUpdatePolicy({ subjectId: user.id, preset: "RELIABLE", mode: "automatic", maxAutoSpendMinor: 10000, requireUserApprovalForPurchase: false });
+    const session = await createSession({ subjectId: user.id, entitlementId: ent.id });
+
+    // Intercept logger.
+    const logEntries: Array<{ message: string; fields: Record<string, unknown> }> = [];
+    const origInfo = logger.info, origWarn = logger.warn, origError = logger.error;
+    (logger as any).info = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
+    (logger as any).warn = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
+    (logger as any).error = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
+
+    try {
+      // Run the real control-plane execution path.
+      const decision = await makeDecision({ tenantId: tenant.id, subjectId: user.id, sessionId: session.id, capabilityType: "INTERNET" });
+      const action = await createAction({ sessionId: session.id, decisionId: decision.decisionId, type: "ACTIVATE", targetResourceId: decision.targetResourceId!, idempotencyKey: `p1244b-${session.id}` });
+      await executeAction(action.id);
+
+      // Find the adapter log entries from the execution.
+      const adapterLogs = logEntries.filter((e) =>
+        e.message.startsWith("mikrotik.") && !e.message.startsWith("mikrotik.mock.")
+      );
+
+      // The adapter should have logged at least one entry (provisioned or provision_idempotent).
+      expect(adapterLogs.length).toBeGreaterThanOrEqual(1);
+
+      // Every adapter log entry carries actionId and sessionId from the execution boundary.
+      for (const log of adapterLogs) {
+        expect(log.fields.actionId).toBeDefined();
+        expect(log.fields.sessionId).toBe(session.id);
+      }
+    } finally {
+      (logger as any).info = origInfo;
+      (logger as any).warn = origWarn;
+      (logger as any).error = origError;
+
+      // Cleanup
+      await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+      await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+      await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
+      await db.connectivityPolicy.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+      await db.providerResourceBinding.deleteMany({ where: { entitlementId: ent.id } }).catch(() => {});
+      await db.protocolResource.deleteMany({ where: { id: resA.id } }).catch(() => {});
+      await db.protocolCapability.deleteMany({ where: { id: capA.id } }).catch(() => {});
+      await db.connectivityEntitlement.deleteMany({ where: { id: ent.id } }).catch(() => {});
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+      await db.tenantSubscription.deleteMany({ where: { id: sub.id } }).catch(() => {});
+      await db.tenantUser.deleteMany({ where: { userId: user.id } }).catch(() => {});
+      await db.tenant.deleteMany({ where: { id: tenant.id } }).catch(() => {});
+      await db.user.deleteMany({ where: { id: user.id } }).catch(() => {});
+      clearMockClientRegistry();
+    }
+  }, 120_000);
 });

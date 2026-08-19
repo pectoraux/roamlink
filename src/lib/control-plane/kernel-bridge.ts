@@ -18,6 +18,7 @@
 import { db } from "@/lib/db";
 import { logger } from "@/lib/logger";
 import { provisionBinding, reconcileProvisioning } from "@/lib/connectivity";
+import type { ProviderCorrelationContext } from "@/lib/observability/provider-correlation";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -61,6 +62,8 @@ export type VerificationResult = {
 export async function resolveResourceBinding(input: {
   protocolResourceId: string;
   subjectId: string;
+  /** Phase 12.4.4b: Correlation context threaded from executeAction. */
+  correlation?: ProviderCorrelationContext;
 }): Promise<KernelBridgeResult> {
   // Load the ProtocolResource with its capability
   const resource = await db.protocolResource.findUnique({
@@ -128,7 +131,7 @@ export async function resolveResourceBinding(input: {
 
       // Reconcile via the frozen kernel
       try {
-        const reconResult = await reconcileProvisioning(existingBinding.id);
+        const reconResult = await reconcileProvisioning(existingBinding.id, input.correlation);
         if (reconResult.status === "failed") {
           return {
             status: "reconciliation_required",
@@ -198,7 +201,7 @@ export async function resolveResourceBinding(input: {
     }).catch(() => {});
 
     try {
-      const reconResult = await reconcileProvisioning(binding.id);
+      const reconResult = await reconcileProvisioning(binding.id, input.correlation);
       if (reconResult.status === "failed") {
         return {
           status: "reconciliation_required",
@@ -258,7 +261,7 @@ export async function resolveResourceBinding(input: {
       userId: input.subjectId,
     });
 
-    const provisionResult = await provisionBinding(binding.id);
+    const provisionResult = await provisionBinding(binding.id, input.correlation);
 
     if (provisionResult.status === "success" || provisionResult.status === "already_provisioned") {
       await db.protocolResource.update({
@@ -398,7 +401,7 @@ export async function verifyResourceUsable(resourceId: string, sessionId: string
 
     if (binding) {
       try {
-        const reconResult = await reconcileProvisioning(binding.id);
+        const reconResult = await reconcileProvisioning(binding.id, input.correlation);
         if (reconResult.status === "failed") {
           return {
             status: "NOT_USABLE",

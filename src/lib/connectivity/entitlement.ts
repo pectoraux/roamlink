@@ -1779,7 +1779,7 @@ export function _setOperationTimeoutForTesting(ms: number): () => void {
  *   - [2C.4.9] The ownership check is the literal last DB operation before
  *     the provider call — no DB reads intervene.
  */
-export async function provisionBinding(bindingId: string): Promise<{
+export async function provisionBinding(bindingId: string, correlation?: import("../observability/provider-correlation").ProviderCorrelationContext): Promise<{
   status: "success" | "failed_retryable" | "failed_permanent" | "already_provisioned" | "claim_lost";
   providerResourceId?: string;
   error?: string;
@@ -1885,7 +1885,7 @@ export async function provisionBinding(bindingId: string): Promise<{
     // entitlementInput constructed in Step 4 — no DB read intervenes between
     // the ownership check (Step 5) and this provider call.
     const result = await Promise.race([
-      adapter.provision({ entitlement: entitlementInput, binding: bindingInput }),
+      adapter.provision({ entitlement: entitlementInput, binding: bindingInput, correlation }),
       new Promise<never>((_, reject) => {
         const t = setTimeout(() => {
           timeoutFired = true;
@@ -2054,7 +2054,7 @@ export type ReconciliationResult = {
  * provisionBinding, so stale workers cannot interfere with a recovery in
  * progress.
  */
-export async function reconcileProvisioning(bindingId: string): Promise<ReconciliationResult> {
+export async function reconcileProvisioning(bindingId: string, correlation?: import("../observability/provider-correlation").ProviderCorrelationContext): Promise<ReconciliationResult> {
   // Step 1: Load the current binding state.
   const binding = await db.providerResourceBinding.findUnique({
     where: { id: bindingId },
@@ -2102,7 +2102,7 @@ export async function reconcileProvisioning(bindingId: string): Promise<Reconcil
       previousStatus: binding.status,
     });
     try {
-      const result = await provisionBinding(bindingId);
+      const result = await provisionBinding(bindingId, correlation);
       if (result.status === "success") {
         return {
           status: "reprovisioned",
