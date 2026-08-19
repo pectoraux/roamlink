@@ -294,6 +294,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
+    const ctx = input.correlation ?? {};
     if (!input.binding.providerResourceId) {
       return { status: "failed_permanent", error: "No providerResourceId on binding" };
     }
@@ -301,9 +302,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     try {
       const client = await this.resolveClient(input.binding);
       await client.suspendResource(input.binding.providerResourceId);
+      logger.info("mikrotik.suspended", withCorrelation(ctx, {
+        bindingId: input.binding.id, providerResourceId: input.binding.providerResourceId,
+      }));
       return { status: "success" };
     } catch (err) {
       const classified = classifyError(err);
+      logger.error("mikrotik.suspend_failed", withCorrelation(ctx, {
+        bindingId: input.binding.id, error: classified.error, classification: classified.status,
+      }));
       return { status: classified.status, error: classified.error };
     }
   }
@@ -313,6 +320,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
+    const ctx = input.correlation ?? {};
     if (!input.binding.providerResourceId) {
       return { status: "failed_permanent", error: "No providerResourceId on binding" };
     }
@@ -320,9 +328,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     try {
       const client = await this.resolveClient(input.binding);
       await client.resumeResource(input.binding.providerResourceId);
+      logger.info("mikrotik.resumed", withCorrelation(ctx, {
+        bindingId: input.binding.id, providerResourceId: input.binding.providerResourceId,
+      }));
       return { status: "success" };
     } catch (err) {
       const classified = classifyError(err);
+      logger.error("mikrotik.resume_failed", withCorrelation(ctx, {
+        bindingId: input.binding.id, error: classified.error, classification: classified.status,
+      }));
       return { status: classified.status, error: classified.error };
     }
   }
@@ -332,6 +346,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ActionResult> {
+    const ctx = input.correlation ?? {};
     if (!input.binding.providerResourceId) {
       // Already released — idempotent
       return { status: "success" };
@@ -340,9 +355,15 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     try {
       const client = await this.resolveClient(input.binding);
       await client.deleteResource(input.binding.providerResourceId);
+      logger.info("mikrotik.released", withCorrelation(ctx, {
+        bindingId: input.binding.id, providerResourceId: input.binding.providerResourceId,
+      }));
       return { status: "success" };
     } catch (err) {
       const classified = classifyError(err);
+      logger.error("mikrotik.release_failed", withCorrelation(ctx, {
+        bindingId: input.binding.id, error: classified.error, classification: classified.status,
+      }));
       return { status: classified.status, error: classified.error };
     }
   }
@@ -352,6 +373,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<UsageMetrics | undefined> {
+    const ctx = input.correlation ?? {};
     if (!input.binding.providerResourceId) return undefined;
 
     try {
@@ -369,10 +391,9 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       };
     } catch (err) {
       const classified = classifyError(err);
-      logger.warn("mikrotik.getUsage_failed", {
-        bindingId: input.binding.id,
-        error: classified.error,
-      });
+      logger.warn("mikrotik.getUsage_failed", withCorrelation(ctx, {
+        bindingId: input.binding.id, error: classified.error,
+      }));
       return undefined;
     }
   }
@@ -382,6 +403,7 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
     entitlement: ConnectivityEntitlementInput;
     binding: ProviderResourceBindingInput;
   }): Promise<ReconciliationResult> {
+    const ctx = input.correlation ?? {};
     if (!input.binding.providerResourceId) {
       // No resource provisioned yet — in sync (nothing to reconcile)
       return {
@@ -396,7 +418,9 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       const resource = await client.getResource(input.binding.providerResourceId);
 
       if (!resource) {
-        // Resource was deleted at the provider
+        logger.warn("mikrotik.reconcile_resource_missing", withCorrelation(ctx, {
+          bindingId: input.binding.id, providerResourceId: input.binding.providerResourceId,
+        }));
         return {
           status: "resource_missing",
           observedState: "not_found",
@@ -409,6 +433,9 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       const bindingStatus = input.binding.status;
 
       if (resource.isActive && (bindingStatus === "BOUND" || bindingStatus === "PROVISIONING")) {
+        logger.info("mikrotik.reconcile_in_sync", withCorrelation(ctx, {
+          bindingId: input.binding.id, observedState: "active",
+        }));
         return {
           status: "in_sync",
           observedState: "active",
@@ -417,7 +444,9 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       }
 
       if (!resource.isActive && bindingStatus === "BOUND") {
-        // Resource is suspended at provider but binding thinks it's BOUND — drift
+        logger.warn("mikrotik.reconcile_drift", withCorrelation(ctx, {
+          bindingId: input.binding.id, observedState: "inactive", bindingStatus,
+        }));
         return {
           status: "drift_detected",
           observedState: "inactive",
@@ -442,6 +471,9 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       };
     } catch (err) {
       const classified = classifyError(err);
+      logger.error("mikrotik.reconcile_failed", withCorrelation(ctx, {
+        bindingId: input.binding.id, error: classified.error, classification: classified.status,
+      }));
       return {
         status: classified.status,
         details: classified.error,

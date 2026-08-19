@@ -365,4 +365,184 @@ describe("Phase 12.4.4 — Operational Observability", () => {
     expect(serialized).toContain("action_safety");
     expect(serialized).toContain("prov_key_safety");
   }, 10_000);
+
+  // =========================================================================
+  // 12.4.4.9 — Full lifecycle correlation: provision → suspend → resume → release → reconcile
+  //
+  // Proves that the SAME correlation context survives across ALL six adapter
+  // operations. Every log entry from every operation carries the full chain.
+  // =========================================================================
+  it("12.4.4.9: full lifecycle — all 6 adapter operations carry the same correlation chain", async () => {
+    const { MikroTikConnectivityAdapter, MockMikroTikProviderClient } = await import("@/lib/connectivity");
+    const { createCorrelationContext } = await import("@/lib/observability/provider-correlation");
+
+    const mockClient = new MockMikroTikProviderClient();
+    const adapter = new MikroTikConnectivityAdapter(() => mockClient);
+
+    const ctx = createCorrelationContext({
+      requestId: "req_lifecycle",
+      tenantId: "tenant_lifecycle",
+      providerInstanceId: "pi_lifecycle",
+      intentId: "intent_lifecycle",
+      decisionId: "decision_lifecycle",
+      actionId: "action_lifecycle",
+      providerKey: "prov_key_lifecycle",
+      bindingId: "binding_lifecycle",
+      sessionId: "session_lifecycle",
+    });
+
+    // Intercept logger.
+    const logEntries: Array<{ message: string; fields: Record<string, unknown> }> = [];
+    const origInfo = logger.info, origWarn = logger.warn, origError = logger.error;
+    (logger as any).info = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
+    (logger as any).warn = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
+    (logger as any).error = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
+
+    const entInput = {
+      id: "ent_lifecycle", tenantId: "tenant_lifecycle", subscriptionId: "sub_lifecycle",
+      status: "ACTIVE", capabilityType: "INTERNET",
+      capabilitySet: { downloadMbps: 50, uploadMbps: 10 },
+      policy: null, validFrom: new Date(), validUntil: null,
+    };
+    const baseBinding = {
+      id: "binding_lifecycle", entitlementId: "ent_lifecycle", providerType: "mikrotik",
+      providerInstanceId: "pi_lifecycle", providerResourceId: null as string | null,
+      providerMetadata: null, status: "PROVISIONING", provisioningState: "PENDING",
+      providerInstanceConfiguration: null,
+    };
+
+    try {
+      // 1. Provision
+      const provResult = await adapter.provision({ entitlement: entInput, binding: baseBinding, correlation: ctx });
+      expect(provResult.status).toBe("success");
+      const providerResourceId = provResult.providerResourceId!;
+
+      // 2. Suspend
+      const suspendedBinding = { ...baseBinding, providerResourceId, status: "BOUND" };
+      const suspResult = await adapter.suspend({ entitlement: entInput, binding: suspendedBinding, correlation: ctx });
+      expect(suspResult.status).toBe("success");
+
+      // 3. Resume
+      const resumeResult = await adapter.resume({ entitlement: entInput, binding: suspendedBinding, correlation: ctx });
+      expect(resumeResult.status).toBe("success");
+
+      // 4. Reconcile (in_sync)
+      const reconResult = await adapter.reconcile({ entitlement: entInput, binding: suspendedBinding, correlation: ctx });
+      expect(reconResult.status).toBe("in_sync");
+
+      // 5. Release
+      const releaseResult = await adapter.release({ entitlement: entInput, binding: suspendedBinding, correlation: ctx });
+      expect(releaseResult.status).toBe("success");
+
+      // 6. Reconcile (resource_missing after release)
+      const reconAfterRelease = await adapter.reconcile({ entitlement: entInput, binding: suspendedBinding, correlation: ctx });
+      expect(reconAfterRelease.status).toBe("resource_missing");
+    } finally {
+      (logger as any).info = origInfo;
+      (logger as any).warn = origWarn;
+      (logger as any).error = origError;
+    }
+
+    // Assert: every log entry from an adapter operation carries the full chain.
+    // Filter to adapter-level logs only (exclude mikrotik.mock.* from the mock client).
+    const adapterLogs = logEntries.filter((e) =>
+      e.message.startsWith("mikrotik.") && !e.message.startsWith("mikrotik.mock.")
+    );
+    expect(adapterLogs.length).toBeGreaterThanOrEqual(6); // provisioned, suspended, resumed, reconcile_in_sync, released, reconcile_resource_missing
+
+    for (const log of adapterLogs) {
+      // Every log entry carries the full correlation chain.
+      expect(log.fields.requestId).toBe("req_lifecycle");
+      expect(log.fields.tenantId).toBe("tenant_lifecycle");
+      expect(log.fields.providerInstanceId).toBe("pi_lifecycle");
+      expect(log.fields.intentId).toBe("intent_lifecycle");
+      expect(log.fields.decisionId).toBe("decision_lifecycle");
+      expect(log.fields.actionId).toBe("action_lifecycle");
+      expect(log.fields.providerKey).toBe("prov_key_lifecycle");
+      expect(log.fields.bindingId).toBe("binding_lifecycle");
+      expect(log.fields.sessionId).toBe("session_lifecycle");
+    }
+  }, 30_000);
+
+  // =========================================================================
+  // 12.4.4.10 — getUsage failure + reconcile failure carry correlation
+  //
+  // Proves that ERROR paths also carry the full correlation chain — not just
+  // success paths. An operator investigating a getUsage failure or a reconcile
+  // failure must see the same identifiers.
+  // =========================================================================
+  it("12.4.4.10: getUsage failure + reconcile failure carry full correlation chain", async () => {
+    const { MikroTikConnectivityAdapter, MockMikroTikProviderClient, setMockFailureSimulation, clearMockFailureSimulation } = await import("@/lib/connectivity");
+    const { createCorrelationContext } = await import("@/lib/observability/provider-correlation");
+
+    // Create a mock client that fails on getUsage and getResource.
+    const mockClient = new MockMikroTikProviderClient();
+    setMockFailureSimulation({ type: "timeout", operations: ["getUsage", "get"] });
+
+    const adapter = new MikroTikConnectivityAdapter(() => mockClient);
+
+    const ctx = createCorrelationContext({
+      requestId: "req_failure",
+      tenantId: "tenant_failure",
+      providerInstanceId: "pi_failure",
+      intentId: "intent_failure",
+      decisionId: "decision_failure",
+      actionId: "action_failure",
+      providerKey: "prov_key_failure",
+      bindingId: "binding_failure",
+      sessionId: "session_failure",
+    });
+
+    // Intercept logger.
+    const logEntries: Array<{ message: string; fields: Record<string, unknown> }> = [];
+    const origInfo = logger.info, origWarn = logger.warn, origError = logger.error;
+    (logger as any).info = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
+    (logger as any).warn = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
+    (logger as any).error = (m: string, f: Record<string, unknown>) => logEntries.push({ message: m, fields: f });
+
+    const entInput = {
+      id: "ent_failure", tenantId: "tenant_failure", subscriptionId: "sub_failure",
+      status: "ACTIVE", capabilityType: "INTERNET",
+      capabilitySet: { downloadMbps: 50, uploadMbps: 10 },
+      policy: null, validFrom: new Date(), validUntil: null,
+    };
+    const binding = {
+      id: "binding_failure", entitlementId: "ent_failure", providerType: "mikrotik",
+      providerInstanceId: "pi_failure", providerResourceId: "*fake_resource_id",
+      providerMetadata: null, status: "BOUND", provisioningState: "COMPLETED",
+      providerInstanceConfiguration: null,
+    };
+
+    try {
+      // getUsage should fail (TIMEOUT) and return undefined.
+      const usageResult = await adapter.getUsage({ entitlement: entInput, binding, correlation: ctx });
+      expect(usageResult).toBeUndefined();
+
+      // reconcile should also fail (TIMEOUT) and return a retryable error.
+      const reconResult = await adapter.reconcile({ entitlement: entInput, binding, correlation: ctx });
+      expect(reconResult.status).toBe("failed_retryable");
+    } finally {
+      clearMockFailureSimulation();
+      (logger as any).info = origInfo;
+      (logger as any).warn = origWarn;
+      (logger as any).error = origError;
+    }
+
+    // Assert: the getUsage_failed log carries the full chain.
+    const getUsageFailedLog = logEntries.find((e) => e.message === "mikrotik.getUsage_failed");
+    expect(getUsageFailedLog).toBeDefined();
+    expect(getUsageFailedLog!.fields.requestId).toBe("req_failure");
+    expect(getUsageFailedLog!.fields.tenantId).toBe("tenant_failure");
+    expect(getUsageFailedLog!.fields.providerInstanceId).toBe("pi_failure");
+    expect(getUsageFailedLog!.fields.bindingId).toBe("binding_failure");
+    expect(getUsageFailedLog!.fields.sessionId).toBe("session_failure");
+
+    // Assert: the reconcile_failed log carries the full chain.
+    const reconcileFailedLog = logEntries.find((e) => e.message === "mikrotik.reconcile_failed");
+    expect(reconcileFailedLog).toBeDefined();
+    expect(reconcileFailedLog!.fields.requestId).toBe("req_failure");
+    expect(reconcileFailedLog!.fields.tenantId).toBe("tenant_failure");
+    expect(reconcileFailedLog!.fields.providerInstanceId).toBe("pi_failure");
+    expect(reconcileFailedLog!.fields.bindingId).toBe("binding_failure");
+  }, 30_000);
 });
