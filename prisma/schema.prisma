@@ -2552,7 +2552,7 @@ model EdgeObservationRecord {
   derivedMeasurementId String?
   receivedAt      DateTime @default(now())
 
-  edgeDevice      EdgeDevice @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  edgeDevice      EdgeDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
 
   @@unique([deviceId, sequence]) // per-device sequence dedup
   @@index([deviceId])
@@ -2623,3 +2623,18 @@ model ConnectivityIntentRecord {
   @@index([status])
   @@index([expiresAt])
 }
+
+// ---------------------------------------------------------------------------
+// Phase 9.1 — Edge Observation (mobile agent contract)
+//
+// The mobile agent uploads EdgeObservation events. These are IMMUTABLE — the
+// server derives authoritative ConnectivityMeasurement from them (source=DEVICE).
+// The device never submits health/decisions; the control plane remains
+// authoritative.
+//
+//   EdgeObservation (immutable, device-reported)
+//        → ConnectivityMeasurement (derived, source=DEVICE)
+//        → ResourceHealth (projection)
+//        → ReevaluationEvent → Decision → Action
+// ---------------------------------------------------------------------------
+

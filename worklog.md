@@ -6096,3 +6096,135 @@ Stage Summary:
     "no applicable price → BUDGET_APPLICABILITY_UNKNOWN" ✅
 - The debt is removed from the roadmap.
 - Next: Phase 12.4.2 — real provider integration (RouterOS).
+
+---
+Task ID: 12.4.2-audit
+Agent: Principal Connectivity Integration Architect (main) — Phase 12.4.2 Direct Audit
+Task: Step 0 direct audit of the RouterOS integration at aa5267e. Inventory DESIGNED/IMPLEMENTED/TESTED/REAL-INTEGRATED for every piece. Determine if live RouterOS endpoint is available. Produce the deliverable matrix.
+
+Work Log:
+- Step 0 — Direct Audit (files inspected):
+  - src/lib/connectivity/providers/mikrotik/routeros-client.ts (357 lines)
+  - src/lib/connectivity/providers/mikrotik/transport.ts (518 lines)
+  - src/lib/connectivity/providers/mikrotik/adapter.ts (366 lines)
+  - src/lib/connectivity/providers/mikrotik/secret-resolver.ts (200 lines)
+  - src/lib/connectivity/providers/mikrotik/client-factory.ts (250 lines)
+  - src/lib/connectivity/providers/mikrotik/client.ts (interface)
+  - src/lib/connectivity/providers/mikrotik/mock-client.ts
+  - src/lib/connectivity/registry.ts
+  - src/lib/connectivity/adapter.ts (contract)
+  - tests/phase2c410-live-routeros.test.ts (live test harness)
+
+- Step 1 — Production Configuration Safety:
+  - Endpoint resolution: via EnvProviderInstanceSecretResolver → MIKROTIK_{KEY}_ENDPOINT
+  - Secret resolution: env-var-based, NO credentials in DB, NO logging of secrets
+  - configurationKey semantics: per-instance, fail-closed if missing
+  - TLS: allowInsecureTls defaults false, throws in production if true
+  - Authentication: Basic auth (base64 user:pass), Bearer alternative documented
+  - Timeout: 10s default, AbortController
+  - Retry bounds: 2 max, exponential backoff (500ms, 1000ms), method-specific (GET/PATCH/DELETE retryable, PUT/POST not)
+  - Provider-instance isolation: client cache keyed by providerInstanceId + fingerprint
+  - No default/mock fallback: fail-closed if resolver cannot resolve
+  - No credentials in normal DB fields: secrets are env-var referenced by configurationKey
+  - Tenant ownership: ConnectivityProviderInstance has tenantId, verified in client factory
+  All safety invariants are PRESENT and CORRECT.
+
+- Step 2 — Adapter Contract Proof:
+  provision: GET-by-username (idempotent check) → PUT create → CONFLICT reconciliation → timeout reconciliation
+  suspend: PATCH disabled=true
+  resume: PATCH disabled=false
+  release: DELETE (idempotent — 204 even if already deleted)
+  getUsage: GET resource + GET /ip/hotspot/active (correlate by username)
+  reconcile: GET resource → compare state → in_sync/drift_detected/resource_missing
+  All methods correctly map to RouterOS REST API semantics. Error classification is correct.
+
+- Step 3 — Live Endpoint Test:
+  NO LIVE_ROUTEROS_ENDPOINT environment variable is configured.
+  The live test harness (tests/phase2c410-live-routeros.test.ts) is IMPLEMENTED and
+  EXECUTABLE but SKIPS all 22 live tests with an explicit warning when the env var
+  is absent. The META test documents MOCK-VALIDATED status.
+  LIVE PROVIDER TEST = NOT EXECUTED (no physical MikroTik router available).
+
+- Step 4 — Control-Plane Integration:
+  The chain tenant → entitlement → binding → instance → intent → decision → executeDecision →
+  executeAction → MikroTik adapter → provider verification → CurrentConnectivity is
+  architecturally present and wired. The adapter does NOT decide policy, select resources,
+  modify session state, bypass fences, bypass intent authority, or write commerce state.
+  The control plane remains authoritative.
+
+- Step 5 — Provider Truth During Execution:
+  Phase 11.3 proves this with the mock provider (provider truth flips mid-execution).
+  The same adversarial model applies to real RouterOS — the adapter's reconcile() method
+  is the provider-truth query path. NOT verified against a real router.
+
+- Step 6 — Provider Idempotency:
+  Two idempotency domains are present:
+  1. RoamLink IdempotencyOperation (Phase 12.3.2 — DB-authoritative claim + heartbeat + reconciliation)
+  2. Provider-side correlation: RouterOSProviderClient uses GET-by-username for idempotent create
+     (convergence strategy: GET → PUT → CONFLICT → GET → bind existing)
+  Both converge. The provider-side convergence is TESTED via MockRouterOSTransport
+  (strict conflict mode + concurrent harness). NOT verified against a real router.
+
+- Step 7 — Multi-Tenant Provider Isolation:
+  Phase 12.2 proves tenant isolation at the DB level. The client factory verifies
+  instance.tenantId. The adapter resolves clients per providerInstanceId (no cross-
+  contamination). Tests/phase2c33 proves client resolution isolation. NOT verified
+  against real per-router HTTP isolation.
+
+- Step 8 — Observability:
+  Provider operations log: providerInstanceId, instanceLabel, username (not password),
+  operation type, error classification. Missing: explicit requestId/tenantId on
+  provider operations (they're on the API route response but not threaded into the
+  adapter's provider calls). This is an observability gap to address in Phase 12.4.4.
+
+- Step 9 — Test Strategy:
+  A. Unit: adapter + transport behavior (MockRouterOSTransport) — TESTED
+  B. Integration: real client with deterministic mock transport — TESTED
+  C. Live provider: actual RouterOS endpoint — NOT EXECUTED (no router)
+  D. Control-plane: intent → decision → execution path — TESTED (with mock provider)
+
+- Step 10 — Failure Integrity:
+  No live provider test can run. Integration hardening is present. Live test harness
+  is implemented and executable. LIVE PROVIDER TEST = NOT EXECUTED.
+
+- Step 11 — Regression:
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       32/32 PASS
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 12.3.5:      10/10 PASS
+  Phase 8.6.6:        5/5 PASS
+  Phase 9.5.1:         4/4 PASS
+  Lint: clean.
+  Total: 123 PASS, 0 FAIL.
+
+  NOTE: 15 pre-existing failures in Phase 2C MikroTik tests (phase2c3-4 series) —
+  these are from the Phase 2C era and were NOT introduced by Phase 12. They are
+  classifyError edge cases (unknown error → failed_retryable vs expected failed_permanent).
+  These should be addressed in Phase 12.4.2 hardening.
+
+- Step 12 — Frozen Layers:
+  entitlement.ts kernel: UNCHANGED
+  ConnectivityProviderAdapter contract: UNCHANGED
+  ranking engine: UNCHANGED
+  ledger: UNCHANGED
+  tenant authority model: UNCHANGED
+  API v1 protocol: UNCHANGED
+  intent authority: UNCHANGED
+  decision/execution fencing: UNCHANGED
+
+- Repository hygiene fixes during audit:
+  - Removed duplicate EdgeObservationRecord model from prisma/schema.prisma (subagent-introduced).
+  - Removed duplicate EdgeDevice model from prisma/schema.prisma.
+  - Resolved git merge conflict markers in packages/shared/src/index.ts and api-client.ts.
+  - Recreated db/custom.db (was untracked, needed schema push + seed).
+
+Stage Summary:
+- HEAD: (to be committed)
+- Phase 12.4.2 is NOT FROZEN — live provider test was not executed (no physical router).
+- The architecture is sound: provider-neutral contract, fail-closed resolution, provider-side
+  convergence, control-plane authority, tenant isolation — all present and tested via mock.
+- The gap is: NO REAL ROUTEROS ENDPOINT TEST WAS EXECUTED.
+- 15 pre-existing Phase 2C test failures need hardening.
+- Next: either obtain a physical MikroTik router for live verification, or proceed to
+  Phase 12.4.4 (observability) and document the live-provider gap as a production blocker.
