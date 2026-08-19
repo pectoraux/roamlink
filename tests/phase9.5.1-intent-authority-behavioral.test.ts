@@ -77,6 +77,41 @@ async function setupFixture(): Promise<Fixture> {
   const bB = await db.providerResourceBinding.create({ data: { entitlementId: ent.id, providerType: "mock", resourceType: "hotspot_user", providerResourceId: prB.providerResourceId, providerMetadata: JSON.stringify({}), status: "BOUND", provisioningState: "COMPLETED", providerInstanceId: pi.id } });
   await db.protocolResource.update({ where: { id: resB.id }, data: { providerBindingId: bB.id } });
 
+  // Phase 12.4.1: Add ConnectivityOffer2 rows with prices so the ranking engine
+  // returns ranked offers and the decision engine's budget check has priced
+  // candidates to evaluate. Without these, ranking returns 0 offers and the
+  // budget check pushes BUDGET_APPLICABILITY_UNKNOWN (not BUDGET_CONSTRAINT).
+  // Offer 1: within budget ($3 = 300 minor units, budget is $5 = 500)
+  // Offer 2: over budget ($10 = 1000 minor units, exceeds $5 = 500)
+  const offerWithin = await db.connectivityOffer2.create({
+    data: {
+      tenantId: tenant.id,
+      capabilityType: "INTERNET",
+      providerType: "mock",
+      spec: JSON.stringify({ downloadMbps: 500, uploadMbps: 100, dataLimitBytes: 5000000000, validityDays: 30, allowedCountries: ["GH"] }),
+      coverage: JSON.stringify({ countries: ["GH"] }),
+      wholesalePriceMinor: 200, // reseller pays $2
+      customerPriceMinor: 300,  // customer pays $3 (within $5 budget)
+      currency: "USD",
+      status: "active",
+      reliabilityScore: 0.92,
+    },
+  });
+  const offerOver = await db.connectivityOffer2.create({
+    data: {
+      tenantId: tenant.id,
+      capabilityType: "INTERNET",
+      providerType: "mock",
+      spec: JSON.stringify({ downloadMbps: 1000, uploadMbps: 200, dataLimitBytes: 10000000000, validityDays: 30, allowedCountries: ["GH"] }),
+      coverage: JSON.stringify({ countries: ["GH"] }),
+      wholesalePriceMinor: 700, // reseller pays $7
+      customerPriceMinor: 1000, // customer pays $10 (over $5 budget)
+      currency: "USD",
+      status: "active",
+      reliabilityScore: 0.95,
+    },
+  });
+
   await createOrUpdatePolicy({ subjectId, preset: "RELIABLE", mode: "automatic", maxAutoSpendMinor: 10000, requireUserApprovalForPurchase: false });
   const session = await createSession({ subjectId, entitlementId: ent.id });
 
@@ -97,6 +132,7 @@ async function setupFixture(): Promise<Fixture> {
     await db.protocolResource.deleteMany({ where: { id: { in: [resA.id, resB.id] } } }).catch(() => {});
     await db.protocolCapability.deleteMany({ where: { id: { in: [capA.id, capB.id] } } }).catch(() => {});
     await db.providerResourceBinding.deleteMany({ where: { id: { in: [bA.id, bB.id] } } }).catch(() => {});
+    await db.connectivityOffer2.deleteMany({ where: { id: { in: [offerWithin.id, offerOver.id] } } }).catch(() => {});
     await db.connectivityEntitlement.deleteMany({ where: { id: ent.id } }).catch(() => {});
     await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
     await db.tenantSubscription.deleteMany({ where: { id: subscription.id } }).catch(() => {});
@@ -113,6 +149,9 @@ describe("Phase 9.5.1 — Intent Authority Behavioral Proof (DB-backed)", () => 
   afterAll(async () => { if (fx) await fx.cleanup(); }, 120_000);
 
   // Gate A1: Budget behavioral proof
+  // Phase 12.4.1: The test fixture now includes ConnectivityOffer2 rows with
+  // prices (one within budget, one over budget) so the budget check actually
+  // evaluates priced candidates.
   it("A1: intent budget=500 → decision with budget constraint applied + reasonCodes includes BUDGET_CONSTRAINT", async () => {
     // Create an intent with a specific budget
     const intent = await createIntent({
@@ -130,7 +169,7 @@ describe("Phase 9.5.1 — Intent Authority Behavioral Proof (DB-backed)", () => 
     const decision = await db.connectivityDecision.findFirst({
       where: { intentId: intent.intentId },
       orderBy: { createdAt: "desc" },
-      select: { id: true, action: true, reasonCodes: true, reasons: true, intentId: true, intentVersion: true },
+      select: { id: true, action: true, reasonCodes: true, reasons: true, intentId: true, intentVersion: true, constraintsSatisfied: true, constraintsViolated: true },
     });
     expect(decision).not.toBeNull();
     expect(decision?.intentId).toBe(intent.intentId);
@@ -140,18 +179,85 @@ describe("Phase 9.5.1 — Intent Authority Behavioral Proof (DB-backed)", () => 
     expect(decision?.reasonCodes).not.toBeNull();
     const codes = JSON.parse(decision!.reasonCodes!);
 
-    // The decision MUST include BUDGET_CONSTRAINT in reasonCodes because
-    // the intent specified a budget. The budget gate is evaluated in the
-    // decision engine's budget check step.
-    //
-    // If no offers exceed the budget, WITHIN_BUDGET is pushed to
-    // constraintsSatisfied with BUDGET_CONSTRAINT reasonCode.
-    // If an offer exceeds budget, OVER_BUDGET is pushed to
-    // constraintsViolated with BUDGET_CONSTRAINT reasonCode.
-    //
-    // Either way, BUDGET_CONSTRAINT should be in the reasonCodes when
-    // a budget was specified and the budget check was evaluated.
+    // Phase 12.4.1: The decision MUST include BUDGET_CONSTRAINT in reasonCodes
+    // because the intent specified a budget and priced offers exist.
     expect(codes).toContain("BUDGET_CONSTRAINT");
+
+    // Phase 12.4.1: The architect's spec — prove both distinctions:
+    //   priced candidate within budget → WITHIN_BUDGET
+    //   priced candidate over budget → OVER_BUDGET
+    // Both are present because the fixture has one offer at $3 (within) and
+    // one at $10 (over the $5 budget).
+    const satisfied = JSON.parse(decision!.constraintsSatisfied || "[]");
+    const violated = JSON.parse(decision!.constraintsViolated || "[]");
+    expect(satisfied).toContain("WITHIN_BUDGET");
+    expect(violated).toContain("OVER_BUDGET");
+  }, 60_000);
+
+  // Gate A4: Budget applicability unknown when no priced offers exist
+  // Phase 12.4.1: Prove the architect's spec:
+  //   "no applicable price → BUDGET_APPLICABILITY_UNKNOWN"
+  //   (NOT BUDGET_CONSTRAINT — no price was actually evaluated)
+  it("A4: intent with budget but no priced offers → BUDGET_APPLICABILITY_UNKNOWN (not BUDGET_CONSTRAINT)", async () => {
+    // Create a NEW tenant with NO ConnectivityOffer2 rows, so the ranking
+    // engine returns 0 offers. The budget check should push
+    // BUDGET_APPLICABILITY_UNKNOWN (not BUDGET_CONSTRAINT).
+    const { hashPassword } = await import("@/lib/security");
+    const slug = `p951-a4-${Date.now().toString(36)}`;
+    const user = await db.user.create({
+      data: { email: `p951-a4-${Date.now()}@test.roamlink`, name: "P951 A4", passwordHash: await hashPassword("test12345"), role: "customer", emailVerified: new Date() },
+    });
+    const tenant = await db.tenant.create({ data: { name: `P951 A4 ${slug}`, slug, status: "active" } });
+    const starterPlan = await db.saaasPlan.findFirst({ where: { name: "starter" } });
+    const subscription = await db.tenantSubscription.create({ data: { tenantId: tenant.id, saaasPlanId: starterPlan!.id, status: "active", billingCycle: "monthly", currentPeriodEnd: new Date(Date.now() + 30 * 86400000) } });
+    const cc = await db.connectivityCapability.findFirst({ where: { type: "INTERNET" } });
+    const pi = await db.connectivityProviderInstance.create({ data: { tenantId: tenant.id, providerType: "mock", name: `P951 A4 ${slug}`, status: "active", configuration: JSON.stringify({}) } });
+    const ent = await db.connectivityEntitlement.create({ data: { tenantId: tenant.id, subscriptionId: subscription.id, capabilityId: cc!.id, status: "ACTIVE", capabilitySet: JSON.stringify({ downloadMbps: 100 }), validFrom: new Date(), userId: user.id } });
+
+    // NO ConnectivityOffer2 rows created for this tenant → ranking returns 0.
+
+    await createOrUpdatePolicy({ subjectId: user.id, preset: "RELIABLE", mode: "automatic", maxAutoSpendMinor: 10000, requireUserApprovalForPurchase: false });
+    const session = await createSession({ subjectId: user.id, entitlementId: ent.id });
+
+    // Create an intent with a budget
+    const intent = await createIntent({
+      subjectId: user.id,
+      rawText: "cheap connectivity under $5",
+      capabilityType: "INTERNET",
+      mode: "AUTOMATIC",
+      maxPriceMinor: 500, // $5.00 budget
+    });
+
+    // Process the INTENT_CHANGED event through the worker
+    await processPendingEvents(10, "p951-a4-worker");
+
+    const decision = await db.connectivityDecision.findFirst({
+      where: { intentId: intent.intentId },
+      orderBy: { createdAt: "desc" },
+      select: { id: true, reasonCodes: true, constraintsSatisfied: true, constraintsViolated: true },
+    });
+
+    expect(decision).not.toBeNull();
+    const codes = JSON.parse(decision!.reasonCodes || "[]");
+    const satisfied = JSON.parse(decision!.constraintsSatisfied || "[]");
+
+    // The decision MUST NOT include BUDGET_CONSTRAINT — no price was evaluated.
+    expect(codes).not.toContain("BUDGET_CONSTRAINT");
+    // It MUST include BUDGET_APPLICABILITY_UNKNOWN.
+    expect(satisfied).toContain("BUDGET_APPLICABILITY_UNKNOWN");
+
+    // Cleanup
+    await db.connectivityIntentRecord.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.connectivityAction.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    await db.connectivityDecision.deleteMany({ where: { sessionId: session.id } }).catch(() => {});
+    await db.reevaluationEvent.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.connectivitySession.deleteMany({ where: { id: session.id } }).catch(() => {});
+    await db.connectivityPolicy.deleteMany({ where: { subjectId: user.id } }).catch(() => {});
+    await db.connectivityEntitlement.deleteMany({ where: { id: ent.id } }).catch(() => {});
+    await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    await db.tenantSubscription.deleteMany({ where: { id: subscription.id } }).catch(() => {});
+    await db.tenant.deleteMany({ where: { id: tenant.id } }).catch(() => {});
+    await db.user.deleteMany({ where: { id: user.id } }).catch(() => {});
   }, 60_000);
 
   // Gate A2: Stale intent version cannot influence later decisions

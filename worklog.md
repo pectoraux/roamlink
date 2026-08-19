@@ -6032,3 +6032,67 @@ Stage Summary:
   The apiV1SuccessResponse / apiV1ErrorResponse helpers prevent routes from
   accidentally omitting the version headers.
 - Phase 12.3.5 is now ready to freeze.
+
+---
+Task ID: 12.4.1
+Agent: Principal Architect (main) — Phase 12.4.1 Close the Phase 9.5.1 Budget Debt
+Task: Close the oldest known red item — the Phase 9.5.1 A1 BUDGET_CONSTRAINT test failure. The architect's spec: "priced candidate within budget → WITHIN_BUDGET + BUDGET_CONSTRAINT" and "no applicable price → BUDGET_APPLICABILITY_UNKNOWN". The test had been failing because the fixture had no ConnectivityOffer2 rows (no priced offers), so the ranking engine returned 0 offers and the budget check pushed BUDGET_APPLICABILITY_UNKNOWN instead of BUDGET_CONSTRAINT.
+
+Work Log:
+- Diagnosis (confirmed):
+  The Phase 9.5.1 A1 test expected BUDGET_CONSTRAINT in the decision's reasonCodes.
+  But the test fixture created protocol capabilities + resources WITHOUT any
+  ConnectivityOffer2 rows (commerce offers with prices). The ranking engine
+  fetched 0 offers, returned rankedCount: 0, and the decision engine's budget
+  check entered the `else` branch (no ranked offers → BUDGET_APPLICABILITY_UNKNOWN,
+  NOT BUDGET_CONSTRAINT). This was not a code bug — it was a fixture gap.
+
+  The decision engine code (src/lib/control-plane/decision-engine.ts:355-389)
+  was always correct:
+    - maxPriceMinor != null AND ranked offers exist → BUDGET_CONSTRAINT
+    - maxPriceMinor != null AND no ranked offers → BUDGET_APPLICABILITY_UNKNOWN
+
+- Fix (tests/phase9.5.1-intent-authority-behavioral.test.ts):
+  Added ConnectivityOffer2 rows to the test fixture:
+    - offerWithin: customerPriceMinor = 300 ($3, within $5 budget)
+    - offerOver: customerPriceMinor = 1000 ($10, over $5 budget)
+  The ranking engine now returns 2 ranked offers, the budget check evaluates
+  them, and BUDGET_CONSTRAINT is emitted.
+
+  Updated the cleanup function to delete the offer rows.
+
+- Enhanced A1 test:
+  Now asserts BOTH the architect's spec distinctions:
+    - priced candidate within budget → WITHIN_BUDGET (in constraintsSatisfied)
+    - priced candidate over budget → OVER_BUDGET (in constraintsViolated)
+    - BUDGET_CONSTRAINT in reasonCodes (because priced offers exist)
+
+- New A4 test (BUDGET_APPLICABILITY_UNKNOWN):
+  Creates a separate tenant with NO ConnectivityOffer2 rows. An intent with a
+  budget is created, the worker processes it, and the decision:
+    - does NOT contain BUDGET_CONSTRAINT (no price was evaluated)
+    - DOES contain BUDGET_APPLICABILITY_UNKNOWN (in constraintsSatisfied)
+  This proves the architect's spec: "no applicable price → BUDGET_APPLICABILITY_UNKNOWN".
+
+- Regression (all DB-backed):
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       32/32 PASS
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 12.3.5:      10/10 PASS
+  Phase 8.6.6:        5/5 PASS
+  Phase 9.5.1:         4/4 PASS  (A1 fixed, A4 new, A2+A3 unchanged) ← DEBT CLOSED
+  Lint: clean (eslint . exit 0).
+  Dev server: Ready, GET / → 200, no runtime/console errors (verified via Agent Browser).
+  Total tracked regression: 123 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The Phase 9.5.1 budget debt is CLOSED:
+    A1: BUDGET_CONSTRAINT emitted when priced offers exist (within + over budget).
+    A4: BUDGET_APPLICABILITY_UNKNOWN emitted when no priced offers exist.
+  The architect's spec is now proven:
+    "priced candidate within budget → WITHIN_BUDGET + BUDGET_CONSTRAINT" ✅
+    "no applicable price → BUDGET_APPLICABILITY_UNKNOWN" ✅
+- The debt is removed from the roadmap.
+- Next: Phase 12.4.2 — real provider integration (RouterOS).
