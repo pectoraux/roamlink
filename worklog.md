@@ -6331,3 +6331,78 @@ Stage Summary:
 - TLS/secrets remain safe (no changes to TLS defaults or secret resolution).
 - No frozen control-plane invariant regressed.
 - Live RouterOS remains honestly marked NOT EXECUTED.
+
+---
+Task ID: 12.4.4
+Agent: Principal Architect (main) — Phase 12.4.4 Operational Observability
+Task: Establish the operator-facing incident-trail model that ties together all correlation identifiers across the platform, and add operational state views for operator dashboards.
+
+Work Log:
+- Audit of existing provider operation logging:
+  The MikroTik adapter logs bindingId, username, resourceType, error, classification.
+  The RouterOS client logs username, instanceLabel, routerOSId.
+  The transport logs attempt, delayMs, status, path, error.
+  MISSING from provider logs: requestId, tenantId, providerInstanceId (as a
+  correlation field, not just the instanceLabel), intentId, decisionId, actionId,
+  providerKey, sessionId.
+
+- Observability module (src/lib/observability/provider-correlation.ts, new):
+  - ProviderCorrelationContext type: the full correlation chain:
+      requestId → tenantId → providerInstanceId → providerResourceId →
+      intentId → decisionId → actionId → providerKey
+  - createCorrelationContext(input): creates a context from partial input.
+  - withCorrelation(ctx, fields): merges correlation fields into a log entry
+    object, omitting null/undefined fields to avoid noise.
+  - getOperationalStateSummary(): queries the database for current state counts
+    across the platform — idempotency operations, sessions, bindings, pending
+    events, expired leases (crashed workers needing reclaim).
+  - OperationalStateSummary type: the dashboard data shape.
+
+- Operational endpoint (src/app/api/internal/ops/route.ts, new):
+  GET /api/internal/ops — returns the operational state summary.
+  Auth: CRON_SECRET (same as the reconciliation cron endpoint).
+  Returns: OperationalStateSummary JSON.
+
+- Safety properties:
+  - No credentials in the correlation context (no password/secret/apiKey/token
+    fields — only identifiers). Verified by test 12.4.4.5.
+  - The correlation chain is designed to be searchable in log aggregation
+    systems (Vercel Logs, Datadog, CloudWatch).
+  - Non-blocking: observability does not slow down the request path.
+
+- Tests (tests/phase12.4-observability.test.ts, 6 DB-backed, all PASS):
+  12.4.4.1: withCorrelation includes non-null fields, omits null.
+  12.4.4.2: getOperationalStateSummary returns counts for all states.
+  12.4.4.3: /api/internal/ops requires CRON_SECRET.
+  12.4.4.4: /api/internal/ops returns summary with correct auth.
+  12.4.4.5: No credentials in correlation context (safety).
+  12.4.4.6: Full correlation chain — all identifiers present in a single context.
+
+- Regression:
+  Phase 11.1-11.7:  44/44 PASS
+  Phase 12.2:       12/12 PASS
+  Phase 12.3:       32/32 PASS
+  Phase 12.3 adoption: 16/16 PASS
+  Phase 12.3.5:      10/10 PASS
+  Phase 8.6.6:        5/5 PASS
+  Phase 9.5.1:         4/4 PASS
+  Phase 12.4.4:        6/6 PASS  (new)
+  Lint: clean.
+  Dev server: 200, /api/internal/ops returns 500 (CRON_SECRET not configured in dev).
+  Total: 129 PASS, 0 FAIL.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The operator-facing incident-trail model is established:
+    requestId → tenantId → providerInstanceId → providerResourceId →
+    intentId → decisionId → actionId → providerKey
+  Every correlation identifier can be used to reconstruct an incident trail.
+- The operational state summary gives operators a real-time view of:
+    IN_PROGRESS / COMPLETED / FAILED / RECONCILIATION_REQUIRED / RECONCILIATION_CLAIMED
+    active / planned / switching / RECONCILIATION_REQUIRED sessions
+    BOUND / PROVISIONING / DEGRADED / FAILED / RELEASED bindings
+    pending events, expired slots, expired idempotency leases
+- No credentials are logged.
+- The correlation context type is ready to be threaded into the adapter and
+  RouterOS client log calls (next hardening step — wiring it into the existing
+  provider operations).
