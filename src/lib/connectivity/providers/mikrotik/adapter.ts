@@ -40,7 +40,7 @@ import { MikroTikProviderError } from "./client";
 import type { AsyncMikroTikClientResolver } from "./client-factory";
 import type { ProviderCorrelationContext } from "../../../observability/provider-correlation";
 import { withCorrelation } from "../../../observability/provider-correlation";
-import { startProviderOperation, completeProviderOperation } from "../../../observability/incident-lookup";
+import { startProviderOperation, completeProviderOperation, AuditStartFailureError } from "../../../observability/incident-lookup";
 import { logger } from "@/lib/logger";
 
 // ---------------------------------------------------------------------------
@@ -253,12 +253,33 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       providerKey: ctx.providerKey ?? null,
     } : null;
 
-    const opRecordId = auditBase
-      ? await startProviderOperation({
+    // Phase 12.4.4e.2: startProviderOperation returns Promise<string> (never
+    // null) OR throws AuditStartFailureError on DB failure. The catch returns
+    // a control-plane infrastructure error — NOT a provider failure — because
+    // no provider mutation has occurred yet (the provider was never called).
+    let opRecordId: string | null = null;
+    if (auditBase) {
+      try {
+        opRecordId = await startProviderOperation({
           ...auditBase,
           providerResourceId: input.binding.providerResourceId ?? null,
-        })
-      : null;
+        });
+      } catch (auditStartErr) {
+        if (auditStartErr instanceof AuditStartFailureError) {
+          logger.error("mikrotik.provision_audit_start_failed", withCorrelation(ctx, {
+            bindingId: input.binding.id,
+            operation: "provision",
+            error: auditStartErr.message,
+            reason: "audit_start_failed_closed",
+          }));
+          return {
+            status: "failed_permanent",
+            error: "Audit identity could not be established — provider mutation prohibited",
+          };
+        }
+        throw auditStartErr;
+      }
+    }
     if (!auditBase) {
       logger.warn("provider_operation.skipped_no_tenant", {
         operation: "provision",
@@ -378,12 +399,30 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       providerKey: ctx.providerKey ?? null,
     } : null;
 
-    const opRecordId = auditBase
-      ? await startProviderOperation({
+    // Phase 12.4.4e.2: audit-start fail closed (see provision() for rationale).
+    let opRecordId: string | null = null;
+    if (auditBase) {
+      try {
+        opRecordId = await startProviderOperation({
           ...auditBase,
           providerResourceId: input.binding.providerResourceId ?? null,
-        })
-      : null;
+        });
+      } catch (auditStartErr) {
+        if (auditStartErr instanceof AuditStartFailureError) {
+          logger.error("mikrotik.suspend_audit_start_failed", withCorrelation(ctx, {
+            bindingId: input.binding.id,
+            operation: "suspend",
+            error: auditStartErr.message,
+            reason: "audit_start_failed_closed",
+          }));
+          return {
+            status: "failed_permanent",
+            error: "Audit identity could not be established — provider mutation prohibited",
+          };
+        }
+        throw auditStartErr;
+      }
+    }
     if (!auditBase) {
       logger.warn("provider_operation.skipped_no_tenant", {
         operation: "suspend",
@@ -462,12 +501,30 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       providerKey: ctx.providerKey ?? null,
     } : null;
 
-    const opRecordId = auditBase
-      ? await startProviderOperation({
+    // Phase 12.4.4e.2: audit-start fail closed (see provision() for rationale).
+    let opRecordId: string | null = null;
+    if (auditBase) {
+      try {
+        opRecordId = await startProviderOperation({
           ...auditBase,
           providerResourceId: input.binding.providerResourceId ?? null,
-        })
-      : null;
+        });
+      } catch (auditStartErr) {
+        if (auditStartErr instanceof AuditStartFailureError) {
+          logger.error("mikrotik.resume_audit_start_failed", withCorrelation(ctx, {
+            bindingId: input.binding.id,
+            operation: "resume",
+            error: auditStartErr.message,
+            reason: "audit_start_failed_closed",
+          }));
+          return {
+            status: "failed_permanent",
+            error: "Audit identity could not be established — provider mutation prohibited",
+          };
+        }
+        throw auditStartErr;
+      }
+    }
     if (!auditBase) {
       logger.warn("provider_operation.skipped_no_tenant", {
         operation: "resume",
@@ -546,12 +603,30 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       providerKey: ctx.providerKey ?? null,
     } : null;
 
-    const opRecordId = auditBase
-      ? await startProviderOperation({
+    // Phase 12.4.4e.2: audit-start fail closed (see provision() for rationale).
+    let opRecordId: string | null = null;
+    if (auditBase) {
+      try {
+        opRecordId = await startProviderOperation({
           ...auditBase,
           providerResourceId: input.binding.providerResourceId ?? null,
-        })
-      : null;
+        });
+      } catch (auditStartErr) {
+        if (auditStartErr instanceof AuditStartFailureError) {
+          logger.error("mikrotik.release_audit_start_failed", withCorrelation(ctx, {
+            bindingId: input.binding.id,
+            operation: "release",
+            error: auditStartErr.message,
+            reason: "audit_start_failed_closed",
+          }));
+          return {
+            status: "failed_permanent",
+            error: "Audit identity could not be established — provider mutation prohibited",
+          };
+        }
+        throw auditStartErr;
+      }
+    }
     if (!auditBase) {
       logger.warn("provider_operation.skipped_no_tenant", {
         operation: "release",
@@ -630,12 +705,28 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       providerKey: ctx.providerKey ?? null,
     } : null;
 
-    const opRecordId = auditBase
-      ? await startProviderOperation({
+    // Phase 12.4.4e.2: audit-start fail closed. getUsage returns undefined on
+    // audit-start failure (no provider call, no usage data).
+    let opRecordId: string | null = null;
+    if (auditBase) {
+      try {
+        opRecordId = await startProviderOperation({
           ...auditBase,
           providerResourceId: input.binding.providerResourceId,
-        })
-      : null;
+        });
+      } catch (auditStartErr) {
+        if (auditStartErr instanceof AuditStartFailureError) {
+          logger.error("mikrotik.getUsage_audit_start_failed", withCorrelation(ctx, {
+            bindingId: input.binding.id,
+            operation: "getUsage",
+            error: auditStartErr.message,
+            reason: "audit_start_failed_closed",
+          }));
+          return undefined;
+        }
+        throw auditStartErr;
+      }
+    }
     if (!auditBase) {
       logger.warn("provider_operation.skipped_no_tenant", {
         operation: "getUsage",
@@ -725,12 +816,31 @@ export class MikroTikConnectivityAdapter implements ConnectivityProviderAdapter 
       providerKey: ctx.providerKey ?? null,
     } : null;
 
-    const opRecordId = auditBase
-      ? await startProviderOperation({
+    // Phase 12.4.4e.2: audit-start fail closed. reconcile returns
+    // failed_permanent with details (ReconciliationResult shape).
+    let opRecordId: string | null = null;
+    if (auditBase) {
+      try {
+        opRecordId = await startProviderOperation({
           ...auditBase,
           providerResourceId: input.binding.providerResourceId ?? null,
-        })
-      : null;
+        });
+      } catch (auditStartErr) {
+        if (auditStartErr instanceof AuditStartFailureError) {
+          logger.error("mikrotik.reconcile_audit_start_failed", withCorrelation(ctx, {
+            bindingId: input.binding.id,
+            operation: "reconcile",
+            error: auditStartErr.message,
+            reason: "audit_start_failed_closed",
+          }));
+          return {
+            status: "failed_permanent",
+            details: "Audit identity could not be established — provider mutation prohibited",
+          };
+        }
+        throw auditStartErr;
+      }
+    }
     if (!auditBase) {
       logger.warn("provider_operation.skipped_no_tenant", {
         operation: "reconcile",

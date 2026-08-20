@@ -907,25 +907,33 @@ export type ProviderOperationRecordInput = {
 };
 
 /**
- * Phase 12.4.4e (P0-2): Create a durable STARTED record BEFORE the provider
- * mutation. This ensures that if the process crashes after the provider
- * mutation but before the terminal update, the record remains STARTED and
- * an operator can identify the incomplete operation.
+ * Phase 12.4.4e (P0-2) + Phase 12.4.4e.2 (durable identity BEFORE mutation):
+ * Create a durable STARTED record BEFORE the provider mutation.
  *
- * Returns the record ID so the adapter can later call completeProviderOperation()
- * with the terminal outcome.
+ * HARD INVARIANT:
+ *   provider mutation starts ⇒ durable ProviderOperationRecord already exists.
  *
- * FAILURES HERE DO NOT BLOCK THE PROVIDER OPERATION:
- *   If the STARTED insert fails (DB error), the provider operation still
- *   proceeds — we log the audit failure but do NOT throw. The provider result
- *   remains authoritative. The audit trail is best-effort for the STARTED
- *   record; the terminal update (if it succeeds) will still create a complete
- *   record. If both STARTED and terminal fail, the operation is unrecorded —
- *   but the control plane's authoritative state (binding/session) is unaffected.
+ *   This function MUST either return a non-null recordId OR throw.
+ *   It MUST NOT silently return null and permit the provider call.
+ *
+ * On success: returns the record ID.
+ * On DB failure: throws AuditStartFailureError. The provider mutation MUST NOT
+ *   begin. The caller (adapter) catches this and returns a control-plane
+ *   infrastructure error — NOT a provider failure. No external side effect
+ *   has occurred.
+ *
+ * WHY THIS IS DIFFERENT FROM TERMINAL-WRITE FAILURE (Phase 12.4.4e.1):
+ *   - START failure: the provider has NOT been called yet. No external side
+ *     effect exists. The correct behavior is to FAIL CLOSED — abort the
+ *     operation before the provider is touched.
+ *   - Terminal failure: the provider mutation ALREADY happened. The result
+ *     is authoritative. The audit record stays STARTED and is recoverable.
+ *
+ * These are fundamentally different failure classes and MUST NOT be conflated.
  */
 export async function startProviderOperation(
   input: ProviderOperationRecordInput,
-): Promise<string | null> {
+): Promise<string> {
   try {
     const record = await db.providerOperationRecord.create({
       data: {
@@ -948,31 +956,73 @@ export async function startProviderOperation(
     });
     return record.id;
   } catch (err) {
-    // Best-effort: log but do NOT throw. The provider operation proceeds.
+    // Phase 12.4.4e.2: FAIL CLOSED. The provider mutation MUST NOT begin.
+    // Log the audit-start failure with full correlation context (no secrets).
     const { logger } = await import("@/lib/logger");
-    logger.warn("provider_operation.start_failed", {
+    logger.error("provider_operation.start_failed_closed", {
       operation: input.operation,
+      tenantId: input.tenantId,
+      providerInstanceId: input.providerInstanceId,
+      providerResourceId: input.providerResourceId,
       bindingId: input.bindingId,
       actionId: input.actionId,
-      tenantId: input.tenantId,
+      requestId: input.requestId,
+      intentId: input.intentId,
+      decisionId: input.decisionId,
+      sessionId: input.sessionId,
       error: err instanceof Error ? err.message : String(err),
+      reason: "STARTED insert failed; provider mutation prohibited (fail closed)",
     });
-    return null;
+    throw new AuditStartFailureError(
+      `Failed to establish durable audit identity for ${input.operation}: ${err instanceof Error ? err.message : String(err)}`,
+      input.operation,
+    );
   }
 }
 
 /**
- * Phase 12.4.4e (P0-2): Update a STARTED record with the terminal outcome.
+ * Phase 12.4.4e.2: Typed error for audit-start failure.
  *
- * If the recordId is null (STARTED insert failed), this function attempts
- * to create a terminal record directly (so the audit trail still captures
- * the outcome, even without the STARTED predecessor).
+ * This is a LOCAL INFRASTRUCTURE failure — RoamLink could not durably
+ * establish operation identity, therefore no provider mutation was authorized.
+ *
+ * It is NOT:
+ *   - CONFIRMED_PROVIDER_FAILURE (the provider was never called)
+ *   - AMBIGUOUS_PROVIDER_FAILURE (no external side effect occurred)
+ *   - RECONCILIATION_REQUIRED (nothing to reconcile — the provider was not touched)
+ *
+ * The caller (adapter) catches this and returns a control-plane error. The
+ * control plane (action-executor) treats this as a local infrastructure error,
+ * NOT a provider failure. The action becomes FAILED (not RECONCILIATION_REQUIRED)
+ * because no external side effect occurred — retrying with a new operation is safe.
+ */
+export class AuditStartFailureError extends Error {
+  constructor(
+    message: string,
+    public readonly operation: string,
+  ) {
+    super(message);
+    this.name = "AuditStartFailureError";
+  }
+}
+
+/**
+ * Phase 12.4.4e (P0-2) + Phase 12.4.4e.1 (durable identity):
+ * Update a STARTED record with the terminal outcome.
+ *
+ * Phase 12.4.4e.2: recordId is now `string` (non-nullable). In production,
+ * startProviderOperation either returns a valid recordId OR throws
+ * AuditStartFailureError (fail closed — the provider mutation never begins).
+ * There is no production path where completeProviderOperation is called with
+ * a null recordId. The null-check is kept for defensive backward compatibility
+ * with the deprecated recordProviderOperation test helper, but it logs a
+ * high-severity error and does NOT create a duplicate.
  *
  * FAILURES HERE DO NOT AFFECT THE PROVIDER RESULT:
  *   The caller has already received the provider's result (success/failure).
  *   If this terminal update fails (DB error), the provider result remains
  *   authoritative — the control-plane execution does NOT become FAILED merely
- *   because the audit write failed. The record stays STARTED (if the STARTED
+ *   because the audit write failed. The record stays STARTED (the STARTED
  *   insert succeeded) and is recoverable/reconcilable.
  */
 export async function completeProviderOperation(
@@ -992,7 +1042,10 @@ export async function completeProviderOperation(
   // ProviderOperationRecord.id is the durable identity of the operation
   // attempt. NEVER create a second record as a fallback.
   //
-  // Case 1: No STARTED record exists (startProviderOperation returned null).
+  // Phase 12.4.4e.2: In production, recordId is always non-null (startProviderOperation
+  // throws on failure). The null-check is defensive only.
+  //
+  // Case 1: No STARTED record exists (defensive — should not happen in production).
   // Do NOT create a terminal record — that would be a SECOND operation identity.
   if (!recordId) {
     logger.error("provider_operation.complete_no_started_record", {

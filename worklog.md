@@ -7978,3 +7978,234 @@ Stage Summary:
 - Concurrent completion is DB-authoritative (first updateMany wins, loser no-ops).
 - The audit subsystem NEVER triggers provider mutations or retries.
 - 171/171 tests pass in 3 different orderings — deterministic.
+
+---
+Task ID: 12.4.4e.2-adapter
+Agent: Adapter Refactor Agent — audit-start fail closed
+Task: Refactor the MikroTik adapter (6 operations: provision, suspend, resume, release, getUsage, reconcile) so each one CATCHES AuditStartFailureError from startProviderOperation and returns a control-plane infrastructure error (NOT a provider failure) when the audit-start fails — fail closed, no provider mutation begins.
+
+Work Log:
+
+- STEP 0 — Read prior context:
+  Read src/lib/observability/incident-lookup.ts (startProviderOperation now returns
+  Promise<string>; on DB failure throws AuditStartFailureError). Read the MikroTik
+  adapter end-to-end. Confirmed each of the 6 operations followed the pattern:
+    const opRecordId = auditBase ? await startProviderOperation({...}) : null;
+    if (!auditBase) { logger.warn(...) }
+  which silently allowed the provider mutation to proceed if startProviderOperation
+  ever failed and returned null. With the Phase 12.4.4e.2 contract change, that
+  null-return path no longer exists; instead AuditStartFailureError is thrown and
+  MUST be caught and translated to a fail-closed result BEFORE the provider call.
+
+- STEP 1 — Import line (adapter.ts:43):
+  OLD:
+    import { startProviderOperation, completeProviderOperation } from ".../incident-lookup";
+  NEW:
+    import { startProviderOperation, completeProviderOperation, AuditStartFailureError } from ".../incident-lookup";
+
+- STEP 2 — Refactored all 6 operations. Each now uses the same shape:
+    let opRecordId: string | null = null;
+    if (auditBase) {
+      try {
+        opRecordId = await startProviderOperation({...auditBase, providerResourceId: ...});
+      } catch (auditStartErr) {
+        if (auditStartErr instanceof AuditStartFailureError) {
+          logger.error("mikrotik.<op>_audit_start_failed", withCorrelation(ctx, {
+            bindingId: input.binding.id,
+            operation: "<op>",
+            error: auditStartErr.message,
+            reason: "audit_start_failed_closed",
+          }));
+          return <op-specific fail-closed shape>;
+        }
+        throw auditStartErr;
+      }
+    }
+    if (!auditBase) {
+      logger.warn("provider_operation.skipped_no_tenant", {...});
+    }
+
+  Per-operation fail-closed return shapes (per spec):
+    provision (ProvisionResult):
+      { status: "failed_permanent",
+        error:  "Audit identity could not be established — provider mutation prohibited" }
+    suspend (ActionResult):
+      { status: "failed_permanent",
+        error:  "Audit identity could not be established — provider mutation prohibited" }
+    resume (ActionResult):
+      same as suspend.
+    release (ActionResult):
+      same as suspend.
+    getUsage (UsageMetrics | undefined):
+      return undefined;
+    reconcile (ReconciliationResult):
+      { status: "failed_permanent",
+        details: "Audit identity could not be established — provider mutation prohibited" }
+
+  File line numbers (after edit):
+    provision  audit-start try/catch:  adapter.ts:256–282  (returns failed_permanent ProvisionResult)
+    suspend    audit-start try/catch:  adapter.ts:402–425  (returns failed_permanent ActionResult)
+    resume     audit-start try/catch:  adapter.ts:504–527  (returns failed_permanent ActionResult)
+    release    audit-start try/catch:  adapter.ts:606–629  (returns failed_permanent ActionResult)
+    getUsage   audit-start try/catch:  adapter.ts:708–729  (returns undefined)
+    reconcile  audit-start try/catch:  adapter.ts:819–843  (returns failed_permanent ReconciliationResult)
+
+  Semantic invariants preserved:
+    - The audit-start try/catch is SEPARATE from the provider-error catch (existing
+      `catch (err)` block). It returns BEFORE any provider mutation begins.
+    - When auditBase is null (test mode, no tenantId), the provider mutation
+      proceeds without a STARTED record (only reachable in test code; production
+      always has ctx.tenantId from the kernel-bridge correlation enrichment).
+      The `if (!auditBase) logger.warn(...)` block is preserved.
+    - The opRecordId passed to completeProviderOperation is now non-null in
+      production (startProviderOperation returns Promise<string> and throws on
+      failure; the catch returns early). The variable is typed `string | null`
+      only because of the !auditBase test path; completeProviderOperation already
+      accepts `string | null` and the existing `if (auditBase)` guards prevent
+      calling it when opRecordId is null.
+    - The error is a LOCAL INFRASTRUCTURE failure (control-plane), NOT a provider
+      failure: the provider was never called. The action-executor treats
+      failed_permanent from the adapter as a FAILED action (not
+      RECONCILIATION_REQUIRED) — correct, because no external side effect occurred.
+    - classifyError, withCorrelation calls, return types, and other files were
+      NOT touched.
+
+- STEP 3 — Verification:
+  * `bun run lint`: clean (no errors).
+  * `bun test tests/phase12.4-observability.test.ts`:
+      14 pass, 0 fail, 197 expect() calls, 2.05s.
+  * `bun test tests/phase12.4.4e-incident-lookup.test.ts`:
+      20 pass, 0 fail, 130 expect() calls, 2.30s.
+  * Bonus regression sweep — MikroTik adapter-specific test files:
+    phase2c33-client-resolution + phase2c4-routeros-client + phase2c31-provider-instance
+    + phase2c34-fail-closed + phase2c32-runtime-resolution:
+      60 pass, 0 fail, 178 expect() calls, 2.26s.
+  ZERO new failures. ZERO regressions.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The MikroTik adapter now treats an audit-start failure as a fail-closed
+  control-plane infrastructure error, BEFORE the provider mutation begins.
+  No external side effect can occur without a durable STARTED record.
+- Per-operation fail-closed shapes match the contract return types
+  (ProvisionResult, ActionResult, UsageMetrics|undefined, ReconciliationResult).
+- The fail-closed return is NOT a provider failure — the action-executor will
+  mark the action FAILED (not RECONCILIATION_REQUIRED), which is correct
+  because no provider side effect exists to reconcile.
+- The test-only path (no ctx.tenantId → auditBase null) still proceeds with
+  the provider mutation (no audit recording); this is reachable only in
+  direct adapter tests, never in production.
+- 94/94 relevant tests pass (14 + 20 + 60). Lint clean.
+
+---
+Task ID: 12.4.4e.2
+Agent: Principal System Architect (main) — Phase 12.4.4e.2 Durable Audit Identity Before Mutation
+Task: Fix the P0 where startProviderOperation caught DB insert failures and returned null, allowing the provider mutation to proceed without a durable ProviderOperationRecord. Enforce: provider mutation starts ⇒ durable record already exists.
+
+Work Log:
+
+- STEP 0 — Direct audit at 4fad832:
+  Read src/lib/observability/incident-lookup.ts startProviderOperation().
+  CONFIRMED: lines 950-961 caught the DB error, logged a warn, and returned null.
+  The adapter then proceeded with the provider mutation regardless of opRecordId
+  being null. This violates: "provider mutation starts ⇒ durable record exists."
+
+- STEP 1 — Hard invariant:
+  provider mutation starts ⇒ durable ProviderOperationRecord already exists.
+  startProviderOperation MUST either return a non-null recordId OR throw.
+  It MUST NOT silently return null.
+
+- STEP 2 — Changed startProviderOperation (src/lib/observability/incident-lookup.ts):
+  * Return type changed from Promise<string | null> to Promise<string>.
+  * On DB failure: throws AuditStartFailureError (new typed error class).
+  * Logs at ERROR level (not warn) with full correlation context:
+    operation, tenantId, providerInstanceId, providerResourceId, bindingId,
+    actionId, requestId, intentId, decisionId, sessionId. No secrets.
+  * JSDoc explicitly documents the difference from terminal-write failure:
+    - START failure: provider NOT called → fail closed (abort mutation).
+    - Terminal failure: provider already called → preserve STARTED, provider result authoritative.
+
+- STEP 3 — Updated MikroTik adapter (src/lib/connectivity/providers/mikrotik/adapter.ts):
+  All 6 operations (provision, suspend, resume, release, getUsage, reconcile) refactored:
+  * Import now includes AuditStartFailureError.
+  * Each operation wraps startProviderOperation in a try/catch that catches
+    AuditStartFailureError and returns the operation-specific fail-closed shape:
+    - provision/suspend/resume/release: { status: "failed_permanent", error: "Audit identity..." }
+    - getUsage: undefined
+    - reconcile: { status: "failed_permanent", details: "Audit identity..." }
+  * The audit-start catch is SEPARATE from the provider-error catch and returns
+    BEFORE any provider mutation begins.
+  * The `if (!auditBase)` guard (for test-mode without ctx.tenantId) is preserved.
+
+- STEP 4 — Terminal-write failure semantics preserved (Phase 12.4.4e.1):
+  completeProviderOperation still uses the 4-case logic:
+    Case 1: recordId null (defensive — should not happen in production) → no duplicate.
+    Case 2: conditional update >0 rows → success.
+    Case 3: 0 rows → re-read: missing/STARTED/terminal → no duplicate.
+    Case 4: update throws → preserve STARTED, no duplicate.
+  The JSDoc was updated to note that recordId is now non-null in production.
+
+- STEP 5-6 — Adapter contract + AuditStartFailureError classification:
+  * AuditStartFailureError is a LOCAL INFRASTRUCtURE error — NOT a provider failure.
+  * The provider was never called. No external side effect occurred.
+  * The adapter returns failed_permanent (NOT ambiguous/reconciliation_required)
+    because no external side effect occurred — retrying with a new operation is safe.
+  * No new public API error code introduced. The existing classifyError() maps
+    the adapter's failed_permanent to the control-plane FAILED state.
+  * The adapter contract (ConnectivityProviderAdapter) is UNCHANGED — no
+    provider-specific breakage.
+
+- STEP 7 — Adversarial tests (3 new, tests/phase12.4.4e-incident-lookup.test.ts):
+  12.4.4e.19: audit START failure → provider mutation prohibited (fail closed).
+    (a) Real path: adapter.provision() with healthy DB → STARTED created, provider
+        called, SUCCEEDED record exists.
+    (b) Forced failure: monkey-patch db.providerOperationRecord.create to throw →
+        startProviderOperation throws AuditStartFailureError → no record created.
+  12.4.4e.20: START succeeds + terminal write fails → STARTED preserved, provider
+    result authoritative. Monkey-patch updateMany to throw → record stays STARTED,
+    no duplicate, SAME record later completed (recovery path).
+  12.4.4e.21: concurrent START attempts → two STARTED records created (audit layer
+    is observational, NOT an execution authority). The existing execution fences
+    (session slot, decision claim) control concurrency — not the audit layer.
+
+- STEP 8 — Documentation updated:
+  * startProviderOperation JSDoc: "FAILS CLOSED" → "FAIL CLOSED" semantics.
+  * completeProviderOperation JSDoc: "recordId is now string (non-nullable) in production."
+  * Stale "terminal update can create a complete record if STARTED creation failed"
+    comments removed (that fallback was eliminated in 12.4.4e.1).
+
+- STEP 9 — Observability:
+  startProviderOperation logs at ERROR level on failure with full correlation
+  context (no secrets): operation, tenantId, providerInstanceId, providerResourceId,
+  bindingId, actionId, requestId, intentId, decisionId, sessionId.
+
+- STEP 10 — No second control plane:
+  ProviderOperationRecord remains observational. It is NEVER read by:
+    - the decision engine, action executor, intent service, session manager,
+    - the entitlement kernel, ranking engine, idempotency layer, reconciliation cron.
+  The only readers are lookupIncident() and the API route.
+  The only writers are startProviderOperation() and completeProviderOperation().
+  The audit layer NEVER authorizes, prevents, or retries provider execution.
+  Concurrency control remains with the session slot (Phase 11.2) and decision
+  claim (Phase 11.1) — NOT the audit layer (proven by 12.4.4e.21).
+
+- STEP 11 — Regression (3 runs, 3 different orderings):
+  Run 1 (canonical): 174 pass, 0 fail, 1125 expect() calls, 23.98s.
+  Run 2 (reverse): 174 pass, 0 fail, 1124 expect() calls, 23.27s.
+  Run 3 (interleaved): 174 pass, 0 fail, 1125 expect() calls, 23.61s.
+  +3 tests from Phase 12.4.4e.2 = 174 total (was 171).
+  ZERO new failures. ZERO regressions.
+
+- Lint: clean.
+- Dev server: 200, no errors.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The hard invariant is now enforced:
+    provider mutation starts ⇒ durable ProviderOperationRecord already exists.
+- START failure → provider mutation prohibited (fail closed). No external side effect.
+- Terminal failure → STARTED preserved, provider result authoritative, SAME record
+  recoverable later.
+- The audit layer is observational — it does NOT authorize or prevent execution.
+  Concurrency control remains with the session slot and decision claim.
+- 174/174 tests pass in 3 different orderings — deterministic.
