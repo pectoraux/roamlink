@@ -2786,6 +2786,14 @@ model ProviderOperationRecord {
   providerKey     String?
   // Reconciliation state at the time of the operation (snapshot)
   reconciliationState String?
+  // Phase 12.4.4f: Recovery ownership for STARTED records.
+  // When a recovery worker claims a STARTED record, it sets recoveryClaimId
+  // and recoveryClaimExpiresAt. This prevents two recovery workers from
+  // querying the provider simultaneously for the same operation.
+  // A crashed recovery worker's claim is reclaimable after expiry.
+  recoveryClaimId        String?
+  recoveryClaimedAt      DateTime?
+  recoveryClaimExpiresAt DateTime?
   // Timestamps
   startedAt       DateTime @default(now())
   completedAt     DateTime?
@@ -2799,4 +2807,6 @@ model ProviderOperationRecord {
   @@index([bindingId])
   @@index([providerKey])
   @@index([startedAt])
+  @@index([recoveryClaimId])
+  @@index([recoveryClaimExpiresAt])
 }

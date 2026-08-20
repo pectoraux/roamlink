@@ -131,6 +131,10 @@ export type IncidentResult = {
     reconciliationState: string | null;
     startedAt: Date;
     completedAt: Date | null;
+    // Phase 12.4.4f: Recovery metadata for STARTED records.
+    recoveryClaimId: string | null;
+    recoveryClaimedAt: Date | null;
+    recoveryClaimExpiresAt: Date | null;
   }>;
 };
 
@@ -777,6 +781,9 @@ export async function lookupIncident(
     reconciliationState: op.reconciliationState,
     startedAt: op.startedAt,
     completedAt: op.completedAt,
+    recoveryClaimId: op.recoveryClaimId,
+    recoveryClaimedAt: op.recoveryClaimedAt,
+    recoveryClaimExpiresAt: op.recoveryClaimExpiresAt,
   }));
 
   // Step 7: Compute the incident-level summary.

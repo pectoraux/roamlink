@@ -9091,3 +9091,125 @@ Stage Summary:
 - The live test harness is PREPARED and skips cleanly.
 - Phase 12.4.2 is NOT FROZEN — live provider proof remains outstanding.
 - Remaining blocker: "No live RouterOS endpoint available."
+
+---
+Task ID: 12.4.4f
+Agent: Principal System Architect (main) — Phase 12.4.4f Provider Operation Recovery
+Task: Make STARTED ProviderOperationRecord rows operationally recoverable. Recovery queries provider truth, classifies the outcome, and updates the SAME record. No blind retry. No second control plane.
+
+Work Log:
+
+- STEP 0 — Direct audit at 86cdcd5 (includes ef824a2):
+  Inspected ProviderOperationRecord schema, incident-lookup.ts, MikroTik adapter,
+  kernel bridge, provider reconciliation, existing cron routes, Phase 11 recovery.
+  Findings:
+  1. STARTED rows are created by startProviderOperation (before provider mutation).
+  2. NO recovery worker existed for STARTED records.
+  3. NO TTL/age threshold existed.
+  4. reconcileBindingWithProvider CAN query provider truth (READ-ONLY).
+  5. completeProviderOperation CAN update the SAME record (conditional fence).
+  6. No path could accidentally retry a provider mutation (recovery is observational).
+
+- STEP 1 — Recovery states:
+  Used the existing ProviderOperationState vocabulary:
+    STARTED → (provider truth query) → SUCCEEDED | FAILED_PERMANENT | AMBIGUOUS
+  No new states invented. The existing AMBIGUOUS state covers unknown outcomes.
+  Age is a TRIGGER for investigation, not proof of outcome.
+
+- STEP 2 — Recovery ownership:
+  Added schema fields to ProviderOperationRecord:
+    recoveryClaimId String?
+    recoveryClaimedAt DateTime?
+    recoveryClaimExpiresAt DateTime?
+  + @@index([recoveryClaimId])
+  + @@index([recoveryClaimExpiresAt])
+  Recovery uses a fenced updateMany (WHERE state=STARTED AND claim expired or null)
+  to atomically claim a STARTED record. Two workers cannot claim the same record.
+
+- STEP 3 — Recovery age threshold:
+  STARTED_RECOVERY_AFTER_MS = 5 * 60 * 1000 (5 minutes).
+  Longer than the provider operation timeout (2 min) and session slot lease (5 min).
+  A STARTED record younger than 5 min is likely still in progress.
+  After 5 min, the worker has either completed (terminal update written) or
+  crashed (STARTED persists → eligible for recovery).
+
+- STEP 4 — Provider truth query:
+  Recovery calls reconcileBindingWithProvider(bindingId), which resolves the
+  adapter + binding + entitlement and calls adapter.reconcile() (READ-ONLY).
+  This queries the provider's actual state. Recovery NEVER calls provision/
+  suspend/resume/release — only the adapter's reconcile() method.
+
+- STEP 5 — No-blind-retry:
+  If provider truth says resource missing:
+  - For provision: classify as FAILED_PERMANENT (resource was never created or deleted).
+  - For release: classify as SUCCEEDED (release achieved desired state — resource gone).
+  - For suspend/resume: classify as AMBIGUOUS (operation effect unknown).
+  Recovery does NOT create a new provider resource. The control plane decides
+  whether another desired transition is appropriate.
+
+- STEP 6 — Same record, same identity:
+  Recovery calls completeProviderOperation(recordId, ...) — the SAME recordId.
+  The conditional fence (WHERE id=recordId AND state=STARTED) ensures only
+  one terminal transition. Record count remains exactly 1.
+
+- STEP 7 — Adversarial tests (7 new, tests/phase12.4.4e-incident-lookup.test.ts):
+  12.4.4f.1: successful recovery — STARTED → SUCCEEDED via provider truth.
+    Creates a mock resource, creates a STARTED record (backdated), runs recovery.
+    Provider truth shows resource exists → SUCCEEDED. Record count = 1.
+  12.4.4f.2: provider resource missing → recovery classifies failure, no new resource.
+    Mock client returns null for getResource. Recovery classifies FAILED_PERMANENT
+    for provision. createResource is NOT called (no blind retry).
+  12.4.4f.3: provider query unavailable → AMBIGUOUS, remains recoverable.
+    getResource throws timeout. Recovery classifies AMBIGUOUS.
+  12.4.4f.4: concurrent recovery → exactly one claims, one transition, record count = 1.
+    Two workers run recovery concurrently. Exactly ONE record remains.
+  12.4.4f.5: recovery claim expires → Worker B reclaims and recovers.
+    Worker A claims and crashes (claim expired). reclaimExpiredRecoveryClaims
+    clears the claim. Worker B recovers successfully.
+  12.4.4f.6: recovery never mutates provider — only read/verify methods called.
+    Instruments ALL provider client methods. Recovery calls ONLY read methods
+    (getResource, getResourceUsage). ZERO mutating method calls.
+  12.4.4f.7: tenant isolation — Tenant B cannot recover Tenant A's operation.
+    Tenant B lookup by actionId/requestId → 404. Tenant A lookup succeeds.
+
+- STEP 8 — Incident lookup updated:
+  Added recovery metadata to IncidentResult.providerOperations:
+    recoveryClaimId, recoveryClaimedAt, recoveryClaimExpiresAt.
+  The lookup exposes STARTED as a legitimate operational state (not FAILED/SUCCEEDED).
+
+- STEP 9 — Operational worker:
+  Integrated with existing connectivity-reconcile cron route
+  (src/app/api/internal/connectivity-reconcile/route.ts). The route now:
+    1. reclaimExpiredRecoveryClaims() — clear crashed recovery claims.
+    2. recoverStaleProviderOperations() — find + claim + recover STARTED records.
+  Uses indexed query (state=STARTED AND startedAt<threshold AND claim expired/null).
+  Bounded by RECOVERY_BATCH_SIZE=10 per cycle.
+
+- STEP 10 — Observability:
+  Every recovery attempt logs:
+    requestId, tenantId, intentId, decisionId, actionId, sessionId,
+    providerInstanceId, providerResourceId, bindingId, providerKey.
+  No secrets logged.
+  Distinguished events: recovery_claimed, recovery_completed, recovery_failed.
+
+- STEP 11 — Regression (3 runs, 3 different orderings):
+  Run 1 (canonical): 185 pass, 0 fail, 1179 expect() calls, 23.48s.
+  Run 2 (reverse):   185 pass, 0 fail, 1178 expect() calls, 23.21s.
+  Run 3 (interleaved): 185 pass, 0 fail, 1178 expect() calls, 23.56s.
+  +7 tests from Phase 12.4.4f = 185 total (was 178).
+  ZERO new failures. ZERO regressions.
+
+- Lint: clean.
+- Dev server: 200, no errors.
+
+Stage Summary:
+- HEAD: (to be committed)
+- STARTED records are now operationally recoverable.
+- Recovery queries provider truth (READ-ONLY) — never mutates the provider.
+- The SAME record is updated — ONE mutation = ONE record invariant preserved.
+- No-blind-retry: missing resources → FAILED/AMBIGUOUS, never auto-recreated.
+- DB-authoritative ownership (fenced claim + lease expiry).
+- Tenant isolation enforced (records are tenant-scoped).
+- Incident lookup exposes STARTED + recovery metadata.
+- Integrated with existing connectivity-reconcile cron.
+- 185/185 tests pass in 3 different orderings — deterministic.

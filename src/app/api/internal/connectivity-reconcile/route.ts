@@ -6,6 +6,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { reconcileConnectivityEntitlements } from "@/lib/connectivity/entitlement";
+import { recoverStaleProviderOperations, reclaimExpiredRecoveryClaims } from "@/lib/observability/provider-operation-recovery";
 import { requireAdmin } from "@/lib/auth";
 import { logger } from "@/lib/logger";
 
@@ -51,8 +52,20 @@ async function runReconciliation() {
     return NextResponse.json({ ok: false, error: "Reconciliation failed" }, { status: 500 });
   }
 
-  const durationMs = Date.now() - startedAt;
-  logger.info("cron.connectivity_reconciliation.completed", { durationMs, ...result });
+  // Phase 12.4.4f: Recover stale STARTED ProviderOperationRecords.
+  // First reclaim expired recovery claims (crashed recovery workers),
+  // then run the recovery worker.
+  let recoveryResult;
+  try {
+    await reclaimExpiredRecoveryClaims();
+    recoveryResult = await recoverStaleProviderOperations();
+  } catch (err) {
+    logger.error("cron.provider_operation_recovery.failed", { error: err instanceof Error ? err.message : String(err) });
+    recoveryResult = { examined: 0, claimed: 0, recovered: 0, ambiguous: 0, failed: 0, retained: 0 };
+  }
 
-  return NextResponse.json({ ok: true, durationMs, ...result });
+  const durationMs = Date.now() - startedAt;
+  logger.info("cron.connectivity_reconciliation.completed", { durationMs, ...result, recovery: recoveryResult });
+
+  return NextResponse.json({ ok: true, durationMs, ...result, recovery: recoveryResult });
 }
