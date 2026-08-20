@@ -130,8 +130,8 @@ describe("Phase 2C.4 — Real RouterOS Client", () => {
     const resA = await resolveBindingRuntime(bindingA.id);
     const resB = await resolveBindingRuntime(bindingB.id);
 
-    const pA = await resA.adapter.provision({ entitlement: resA.entitlement, binding: resA.binding });
-    const pB = await resB.adapter.provision({ entitlement: resB.entitlement, binding: resB.binding });
+    const pA = await resA.adapter.provision({ entitlement: resA.entitlement, binding: resA.binding, correlation: { tenantId, providerInstanceId: resA.binding.providerInstanceId } });
+    const pB = await resB.adapter.provision({ entitlement: resB.entitlement, binding: resB.binding, correlation: { tenantId, providerInstanceId: resB.binding.providerInstanceId } });
 
     expect(pA.status).toBe("success");
     expect(pB.status).toBe("success");
@@ -160,7 +160,7 @@ describe("Phase 2C.4 — Real RouterOS Client", () => {
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
 
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(result.status).toBe("failed_permanent");
     expect(result.error).toContain("no configured");
   }, 30000);
@@ -180,7 +180,7 @@ describe("Phase 2C.4 — Real RouterOS Client", () => {
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
 
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(result.status).toBe("failed_retryable");
     expect(result.error).toContain("timeout");
 
@@ -202,7 +202,7 @@ describe("Phase 2C.4 — Real RouterOS Client", () => {
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
 
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(result.status).toBe("failed_permanent");
     expect(result.error).toContain("AUTHENTICATION");
 
@@ -224,7 +224,7 @@ describe("Phase 2C.4 — Real RouterOS Client", () => {
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
 
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(result.status).toBe("failed_retryable");
 
     clearMockClientRegistry();
@@ -244,8 +244,8 @@ describe("Phase 2C.4 — Real RouterOS Client", () => {
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
 
-    const p1 = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
-    const p2 = await res.adapter.provision({ entitlement: res.entitlement, binding: { ...res.binding, providerResourceId: p1.providerResourceId } });
+    const p1 = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
+    const p2 = await res.adapter.provision({ entitlement: res.entitlement, binding: { ...res.binding, providerResourceId: p1.providerResourceId }, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(p1.status).toBe("success");
     expect(p2.status).toBe("success");
@@ -274,24 +274,24 @@ describe("Phase 2C.4 — Real RouterOS Client", () => {
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
 
-    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     const bi = { ...res.binding, providerResourceId: p.providerResourceId };
 
     // Suspend twice
-    const s1 = await res.adapter.suspend({ entitlement: res.entitlement, binding: bi });
-    const s2 = await res.adapter.suspend({ entitlement: res.entitlement, binding: bi });
+    const s1 = await res.adapter.suspend({ entitlement: res.entitlement, binding: bi, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
+    const s2 = await res.adapter.suspend({ entitlement: res.entitlement, binding: bi, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(s1.status).toBe("success");
     expect(s2.status).toBe("success");
 
     // Resume twice
-    const r1 = await res.adapter.resume({ entitlement: res.entitlement, binding: bi });
-    const r2 = await res.adapter.resume({ entitlement: res.entitlement, binding: bi });
+    const r1 = await res.adapter.resume({ entitlement: res.entitlement, binding: bi, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
+    const r2 = await res.adapter.resume({ entitlement: res.entitlement, binding: bi, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(r1.status).toBe("success");
     expect(r2.status).toBe("success");
 
     // Release twice
-    const d1 = await res.adapter.release({ entitlement: res.entitlement, binding: bi });
-    const d2 = await res.adapter.release({ entitlement: res.entitlement, binding: bi });
+    const d1 = await res.adapter.release({ entitlement: res.entitlement, binding: bi, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
+    const d2 = await res.adapter.release({ entitlement: res.entitlement, binding: bi, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(d1.status).toBe("success");
     expect(d2.status).toBe("success");
 
@@ -312,12 +312,12 @@ describe("Phase 2C.4 — Real RouterOS Client", () => {
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
 
-    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.PROVISIONING });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.BOUND, providerResourceId: p.providerResourceId });
 
     // Suspend at the provider (creates drift)
-    await res.adapter.suspend({ entitlement: res.entitlement, binding: { ...res.binding, providerResourceId: p.providerResourceId } });
+    await res.adapter.suspend({ entitlement: res.entitlement, binding: { ...res.binding, providerResourceId: p.providerResourceId }, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     const reconResult = await reconcileBindingWithProvider(binding.id);
     expect(reconResult.status).toBe("transitioned");
@@ -343,12 +343,12 @@ describe("Phase 2C.4 — Real RouterOS Client", () => {
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
 
-    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.PROVISIONING });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.BOUND, providerResourceId: p.providerResourceId });
 
     // Delete at the provider (resource disappears)
-    await res.adapter.release({ entitlement: res.entitlement, binding: { ...res.binding, providerResourceId: p.providerResourceId } });
+    await res.adapter.release({ entitlement: res.entitlement, binding: { ...res.binding, providerResourceId: p.providerResourceId }, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     const reconResult = await reconcileBindingWithProvider(binding.id);
     expect(reconResult.status).toBe("transitioned");

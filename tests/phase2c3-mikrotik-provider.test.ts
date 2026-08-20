@@ -145,6 +145,7 @@ describe("Phase 2C.3 — MikroTik Reference Provider", () => {
     const result = await mikrotikConnectivityAdapter.provision({
       entitlement: makeEntInput(ent),
       binding: makeBindingInput(binding),
+      correlation: { tenantId, providerInstanceId: binding.providerInstanceId },
     });
     expect(result.status).toBe("success");
     expect(result.providerResourceId).toBeTruthy();
@@ -156,8 +157,8 @@ describe("Phase 2C.3 — MikroTik Reference Provider", () => {
   // ---------------------------------------------------------------
   it("5. duplicate provision is idempotent", async () => {
     const { ent, binding } = await createMikrotikBinding();
-    const r1 = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding) });
-    const r2 = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding, r1.providerResourceId, r1.providerMetadata) });
+    const r1 = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
+    const r2 = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding, r1.providerResourceId, r1.providerMetadata), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     expect(r1.status).toBe("success");
     expect(r2.status).toBe("success");
     expect(r2.providerResourceId).toBe(r1.providerResourceId);
@@ -168,10 +169,10 @@ describe("Phase 2C.3 — MikroTik Reference Provider", () => {
   // ---------------------------------------------------------------
   it("6. suspend is idempotent", async () => {
     const { ent, binding } = await createMikrotikBinding();
-    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding) });
+    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     const bi = makeBindingInput(binding, p.providerResourceId, p.providerMetadata);
-    const s1 = await mikrotikConnectivityAdapter.suspend({ entitlement: makeEntInput(ent), binding: bi });
-    const s2 = await mikrotikConnectivityAdapter.suspend({ entitlement: makeEntInput(ent), binding: bi });
+    const s1 = await mikrotikConnectivityAdapter.suspend({ entitlement: makeEntInput(ent), binding: bi, correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
+    const s2 = await mikrotikConnectivityAdapter.suspend({ entitlement: makeEntInput(ent), binding: bi, correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     expect(s1.status).toBe("success");
     expect(s2.status).toBe("success");
   }, 30000);
@@ -181,11 +182,11 @@ describe("Phase 2C.3 — MikroTik Reference Provider", () => {
   // ---------------------------------------------------------------
   it("7. resume is idempotent", async () => {
     const { ent, binding } = await createMikrotikBinding();
-    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding) });
+    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     const bi = makeBindingInput(binding, p.providerResourceId, p.providerMetadata);
-    await mikrotikConnectivityAdapter.suspend({ entitlement: makeEntInput(ent), binding: bi });
-    const r1 = await mikrotikConnectivityAdapter.resume({ entitlement: makeEntInput(ent), binding: bi });
-    const r2 = await mikrotikConnectivityAdapter.resume({ entitlement: makeEntInput(ent), binding: bi });
+    await mikrotikConnectivityAdapter.suspend({ entitlement: makeEntInput(ent), binding: bi, correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
+    const r1 = await mikrotikConnectivityAdapter.resume({ entitlement: makeEntInput(ent), binding: bi, correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
+    const r2 = await mikrotikConnectivityAdapter.resume({ entitlement: makeEntInput(ent), binding: bi, correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     expect(r1.status).toBe("success");
     expect(r2.status).toBe("success");
   }, 30000);
@@ -195,10 +196,10 @@ describe("Phase 2C.3 — MikroTik Reference Provider", () => {
   // ---------------------------------------------------------------
   it("8. release is idempotent", async () => {
     const { ent, binding } = await createMikrotikBinding();
-    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding) });
+    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     const bi = makeBindingInput(binding, p.providerResourceId, p.providerMetadata);
-    const r1 = await mikrotikConnectivityAdapter.release({ entitlement: makeEntInput(ent), binding: bi });
-    const r2 = await mikrotikConnectivityAdapter.release({ entitlement: makeEntInput(ent), binding: bi });
+    const r1 = await mikrotikConnectivityAdapter.release({ entitlement: makeEntInput(ent), binding: bi, correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
+    const r2 = await mikrotikConnectivityAdapter.release({ entitlement: makeEntInput(ent), binding: bi, correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     expect(r1.status).toBe("success");
     expect(r2.status).toBe("success");
   }, 30000);
@@ -208,12 +209,12 @@ describe("Phase 2C.3 — MikroTik Reference Provider", () => {
   // ---------------------------------------------------------------
   it("9. missing resource → resource_missing", async () => {
     const { ent, binding } = await createMikrotikBinding();
-    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding) });
+    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.PROVISIONING });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.BOUND, providerResourceId: p.providerResourceId });
 
     // Release at provider to make resource disappear
-    await mikrotikConnectivityAdapter.release({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding, p.providerResourceId, p.providerMetadata) });
+    await mikrotikConnectivityAdapter.release({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding, p.providerResourceId, p.providerMetadata), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
 
     const result = await reconcileBindingWithProvider(binding.id);
     expect(result.status).toBe("transitioned");
@@ -228,12 +229,12 @@ describe("Phase 2C.3 — MikroTik Reference Provider", () => {
   // ---------------------------------------------------------------
   it("10. drift → drift_detected → DEGRADED", async () => {
     const { ent, binding } = await createMikrotikBinding();
-    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding) });
+    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.PROVISIONING });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.BOUND, providerResourceId: p.providerResourceId });
 
     // Suspend at provider (drift)
-    await mikrotikConnectivityAdapter.suspend({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding, p.providerResourceId, p.providerMetadata) });
+    await mikrotikConnectivityAdapter.suspend({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding, p.providerResourceId, p.providerMetadata), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
 
     const result = await reconcileBindingWithProvider(binding.id);
     expect(result.status).toBe("transitioned");
@@ -248,7 +249,7 @@ describe("Phase 2C.3 — MikroTik Reference Provider", () => {
   // ---------------------------------------------------------------
   it("11. retryable RouterOS failure → RECONCILIATION_REQUIRED", async () => {
     const { ent, binding } = await createMikrotikBinding();
-    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding) });
+    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.PROVISIONING });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.BOUND, providerResourceId: p.providerResourceId });
 
@@ -273,7 +274,7 @@ describe("Phase 2C.3 — MikroTik Reference Provider", () => {
   // ---------------------------------------------------------------
   it("12. permanent RouterOS failure → MANUAL_INTERVENTION_REQUIRED", async () => {
     const { ent, binding } = await createMikrotikBinding();
-    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding) });
+    const p = await mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.PROVISIONING });
     await transitionBinding({ bindingId: binding.id, toState: BINDING_STATES.BOUND, providerResourceId: p.providerResourceId });
 
@@ -296,8 +297,8 @@ describe("Phase 2C.3 — MikroTik Reference Provider", () => {
   it("13. concurrent provision → ONE resource (idempotent)", async () => {
     const { ent, binding } = await createMikrotikBinding();
     const results = await Promise.allSettled([
-      mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding) }),
-      mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding) }),
+      mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } }),
+      mikrotikConnectivityAdapter.provision({ entitlement: makeEntInput(ent), binding: makeBindingInput(binding), correlation: { tenantId, providerInstanceId: binding.providerInstanceId } }),
     ]);
     const successes = results.filter((r) => r.status === "fulfilled" && r.value.status === "success").length;
     expect(successes).toBeGreaterThanOrEqual(1);

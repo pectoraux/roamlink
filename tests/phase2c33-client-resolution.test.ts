@@ -130,6 +130,7 @@ describe("Phase 2C.3.3 — Provider Instance → Client Resolution", () => {
     const provisionA = await resA.adapter.provision({
       entitlement: resA.entitlement,
       binding: resA.binding,
+      correlation: { tenantId, providerInstanceId: resA.binding.providerInstanceId },
     });
     expect(provisionA.status).toBe("success");
 
@@ -137,6 +138,7 @@ describe("Phase 2C.3.3 — Provider Instance → Client Resolution", () => {
     const provisionB = await resB.adapter.provision({
       entitlement: resB.entitlement,
       binding: resB.binding,
+      correlation: { tenantId, providerInstanceId: resB.binding.providerInstanceId },
     });
     expect(provisionB.status).toBe("success");
 
@@ -183,8 +185,8 @@ describe("Phase 2C.3.3 — Provider Instance → Client Resolution", () => {
 
     // Run concurrent provisioning
     const [resultA, resultB] = await Promise.all([
-      resA.adapter.provision({ entitlement: resA.entitlement, binding: resA.binding }),
-      resB.adapter.provision({ entitlement: resB.entitlement, binding: resB.binding }),
+      resA.adapter.provision({ entitlement: resA.entitlement, binding: resA.binding, correlation: { tenantId, providerInstanceId: resA.binding.providerInstanceId } }),
+      resB.adapter.provision({ entitlement: resB.entitlement, binding: resB.binding, correlation: { tenantId, providerInstanceId: resB.binding.providerInstanceId } }),
     ]);
 
     expect(resultA.status).toBe("success");
@@ -224,8 +226,8 @@ describe("Phase 2C.3.3 — Provider Instance → Client Resolution", () => {
     // Provision both via the adapter
     const resA = await resolveBindingRuntime(bindingA.id);
     const resB = await resolveBindingRuntime(bindingB.id);
-    const pA = await resA.adapter.provision({ entitlement: resA.entitlement, binding: resA.binding });
-    const pB = await resB.adapter.provision({ entitlement: resB.entitlement, binding: resB.binding });
+    const pA = await resA.adapter.provision({ entitlement: resA.entitlement, binding: resA.binding, correlation: { tenantId, providerInstanceId: resA.binding.providerInstanceId } });
+    const pB = await resB.adapter.provision({ entitlement: resB.entitlement, binding: resB.binding, correlation: { tenantId, providerInstanceId: resB.binding.providerInstanceId } });
 
     // Transition to BOUND
     await transitionBinding({ bindingId: bindingA.id, toState: BINDING_STATES.PROVISIONING });

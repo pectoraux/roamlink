@@ -1656,4 +1656,311 @@ describe("Phase 12.4.4e — Incident Lookup Adversarial Tests", () => {
     // Cleanup.
     await db.providerOperationRecord.deleteMany({ where: { actionId: "action_e21" } }).catch(() => {});
   }, 30_000);
+
+  // =========================================================================
+  // 12.4.4e.22 — Missing audit context blocks mutation (table-driven, all 4 mutators).
+  //
+  // Phase 12.4.4e.3: Use the REAL production adapter path. For each MUTATING
+  // operation (provision, suspend, resume, release), invoke with missing
+  // tenant/correlation context. Assert:
+  //   - no ProviderOperationRecord is created
+  //   - mock/transport provider mutation is NOT called
+  //   - explicit infrastructure/audit-start failure
+  //   - no reconciliation_required state (no provider side effect occurred)
+  // =========================================================================
+  it("12.4.4e.22: missing audit context blocks mutation — all 4 mutators fail closed", async () => {
+    const { mikrotikConnectivityAdapter, registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+
+    const pi = await db.connectivityProviderInstance.create({
+      data: { tenantId: tA.tenantId, providerType: "mikrotik", name: `P1244e22 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik-e22" },
+    });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    // Track whether ANY provider client method is called.
+    let providerCalled = false;
+    const methods: Array<keyof typeof mockMikroTikProviderClient> = ["createResource", "suspendResource", "resumeResource", "deleteResource", "getResource", "getResourceUsage"];
+    const originals: Record<string, any> = {};
+    for (const m of methods) {
+      originals[m] = (mockMikroTikProviderClient as any)[m].bind(mockMikroTikProviderClient);
+      (mockMikroTikProviderClient as any)[m] = async (...args: any[]) => {
+        providerCalled = true;
+        return originals[m](...args);
+      };
+    }
+
+    try {
+      const binding = await db.providerResourceBinding.create({
+        data: { entitlementId: tA.entitlementId, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: "pr-e22", providerMetadata: JSON.stringify({}), status: "BOUND", provisioningState: "COMPLETED", providerInstanceId: pi.id },
+      });
+
+      const entInput = {
+        id: tA.entitlementId, tenantId: tA.tenantId, subscriptionId: "sub", status: "ACTIVE",
+        capabilityType: "INTERNET", capabilitySet: { downloadMbps: 50, uploadMbps: 10 },
+        policy: null, validFrom: new Date(), validUntil: null,
+      };
+      const bindingInput = { id: binding.id, entitlementId: tA.entitlementId, providerType: "mikrotik", providerResourceId: "pr-e22", providerMetadata: null, status: "BOUND" as const, provisioningState: null, providerInstanceId: pi.id, providerInstanceConfiguration: null };
+
+      // provision — NO correlation (missing tenant context).
+      providerCalled = false;
+      const provResult = await mikrotikConnectivityAdapter.provision({
+        entitlement: entInput, binding: bindingInput,
+        // NO correlation field — simulates missing audit context.
+      });
+      expect(provResult.status).toBe("failed_permanent");
+      expect(provResult.error).toMatch(/audit identity|provider mutation prohibited/i);
+      expect(providerCalled).toBe(false); // provider NOT called
+
+      // suspend — NO correlation.
+      providerCalled = false;
+      const suspResult = await mikrotikConnectivityAdapter.suspend({
+        entitlement: entInput, binding: bindingInput,
+      });
+      expect(suspResult.status).toBe("failed_permanent");
+      expect(providerCalled).toBe(false);
+
+      // resume — NO correlation.
+      providerCalled = false;
+      const resResult = await mikrotikConnectivityAdapter.resume({
+        entitlement: entInput, binding: bindingInput,
+      });
+      expect(resResult.status).toBe("failed_permanent");
+      expect(providerCalled).toBe(false);
+
+      // release — NO correlation.
+      providerCalled = false;
+      const relResult = await mikrotikConnectivityAdapter.release({
+        entitlement: entInput, binding: bindingInput,
+      });
+      expect(relResult.status).toBe("failed_permanent");
+      expect(providerCalled).toBe(false);
+
+      // No ProviderOperationRecord was created (all 4 failed closed before STARTED insert).
+      const opRecords = await db.providerOperationRecord.findMany({
+        where: { bindingId: binding.id },
+      });
+      expect(opRecords.length).toBe(0);
+
+      // Cleanup.
+      await db.providerResourceBinding.deleteMany({ where: { id: binding.id } }).catch(() => {});
+    } finally {
+      // Restore originals.
+      for (const m of methods) {
+        (mockMikroTikProviderClient as any)[m] = originals[m];
+      }
+      clearMockClientRegistry();
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    }
+  }, 60_000);
+
+  // =========================================================================
+  // 12.4.4e.23 — Complete audit context permits mutation (control case).
+  //
+  // Phase 12.4.4e.3: Provide authoritative tenantId/correlation.
+  //   - STARTED record created.
+  //   - Provider mutation executes.
+  //   - SAME record transitions terminal.
+  //   - Exactly one ProviderOperationRecord exists.
+  // =========================================================================
+  it("12.4.4e.23: complete audit context permits mutation → exactly ONE record", async () => {
+    const { mikrotikConnectivityAdapter, registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+
+    const pi = await db.connectivityProviderInstance.create({
+      data: { tenantId: tA.tenantId, providerType: "mikrotik", name: `P1244e23 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik-e23" },
+    });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    try {
+      const binding = await db.providerResourceBinding.create({
+        data: { entitlementId: tA.entitlementId, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: null, providerMetadata: JSON.stringify({}), status: "UNBOUND", provisioningState: null, providerInstanceId: pi.id },
+      });
+
+      const entInput = {
+        id: tA.entitlementId, tenantId: tA.tenantId, subscriptionId: "sub", status: "ACTIVE",
+        capabilityType: "INTERNET", capabilitySet: { downloadMbps: 50, uploadMbps: 10 },
+        policy: null, validFrom: new Date(), validUntil: null,
+      };
+
+      // provision WITH correlation (complete audit context).
+      const result = await mikrotikConnectivityAdapter.provision({
+        entitlement: entInput,
+        binding: { id: binding.id, entitlementId: tA.entitlementId, providerType: "mikrotik", providerResourceId: null, providerMetadata: null, status: "UNBOUND" as const, provisioningState: null, providerInstanceId: pi.id, providerInstanceConfiguration: null },
+        correlation: { tenantId: tA.tenantId, providerInstanceId: pi.id, actionId: "action_e23", requestId: "req_e23" },
+      });
+
+      expect(result.status).toBe("success");
+
+      // Exactly ONE ProviderOperationRecord — STARTED → SUCCEEDED.
+      const opRecords = await db.providerOperationRecord.findMany({
+        where: { actionId: "action_e23", tenantId: tA.tenantId },
+        select: { id: true, state: true, outcome: true, completedAt: true },
+      });
+      expect(opRecords.length).toBe(1);
+      expect(opRecords[0].state).toBe("SUCCEEDED");
+      expect(opRecords[0].outcome).toBe("SUCCEEDED");
+      expect(opRecords[0].completedAt).not.toBeNull();
+
+      // Cleanup.
+      await db.providerOperationRecord.deleteMany({ where: { actionId: "action_e23" } }).catch(() => {});
+      await db.providerResourceBinding.deleteMany({ where: { id: binding.id } }).catch(() => {});
+    } finally {
+      clearMockClientRegistry();
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    }
+  }, 60_000);
+
+  // =========================================================================
+  // 12.4.4e.24 — Read operation semantics are explicit.
+  //
+  // Phase 12.4.4e.3: Test getUsage/reconcile with MISSING tenant context.
+  // READ operations proceed WITHOUT an audit record (explicit, documented —
+  // reads have no external side effect). Assert:
+  //   - read succeeds (returns data or undefined)
+  //   - NO ProviderOperationRecord created
+  //   - no silent bypass error
+  // =========================================================================
+  it("12.4.4e.24: read operation without tenant context → proceeds without audit record (explicit)", async () => {
+    const { mikrotikConnectivityAdapter, registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+
+    const pi = await db.connectivityProviderInstance.create({
+      data: { tenantId: tA.tenantId, providerType: "mikrotik", name: `P1244e24 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik-e24" },
+    });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    try {
+      const binding = await db.providerResourceBinding.create({
+        data: { entitlementId: tA.entitlementId, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: "pr-e24", providerMetadata: JSON.stringify({}), status: "BOUND", provisioningState: "COMPLETED", providerInstanceId: pi.id },
+      });
+
+      const entInput = {
+        id: tA.entitlementId, tenantId: tA.tenantId, subscriptionId: "sub", status: "ACTIVE",
+        capabilityType: "INTERNET", capabilitySet: { downloadMbps: 50, uploadMbps: 10 },
+        policy: null, validFrom: new Date(), validUntil: null,
+      };
+      const bindingInput = { id: binding.id, entitlementId: tA.entitlementId, providerType: "mikrotik", providerResourceId: "pr-e24", providerMetadata: null, status: "BOUND" as const, provisioningState: null, providerInstanceId: pi.id, providerInstanceConfiguration: null };
+
+      // getUsage — NO correlation (missing tenant context).
+      const usage = await mikrotikConnectivityAdapter.getUsage({
+        entitlement: entInput, binding: bindingInput,
+        // NO correlation — READ operation proceeds without audit record.
+      });
+      // getUsage returns UsageMetrics | undefined. The read succeeded —
+      // no audit-start failure (READ ops don't fail closed). The mock may
+      // return undefined if no usage data exists, which is valid.
+      // The key assertion is: the read did NOT throw AuditStartFailureError.
+      // (If it had, we wouldn't reach this line.)
+      expect(usage === undefined || typeof usage === "object").toBe(true);
+
+      // reconcile — NO correlation.
+      const recon = await mikrotikConnectivityAdapter.reconcile({
+        entitlement: entInput, binding: bindingInput,
+        // NO correlation.
+      });
+      // reconcile returns a ReconciliationResult. The read succeeded.
+      expect(recon.status).toBeDefined();
+
+      // NO ProviderOperationRecord created (READ without tenant context → no audit).
+      const opRecords = await db.providerOperationRecord.findMany({
+        where: { bindingId: binding.id },
+      });
+      expect(opRecords.length).toBe(0);
+
+      // Cleanup.
+      await db.providerResourceBinding.deleteMany({ where: { id: binding.id } }).catch(() => {});
+    } finally {
+      clearMockClientRegistry();
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    }
+  }, 60_000);
+
+  // =========================================================================
+  // 12.4.4e.25 — No adapter-level tenant invention.
+  //
+  // Phase 12.4.4e.3: Provide valid provider resource + valid provider instance
+  // but MISSING tenantId. Assert:
+  //   - adapter does NOT query arbitrary user/entitlement state to invent a tenant
+  //   - provider mutation is not executed
+  //   - no audit bypass
+  // =========================================================================
+  it("12.4.4e.25: no adapter-level tenant invention — missing tenantId blocks mutation", async () => {
+    const { mikrotikConnectivityAdapter, registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+
+    const pi = await db.connectivityProviderInstance.create({
+      data: { tenantId: tA.tenantId, providerType: "mikrotik", name: `P1244e25 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik-e25" },
+    });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    // Track whether the adapter queries ConnectivityEntitlement or TenantUser
+    // (it should NOT — tenant authority is upstream, not in the adapter).
+    let entitlementQueryCount = 0;
+    const originalEntFindFirst = db.connectivityEntitlement.findFirst.bind(db.connectivityEntitlement);
+    (db.connectivityEntitlement as any).findFirst = async (...args: any[]) => {
+      entitlementQueryCount++;
+      return originalEntFindFirst(...args);
+    };
+    let tenantUserQueryCount = 0;
+    const originalTUFindFirst = db.tenantUser.findFirst.bind(db.tenantUser);
+    (db.tenantUser as any).findFirst = async (...args: any[]) => {
+      tenantUserQueryCount++;
+      return originalTUFindFirst(...args);
+    };
+
+    let providerCalled = false;
+    const originalCreate = mockMikroTikProviderClient.createResource.bind(mockMikroTikProviderClient);
+    mockMikroTikProviderClient.createResource = async (...args: Parameters<typeof originalCreate>) => {
+      providerCalled = true;
+      return originalCreate(...args);
+    };
+
+    try {
+      const binding = await db.providerResourceBinding.create({
+        data: { entitlementId: tA.entitlementId, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: null, providerMetadata: JSON.stringify({}), status: "UNBOUND", provisioningState: null, providerInstanceId: pi.id },
+      });
+
+      // provision with a correlation context that has providerInstanceId but
+      // NO tenantId (simulating an upstream that forgot to set tenantId).
+      const result = await mikrotikConnectivityAdapter.provision({
+        entitlement: {
+          id: tA.entitlementId, tenantId: tA.tenantId, subscriptionId: "sub", status: "ACTIVE",
+          capabilityType: "INTERNET", capabilitySet: { downloadMbps: 50, uploadMbps: 10 },
+          policy: null, validFrom: new Date(), validUntil: null,
+        },
+        binding: { id: binding.id, entitlementId: tA.entitlementId, providerType: "mikrotik", providerResourceId: null, providerMetadata: null, status: "UNBOUND" as const, provisioningState: null, providerInstanceId: pi.id, providerInstanceConfiguration: null },
+        correlation: {
+          // providerInstanceId is present but tenantId is MISSING.
+          providerInstanceId: pi.id,
+          actionId: "action_e25",
+          requestId: "req_e25",
+          // NO tenantId — the adapter must NOT invent one.
+        },
+      });
+
+      // The adapter FAILED CLOSED — provider mutation prohibited.
+      expect(result.status).toBe("failed_permanent");
+      expect(result.error).toMatch(/audit identity|provider mutation prohibited/i);
+
+      // Provider was NOT called.
+      expect(providerCalled).toBe(false);
+
+      // The adapter did NOT query ConnectivityEntitlement or TenantUser to
+      // invent a tenantId. Tenant authority is upstream, not in the adapter.
+      expect(entitlementQueryCount).toBe(0);
+      expect(tenantUserQueryCount).toBe(0);
+
+      // No ProviderOperationRecord was created (fail closed before STARTED insert).
+      const opRecords = await db.providerOperationRecord.findMany({
+        where: { actionId: "action_e25" },
+      });
+      expect(opRecords.length).toBe(0);
+
+      // Cleanup.
+      await db.providerResourceBinding.deleteMany({ where: { id: binding.id } }).catch(() => {});
+    } finally {
+      // Restore originals.
+      (db.connectivityEntitlement as any).findFirst = originalEntFindFirst;
+      (db.tenantUser as any).findFirst = originalTUFindFirst;
+      mockMikroTikProviderClient.createResource = originalCreate;
+      clearMockClientRegistry();
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    }
+  }, 60_000);
 });

@@ -1006,6 +1006,106 @@ export class AuditStartFailureError extends Error {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 12.4.4e.3 — Centralized audit-context policy
+// ---------------------------------------------------------------------------
+
+/**
+ * Operation class classification (Phase 12.4.4e.3).
+ *
+ * MUTATING operations (provision, suspend, resume, release) change external
+ * provider state. They REQUIRE an authoritative tenant/correlation context
+ * and a durable STARTED record BEFORE the provider mutation begins. Missing
+ * context → FAIL CLOSED (no provider call).
+ *
+ * READ operations (getUsage, reconcile) query provider state without mutating
+ * it. They have explicit audit semantics: if a tenant context is present,
+ * a STARTED→terminal audit record is created (for observability). If no
+ * tenant context is present, the read proceeds WITHOUT an audit record (the
+ * read has no external side effect, so there is nothing to durably track).
+ * This is EXPLICITLY documented — NOT a silent bypass.
+ */
+export type ProviderOperationClass = "MUTATING" | "READ";
+
+const MUTATING_OPERATIONS = new Set<string>(["provision", "suspend", "resume", "release"]);
+const READ_OPERATIONS = new Set<string>(["getUsage", "reconcile"]);
+
+export function classifyProviderOperation(operation: string): ProviderOperationClass {
+  if (MUTATING_OPERATIONS.has(operation)) return "MUTATING";
+  if (READ_OPERATIONS.has(operation)) return "READ";
+  // Unknown operations default to MUTATING (fail-closed) for safety.
+  return "MUTATING";
+}
+
+/**
+ * Phase 12.4.4e.3: Resolve the audit context for a provider operation.
+ *
+ * This is the CENTRALIZED policy helper that eliminates the per-operation
+ * `if (!auditBase)` bypass. It enforces:
+ *
+ *   MUTATING operations (provision, suspend, resume, release):
+ *     - tenantId is REQUIRED. If missing → throw AuditStartFailureError.
+ *     - Create a STARTED record, return recordId.
+ *     - The provider mutation MUST NOT begin until this returns successfully.
+ *
+ *   READ operations (getUsage, reconcile):
+ *     - If tenantId is present → create a STARTED record, return recordId.
+ *     - If tenantId is absent → return null (no audit record). The read
+ *       proceeds WITHOUT an audit record. This is EXPLICIT and documented:
+ *       reads have no external side effect, so there is nothing to durably
+ *       track. Correlation is still preserved in structured logs.
+ *
+ * This helper does NOT invent tenantId from provider resources, instances,
+ * subjects, or entitlements. Tenant authority must be established upstream
+ * (executeAction → kernel-bridge → adapter correlation context).
+ *
+ * @throws AuditStartFailureError if a MUTATING operation lacks tenantId,
+ *   or if the STARTED insert fails (DB error).
+ */
+export async function resolveProviderOperationAuditContext(
+  input: ProviderOperationRecordInput,
+): Promise<string | null> {
+  const opClass = classifyProviderOperation(input.operation);
+
+  if (opClass === "MUTATING") {
+    // MUTATING: tenantId is REQUIRED. Fail closed if missing.
+    if (!input.tenantId) {
+      const { logger } = await import("@/lib/logger");
+      logger.error("provider_operation.mutation_missing_tenant_context", {
+        operation: input.operation,
+        bindingId: input.bindingId,
+        providerInstanceId: input.providerInstanceId,
+        actionId: input.actionId,
+        requestId: input.requestId,
+        reason: "MUTATING operation requires authoritative tenant context; provider mutation prohibited (fail closed)",
+      });
+      throw new AuditStartFailureError(
+        `MUTATING operation ${input.operation} requires authoritative tenant context — provider mutation prohibited`,
+        input.operation,
+      );
+    }
+    // tenantId present → create STARTED record (throws on DB failure).
+    return startProviderOperation(input);
+  }
+
+  // READ: tenantId is optional. If present, create STARTED record. If absent,
+  // return null (no audit record — explicitly documented).
+  if (!input.tenantId) {
+    const { logger } = await import("@/lib/logger");
+    logger.info("provider_operation.read_no_tenant_context", {
+      operation: input.operation,
+      bindingId: input.bindingId,
+      providerInstanceId: input.providerInstanceId,
+      actionId: input.actionId,
+      requestId: input.requestId,
+      reason: "READ operation without tenant context; proceeding without audit record (no external side effect)",
+    });
+    return null;
+  }
+
+  return startProviderOperation(input);
+}
+
 /**
  * Phase 12.4.4e (P0-2) + Phase 12.4.4e.1 (durable identity):
  * Update a STARTED record with the terminal outcome.

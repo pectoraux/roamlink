@@ -8209,3 +8209,418 @@ Stage Summary:
 - The audit layer is observational — it does NOT authorize or prevent execution.
   Concurrency control remains with the session slot and decision claim.
 - 174/174 tests pass in 3 different orderings — deterministic.
+
+---
+Task ID: 12.4.4e.3-adapter
+Agent: Adapter Refactor Agent — close auditBase null bypass
+Task: Refactor the MikroTik adapter (6 operations: provision, suspend, resume, release, getUsage, reconcile) to use the NEW centralized `resolveProviderOperationAuditContext` helper (added in Phase 12.4.4e.3 to incident-lookup.ts) instead of the per-operation `auditBase` pattern. The helper enforces:
+  - MUTATING (provision/suspend/resume/release): tenantId REQUIRED → throws AuditStartFailureError if missing.
+  - READ (getUsage/reconcile): tenantId optional → creates STARTED record only if context present, else returns null.
+
+This closes the prior Phase 12.4.4e.2 "test-only path" where MUTATING ops called directly on the adapter WITHOUT a correlation context would silently proceed without an audit record (auditBase = null). With Phase 12.4.4e.3, those calls now fail closed — the auditBase null bypass is eliminated.
+
+Work Log:
+
+- STEP 0 — Read prior context:
+  Read the latest Phase 12.4.4e.2-adapter worklog entry, the new `resolveProviderOperationAuditContext` helper at incident-lookup.ts:1040-1107, the `classifyProviderOperation` helper at incident-lookup.ts:1033-1038, and the `ProviderOperationRecordInput` type at incident-lookup.ts:893-907 (where `tenantId: string` — non-nullable, but empty-string-is-falsy makes `ctx.tenantId ?? ""` work correctly with the helper's `if (!input.tenantId)` check).
+
+  Confirmed the helper's two-branch policy:
+    - MUTATING + empty tenantId → throws AuditStartFailureError (fail closed).
+    - READ + empty tenantId → returns null (no audit record; reads have no external side effect).
+    - Either class + non-empty tenantId → startProviderOperation (creates STARTED, throws on DB failure).
+
+- STEP 1 — Import line (adapter.ts:43):
+  OLD:
+    import { startProviderOperation, completeProviderOperation, AuditStartFailureError } from "../../../observability/incident-lookup";
+  NEW:
+    import { completeProviderOperation, AuditStartFailureError, resolveProviderOperationAuditContext } from "../../../observability/incident-lookup";
+  (startProviderOperation removed — the adapter no longer calls it directly; only the helper does, internally.)
+
+- STEP 2 — Refactored all 6 operations. Each one now uses the same shape:
+
+    // Phase 12.4.4e.3: Centralized audit-context policy (resolveProviderOperationAuditContext).
+    // MUTATING: tenantId REQUIRED → fail closed if missing.
+    // READ: tenantId optional → audit record created only if context present.
+    const auditContext = {
+      operation: "<op-name>" as const,
+      bindingId: input.binding.id,
+      providerInstanceId: ctx.providerInstanceId ?? input.binding.providerInstanceId ?? null,
+      providerType: "mikrotik",
+      tenantId: ctx.tenantId ?? "",  // empty string → helper treats as "missing" for MUTATING
+      requestId: ctx.requestId ?? null,
+      intentId: ctx.intentId ?? null,
+      decisionId: ctx.decisionId ?? null,
+      actionId: ctx.actionId ?? null,
+      sessionId: ctx.sessionId ?? null,
+      providerKey: ctx.providerKey ?? null,
+    };
+    let opRecordId: string | null = null;
+    try {
+      opRecordId = await resolveProviderOperationAuditContext({
+        ...auditContext,
+        providerResourceId: input.binding.providerResourceId ?? null,
+      });
+    } catch (auditStartErr) {
+      if (auditStartErr instanceof AuditStartFailureError) {
+        logger.error("mikrotik.<op>_audit_start_failed", withCorrelation(ctx, {
+          bindingId: input.binding.id,
+          operation: "<op-name>",
+          error: auditStartErr.message,
+          reason: "audit_start_failed_closed",
+        }));
+        return <op-specific fail-closed shape>;
+      }
+      throw auditStartErr;
+    }
+
+  Implementation notes:
+    * Replaced the OLD `const auditBase = ctx.tenantId ? {...} : null` conditional with
+      an UNCONDITIONAL `const auditContext = {...}` (tenantId is now `ctx.tenantId ?? ""`).
+      The helper handles the "empty tenantId" semantics centrally.
+    * The `if (!auditBase) { logger.warn("provider_operation.skipped_no_tenant", ...) }`
+      block is DELETED — the helper logs the appropriate `provider_operation.mutation_missing_tenant_context`
+      (error, MUTATING) or `provider_operation.read_no_tenant_context` (info, READ) message.
+    * The existing `if (auditBase) { await completeProviderOperation(opRecordId, {...auditBase, ...}); }`
+      guards were rewritten as `if (opRecordId) { await completeProviderOperation(opRecordId, {...auditContext, ...}); }`
+      — `opRecordId` is null for READ ops without tenant context (no audit record to complete),
+      and non-null for MUTATING ops (fail-closed returns early if missing tenant) and READ ops
+      with tenant context.
+    * The `completeProviderOperation(opRecordId, ...)` calls themselves stay structurally identical
+      (same outcome, outcomeDetail, providerResourceId, reconciliationState fields). The only
+      change is the spread `...auditBase` → `...auditContext`.
+
+  Per-operation fail-closed return shapes (unchanged from prior Phase 12.4.4e.2-adapter):
+    provision (ProvisionResult):
+      { status: "failed_permanent",
+        error:  "Audit identity could not be established — provider mutation prohibited" }
+    suspend (ActionResult):
+      { status: "failed_permanent",
+        error:  "Audit identity could not be established — provider mutation prohibited" }
+    resume (ActionResult): same as suspend.
+    release (ActionResult): same as suspend.
+    getUsage (UsageMetrics | undefined): return undefined;
+    reconcile (ReconciliationResult):
+      { status: "failed_permanent",
+        details: "Audit identity could not be established — provider mutation prohibited" }
+
+  File line numbers (after edit; final file is 942 lines):
+    provision   audit-context try/catch block:  adapter.ts:236–278
+                                                (fail-closed return at lines 272–275)
+    suspend     audit-context try/catch block:  adapter.ts:375–413
+                                                (fail-closed return at lines 407–410)
+    resume      audit-context try/catch block:  adapter.ts:469–507
+                                                (fail-closed return at lines 501–504)
+    release     audit-context try/catch block:  adapter.ts:563–601
+                                                (fail-closed return at lines 595–598)
+    getUsage    audit-context try/catch block:  adapter.ts:657–693
+                                                (fail-closed return at line 690)
+    reconcile   audit-context try/catch block:  adapter.ts:760–799
+                                                (fail-closed return at lines 793–796)
+
+  Semantic invariants preserved:
+    - The audit-start try/catch is SEPARATE from the provider-error catch (existing
+      `catch (err)` block). It returns BEFORE any provider mutation begins.
+    - For MUTATING ops without tenant context: helper throws AuditStartFailureError →
+      adapter catches, logs `mikrotik.<op>_audit_start_failed` (reason: audit_start_failed_closed),
+      returns `failed_permanent`. The provider is NEVER called. No external side effect.
+    - For READ ops without tenant context: helper returns null (no audit record). The
+      read proceeds (no external side effect — reads are idempotent). completeProviderOperation
+      is NOT called (opRecordId is null). No spurious "complete_no_started_record" error log.
+    - For both classes WITH tenant context: helper creates STARTED record, returns recordId.
+      completeProviderOperation is called (Case 2 — conditional updateMany on STARTED).
+    - The error is a LOCAL INFRASTRUCTURE failure (control-plane), NOT a provider failure:
+      the provider was never called. The action-executor treats failed_permanent from the
+      adapter as a FAILED action (not RECONCILIATION_REQUIRED) — correct, because no
+      external side effect occurred.
+    - classifyError, withCorrelation calls, return types, and other files were NOT touched.
+
+- STEP 3 — Verification (spec-required commands):
+  * `bun run lint`: clean (no errors).
+  * `bun test tests/phase12.4-observability.test.ts`:
+      14 pass, 0 fail, 197 expect() calls, 1.78s.
+  * `bun test tests/phase12.4.4e-incident-lookup.test.ts`:
+      23 pass, 0 fail, 154 expect() calls, 2.23s.
+  All three spec-required commands pass. ZERO new failures in scope.
+
+- STEP 4 — Downstream impact survey (NOT in spec scope, but documented for transparency):
+  The Phase 12.4.4e.3 refactor INTENTIONALLY changes behavior for direct adapter
+  calls without a correlation context (the prior "test-only path" that allowed
+  MUTATING ops to proceed without an audit record). Direct adapter tests that
+  do NOT pass `correlation: { tenantId, ... }` now correctly fail closed for
+  MUTATING operations. This is the EXPECTED consequence of closing the auditBase
+  null bypass — the prior Phase 12.4.4e.2-adapter worklog explicitly noted:
+    "The test-only path (no ctx.tenantId → auditBase null) still proceeds with
+     the provider mutation (no audit recording); this is reachable only in
+     direct adapter tests, never in production."
+  Phase 12.4.4e.3 closes that bypass.
+
+  Affected test files (direct adapter calls without ctx.tenantId on MUTATING ops):
+    tests/phase2c3-mikrotik-provider.test.ts:
+      9 pass, 10 fail (was 19/0 before refactor)
+      — Failures are tests #4-#13 which call provision/suspend/resume/release
+        directly without `correlation: { tenantId }`. Each correctly returns
+        failed_permanent with "Audit identity could not be established —
+        provider mutation prohibited" instead of success.
+    tests/phase2c{31,32,33,34}*.test.ts + phase2c4-routeros-client.test.ts:
+      43 pass, 17 fail (was 60/0 before refactor)
+      — Same pattern: tests call adapter MUTATING ops directly without tenantId.
+
+  These tests need to be updated to either:
+    (a) pass `correlation: { tenantId: <test-tenant>, ... }` to exercise the
+        production path (which always has tenantId from kernel-bridge), OR
+    (b) be updated to expect `failed_permanent` for MUTATING ops without tenantId.
+
+  This is OUT OF SCOPE for this task ("Do NOT touch any other file"). The
+  principal architect should schedule a follow-up task to update these tests
+  to reflect the new centralized audit-context policy.
+
+- STEP 5 — Behavioral contract confirmed:
+  Production path (kernel-bridge → adapter):
+    ctx.tenantId is ALWAYS present (enriched by kernel-bridge correlation).
+    → resolveProviderOperationAuditContext creates STARTED record for all 6 ops.
+    → completeProviderOperation updates to terminal state on outcome.
+    → Identical to prior Phase 12.4.4e.2 behavior in production.
+
+  Direct adapter tests (no correlation):
+    MUTATING ops (provision/suspend/resume/release):
+      ctx.tenantId is undefined → auditContext.tenantId is "" → helper throws
+      AuditStartFailureError → adapter returns failed_permanent (fail closed).
+      CHANGE from prior behavior: was "proceed without audit, warn log".
+    READ ops (getUsage/reconcile):
+      ctx.tenantId is undefined → auditContext.tenantId is "" → helper returns null
+      → opRecordId is null → completeProviderOperation NOT called → read proceeds.
+      SAME as prior behavior (was "proceed without audit, warn log"; now
+      "proceed without audit, info log from helper").
+
+Stage Summary:
+- HEAD: (to be committed)
+- The MikroTik adapter's per-operation `auditBase` pattern is ELIMINATED.
+  All 6 operations now delegate tenant-context policy to the centralized
+  `resolveProviderOperationAuditContext` helper.
+- The auditBase null bypass for MUTATING operations is CLOSED: a MUTATING
+  op called without authoritative tenant context now fails closed BEFORE the
+  provider is touched. No external side effect, no orphaned audit record.
+- READ operations retain the silent path: when tenant context is absent,
+  they proceed without an audit record (no external side effect → nothing
+  to durably track). The helper logs at info level (not warn) to make this
+  explicit and documented.
+- The hard invariant from Phase 12.4.4e.2 ("provider mutation starts ⇒
+  durable ProviderOperationRecord already exists") is now ENFORCED CENTRALLY
+  by the helper, not per-operation. The adapter is the POLICY CONSUMER,
+  not the policy author.
+- 37/37 spec-required tests pass (14 + 23). Lint clean.
+- Downstream direct-adapter test failures (27 across 6 files) are the
+  EXPECTED consequence of closing the auditBase null bypass and are out
+  of scope for this task. Principal architect should schedule a follow-up
+  to update those tests to reflect the new centralized policy.
+
+---
+Task ID: 12.4.4e.3-tests-2c
+Agent: Test Fixer Agent — add correlation context to Phase 2C tests
+Task: Fix the 6 Phase 2C test files that call the MikroTik adapter directly on
+MUTATING operations (provision/suspend/resume/release) without a
+`correlation.tenantId`. After the Phase 12.4.4e.3 adapter refactor closed the
+`auditBase = null` bypass, these direct adapter calls fail closed with
+`AuditStartFailureError` → `failed_permanent`. Fix is to add
+`correlation: { tenantId, providerInstanceId }` to every adapter MUTATING
+call so the audit-context policy authorizes the operation (matching the
+production path which always has tenantId from kernel-bridge enrichment).
+
+Work Log:
+
+- STEP 0 — File-name reconciliation:
+  The task spec listed 6 file paths. Two of the paths did not exist verbatim
+  in /home/z/my-project/tests/:
+    spec: phase2c31-mikrotik-binding-lifecycle.test.ts
+    actual: phase2c31-provider-instance.test.ts
+    spec: phase2c32-mikrotik-error-classification.test.ts
+    actual: phase2c32-runtime-resolution.test.ts
+    spec: phase2c33-mikrotik-reconciliation.test.ts
+    actual: phase2c33-client-resolution.test.ts
+    spec: phase2c34-mikrotik-adapter-integration.test.ts
+    actual: phase2c34-fail-closed.test.ts
+  The Phase 12.4.4e.3-adapter worklog (line 8364) refers to these as
+  `phase2c{31,32,33,34}*.test.ts` — confirming the existing files are the
+  ones in scope. I used the actual file names.
+
+- STEP 1 — phase2c3-mikrotik-provider.test.ts:
+  Surveyed all direct `mikrotikConnectivityAdapter.{provision,suspend,
+  resume,release}` calls. Found 21 MUTATING adapter calls across tests
+  #4–#13. Added `correlation: { tenantId, providerInstanceId: binding.
+  providerInstanceId }` to each. The `tenantId` comes from the module-level
+  fixture (created in `ensureSetup`). The `providerInstanceId` comes from the
+  `binding.providerInstanceId` field (set by `createMikrotikBinding` via
+  `pi.id`). READ operations (`reconcileBindingWithProvider`) were NOT
+  modified — they go through the internal helper which builds its own
+  correlation context. Result: 19/19 pass (was 9/10).
+
+- STEP 2 — phase2c31-provider-instance.test.ts:
+  1 direct adapter.provision call (test D — "different client implementation
+  works with same adapter class"). The test creates `binding` without a
+  `providerInstanceId`, so I used `correlation: { tenantId: tenantA }`
+  (providerInstanceId omitted — the audit gate only requires tenantId for
+  MUTATING ops; providerInstanceId is optional and falls back to
+  `binding.providerInstanceId ?? null`).
+  Result: 13/13 pass (was 12/1).
+
+- STEP 3 — phase2c32-runtime-resolution.test.ts:
+  Inspected the file: zero direct `adapter.{provision,suspend,resume,
+  release}` calls. All operations go through `resolveBindingRuntime` and
+  `transitionBinding` (internal helpers). No changes required.
+  Baseline verified: 12/12 pass (unchanged from before the
+  12.4.4e.3 refactor — confirming this file was unaffected by the bypass
+  closure).
+
+- STEP 4 — phase2c33-client-resolution.test.ts:
+  6 direct adapter.provision calls across tests E+F+G+H, I, J+K. Added
+  `correlation: { tenantId, providerInstanceId: res{A,B}.binding.
+  providerInstanceId }` to each. The fixture's `tenantId` is module-level;
+  `providerInstanceId` is taken from `resA.binding.providerInstanceId` /
+  `resB.binding.providerInstanceId` (each binding has its instance set).
+  Result: 9/9 pass (was 6/3).
+
+- STEP 5 — phase2c34-fail-closed.test.ts:
+  6 direct adapter.provision calls across tests A+B, C, J (×2), L.
+  IMPORTANT: tests C and J-expect-failure call `provision` on a binding
+  whose instance has NO registered mock client. The test expects
+  `failed_permanent` with error containing "no configured MikroTik client"
+  (failure from the client resolver, NOT from the audit gate). Adding
+  `correlation: { tenantId, providerInstanceId: res.binding.
+  providerInstanceId }` lets the audit gate pass, then the missing-client
+  failure happens as expected — the test's `expect(result.error).toContain
+  ("no configured MikroTik client")` assertion still holds.
+  Result: 10/10 pass (was 6/4).
+
+- STEP 6 — phase2c4-routeros-client.test.ts:
+  19 direct adapter MUTATING calls across tests 1+2+3+4 (provision ×2),
+  5 (provision, expects fail-closed "no configured"), 9 (provision, expects
+  failed_retryable on TIMEOUT), 10 (provision, expects failed_permanent on
+  AUTHENTICATION), 13 (provision, expects failed_retryable on RETRYABLE),
+  16 (provision ×2, idempotent), 17+18+19 (provision + suspend ×2 + resume
+  ×2 + release ×2), 20 (provision + suspend), 21 (provision + release).
+  For each, added `correlation: { tenantId, providerInstanceId: res.binding.
+  providerInstanceId }`. Failure-expecting tests (5, 9, 10, 13) all still
+  produce their expected `failed_permanent`/`failed_retryable` results
+  because the audit gate passes (tenantId present) and the failure comes
+  from the simulated transport error mode — same as before the refactor.
+  Result: 16/16 pass (was 7/9).
+
+- STEP 7 — Final verification (each file run independently):
+    tests/phase2c3-mikrotik-provider.test.ts        → 19 pass / 0 fail  (62 expect calls)
+    tests/phase2c31-provider-instance.test.ts       → 13 pass / 0 fail  (39 expect calls)
+    tests/phase2c32-runtime-resolution.test.ts      → 12 pass / 0 fail  (26 expect calls)
+    tests/phase2c33-client-resolution.test.ts        →  9 pass / 0 fail  (32 expect calls)
+    tests/phase2c34-fail-closed.test.ts             → 10 pass / 0 fail  (32 expect calls)
+    tests/phase2c4-routeros-client.test.ts          → 16 pass / 0 fail  (49 expect calls)
+    TOTAL                                            79 pass / 0 fail
+
+Stage Summary:
+- HEAD: (to be committed)
+- 53 direct adapter MUTATING calls across 5 Phase 2C test files now pass
+  `correlation: { tenantId, providerInstanceId }` to the adapter, matching
+  the production path (kernel-bridge → adapter always enriches tenantId).
+- phase2c32-runtime-resolution.test.ts had zero direct adapter MUTATING
+  calls and required no changes — its 12 tests already passed before and
+  after the refactor.
+- All failure-expecting tests (phase2c34 test C/J; phase2c4 test 5/9/10/13)
+  continue to fail with the EXPECTED provider-side error (missing client /
+  simulated transport failure mode), NOT with the audit-gate
+  AuditStartFailureError. The audit gate now correctly passes (tenantId
+  present), and the failure comes from the downstream provider client —
+  exactly the production semantics the tests were designed to verify.
+- No assertions changed. No test logic changed. No production code touched.
+  No other test files modified. The only delta is the addition of the
+  `correlation: { tenantId, providerInstanceId }` field on adapter MUTATING
+  call sites.
+- The Phase 12.4.4e.3 "downstream direct-adapter test failures" item
+  (worklog line 8364-8375) is now RESOLVED: 79/79 Phase 2C tests pass with
+  the centralized audit-context policy in force.
+
+---
+Task ID: 12.4.4e.3
+Agent: Principal System Architect (main) — Phase 12.4.4e.3 Close Audit Context Bypass
+Task: Close the `auditBase = null` bypass in the MikroTik adapter. MUTATING operations must fail closed when tenant context is missing. READ operations have explicit documented semantics. No adapter-level tenant invention.
+
+Work Log:
+
+- STEP 0 — Direct audit at c05447d:
+  Read src/lib/connectivity/providers/mikrotik/adapter.ts.
+  CONFIRMED: all 6 operations used `const auditBase = ctx.tenantId ? {...} : null`,
+  then `if (!auditBase) { logger.warn(...) }`, then proceeded with the provider
+  mutation. When ctx.tenantId was null, auditBase was null, NO ProviderOperationRecord
+  was created, and the provider mutation executed. This violated:
+    "provider mutation starts ⇒ durable ProviderOperationRecord already exists."
+
+- STEP 1 — Operation classes defined:
+  A. MUTATING (provision, suspend, resume, release): change external provider state.
+     REQUIRE authoritative tenant context + STARTED record BEFORE mutation.
+  B. READ (getUsage, reconcile): query provider state without mutating.
+     Explicit audit policy: if tenant context present → create STARTED record.
+     If absent → proceed WITHOUT audit record (no external side effect).
+
+- STEP 2 — Centralized policy helper (src/lib/observability/incident-lookup.ts):
+  Added `resolveProviderOperationAuditContext(input)`:
+    - MUTATING: tenantId REQUIRED. If missing → throw AuditStartFailureError (fail closed).
+    - READ: tenantId optional. If present → create STARTED record. If absent → return null.
+  Added `classifyProviderOperation(operation)` → "MUTATING" | "READ".
+  The helper does NOT invent tenantId from provider resources, instances, subjects,
+  or entitlements. Tenant authority must be established upstream.
+
+- STEP 3 — Adapter refactored (src/lib/connectivity/providers/mikrotik/adapter.ts):
+  All 6 operations replaced the `auditBase` + `if (!auditBase)` bypass with
+  `resolveProviderOperationAuditContext`. The `if (!auditBase) { logger.warn(...) }`
+  blocks were DELETED. The helper logs centrally.
+  Import updated: `startProviderOperation` removed (adapter no longer calls it directly).
+
+- STEP 4 — Phase 2C test files updated (6 files):
+  Direct adapter calls without correlation now fail closed for MUTATING ops.
+  Added `correlation: { tenantId, providerInstanceId }` to 53 adapter MUTATING calls
+  across 6 test files. No assertions or test logic changed.
+
+- STEP 5 — Adversarial tests (4 new, tests/phase12.4.4e-incident-lookup.test.ts):
+  12.4.4e.22: missing audit context blocks mutation — all 4 mutators fail closed.
+    provision/suspend/resume/release without correlation → failed_permanent,
+    provider NOT called, no ProviderOperationRecord created.
+  12.4.4e.23: complete audit context permits mutation → exactly ONE record.
+    provision with correlation → STARTED → SUCCEEDED, exactly one record.
+  12.4.4e.24: read operation without tenant context → proceeds without audit record.
+    getUsage/reconcile without correlation → read succeeds, NO ProviderOperationRecord.
+  12.4.4e.25: no adapter-level tenant invention.
+    provision with providerInstanceId but NO tenantId → failed_permanent,
+    adapter does NOT query ConnectivityEntitlement or TenantUser (0 queries),
+    provider NOT called, no ProviderOperationRecord created.
+
+- STEP 6-9 — Invariants preserved:
+  * Terminal-write failure semantics (Phase 12.4.4e.1): unchanged.
+  * START failure fails closed (Phase 12.4.4e.2): unchanged.
+  * Tenant isolation (Phase 12.4.4e P0-1): unchanged — tests 12.4.4e.9-12 still pass.
+  * No second control plane: ProviderOperationRecord is observational only.
+    Concurrency controlled by session slot (Phase 11.2) + decision claim (Phase 11.1).
+  * No tenant invention in adapter: proven by 12.4.4e.25 (0 entitlement/tenantUser queries).
+
+- STEP 10 — Documentation updated:
+  * startProviderOperation JSDoc: fail-closed semantics documented.
+  * resolveProviderOperationAuditContext JSDoc: MUTATING vs READ policy documented.
+  * Adapter comments: "Centralized audit-context policy" with MUTATING/READ classification.
+  * Stale "provider operation proceeds when auditBase is absent" comments deleted.
+
+- STEP 11 — Regression (3 runs, 3 different orderings):
+  Run 1 (canonical): 178 pass, 0 fail, 1149 expect() calls, 23.22s.
+  Run 2 (reverse): 178 pass, 0 fail, 1149 expect() calls, 23.38s.
+  Run 3 (interleaved): 178 pass, 0 fail, 1149 expect() calls, 23.05s.
+  +4 tests from Phase 12.4.4e.3 = 178 total (was 174).
+  ZERO new failures. ZERO regressions.
+
+- Lint: clean.
+- Dev server: 200, no errors.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The `auditBase = null` bypass is CLOSED.
+- MUTATING operations (provision, suspend, resume, release) REQUIRE tenant context.
+  Missing context → AuditStartFailureError → fail closed (provider NOT called).
+- READ operations (getUsage, reconcile) have explicit semantics:
+  with tenant context → audit record; without → proceed (no external side effect).
+- No adapter-level tenant invention (proven by 12.4.4e.25).
+- The centralized helper eliminates per-operation bypass duplication.
+- 178/178 tests pass in 3 different orderings — deterministic.

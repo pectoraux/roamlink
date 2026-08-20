@@ -186,6 +186,7 @@ describe("Phase 2C.3.1 — Provider Instance + Client Injection", () => {
     const result = await adapter.provision({
       entitlement: { id: ent.id, tenantId: tenantA, subscriptionId: subscriptionA, status: "ACTIVE", capabilityType: "INTERNET", capabilitySet: { downloadMbps: 50 }, policy: null, validFrom: new Date(), validUntil: null },
       binding: { id: binding.id, entitlementId: ent.id, providerType: "mikrotik", providerResourceId: null, providerMetadata: null, status: "UNBOUND", provisioningState: null },
+      correlation: { tenantId: tenantA },
     });
     expect(result.status).toBe("success");
   }, 30000);

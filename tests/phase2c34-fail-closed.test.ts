@@ -114,8 +114,8 @@ describe("Phase 2C.3.4 — Fail-Closed Provider Client Resolution", () => {
     const resA = await resolveBindingRuntime(bindingA.id);
     const resB = await resolveBindingRuntime(bindingB.id);
 
-    const pA = await resA.adapter.provision({ entitlement: resA.entitlement, binding: resA.binding });
-    const pB = await resB.adapter.provision({ entitlement: resB.entitlement, binding: resB.binding });
+    const pA = await resA.adapter.provision({ entitlement: resA.entitlement, binding: resA.binding, correlation: { tenantId, providerInstanceId: resA.binding.providerInstanceId } });
+    const pB = await resB.adapter.provision({ entitlement: resB.entitlement, binding: resB.binding, correlation: { tenantId, providerInstanceId: resB.binding.providerInstanceId } });
 
     expect(pA.status).toBe("success");
     expect(pB.status).toBe("success");
@@ -146,7 +146,7 @@ describe("Phase 2C.3.4 — Fail-Closed Provider Client Resolution", () => {
     const res = await resolveBindingRuntime(binding.id);
 
     // Provisioning should FAIL — not fall back to a default mock client
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(result.status).toBe("failed_permanent");
     expect(result.error).toContain("no configured MikroTik client");
     expect(result.error).toContain("No fallback");
@@ -209,7 +209,7 @@ describe("Phase 2C.3.4 — Fail-Closed Provider Client Resolution", () => {
 
     // Step 1: Verify binding works with registered client
     const res1 = await resolveBindingRuntime(binding.id);
-    const p1 = await res1.adapter.provision({ entitlement: res1.entitlement, binding: res1.binding });
+    const p1 = await res1.adapter.provision({ entitlement: res1.entitlement, binding: res1.binding, correlation: { tenantId, providerInstanceId: res1.binding.providerInstanceId } });
     expect(p1.status).toBe("success");
     expect(client.operationLog.length).toBeGreaterThan(0);
 
@@ -218,7 +218,7 @@ describe("Phase 2C.3.4 — Fail-Closed Provider Client Resolution", () => {
 
     // Step 3: Try another operation — MUST FAIL, not fall back
     const res2 = await resolveBindingRuntime(binding.id);
-    const p2 = await res2.adapter.provision({ entitlement: res2.entitlement, binding: res2.binding });
+    const p2 = await res2.adapter.provision({ entitlement: res2.entitlement, binding: res2.binding, correlation: { tenantId, providerInstanceId: res2.binding.providerInstanceId } });
 
     // CRITICAL: must fail, NOT succeed on a default client
     expect(p2.status).toBe("failed_permanent");
@@ -244,7 +244,7 @@ describe("Phase 2C.3.4 — Fail-Closed Provider Client Resolution", () => {
     const res = await resolveBindingRuntime(binding.id);
     expect(res.binding.providerInstanceId).toBe(inst.id);
 
-    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(p.status).toBe("success");
     expect(client.operationLog.length).toBeGreaterThan(0);
     expect(client.operationLog[0].operation).toBe("create");
