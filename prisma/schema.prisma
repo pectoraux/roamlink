@@ -2835,3 +2835,33 @@ model RateLimitEvent {
   @@index([scope, scopeId, createdAt])
   @@index([createdAt])
 }
+
+// ---------------------------------------------------------------------------
+// Phase 12.4.6.1 — Rate Limit Counter (atomic fixed-window counter)
+//
+// Each (scope, scopeId, windowKey) has a counter row. The limiter performs a
+// conditional UPDATE (increment WHERE count < limit) which is DB-authoritative:
+// two concurrent requests cannot both increment past the limit because the
+// conditional WHERE is evaluated atomically by the database.
+//
+// Scopes:
+//   key       — per API key (DEFAULT_KEY_LIMIT_PER_MINUTE = 100)
+//   tenant    — per tenant aggregate (DEFAULT_TENANT_LIMIT_PER_MINUTE = 500)
+//   sensitive — per tenant+path for sensitive endpoints (SENSITIVE_ENDPOINT_LIMIT = 10)
+//
+// windowKey: minute-granularity ISO timestamp (e.g., "2024-01-15T10:23")
+// expiresAt: used for cleanup pruning (5 minutes after window ends)
+// ---------------------------------------------------------------------------
+
+model RateLimitCounter {
+  id          String   @id @default(cuid())
+  scope       String   // "key" | "tenant" | "sensitive"
+  scopeId     String   // apiKeyId | tenantId | "tenantId:path"
+  windowKey   String   // minute-granularity ISO timestamp
+  count       Int      @default(0)
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  @@unique([scope, scopeId, windowKey])
+  @@index([expiresAt])
+}
