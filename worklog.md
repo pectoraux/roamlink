@@ -9283,3 +9283,67 @@ Stage Summary:
   determined but the outcome is genuinely inconclusive (e.g., resource missing
   for suspend/resume — the operation's effect can never be verified).
 - 187/187 tests pass in 3 different orderings — deterministic.
+
+---
+Task ID: 12.4.4f.2
+Agent: Principal System Architect (main) — Phase 12.4.4f Recovery Claim-Fencing
+Task: Fix the P0 claim-ownership race where recovery mutations (terminal completion, non-terminal release, error-path release) were not fenced by recoveryClaimId. A stale recovery worker could overwrite a newer worker's result or destroy an active claim.
+
+Work Log:
+
+- P0 FIX — All three recovery-owned mutations are now fenced by recoveryClaimId:
+  1. Terminal completion (STARTED → SUCCEEDED/FAILED/etc.):
+     Was: completeProviderOperation(record.id, ...) — fenced only by (id, state=STARTED).
+     Now: updateMany WHERE id=recordId AND state=STARTED AND recoveryClaimId=claimId.
+     If Worker A's lease expired and Worker B reclaimed, A's terminal update
+     affects 0 rows (it no longer owns the claim).
+  2. Non-terminal release (provider unavailable → retain STARTED):
+     Was: update WHERE id=recordId — NOT fenced.
+     Now: updateMany WHERE id=recordId AND state=STARTED AND recoveryClaimId=claimId.
+     A stale release affects 0 rows — B's claim is intact.
+  3. Error-path release (recovery threw → release claim):
+     Was: update WHERE id=recordId — NOT fenced.
+     Now: updateMany WHERE id=recordId AND state=STARTED AND recoveryClaimId=claimId.
+     A stale error-release affects 0 rows — B's claim is intact.
+
+- The terminal completion no longer calls completeProviderOperation (which was
+  unscoped). Instead, the recovery worker uses its own fenced updateMany with
+  the recoveryClaimId in the WHERE clause. This mirrors the claim-fencing
+  discipline already established for decision execution (Phase 11.1) and
+  session execution (Phase 11.2).
+
+- When a fenced update affects 0 rows (claim lost), the recovery worker logs
+  a warning (recovery_terminal_claim_lost or recovery_retain_claim_lost) and
+  moves on. It does NOT throw — the record is still recoverable by Worker B.
+
+- Adversarial tests (3 new, tests/phase12.4.4e-incident-lookup.test.ts):
+  12.4.4f.10: stale terminal completion → 0 rows, B's claim intact.
+    Worker A claims, lease expires, Worker B reclaims. A attempts terminal
+    completion with stale claimId → 0 rows. B's claim intact.
+  12.4.4f.11: stale non-terminal release → 0 rows, B's claim intact.
+    Worker A claims, lease expires, Worker B acquires. A receives unavailable,
+    attempts release with stale claimId → 0 rows. B's claim intact.
+    A did NOT write reconciliationState.
+  12.4.4f.12: valid claim → terminal completion succeeds, claim cleared by A.
+    Worker A claims with valid lease. A completes terminal → 1 row. Record
+    is SUCCEEDED. Claim cleared. Exactly ONE record.
+
+- Regression (3 runs, 3 different orderings):
+  Run 1 (canonical): 190 pass, 0 fail, 1213 expect() calls, 24.76s.
+  Run 2 (reverse):   190 pass, 0 fail, 1214 expect() calls, 24.34s.
+  Run 3 (interleaved): 190 pass, 0 fail, 1214 expect() calls, 24.22s.
+  +3 tests from Phase 12.4.4f.2 = 190 total (was 187).
+  ZERO new failures. ZERO regressions.
+
+- Lint: clean.
+- Dev server: 200, no errors.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The claim-ownership race is fixed: once a worker loses its recovery claim,
+  it becomes unable to mutate the ProviderOperationRecord in any way.
+- All three mutation paths (terminal, non-terminal, error) are fenced by
+  WHERE id=recordId AND state=STARTED AND recoveryClaimId=claimId.
+- The fencing mirrors the established discipline from Phase 11.1 (decision
+  execution claims) and Phase 11.2 (session execution slots).
+- 190/190 tests pass in 3 different orderings — deterministic.

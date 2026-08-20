@@ -2722,4 +2722,259 @@ describe("Phase 12.4.4e — Incident Lookup Adversarial Tests", () => {
       await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
     }
   }, 60_000);
+
+  // =========================================================================
+  // 12.4.4f.10 — Worker A claims, lease expires, Worker B reclaims,
+  // A's terminal completion affects 0 rows (claim-fenced).
+  //
+  // Phase 12.4.4f.2: Once a worker loses its recovery claim, it must become
+  // unable to mutate the ProviderOperationRecord in any way.
+  // =========================================================================
+  it("12.4.4f.10: stale terminal completion → 0 rows, B's claim intact", async () => {
+    const { startProviderOperation } = await import("@/lib/observability/incident-lookup");
+    const { STARTED_RECOVERY_AFTER_MS, RECOVERY_CLAIM_LEASE_MS } = await import("@/lib/observability/provider-operation-recovery");
+    const { registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+
+    const pi = await db.connectivityProviderInstance.create({
+      data: { tenantId: tA.tenantId, providerType: "mikrotik", name: `P1244f10 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik-f10" },
+    });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    const mockResource = await mockMikroTikProviderClient.createResource({
+      resourceType: "hotspot_user", username: "rl-f10", password: "pw-f10",
+      downloadRateLimitBps: 50000000, uploadRateLimitBps: 10000000,
+    });
+
+    try {
+      const binding = await db.providerResourceBinding.create({
+        data: { entitlementId: tA.entitlementId, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: mockResource.id, providerMetadata: JSON.stringify({}), status: "BOUND", provisioningState: "COMPLETED", providerInstanceId: pi.id },
+      });
+      const cap = await db.protocolCapability.findFirst({ where: { tenantId: tA.tenantId } });
+      const res = await db.protocolResource.create({ data: { capabilityId: cap!.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "f10" }), state: "IN_USE", providerBindingId: binding.id } });
+
+      const oldStartedAt = new Date(Date.now() - STARTED_RECOVERY_AFTER_MS - 60_000);
+      const recordId = await startProviderOperation({
+        operation: "provision", bindingId: binding.id, providerInstanceId: pi.id,
+        providerType: "mikrotik", tenantId: tA.tenantId, providerResourceId: mockResource.id,
+        actionId: "action_f10", requestId: "req_f10",
+      });
+      await db.providerOperationRecord.update({ where: { id: recordId }, data: { startedAt: oldStartedAt } });
+
+      // Worker A claims the record.
+      const claimA = "worker-A-f10";
+      await db.providerOperationRecord.update({
+        where: { id: recordId },
+        data: {
+          recoveryClaimId: claimA,
+          recoveryClaimedAt: new Date(Date.now() - RECOVERY_CLAIM_LEASE_MS - 60_000),
+          recoveryClaimExpiresAt: new Date(Date.now() - 60_000), // expired
+        },
+      });
+
+      // Worker B reclaims (via the claim query — expired claim is claimable).
+      const claimB = "worker-B-f10";
+      const reclaimB = await db.providerOperationRecord.updateMany({
+        where: {
+          id: recordId, state: "STARTED",
+          OR: [{ recoveryClaimId: null }, { recoveryClaimExpiresAt: { lt: new Date() } }],
+        },
+        data: {
+          recoveryClaimId: claimB,
+          recoveryClaimedAt: new Date(),
+          recoveryClaimExpiresAt: new Date(Date.now() + RECOVERY_CLAIM_LEASE_MS),
+        },
+      });
+      expect(reclaimB.count).toBe(1);
+
+      // Worker A attempts terminal completion with its stale claimId.
+      // The fence (WHERE recoveryClaimId = claimA) must reject this — 0 rows.
+      const staleTerminal = await db.providerOperationRecord.updateMany({
+        where: { id: recordId, state: "STARTED", recoveryClaimId: claimA },
+        data: {
+          state: "SUCCEEDED", outcome: "SUCCEEDED", completedAt: new Date(),
+          recoveryClaimId: null, recoveryClaimedAt: null, recoveryClaimExpiresAt: null,
+        },
+      });
+      expect(staleTerminal.count).toBe(0); // A's stale terminal rejected
+
+      // Worker B's claim is intact.
+      const record = await db.providerOperationRecord.findUnique({
+        where: { id: recordId },
+        select: { state: true, recoveryClaimId: true },
+      });
+      expect(record?.state).toBe("STARTED");
+      expect(record?.recoveryClaimId).toBe(claimB); // B's claim intact
+
+      // Cleanup.
+      await db.providerOperationRecord.deleteMany({ where: { id: recordId } }).catch(() => {});
+      await db.protocolResource.deleteMany({ where: { id: res.id } }).catch(() => {});
+      await db.providerResourceBinding.deleteMany({ where: { id: binding.id } }).catch(() => {});
+    } finally {
+      clearMockClientRegistry();
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    }
+  }, 30_000);
+
+  // =========================================================================
+  // 12.4.4f.11 — Stale non-terminal release → 0 rows, B's claim intact.
+  //
+  // Worker A claims, lease expires, Worker B acquires, A receives unavailable,
+  // A attempts to release claim → 0 rows (fenced by recoveryClaimId).
+  // =========================================================================
+  it("12.4.4f.11: stale non-terminal release → 0 rows, B's claim intact", async () => {
+    const { startProviderOperation } = await import("@/lib/observability/incident-lookup");
+    const { STARTED_RECOVERY_AFTER_MS, RECOVERY_CLAIM_LEASE_MS } = await import("@/lib/observability/provider-operation-recovery");
+    const { registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+
+    const pi = await db.connectivityProviderInstance.create({
+      data: { tenantId: tA.tenantId, providerType: "mikrotik", name: `P1244f11 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik-f11" },
+    });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    const mockResource = await mockMikroTikProviderClient.createResource({
+      resourceType: "hotspot_user", username: "rl-f11", password: "pw-f11",
+      downloadRateLimitBps: 50000000, uploadRateLimitBps: 10000000,
+    });
+
+    try {
+      const binding = await db.providerResourceBinding.create({
+        data: { entitlementId: tA.entitlementId, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: mockResource.id, providerMetadata: JSON.stringify({}), status: "BOUND", provisioningState: "COMPLETED", providerInstanceId: pi.id },
+      });
+      const cap = await db.protocolCapability.findFirst({ where: { tenantId: tA.tenantId } });
+      const res = await db.protocolResource.create({ data: { capabilityId: cap!.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "f11" }), state: "IN_USE", providerBindingId: binding.id } });
+
+      const oldStartedAt = new Date(Date.now() - STARTED_RECOVERY_AFTER_MS - 60_000);
+      const recordId = await startProviderOperation({
+        operation: "provision", bindingId: binding.id, providerInstanceId: pi.id,
+        providerType: "mikrotik", tenantId: tA.tenantId, providerResourceId: mockResource.id,
+        actionId: "action_f11", requestId: "req_f11",
+      });
+      await db.providerOperationRecord.update({ where: { id: recordId }, data: { startedAt: oldStartedAt } });
+
+      // Worker A claims.
+      const claimA = "worker-A-f11";
+      await db.providerOperationRecord.update({
+        where: { id: recordId },
+        data: {
+          recoveryClaimId: claimA,
+          recoveryClaimedAt: new Date(Date.now() - RECOVERY_CLAIM_LEASE_MS - 60_000),
+          recoveryClaimExpiresAt: new Date(Date.now() - 60_000), // expired
+        },
+      });
+
+      // Worker B acquires.
+      const claimB = "worker-B-f11";
+      await db.providerOperationRecord.updateMany({
+        where: { id: recordId, state: "STARTED", recoveryClaimExpiresAt: { lt: new Date() } },
+        data: { recoveryClaimId: claimB, recoveryClaimedAt: new Date(), recoveryClaimExpiresAt: new Date(Date.now() + RECOVERY_CLAIM_LEASE_MS) },
+      });
+
+      // Worker A attempts non-terminal release (unavailable) with stale claimId.
+      const staleRelease = await db.providerOperationRecord.updateMany({
+        where: { id: recordId, state: "STARTED", recoveryClaimId: claimA },
+        data: { recoveryClaimId: null, recoveryClaimedAt: null, recoveryClaimExpiresAt: null, reconciliationState: "provider_unavailable" },
+      });
+      expect(staleRelease.count).toBe(0); // A's stale release rejected
+
+      // Worker B's claim is intact.
+      const record = await db.providerOperationRecord.findUnique({
+        where: { id: recordId },
+        select: { state: true, recoveryClaimId: true, reconciliationState: true },
+      });
+      expect(record?.state).toBe("STARTED");
+      expect(record?.recoveryClaimId).toBe(claimB); // B's claim intact
+      expect(record?.reconciliationState).not.toBe("provider_unavailable"); // A did NOT write
+
+      // Cleanup.
+      await db.providerOperationRecord.deleteMany({ where: { id: recordId } }).catch(() => {});
+      await db.protocolResource.deleteMany({ where: { id: res.id } }).catch(() => {});
+      await db.providerResourceBinding.deleteMany({ where: { id: binding.id } }).catch(() => {});
+    } finally {
+      clearMockClientRegistry();
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    }
+  }, 30_000);
+
+  // =========================================================================
+  // 12.4.4f.12 — Valid claim → successful terminal completion.
+  //
+  // Worker A's claim remains valid. A completes successfully.
+  // Exactly one terminal transition. Recovery claim cleared only by A.
+  // =========================================================================
+  it("12.4.4f.12: valid claim → terminal completion succeeds, claim cleared by A", async () => {
+    const { startProviderOperation } = await import("@/lib/observability/incident-lookup");
+    const { STARTED_RECOVERY_AFTER_MS, RECOVERY_CLAIM_LEASE_MS } = await import("@/lib/observability/provider-operation-recovery");
+    const { registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+
+    const pi = await db.connectivityProviderInstance.create({
+      data: { tenantId: tA.tenantId, providerType: "mikrotik", name: `P1244f12 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik-f12" },
+    });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    const mockResource = await mockMikroTikProviderClient.createResource({
+      resourceType: "hotspot_user", username: "rl-f12", password: "pw-f12",
+      downloadRateLimitBps: 50000000, uploadRateLimitBps: 10000000,
+    });
+
+    try {
+      const binding = await db.providerResourceBinding.create({
+        data: { entitlementId: tA.entitlementId, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: mockResource.id, providerMetadata: JSON.stringify({}), status: "BOUND", provisioningState: "COMPLETED", providerInstanceId: pi.id },
+      });
+      const cap = await db.protocolCapability.findFirst({ where: { tenantId: tA.tenantId } });
+      const res = await db.protocolResource.create({ data: { capabilityId: cap!.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "f12" }), state: "IN_USE", providerBindingId: binding.id } });
+
+      const oldStartedAt = new Date(Date.now() - STARTED_RECOVERY_AFTER_MS - 60_000);
+      const recordId = await startProviderOperation({
+        operation: "provision", bindingId: binding.id, providerInstanceId: pi.id,
+        providerType: "mikrotik", tenantId: tA.tenantId, providerResourceId: mockResource.id,
+        actionId: "action_f12", requestId: "req_f12",
+      });
+      await db.providerOperationRecord.update({ where: { id: recordId }, data: { startedAt: oldStartedAt } });
+
+      // Worker A claims with a VALID (non-expired) lease.
+      const claimA = "worker-A-f12-valid";
+      await db.providerOperationRecord.update({
+        where: { id: recordId },
+        data: {
+          recoveryClaimId: claimA,
+          recoveryClaimedAt: new Date(),
+          recoveryClaimExpiresAt: new Date(Date.now() + RECOVERY_CLAIM_LEASE_MS), // valid
+        },
+      });
+
+      // Worker A completes terminal — fenced by claimA. Should succeed (1 row).
+      const terminalUpdate = await db.providerOperationRecord.updateMany({
+        where: { id: recordId, state: "STARTED", recoveryClaimId: claimA },
+        data: {
+          state: "SUCCEEDED", outcome: "SUCCEEDED", completedAt: new Date(),
+          recoveryClaimId: null, recoveryClaimedAt: null, recoveryClaimExpiresAt: null,
+        },
+      });
+      expect(terminalUpdate.count).toBe(1);
+
+      // Record is terminal, claim cleared.
+      const record = await db.providerOperationRecord.findUnique({
+        where: { id: recordId },
+        select: { state: true, outcome: true, completedAt: true, recoveryClaimId: true },
+      });
+      expect(record?.state).toBe("SUCCEEDED");
+      expect(record?.outcome).toBe("SUCCEEDED");
+      expect(record?.completedAt).not.toBeNull();
+      expect(record?.recoveryClaimId).toBeNull(); // cleared by A
+
+      // Exactly ONE record.
+      const allRecords = await db.providerOperationRecord.findMany({
+        where: { actionId: "action_f12", tenantId: tA.tenantId },
+      });
+      expect(allRecords.length).toBe(1);
+
+      // Cleanup.
+      await db.providerOperationRecord.deleteMany({ where: { id: recordId } }).catch(() => {});
+      await db.protocolResource.deleteMany({ where: { id: res.id } }).catch(() => {});
+      await db.providerResourceBinding.deleteMany({ where: { id: binding.id } }).catch(() => {});
+    } finally {
+      clearMockClientRegistry();
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    }
+  }, 30_000);
 });

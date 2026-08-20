@@ -211,41 +211,65 @@ export async function recoverStaleProviderOperations(): Promise<RecoveryResult> 
       if (classification.terminal) {
         // Step 5a: Terminal classification — update the SAME record with the
         // terminal outcome. The record transitions STARTED → terminal.
-        await completeProviderOperation(record.id, {
-          operation: record.operation as "provision" | "suspend" | "resume" | "release" | "getUsage" | "reconcile",
-          tenantId: record.tenantId,
-          bindingId: record.bindingId,
-          providerInstanceId: record.providerInstanceId,
-          providerType: record.providerType,
-          providerResourceId: record.providerResourceId,
-          requestId: record.requestId,
-          intentId: record.intentId,
-          decisionId: record.decisionId,
-          actionId: record.actionId,
-          sessionId: record.sessionId,
-          providerKey: record.providerKey,
-          outcome: classification.state,
-          outcomeDetail: {
-            recoveryClaimId: claimId,
-            recoveredAt: new Date().toISOString(),
-            providerTruthStatus: truth.status,
-            providerTruthObservedState: truth.observedState,
-            providerTruthError: truth.error,
-            classificationReason: classification.reason,
+        //
+        // Phase 12.4.4f.2: The terminal update MUST be fenced by the recovery
+        // claim. If Worker A's lease expired and Worker B reclaimed the record,
+        // Worker A's terminal update MUST affect 0 rows (it no longer owns
+        // the claim). This prevents a stale recovery worker from overwriting
+        // a newer recovery worker's result.
+        const terminalUpdate = await db.providerOperationRecord.updateMany({
+          where: {
+            id: record.id,
+            state: "STARTED",
+            recoveryClaimId: claimId, // fenced by recovery claim ownership
           },
-          reconciliationState: classification.reconciliationState,
+          data: {
+            state: classification.state,
+            outcome: classification.state,
+            outcomeDetail: JSON.stringify({
+              recoveryClaimId: claimId,
+              recoveredAt: new Date().toISOString(),
+              providerTruthStatus: truth.status,
+              providerTruthObservedState: truth.observedState,
+              providerTruthError: truth.error,
+              classificationReason: classification.reason,
+            }),
+            providerResourceId: record.providerResourceId,
+            reconciliationState: classification.reconciliationState ?? null,
+            completedAt: new Date(),
+            // Clear the recovery claim (terminal state — claim no longer relevant).
+            recoveryClaimId: null,
+            recoveryClaimedAt: null,
+            recoveryClaimExpiresAt: null,
+          },
         });
 
-        result.recovered++;
+        if (terminalUpdate.count > 0) {
+          result.recovered++;
 
-        logger.info("provider_operation.recovery_completed", {
-          recordId: record.id,
-          operation: record.operation,
-          claimId,
-          outcome: classification.state,
-          providerTruthStatus: truth.status,
-          reason: classification.reason,
-        });
+          logger.info("provider_operation.recovery_completed", {
+            recordId: record.id,
+            operation: record.operation,
+            claimId,
+            outcome: classification.state,
+            providerTruthStatus: truth.status,
+            reason: classification.reason,
+          });
+        } else {
+          // Worker A's claim expired and Worker B reclaimed or resolved the
+          // record. Worker A's terminal update affected 0 rows — it no longer
+          // owns the claim. This is the correct behavior: a stale recovery
+          // worker cannot overwrite a newer worker's result.
+          result.failed++;
+
+          logger.warn("provider_operation.recovery_terminal_claim_lost", {
+            recordId: record.id,
+            operation: record.operation,
+            claimId,
+            outcome: classification.state,
+            reason: "recovery claim expired before terminal update; another worker may have reclaimed the record; terminal update affected 0 rows",
+          });
+        }
       } else {
         // Step 5b: NON-TERMINAL classification (provider unavailable / query failed).
         // The provider truth could not be determined. Do NOT transition to terminal.
@@ -253,8 +277,18 @@ export async function recoverStaleProviderOperations(): Promise<RecoveryResult> 
         // Release the recovery claim so another worker can try later.
         // Persist the recovery attempt metadata on the record (reconciliationState)
         // without changing the state.
-        await db.providerOperationRecord.update({
-          where: { id: record.id },
+        //
+        // Phase 12.4.4f.2: The release MUST be fenced by the recovery claim.
+        // If Worker A's lease expired and Worker B reclaimed the record,
+        // Worker A's release MUST affect 0 rows (it no longer owns the claim).
+        // This prevents a stale recovery worker from destroying Worker B's
+        // active claim.
+        const releaseUpdate = await db.providerOperationRecord.updateMany({
+          where: {
+            id: record.id,
+            state: "STARTED",
+            recoveryClaimId: claimId, // fenced by recovery claim ownership
+          },
           data: {
             // Release the recovery claim — another recovery worker can claim
             // this record in a future cycle.
@@ -267,24 +301,45 @@ export async function recoverStaleProviderOperations(): Promise<RecoveryResult> 
           },
         });
 
-        result.retained++;
+        if (releaseUpdate.count > 0) {
+          result.retained++;
 
-        logger.info("provider_operation.recovery_retained", {
-          recordId: record.id,
-          operation: record.operation,
-          claimId,
-          providerTruthStatus: truth.status,
-          reason: classification.reason,
-          reconciliationState: classification.reconciliationState,
-          note: "provider truth unavailable; record remains STARTED and is eligible for next recovery cycle",
-        });
+          logger.info("provider_operation.recovery_retained", {
+            recordId: record.id,
+            operation: record.operation,
+            claimId,
+            providerTruthStatus: truth.status,
+            reason: classification.reason,
+            reconciliationState: classification.reconciliationState,
+            note: "provider truth unavailable; record remains STARTED and is eligible for next recovery cycle",
+          });
+        } else {
+          // Worker A's claim expired and Worker B reclaimed the record.
+          // Worker A's release affected 0 rows — it no longer owns the claim.
+          result.failed++;
+
+          logger.warn("provider_operation.recovery_retain_claim_lost", {
+            recordId: record.id,
+            operation: record.operation,
+            claimId,
+            reason: "recovery claim expired before non-terminal release; another worker may have reclaimed the record; release affected 0 rows",
+          });
+        }
       }
     } catch (err) {
       // The provider truth query threw (DB error, unexpected exception).
       // Release the recovery claim so another worker can try later.
       // The record remains STARTED — it is still recoverable.
-      await db.providerOperationRecord.update({
-        where: { id: record.id },
+      //
+      // Phase 12.4.4f.2: The error-path release MUST be fenced by the
+      // recovery claim. If Worker A's claim expired and Worker B reclaimed,
+      // Worker A's release MUST affect 0 rows.
+      await db.providerOperationRecord.updateMany({
+        where: {
+          id: record.id,
+          state: "STARTED",
+          recoveryClaimId: claimId, // fenced by recovery claim ownership
+        },
         data: {
           recoveryClaimId: null,
           recoveryClaimedAt: null,
@@ -299,7 +354,7 @@ export async function recoverStaleProviderOperations(): Promise<RecoveryResult> 
         operation: record.operation,
         claimId,
         error: err instanceof Error ? err.message : String(err),
-        reason: "recovery threw; claim released; record remains STARTED and is recoverable",
+        reason: "recovery threw; claim released (if still owned); record remains STARTED and is recoverable",
       });
     }
   }
