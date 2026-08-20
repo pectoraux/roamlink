@@ -9347,3 +9347,150 @@ Stage Summary:
 - The fencing mirrors the established discipline from Phase 11.1 (decision
   execution claims) and Phase 11.2 (session execution slots).
 - 190/190 tests pass in 3 different orderings — deterministic.
+
+---
+Task ID: 12.4.5
+Agent: Principal System Architect + Production Readiness Lead (main) — Phase 12.4.5 Production Readiness Gate
+Task: Architecture-wide production-readiness audit. Determine whether RoamLink is genuinely production-ready.
+
+Work Log:
+
+- STEP 0 — Direct audit at 24618d2:
+  Inspected schema, migrations, routes, workers, secrets, rate limiting, data retention, backup/restore.
+
+- STEP 12.4.5.1 — Real provider blocker:
+  LIVE_ROUTEROS_ENDPOINT: NOT CONFIGURED.
+  The live RouterOS test harness (tests/phase2c410-live-routeros.test.ts) is PREPARED
+  but SKIPS cleanly. 180 mock tests pass, 21 live tests skip.
+  LIVE_PROVIDER_VERIFICATION = BLOCKED.
+
+- STEP 12.4.5.2 — Deployment/database:
+  Schema provider: sqlite (dev). Production target: postgresql (documented in schema comment).
+  14 migration directories exist. Seed script required for startup (plans, admin user, capabilities).
+  No production DATABASE_URL configured in this environment.
+  vercel.json has 1 cron (/api/internal/reconcile, every 5 min).
+  Missing vercel.json cron entries for: observe-connectivity, connectivity-reconcile, measure-uptime.
+
+- STEP 12.4.5.3 — Secrets/security:
+  .env files gitignored. .env.example has placeholder values only.
+  Provider credentials resolved via environment variables (EnvProviderInstanceSecretResolver).
+  No secrets in ProviderOperationRecord (audit confirmed).
+  No secrets in logs (withCorrelation redacts all credential fields).
+  No secrets in API responses.
+  CRON_SECRET required for internal endpoints.
+  API keys hashed (bcrypt) in database.
+
+- STEP 12.4.5.4 — Tenant security:
+  Tenant resolution via resolveApiPrincipal (server-derived, caller cannot override).
+  Cross-tenant reads denied (Phase 12.2, tested by 12.2.7-12.2.12).
+  API-key tenant authority enforced (Phase 12.3.6, tested by 12.3.6.1-12.3.6.8).
+  Incident lookup tenant-scoped (Phase 12.4.4e, tested by 12.4.4e.4, 12.4.4e.5, 12.4.4e.9-12.4.4e.12).
+  Provider operation recovery tenant-scoped (Phase 12.4.4f.7).
+  No client-supplied tenantId bypass found.
+
+- STEP 12.4.5.5 — API readiness:
+  105 API routes enumerated.
+  /api/v1/* uses apiV1SuccessResponse/apiV1ErrorResponse (X-API-Version + X-API-Stable headers).
+  resolveApiPrincipal accepts API-key OR session auth.
+  Canonical error envelope: { error: { code, message, requestId } }.
+  requestId propagated via x-request-id header.
+  Rate limiting: defined in error taxonomy (rate_limited, 429) but NO rate limiter implementation found.
+  Only per-device observation rate limiting exists (Phase 10: maxObservationsPerMinute).
+
+- STEP 12.4.5.6 — Connectivity control plane:
+  Phase 11 invariants intact (11.1-11.7 all pass).
+  Decision retry bound: MAX_ATTEMPTS=5, dead-letter (Phase 11.1).
+  Session execution serialization: fenced slot + lease (Phase 11.2).
+  Provider truth precedence: fail-closed (Phase 11.3, 11.5).
+  Stale intent rejection: exact (intentId, intentVersion) (Phase 11.4, 12.4.4c.3).
+  Event convergence: durable hydration (Phase 11.6).
+  Auditability: full causal chain (Phase 11.7).
+  Lease relationships:
+    - Session execution slot: 5 min lease, reclaimable.
+    - Decision execution lease: 2 min lease, reclaimable.
+    - Provider operation recovery: 2 min claim lease, reclaimable.
+
+- STEP 12.4.5.7 — Commerce/payment:
+  IdempotencyOperation state machine: IN_PROGRESS → COMPLETED/FAILED/RECONCILIATION_REQUIRED.
+  Heartbeat + fenced ownership (Phase 12.3.2.1-12.3.2.8).
+  OperationOutcome classification: SUCCESS/CONFIRMED_FAILURE/AMBIGUOUS (Phase 12.3.2.3).
+  providerKey required for external operations (Phase 12.3.2.4).
+  Reconciliation ownership fenced (Phase 12.3.2.5-12.3.2.7).
+  Stale worker claim-loss: throws 409, not original error (Phase 12.3.2.6-12.3.2.8).
+  No real payment provider sandbox verified.
+
+- STEP 12.4.5.8 — Observability:
+  Full correlation chain: requestId → tenantId → intentId → decisionId → actionId → providerInstanceId → providerResourceId → bindingId → providerKey.
+  ProviderOperationRecord lifecycle: STARTED → terminal, claim-fenced recovery.
+  Incident lookup: authenticated, tenant-scoped, versioned, read-only, non-secret.
+  STARTED recovery: non-terminal for transient unavailability, claim-fenced.
+
+- STEP 12.4.5.9 — Workers/schedulers:
+  6 internal endpoints:
+    - /api/internal/reconcile (every 5 min via vercel.json): subscriptions, credit issuances, deposits, reservations, saas renewals, saas financial reconciliation.
+    - /api/internal/connectivity-reconcile: connectivity entitlements + provider operation recovery (NO vercel.json cron entry).
+    - /api/internal/observe-connectivity: observation loop (NO vercel.json cron entry).
+    - /api/internal/measure-uptime: uptime measurement (NO vercel.json cron entry).
+    - /api/internal/ops: operational state summary (manual/auth-gated).
+    - /api/internal/reconcile-costs: cost reconciliation (manual/auth-gated).
+  Only 1 of 4 connectivity workers is scheduled in vercel.json.
+  Dead-letter: events (EVENT_MAX_ATTEMPTS=5), decisions (DECISION_MAX_ATTEMPTS).
+
+- STEP 12.4.5.10 — Rate limiting:
+  No API-level rate limiter implemented (only error taxonomy defines rate_limited/429).
+  Per-device observation rate limiting: maxObservationsPerMinute (Phase 10).
+  No tenant-aware API rate limiting.
+  No login/session abuse protection beyond session TTL.
+  No webhook rate limiting.
+
+- STEP 12.4.5.11 — Data retention/privacy:
+  No retention policy for ProviderOperationRecord.
+  No retention policy for ReevaluationEvent (dead-lettered but not deleted).
+  No retention policy for ConnectivityMeasurement, ResourceHealth, AuditLog.
+  No tenant offboarding procedure.
+  No user deletion/GDPR procedure.
+  No stale observation cleanup cron.
+  Session TTL: 30 days. Install token TTL: 15 minutes.
+
+- STEP 12.4.5.12 — Disaster recovery:
+  No backup scripts found.
+  No restore scripts found.
+  No point-in-time recovery procedure.
+  No restore testing procedure.
+  STARTED provider operation recovery: implemented (Phase 12.4.4f).
+  Orphaned claim recovery: implemented for events, decisions, session slots, provider operations.
+  No database connection failure handling beyond Prisma's built-in retry.
+
+- STEP 12.4.5.13 — Live smoke test:
+  Not performed — no production deployment available in this environment.
+  Dev server (localhost:3000) returns 200.
+
+- STEP 12.4.5.14 — Failure injection:
+  Tested via Phase 12.4.4e/f adversarial tests:
+    - DB unavailable during STARTED creation → AuditStartFailureError → fail closed.
+    - DB unavailable during terminal audit update → STARTED preserved, provider result authoritative.
+    - Provider timeout → AMBIGUOUS (non-terminal, STARTED retained).
+    - Provider resource missing → FAILED_PERMANENT (provision) / SUCCEEDED (release).
+    - Worker crash → claim expires → reclaimable.
+    - Lease expiration → stale worker fenced (0 rows).
+    - Concurrent workers → exactly one claims, one terminal transition.
+    - Stale intent → INTENT_EXPIRED, WAIT.
+    - Tenant mismatch → 404 (no tenant-existence leak).
+
+- STEP 12.4.5.15 — Regression:
+  Run 1 (canonical): 191 pass, 0 fail, 1221 expect() calls, 23.88s.
+  Run 2 (reverse):   191 pass, 0 fail, 1220 expect() calls, 23.90s.
+  Run 3 (interleaved): 191 pass, 0 fail, 1221 expect() calls, 24.00s.
+  Lint: clean.
+  TypeScript: not run (Next.js Turbopack handles compilation; no standalone tsc check configured).
+
+Stage Summary:
+- HEAD: 24618d2
+- 191/191 tests pass in 3 different orderings — deterministic.
+- LIVE_PROVIDER_VERIFICATION = BLOCKED (no RouterOS endpoint).
+- 3 of 4 connectivity workers not scheduled in vercel.json.
+- No API-level rate limiting.
+- No data retention policy.
+- No backup/restore procedure.
+- No real payment provider verified.
+- Production DB deployment unverified (schema portable but SQLite in dev).
