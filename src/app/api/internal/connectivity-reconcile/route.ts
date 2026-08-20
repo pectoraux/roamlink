@@ -64,8 +64,18 @@ async function runReconciliation() {
     recoveryResult = { examined: 0, claimed: 0, recovered: 0, ambiguous: 0, failed: 0, retained: 0 };
   }
 
+  // Phase 12.4.6.2: Prune old rate limit events.
+  let rateLimitPruned = 0;
+  try {
+    const { pruneRateLimitEvents } = await import("@/lib/api/rate-limit");
+    const pruneResult = await pruneRateLimitEvents();
+    rateLimitPruned = pruneResult.pruned;
+  } catch (err) {
+    logger.error("cron.rate_limit_prune.failed", { error: err instanceof Error ? err.message : String(err) });
+  }
+
   const durationMs = Date.now() - startedAt;
-  logger.info("cron.connectivity_reconciliation.completed", { durationMs, ...result, recovery: recoveryResult });
+  logger.info("cron.connectivity_reconciliation.completed", { durationMs, ...result, recovery: recoveryResult, rateLimitPruned });
 
   return NextResponse.json({ ok: true, durationMs, ...result, recovery: recoveryResult });
 }

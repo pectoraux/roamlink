@@ -9494,3 +9494,94 @@ Stage Summary:
 - No backup/restore procedure.
 - No real payment provider verified.
 - Production DB deployment unverified (schema portable but SQLite in dev).
+
+---
+Task ID: 12.4.6
+Agent: Principal System Architect + Production Readiness Lead (main) — Phase 12.4.6 Production Blocker Remediation
+Task: Remediate the P0/P1 blockers from Phase 12.4.5. Add missing worker scheduling, implement API rate limiting, document retention/monitoring policies, check infrastructure availability.
+
+Work Log:
+
+- 12.4.6.1 — Worker scheduling:
+  Added 3 missing cron entries to vercel.json:
+    - /api/internal/observe-connectivity (*/1 min) — observation loop
+    - /api/internal/connectivity-reconcile (*/5 min) — connectivity reconciliation + provider operation recovery
+    - /api/internal/measure-uptime (*/5 min) — uptime measurement
+  All 3 workers already have CRON_SECRET protection verified.
+  Total: 4 production crons now scheduled (was 1).
+
+- 12.4.6.2 — API rate limiting:
+  Implemented DB-authoritative rate limiter (src/lib/api/rate-limit.ts):
+    - RateLimitEvent model added to schema.
+    - checkRateLimit(identity): inserts an event, counts in sliding window (1 min).
+    - Three scopes: per-key (100/min), per-tenant (500/min), sensitive (10/min).
+    - Sensitive endpoints: /api/auth/login, /api/auth/register, /api/webhooks/*, /api/v1/connectivity/edge/observations.
+    - pruneRateLimitEvents(): deletes events older than 5 minutes.
+    - withRateLimit middleware (src/lib/api/rate-limit-middleware.ts): wraps v1 route handlers.
+    - Rate limit pruning integrated into connectivity-reconcile cron.
+  5 adversarial tests (tests/phase12.4.6.2-rate-limit.test.ts):
+    - 12.4.6.2.1: per-key limit boundary (N succeeds, N+1 → denied)
+    - 12.4.6.2.2: two keys same tenant (separate per-key limits)
+    - 12.4.6.2.3: tenant isolation (Tenant A cannot consume Tenant B's quota)
+    - 12.4.6.2.4: sensitive endpoint lower limit enforced
+    - 12.4.6.2.5: denied response shape (limit, remaining, resetAt, scope)
+
+- 12.4.6.3 — PostgreSQL staging:
+  NOT AVAILABLE — no PostgreSQL staging infrastructure in this environment.
+  SQLite remains the dev database. Production PostgreSQL target is documented but unverified.
+  The schema is portable (provider = sqlite with comment to change to postgresql).
+  14 migrations exist.
+
+- 12.4.6.4 — Backup/restore:
+  NOT IMPLEMENTED — no backup/restore scripts or procedures created.
+  Documented as a remaining P0 blocker. Requires PostgreSQL staging to test.
+
+- 12.4.6.5 — Live RouterOS:
+  BLOCKED — LIVE_ROUTEROS_ENDPOINT not configured.
+  The live test harness (tests/phase2c410-live-routeros.test.ts) is prepared but skips.
+  180 mock tests pass, 21 live tests skip.
+
+- 12.4.6.6 — Real payment provider:
+  NOT AVAILABLE — no Stripe/Paystack sandbox credentials configured.
+  Commerce idempotency is tested via mock (Phase 12.3.2.x).
+
+- 12.4.6.7 — Data retention:
+  Policy documented in docs/data-retention-policy.md.
+  Covers: ProviderOperationRecord (90d), ReevaluationEvent (30d terminal), 
+  ConnectivityMeasurement (90d), AuditLog (7y), IdempotencyOperation (30d),
+  sessions (30d TTL), intent history (90d), RateLimitEvent (5min).
+  Tenant offboarding and GDPR/user deletion procedures defined.
+  Cleanup crons NOT YET IMPLEMENTED — policy is documented, implementation is future phase.
+
+- 12.4.6.8 — Process restart:
+  NOT TESTED — no staging deployment available.
+  Existing lease/recovery mechanisms are designed for this (claim expiry + reclaim).
+
+- 12.4.6.10 — Monitoring/alerting:
+  Contract documented in docs/monitoring-alerting-contract.md.
+  Defines minimum signals: worker health, provider health, payment health,
+  rate limiting, dead-letter growth, database health.
+  Structured log events are already emitted by the codebase.
+  External alerting integration is a deployment-time task.
+
+- Regression (3 runs, 3 different orderings):
+  Run 1 (canonical): 196 pass, 0 fail, 1462 expect() calls, 24.31s.
+  Run 2 (reverse):   196 pass, 0 fail, 1462 expect() calls, 24.28s.
+  Run 3 (interleaved): 196 pass, 0 fail, 1461 expect() calls, 24.37s.
+  +5 tests from Phase 12.4.6.2 = 196 total (was 191).
+  Lint: clean.
+  Dev server: 200.
+
+Stage Summary:
+- HEAD: (to be committed)
+- P0 blockers REMEDIATED:
+  1. Worker scheduling: 3 missing cron entries ADDED to vercel.json (P0 → FIXED)
+  2. API rate limiting: DB-authoritative limiter IMPLEMENTED + tested (P0 → FIXED)
+- P0 blockers REMAINING:
+  3. RouterOS live verification: BLOCKED (no physical router)
+  4. Backup/restore: NOT IMPLEMENTED (requires PostgreSQL staging)
+  5. Production PostgreSQL deployment: NOT VERIFIED (no staging infrastructure)
+- P1 blockers REMAINING:
+  6. Data retention cleanup crons: POLICY DOCUMENTED, implementation pending
+  7. Real payment provider: NOT VERIFIED (no sandbox credentials)
+  8. Process restart verification: NOT TESTED (no staging deployment)

@@ -3,6 +3,18 @@
     {
       "path": "/api/internal/reconcile",
       "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/internal/observe-connectivity",
+      "schedule": "*/1 * * * *"
+    },
+    {
+      "path": "/api/internal/connectivity-reconcile",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/internal/measure-uptime",
+      "schedule": "*/5 * * * *"
     }
   ]
 }

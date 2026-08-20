@@ -2810,3 +2810,28 @@ model ProviderOperationRecord {
   @@index([recoveryClaimId])
   @@index([recoveryClaimExpiresAt])
 }
+
+// ---------------------------------------------------------------------------
+// Phase 12.4.6.2 — Rate Limit Event (DB-authoritative sliding window)
+//
+// Each API request creates a RateLimitEvent row. The limiter counts events
+// in the sliding window (1 minute) and rejects if the count exceeds the limit.
+// Events are pruned by the connectivity-reconcile cron (events older than 5 min).
+//
+// Scopes:
+//   key       — per API key (DEFAULT_KEY_LIMIT_PER_MINUTE = 100)
+//   tenant    — per tenant aggregate (DEFAULT_TENANT_LIMIT_PER_MINUTE = 500)
+//   sensitive — per tenant+path for sensitive endpoints (SENSITIVE_ENDPOINT_LIMIT = 10)
+// ---------------------------------------------------------------------------
+
+model RateLimitEvent {
+  id          String   @id @default(cuid())
+  tenantId    String
+  scope       String   // "key" | "tenant" | "sensitive"
+  scopeId     String   // apiKeyId | tenantId | "tenantId:path"
+  path        String
+  createdAt   DateTime @default(now())
+
+  @@index([scope, scopeId, createdAt])
+  @@index([createdAt])
+}
