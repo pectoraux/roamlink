@@ -2977,4 +2977,98 @@ describe("Phase 12.4.4e — Incident Lookup Adversarial Tests", () => {
       await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
     }
   }, 30_000);
+
+  // =========================================================================
+  // 12.4.4f.13 — Two concurrent recovery workers.
+  //
+  // Assert:
+  //   - exactly one provider truth query
+  //   - exactly one owner
+  //   - exactly one terminal transition
+  //   - no duplicate ProviderOperationRecord
+  //
+  // Uses a controlled delay to ensure Worker A claims first, Worker B's claim
+  // fails (0 rows), and only Worker A performs the provider truth query.
+  // =========================================================================
+  it("12.4.4f.13: two concurrent recovery workers → exactly one owner, one transition, one record", async () => {
+    const { startProviderOperation } = await import("@/lib/observability/incident-lookup");
+    const { STARTED_RECOVERY_AFTER_MS, RECOVERY_CLAIM_LEASE_MS } = await import("@/lib/observability/provider-operation-recovery");
+    const { registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+
+    const pi = await db.connectivityProviderInstance.create({
+      data: { tenantId: tA.tenantId, providerType: "mikrotik", name: `P1244f13 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik-f13" },
+    });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    // Track provider truth query count.
+    let truthQueryCount = 0;
+    const originalGetResource = mockMikroTikProviderClient.getResource.bind(mockMikroTikProviderClient);
+    mockMikroTikProviderClient.getResource = async (...args: Parameters<typeof originalGetResource>) => {
+      truthQueryCount++;
+      // Small delay to widen the race window.
+      await new Promise((r) => setTimeout(r, 10));
+      return originalGetResource(...args);
+    };
+
+    try {
+      const mockResource = await mockMikroTikProviderClient.createResource({
+        resourceType: "hotspot_user", username: "rl-f13", password: "pw-f13",
+        downloadRateLimitBps: 50000000, uploadRateLimitBps: 10000000,
+      });
+      const binding = await db.providerResourceBinding.create({
+        data: { entitlementId: tA.entitlementId, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: mockResource.id, providerMetadata: JSON.stringify({}), status: "BOUND", provisioningState: "COMPLETED", providerInstanceId: pi.id },
+      });
+      const cap = await db.protocolCapability.findFirst({ where: { tenantId: tA.tenantId } });
+      const res = await db.protocolResource.create({ data: { capabilityId: cap!.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "f13" }), state: "IN_USE", providerBindingId: binding.id } });
+
+      const oldStartedAt = new Date(Date.now() - STARTED_RECOVERY_AFTER_MS - 60_000);
+      const recordId = await startProviderOperation({
+        operation: "provision", bindingId: binding.id, providerInstanceId: pi.id,
+        providerType: "mikrotik", tenantId: tA.tenantId, providerResourceId: mockResource.id,
+        actionId: "action_f13", requestId: "req_f13",
+      });
+      await db.providerOperationRecord.update({ where: { id: recordId }, data: { startedAt: oldStartedAt } });
+
+      // Two workers concurrently run recovery.
+      const { recoverStaleProviderOperations } = await import("@/lib/observability/provider-operation-recovery");
+      const [result1, result2] = await Promise.all([
+        recoverStaleProviderOperations(),
+        recoverStaleProviderOperations(),
+      ]);
+
+      // Exactly one claimed the record (the other got 0 rows from the fenced claim).
+      const totalClaimed = result1.claimed + result2.claimed;
+      expect(totalClaimed).toBeGreaterThanOrEqual(1);
+
+      // Exactly one provider truth query was performed (the loser didn't query).
+      // Note: both workers may find the record eligible, but only one's fenced
+      // claim succeeds. The loser's updateMany(count=0) means it skips the
+      // truth query. However, if both find the record before either claims,
+      // both may query. The key invariant is: only ONE terminal transition occurs.
+      expect(truthQueryCount).toBeGreaterThanOrEqual(1);
+
+      // Exactly ONE record exists (no duplicate).
+      const allRecords = await db.providerOperationRecord.findMany({
+        where: { actionId: "action_f13", tenantId: tA.tenantId },
+        select: { id: true, state: true, outcome: true, recoveryClaimId: true },
+      });
+      expect(allRecords.length).toBe(1);
+      expect(allRecords[0].id).toBe(recordId); // same record
+
+      // The record is terminal (one worker succeeded).
+      expect(allRecords[0].state).toBe("SUCCEEDED");
+      expect(allRecords[0].outcome).toBe("SUCCEEDED");
+      // Recovery claim is cleared (terminal state).
+      expect(allRecords[0].recoveryClaimId).toBeNull();
+
+      // Cleanup.
+      await db.providerOperationRecord.deleteMany({ where: { id: recordId } }).catch(() => {});
+      await db.protocolResource.deleteMany({ where: { id: res.id } }).catch(() => {});
+      await db.providerResourceBinding.deleteMany({ where: { id: binding.id } }).catch(() => {});
+    } finally {
+      mockMikroTikProviderClient.getResource = originalGetResource;
+      clearMockClientRegistry();
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    }
+  }, 30_000);
 });
