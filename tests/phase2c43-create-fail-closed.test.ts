@@ -103,7 +103,7 @@ describe("Phase 2C.4.3 — RouterOS Create Fail-Closed", () => {
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     // CRITICAL: must FAIL, not proceed to PUT
     expect(result.status).toBe("failed_retryable");
@@ -130,7 +130,7 @@ describe("Phase 2C.4.3 — RouterOS Create Fail-Closed", () => {
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(result.status).toBe("failed_retryable");
 
@@ -153,7 +153,7 @@ describe("Phase 2C.4.3 — RouterOS Create Fail-Closed", () => {
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(result.status).toBe("success");
 
@@ -195,7 +195,7 @@ describe("Phase 2C.4.3 — RouterOS Create Fail-Closed", () => {
       downloadBytes: 0, uploadBytes: 0, sessionStartTime: new Date(),
     });
 
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(result.status).toBe("success");
 
@@ -239,7 +239,7 @@ describe("Phase 2C.4.3 — RouterOS Create Fail-Closed", () => {
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(result.status).toBe("success");
 
@@ -276,7 +276,7 @@ describe("Phase 2C.4.3 — RouterOS Create Fail-Closed", () => {
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(result.status).toBe("success");
 
@@ -305,8 +305,8 @@ describe("Phase 2C.4.3 — RouterOS Create Fail-Closed", () => {
 
     // Run concurrent provisions
     const results = await Promise.allSettled([
-      res.adapter.provision({ entitlement: res.entitlement, binding: res.binding }),
-      res.adapter.provision({ entitlement: res.entitlement, binding: res.binding }),
+      res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } }),
+      res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } }),
     ]);
 
     const successes = results.filter((r) => r.status === "fulfilled" && r.value.status === "success").length;

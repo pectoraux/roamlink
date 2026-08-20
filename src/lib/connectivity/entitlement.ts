@@ -863,9 +863,18 @@ export async function reconcileBindingWithProvider(bindingId: string): Promise<{
     // Call the adapter's reconcile() — this is an OBSERVATION, not a mutation.
     // The adapter receives the full binding input INCLUDING providerInstanceId
     // and providerInstanceConfiguration.
+    // Phase 12.4.4e.3: enrich correlation with tenantId for audit observability
+    // (reconcile is a READ op — proceeds without audit if no tenantId, but
+    // enriching from the authoritative entitlement gives full observability).
+    const reconcileCorrelation: import("../observability/provider-correlation").ProviderCorrelationContext = {
+      tenantId: entitlementInput.tenantId,
+      providerInstanceId: bindingInput.providerInstanceId ?? null,
+      bindingId: bindingInput.id,
+    };
     const adapterResult = await adapter.reconcile({
       entitlement: entitlementInput,
       binding: bindingInput,
+      correlation: reconcileCorrelation,
     });
 
     // Step 4: Map the observation to a kernel decision (target state + metadata).
@@ -1842,6 +1851,21 @@ export async function provisionBinding(bindingId: string, correlation?: import("
   // subsequent ticks are SKIPPED rather than stacked. This prevents connection-
   // pool exhaustion when the heartbeat interval is shorter than the query
   // latency, while still extending the lease as often as the DB allows.
+
+  // Phase 12.4.4e.3: Enrich the correlation context with authoritative
+  // tenantId from the entitlement/providerInstance. The adapter's MUTATING
+  // operations require tenantId (fail closed). When the caller (control plane)
+  // provides a correlation, use it. When the caller is the reconciliation
+  // worker (no correlation), enrich from the authoritative DB state.
+  // The adapter does NOT invent tenantId — it comes from here (the entitlement
+  // kernel, which IS the tenant-authority layer for bindings).
+  const enrichedCorrelation: import("../observability/provider-correlation").ProviderCorrelationContext = {
+    ...(correlation ?? {}),
+    tenantId: correlation?.tenantId ?? entitlement.tenantId,
+    providerInstanceId: correlation?.providerInstanceId ?? binding.providerInstanceId ?? null,
+    bindingId: correlation?.bindingId ?? binding.id,
+  };
+
   let heartbeatLost = false;
   let heartbeatLostReason: string | null = null;
   let heartbeatInFlight = false;
@@ -1885,7 +1909,7 @@ export async function provisionBinding(bindingId: string, correlation?: import("
     // entitlementInput constructed in Step 4 — no DB read intervenes between
     // the ownership check (Step 5) and this provider call.
     const result = await Promise.race([
-      adapter.provision({ entitlement: entitlementInput, binding: bindingInput, correlation }),
+      adapter.provision({ entitlement: entitlementInput, binding: bindingInput, correlation: enrichedCorrelation }),
       new Promise<never>((_, reject) => {
         const t = setTimeout(() => {
           timeoutFired = true;

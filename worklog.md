@@ -8624,3 +8624,470 @@ Stage Summary:
 - No adapter-level tenant invention (proven by 12.4.4e.25).
 - The centralized helper eliminates per-operation bypass duplication.
 - 178/178 tests pass in 3 different orderings — deterministic.
+
+---
+Task ID: 12.4.2-test-fixes-2c4x
+Agent: Test Fixer Agent — add correlation to Phase 2C.4.x tests
+Task: Fix the 3 Phase 2C.4.x test files that were calling the MikroTik adapter
+directly on MUTATING operations (provision/suspend/resume/release) without a
+`correlation.tenantId`. After the Phase 12.4.4e.3 adapter refactor closed the
+`auditBase = null` bypass, these direct adapter calls fail closed with
+`AuditStartFailureError` → `failed_permanent`. Fix is to add
+`correlation: { tenantId, providerInstanceId }` to every direct adapter
+MUTATING call so the audit-context policy authorizes the operation (matching
+the production path which always has tenantId from kernel-bridge enrichment).
+
+Files in scope:
+  1. tests/phase2c43-create-fail-closed.test.ts
+  2. tests/phase2c46-lease-enforcement.test.ts
+  3. tests/phase2c46b-provider-convergence.test.ts
+
+Work Log:
+
+- STEP 0 — Baseline (before fix):
+    phase2c43-create-fail-closed.test.ts    →  5 pass / 7 fail (the 7 failing
+                                                  tests are A,B,C,D,E+F,G,H
+                                                  which all call
+                                                  `res.adapter.provision(...)`
+                                                  directly without correlation
+                                                  → fail closed with
+                                                  AuditStartFailureError).
+    phase2c46-lease-enforcement.test.ts     → 13 pass / 0 fail (already
+                                                  passing — verified that no
+                                                  direct `adapter.*` MUTATING
+                                                  calls exist in this file).
+    phase2c46b-provider-convergence.test.ts →  6 pass / 0 fail (already
+                                                  passing — verified that no
+                                                  direct `adapter.*` MUTATING
+                                                  calls exist in this file).
+
+- STEP 1 — phase2c43-create-fail-closed.test.ts:
+  Surveyed all `.adapter.` references. Found 8 direct `res.adapter.provision`
+  calls across tests A,B,C,D,E+F,G,H (H has two concurrent calls inside
+  Promise.allSettled). For each, added:
+    `correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId }`
+  The `tenantId` is taken from `res.entitlement.tenantId` (the helper
+  `resolveBindingRuntime` returns `{ adapter, binding, entitlement }`); the
+  `providerInstanceId` from `res.binding.providerInstanceId` (set by
+  `createResourceBinding` via `instanceId`).
+  No assertions changed. No test logic changed.
+  Result: 12/12 pass (was 5/7). +7 tests recovered, 0 regressions.
+
+- STEP 2 — phase2c46-lease-enforcement.test.ts:
+  Searched for `.adapter.` references — ZERO direct adapter MUTATING calls.
+  All operations go through `provisionBinding` (which internally enriches
+  the correlation context via the kernel-bridge path) and through the test's
+  blocking client wrapper (`client.createResource` is the RouterOSProviderClient,
+  NOT the adapter — it bypasses the audit gate entirely and doesn't need
+  correlation). The references to `adapter.provision()` in the comments
+  describe the production flow conceptually but are not actual call sites.
+  No changes required. Baseline (13/13 pass) confirmed.
+
+- STEP 3 — phase2c46b-provider-convergence.test.ts:
+  Same as STEP 2 — searched for `.adapter.` references; ZERO direct adapter
+  MUTATING calls. Test S uses `claimProvisioning` + `client.createResource`
+  (RouterOSProviderClient, not the adapter) + `provisionBinding` (kernel-bridge
+  path). Test R/T/U use the client directly. The references to
+  `adapter.provision()` are in comments describing the audit scenario.
+  No changes required. Baseline (6/6 pass) confirmed.
+
+- STEP 4 — Final verification (each file run independently):
+    tests/phase2c43-create-fail-closed.test.ts    → 12 pass / 0 fail  (32 expect calls)
+    tests/phase2c46-lease-enforcement.test.ts     → 13 pass / 0 fail  (72 expect calls)
+    tests/phase2c46b-provider-convergence.test.ts →  6 pass / 0 fail  (42 expect calls)
+    TOTAL                                           31 pass / 0 fail
+
+- STEP 5 — Lint:
+    `bun run lint` → clean (no errors). The only file edited was
+    phase2c43-create-fail-closed.test.ts (added `correlation` field to 8
+    call sites; no logic change).
+
+Stage Summary:
+- HEAD: (to be committed)
+- 8 direct `res.adapter.provision` call sites in
+  phase2c43-create-fail-closed.test.ts now pass
+  `correlation: { tenantId: res.entitlement.tenantId, providerInstanceId:
+  res.binding.providerInstanceId }` to the adapter, matching the production
+  path (kernel-bridge → adapter always enriches tenantId).
+- phase2c46-lease-enforcement.test.ts and phase2c46b-provider-convergence.test.ts
+  had ZERO direct adapter MUTATING calls — they exclusively use
+  `provisionBinding` (which handles correlation internally via the
+  kernel-bridge path) and `RouterOSProviderClient.createResource` (which is
+  below the audit gate and does not need a correlation context). No changes
+  were required; their baselines were already green.
+- All failure-expecting tests in phase2c43 (A: timeout, B: 5xx, E+F: PUT
+  timeout reconciliation, G: PUT retry) continue to produce their expected
+  results because the audit gate now passes (tenantId present) and the
+  failure comes from the simulated transport error mode — exactly the
+  semantics the tests were designed to verify.
+- No assertions changed. No test logic changed. No production code touched.
+  No other test files modified. The only delta is the addition of the
+  `correlation` field on 8 adapter MUTATING call sites in a single test file.
+- 31/31 Phase 2C.4.x tests pass with the centralized audit-context policy
+  in force.
+
+---
+Task ID: 12.4.2-test-fixes-2c41
+Agent: Test Fixer Agent — add correlation to phase2c41 tests
+Task: Fix `tests/phase2c41-protocol-correctness.test.ts` which calls
+`adapter.provision()` / `adapter.suspend()` directly without a correlation
+context. After the Phase 12.4.4e.3 adapter refactor closed the
+`auditBase = null` bypass, these direct adapter MUTATING calls fail closed
+with `AuditStartFailureError` → `failed_permanent`. Fix is to add
+`correlation: { tenantId, providerInstanceId }` to every adapter MUTATING
+call so the audit-context policy authorizes the operation (matching the
+production path which always has tenantId from kernel-bridge enrichment).
+
+File in scope:
+  /home/z/my-project/tests/phase2c41-protocol-correctness.test.ts
+
+Work Log:
+
+- STEP 0 — File survey:
+  Read the test file. The fixture uses a module-level `tenantId` variable
+  (set in `ensureSetup` via `createTenant`) and a module-level `userId`
+  / `subscriptionId`. Each test creates a fresh provider instance
+  (`createProviderInstance({ tenantId, providerType: "mikrotik", name,
+  userId })`) and uses `createBindingWithInstance(instanceId)` → which
+  calls `createResourceBinding({ ..., providerInstanceId: instanceId })`.
+  Each test then calls `resolveBindingRuntime(binding.id)` which returns
+  `{ adapter, binding, entitlement }`. Per the task instructions, the
+  tenantId comes from `res.entitlement.tenantId` (matches the convention
+  adopted in the phase2c43 fix recorded above) and the providerInstanceId
+  comes from `res.binding.providerInstanceId`.
+
+- STEP 1 — Enumerated every adapter MUTATING call site:
+    Test 1  (line 112) — adapter.provision  → no correlation
+    Test 2  (line 150) — adapter.provision  → no correlation
+    Test 3  (line 187) — adapter.provision  → no correlation
+    Test 5  (line 211) — adapter.provision  → no correlation
+    Test 7+8 (line 234) — adapter.provision → no correlation
+    Test 7+8 (line 243) — adapter.suspend    → no correlation
+                              (binding = `bi` = {...res.binding,
+                               providerResourceId: p.providerResourceId};
+                               bi.providerInstanceId === res.binding.
+                               providerInstanceId, so the correlation
+                               providerInstanceId is taken from
+                               res.binding.providerInstanceId for consistency)
+    Test 10 (line 267) — adapter.provision  → no correlation
+  Total: 7 direct adapter MUTATING call sites (6 provision + 1 suspend).
+  Zero `adapter.resume` or `adapter.release` calls in this file.
+
+- STEP 2 — Applied edits via MultiEdit (atomic, 7 operations):
+  Each call site was extended with:
+    `, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId }`
+  inserted immediately after the existing `binding: ...` argument, before
+  the closing `}` of the call's object literal. Each edit was matched
+  uniquely by including surrounding context lines (test-specific comments
+  like `// CRITICAL: create must use PUT, not POST`,
+  `// CRITICAL: after timeout, ...`,
+  `// Exactly one successful PUT (the retry after reconcile)`,
+  `// 7+8+9: RouterOS .id used as resource identity`,
+  `expect(p.providerResourceId).toBeTruthy();`, the unique suspend line,
+  and `// Now set instance to inactive`).
+
+- STEP 3 — No other changes:
+  No assertions changed. No test logic changed. No production code touched.
+  No other test files modified. The Static tests (lines 292-336) read
+  source files via `fs.readFileSync` and were correctly NOT touched — they
+  don't invoke adapter operations.
+
+- STEP 4 — Verification (spec-required command):
+  `cd /home/z/my-project && timeout 60 bun test tests/phase2c41-protocol-correctness.test.ts`
+  Result:
+    11 pass / 0 fail
+    35 expect() calls
+    Ran 11 tests across 1 file. [612.00ms]
+  Test breakdown:
+    1: create uses PUT method                                   → pass
+    2: create timeout → reconcile via GET before retry         → pass
+    3: create 5xx → reconcile before retry (no blind duplicate)→ pass
+    5: create truly absent → exactly one PUT                  → pass
+    7+8: create returns .id, used for subsequent operations    → pass
+    10: inactive instance rejected even with cached client     → pass
+    Static: no POST /ip/hotspot/user in routeros-client        → pass
+    Static: cache key includes fingerprint                      → pass
+    Static: instance loaded from PostgreSQL BEFORE cache check  → pass
+    Static: create has reconcile-before-retry logic             → pass
+    Static: transport supports PUT method                       → pass
+
+- STEP 5 — Lint:
+  `bun run lint` → clean (no errors). The only delta is the addition of
+  the `correlation` field on 7 adapter MUTATING call sites in a single
+  test file; no logic, assertion, or production code change.
+
+Stage Summary:
+- HEAD: (to be committed)
+- 7 direct adapter MUTATING call sites in
+  tests/phase2c41-protocol-correctness.test.ts now pass
+  `correlation: { tenantId: res.entitlement.tenantId, providerInstanceId:
+  res.binding.providerInstanceId }` to the adapter, matching the production
+  path (kernel-bridge → adapter always enriches tenantId).
+- Tests 1, 2, 3, 5, 7+8 (provision + suspend), and 10 (provision) all
+  pass with the centralized audit-context policy in force.
+- Tests 2 and 3 (transport-timeout / 5xx reconciliation) continue to
+  exercise the reconcile-before-retry path correctly: the audit gate now
+  passes (tenantId present) and the simulated transport error mode drives
+  the expected GET/PUT sequencing — exactly the semantics the tests were
+  designed to verify.
+- No assertions changed. No test logic changed. No production code
+  touched. No other test files modified.
+- 11/11 phase2c41 tests pass; lint clean.
+
+---
+Task ID: 12.4.2-test-fixes-2c42-2c46
+Agent: Test Fixer Agent — add correlation to phase2c42 and phase2c46
+Task: Fix `tests/phase2c42-usage-retry-cache.test.ts` and
+`tests/phase2c46-lease-enforcement.test.ts` which were flagged as calling
+`adapter.provision()` directly without a correlation context. After the
+Phase 12.4.4e.3 adapter refactor closed the `auditBase = null` bypass,
+any direct adapter MUTATING call without `correlation.tenantId` fails
+closed with `AuditStartFailureError` → `failed_permanent`. Fix is to add
+`correlation: { tenantId, providerInstanceId }` to every direct adapter
+MUTATING call so the audit-context policy authorizes the operation
+(matching the production path which always has tenantId from kernel-bridge
+enrichment).
+
+Files in scope:
+  /home/z/my-project/tests/phase2c42-usage-retry-cache.test.ts
+  /home/z/my-project/tests/phase2c46-lease-enforcement.test.ts
+
+Work Log:
+
+- STEP 0 — File survey:
+  Read both test files. Each uses the same fixture pattern: a module-level
+  `tenantId` variable (set in `ensureSetup` via `createTenant`) and a
+  module-level `userId` / `subscriptionId`. Each test creates a fresh
+  provider instance (`createProviderInstance({ tenantId, providerType:
+  "mikrotik", name, userId })`) and uses `createBindingWithInstance(
+  instanceId)` → which calls `createResourceBinding({ ...,
+  providerInstanceId: instanceId })`. Each test then calls
+  `resolveBindingRuntime(binding.id)` which returns `{ adapter, binding,
+  entitlement }`. Per the task instructions, the tenantId comes from
+  `res.entitlement.tenantId` (matches the convention adopted in the
+  phase2c43 and phase2c41 fixes recorded above) and the providerInstanceId
+  comes from `res.binding.providerInstanceId`.
+
+- STEP 1 — Enumerated every direct adapter MUTATING call site:
+  phase2c42-usage-retry-cache.test.ts:
+    Test E+G (line 170) — res.adapter.provision  → no correlation
+    Test F   (line 215) — res.adapter.provision  → no correlation
+    Test H+I+J (line 237) — res1.adapter.provision  → no correlation
+    Test H+I+J (line 248) — res2.adapter.provision → no correlation
+                              (binding = { ...res2.binding,
+                               providerResourceId: p1.providerResourceId };
+                               res2.binding.providerInstanceId === the
+                               fixture instance id, so the correlation
+                               providerInstanceId is taken from
+                               res2.binding.providerInstanceId for
+                               consistency)
+    Total: 4 direct adapter.provision call sites.
+    Zero `adapter.suspend`, `adapter.resume`, or `adapter.release` calls.
+
+  phase2c46-lease-enforcement.test.ts:
+    Searched for direct `adapter.provision/suspend/resume/release` call
+    sites. ZERO found — every mention of `adapter.provision` is in
+    comments or test description strings. All actual MUTATING operations
+    in this file go through `provisionBinding(binding.id)` (which handles
+    correlation internally via the kernel-bridge path) and through
+    `ControllableMikroTikClient.createResource` (which is below the audit
+    gate and does not need a correlation context). This matches the
+    baseline already recorded in the prior 12.4.2-test-fixes-2c43 entry:
+    "phase2c46-lease-enforcement.test.ts ... had ZERO direct adapter
+    MUTATING calls ... No changes were required; their baselines were
+    already green."
+
+- STEP 2 — Applied edits to phase2c42-usage-retry-cache.test.ts via
+  MultiEdit (atomic, 4 operations). Each call site was extended with:
+    `, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId }`
+  (using `res1`/`res2` as appropriate for tests H+I+J) inserted
+  immediately after the existing `binding: ...` argument, before the
+  closing `}` of the call's object literal. Each edit was matched
+  uniquely by including surrounding context lines (test-specific
+  comments like `// CRITICAL: exactly 2 PUT calls total:`,
+  `// The first GET (lookup) fails, but the client proceeds to PUT
+  create`, the `p1`/`p2` distinguishers on the H+I+J test, and the
+  unique spread-binding `{ ...res2.binding, providerResourceId:
+  p1.providerResourceId }`).
+
+  phase2c46-lease-enforcement.test.ts: NO EDITS (zero direct adapter
+  MUTATING call sites — all such calls go through `provisionBinding`,
+  which enriches correlation internally).
+
+- STEP 3 — No other changes:
+  No assertions changed. No test logic changed. No production code
+  touched. No other test files modified. The Static tests in both files
+  read source files via `fs.readFileSync` and were correctly NOT touched
+  — they don't invoke adapter operations.
+
+- STEP 4 — Verification (spec-required commands):
+  `cd /home/z/my-project && timeout 60 bun test tests/phase2c42-usage-retry-cache.test.ts`
+  Result BEFORE fix: 9 pass / 3 fail (E+G, F, H+I+J — all
+  failed_permanent on adapter.provision due to
+  AuditStartFailureError / mutation_missing_tenant_context).
+  Result AFTER fix:
+    12 pass / 0 fail
+    31 expect() calls
+    Ran 12 tests across 1 file. [597.00ms]
+  Test breakdown:
+    A+B+C: usage uses username for active-session correlation        → pass
+    D:     usage returns isActive=false for disabled resource        → pass
+    E+G:   transport does NOT retry PUT on timeout                   → pass
+    F:     GET after retryable failure succeeds (client retries)     → pass
+    H+I+J: invalidateRouterOSClient evicts old client                 → pass
+    Static (7): resource.username / method-specific retry policy /
+      cache key secretVersion / invalidateRouterOSClient exists /
+      cache eviction / ResolvedProviderCredentials.version           → pass
+
+  `cd /home/z/my-project && timeout 60 bun test tests/phase2c46-lease-enforcement.test.ts`
+  Result (baseline, no changes required):
+    13 pass / 0 fail
+    72 expect() calls
+    Ran 13 tests across 1 file. [39.77s]
+  Test breakdown:
+    J: verifyProvisioningOwnership                                   → pass
+    I: stale worker loses ownership pre-provider                     → pass
+    K: extendProvisioningLease                                       → pass
+    L: heartbeat keeps lease alive past natural expiry               → pass
+    M: stale worker inside adapter.provision cannot finalize         → pass
+    N: provider operation exceeding bounded timeout → FAILED        → pass
+    O: unexpected error + claim taken over → claim_lost + CRITICAL   → pass
+    P: lease takeover sets RECONCILIATION_REQUIRED                   → pass
+    Q: happy-path provisioning succeeds and clears the claim         → pass
+    Static (4): verifyProvisioningOwnership + extendProvisioningLease
+      exist / pre-provider ownership check in provisionBinding / NO
+      silent .catch(() => {}) / takeover marks RECONCILIATION_REQUIRED→ pass
+
+- STEP 5 — Lint:
+  `bun run lint` → clean (no errors). The only file edited was
+  phase2c42-usage-retry-cache.test.ts (added `correlation` field to 4
+  call sites; no logic change).
+
+Stage Summary:
+- HEAD: (to be committed)
+- 4 direct `res.adapter.provision` call sites in
+  phase2c42-usage-retry-cache.test.ts now pass
+  `correlation: { tenantId: res.entitlement.tenantId, providerInstanceId:
+  res.binding.providerInstanceId }` to the adapter (using `res1`/`res2`
+  as appropriate for the H+I+J credential-rotation test), matching the
+  production path (kernel-bridge → adapter always enriches tenantId).
+- phase2c46-lease-enforcement.test.ts had ZERO direct adapter MUTATING
+  calls — they exclusively use `provisionBinding` (which handles
+  correlation internally via the kernel-bridge path) and
+  `ControllableMikroTikClient.createResource` (which is below the audit
+  gate and does not need a correlation context). No changes were
+  required; the baseline was already green (13/13 pass).
+- Tests E+G, F, and H+I+J (provision with transport-timeout / GET
+  retry / credential rotation semantics) continue to produce their
+  expected results because the audit gate now passes (tenantId present)
+  and the simulated transport behavior drives the expected PUT/GET
+  sequencing — exactly the semantics the tests were designed to verify.
+- No assertions changed. No test logic changed. No production code
+  touched. No other test files modified. The only delta is the addition
+  of the `correlation` field on 4 adapter MUTATING call sites in a
+  single test file.
+- 12/12 phase2c42 tests pass + 13/13 phase2c46 tests pass; lint clean.
+
+---
+Task ID: 12.4.2
+Agent: Principal System Architect (main) — Phase 12.4.2 Real RouterOS Verification
+Task: Audit MikroTik provider, fix all Phase 2C test failures, check for live RouterOS endpoint, run full regression. Do NOT claim frozen unless a real provider has been exercised.
+
+Work Log:
+
+- STEP 0 — Direct audit at 2cfc7b2:
+  Inspected src/lib/connectivity/providers/mikrotik/ (adapter, client, factory, transport, secret-resolver).
+  Inspected ConnectivityProviderAdapter contract, RouterOS transport, client factory.
+  Inspected tests/phase2c* (17 test files).
+  Inspected environment config (.env, .env.local).
+
+  Provider matrix:
+
+  | Capability              | Designed | Implemented | Mock-tested | Live-tested |
+  |-------------------------|----------|-------------|-------------|-------------|
+  | authentication          | YES      | YES         | YES         | NO          |
+  | provision               | YES      | YES         | YES         | NO          |
+  | suspend                 | YES      | YES         | YES         | NO          |
+  | resume                  | YES      | YES         | YES         | NO          |
+  | release                 | YES      | YES         | YES         | NO          |
+  | getUsage                | YES      | YES         | YES         | NO          |
+  | reconcile               | YES      | YES         | YES         | NO          |
+  | provider truth verification | YES  | YES         | YES         | NO          |
+  | retries                 | YES      | YES         | YES         | NO          |
+  | idempotency             | YES      | YES         | YES         | NO          |
+  | crash recovery          | YES      | YES         | YES         | NO          |
+
+- STEP 1 — Fixed pre-existing Phase 2C test failures:
+  Root cause: Phase 12.4.4e.3 closed the `auditBase = null` bypass. MUTATING
+  operations now REQUIRE `correlation.tenantId`. Phase 2C tests called
+  `adapter.provision()` directly without correlation → fail closed.
+
+  Fix 1 (entitlement kernel): `provisionBinding` now enriches the correlation
+  context with `tenantId` from the authoritative entitlement. This is the
+  correct architectural fix — the entitlement kernel IS the tenant-authority
+  layer for bindings. The adapter does NOT invent tenantId; it comes from here.
+  Also enriched `reconcileBindingWithProvider` for observability.
+
+  Fix 2 (test files): Added `correlation: { tenantId, providerInstanceId }` to
+  direct adapter MUTATING calls in 6 Phase 2C test files:
+    - phase2c3-mikrotik-provider.test.ts (21 calls)
+    - phase2c31-provider-instance.test.ts (1 call)
+    - phase2c33-client-resolution.test.ts (6 calls)
+    - phase2c34-fail-closed.test.ts (6 calls)
+    - phase2c4-routeros-client.test.ts (19 calls)
+    - phase2c41-protocol-correctness.test.ts (7 calls)
+    - phase2c42-usage-retry-cache.test.ts (4 calls)
+    - phase2c43-create-fail-closed.test.ts (8 calls)
+  Total: 72 direct adapter MUTATING calls updated with correlation context.
+  No assertions or test logic changed. No production code touched (except
+  the entitlement kernel enrichment, which is a production fix).
+
+- STEP 2 — Live environment gate:
+  Checked for LIVE_ROUTEROS_ENDPOINT, LIVE_ROUTEROS_USERNAME, LIVE_ROUTEROS_PASSWORD.
+  Result: NOT CONFIGURED.
+  LIVE PROVIDER GATE = BLOCKED.
+  Per the architect's instructions: DO NOT pretend live integration was verified.
+
+- STEP 3-10 — Live lifecycle/safety/failure/control-plane/reconciliation/
+  observability/security/cleanup tests:
+  NOT EXECUTED — blocked on live RouterOS endpoint.
+  The live test harness (tests/phase2c410-live-routeros.test.ts) is PREPARED
+  but SKIPS cleanly when LIVE_ROUTEROS_ENDPOINT is not set (21 tests skip,
+  1 META test passes documenting MOCK-VALIDATED status).
+
+- STEP 11 — Regression (3 runs, 3 different orderings):
+  Canonical regression (17 files):
+    Run 1 (canonical): 178 pass, 0 fail, 1148 expect() calls, 23.13s.
+    Run 2 (reverse):   178 pass, 0 fail, 1148 expect() calls, 22.96s.
+    Run 3 (interleaved): 178 pass, 0 fail, 1148 expect() calls, 22.83s.
+  MikroTik/Phase 2C suite (17 files):
+    180 pass, 21 skip (live), 0 fail, 654 expect() calls, 71.09s.
+  ZERO new failures. ZERO regressions.
+
+- Lint: clean.
+- Dev server: 200, no errors.
+
+- Error classification matrix (documented, no changes needed — classifyError
+  was already correct from Phase 12.4.2a):
+  | Condition                  | Expected          |
+  |----------------------------|-------------------|
+  | timeout                    | failed_retryable  |
+  | connection reset           | failed_retryable  |
+  | 429/rate limit             | failed_retryable  |
+  | temporary 5xx              | failed_retryable  |
+  | authentication failure     | failed_permanent  |
+  | invalid configuration      | failed_permanent  |
+  | malformed request          | failed_permanent  |
+  | provider resource missing  | permanent/domain  |
+  | authorization denied       | failed_permanent  |
+  | unknown error              | failed_retryable  |
+  These are implemented via PERMANENT_ERROR_PATTERNS in the MikroTik adapter.
+
+Stage Summary:
+- HEAD: (to be committed)
+- All Phase 2C/MikroTik mock tests pass (180 pass, 21 live-skip, 0 fail).
+- Canonical regression: 178/178 pass in 3 orderings — deterministic.
+- Live RouterOS verification: BLOCKED (no live endpoint configured).
+- The live test harness is PREPARED and skips cleanly.
+- Phase 12.4.2 is NOT FROZEN — live provider proof remains outstanding.
+- Remaining blocker: "No live RouterOS endpoint available."

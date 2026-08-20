@@ -167,7 +167,7 @@ describe("Phase 2C.4.2 — Usage Identity + Retry + Credential Cache Correctness
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(result.status).toBe("success");
 
@@ -212,7 +212,7 @@ describe("Phase 2C.4.2 — Usage Identity + Retry + Credential Cache Correctness
 
     // The first GET (lookup) fails, but the client proceeds to PUT create
     // (the GET is just an idempotency check — if it fails, the client tries to create)
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(result.status).toBe("success");
 
     clearMockClientRegistry();
@@ -234,7 +234,7 @@ describe("Phase 2C.4.2 — Usage Identity + Retry + Credential Cache Correctness
     registerMockClientForInstance(inst.id, client1);
     const { binding } = await createBindingWithInstance(inst.id);
     const res1 = await resolveBindingRuntime(binding.id);
-    const p1 = await res1.adapter.provision({ entitlement: res1.entitlement, binding: res1.binding });
+    const p1 = await res1.adapter.provision({ entitlement: res1.entitlement, binding: res1.binding, correlation: { tenantId: res1.entitlement.tenantId, providerInstanceId: res1.binding.providerInstanceId } });
     expect(p1.status).toBe("success");
     expect(transport1.operationLog.length).toBeGreaterThan(0);
 
@@ -245,7 +245,7 @@ describe("Phase 2C.4.2 — Usage Identity + Retry + Credential Cache Correctness
     // Register client2 (simulating credential rotation)
     registerMockClientForInstance(inst.id, client2);
     const res2 = await resolveBindingRuntime(binding.id);
-    const p2 = await res2.adapter.provision({ entitlement: res2.entitlement, binding: { ...res2.binding, providerResourceId: p1.providerResourceId } });
+    const p2 = await res2.adapter.provision({ entitlement: res2.entitlement, binding: { ...res2.binding, providerResourceId: p1.providerResourceId }, correlation: { tenantId: res2.entitlement.tenantId, providerInstanceId: res2.binding.providerInstanceId } });
     expect(p2.status).toBe("success");
 
     // CRITICAL: transport2 received operations, transport1 did NOT receive new operations

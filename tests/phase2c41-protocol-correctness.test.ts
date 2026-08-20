@@ -109,7 +109,7 @@ describe("Phase 2C.4.1 — RouterOS Protocol Correctness + Client Cache Safety",
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(p.status).toBe("success");
 
@@ -147,7 +147,7 @@ describe("Phase 2C.4.1 — RouterOS Protocol Correctness + Client Cache Safety",
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(result.status).toBe("success");
 
@@ -184,7 +184,7 @@ describe("Phase 2C.4.1 — RouterOS Protocol Correctness + Client Cache Safety",
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(result.status).toBe("success");
 
@@ -208,7 +208,7 @@ describe("Phase 2C.4.1 — RouterOS Protocol Correctness + Client Cache Safety",
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const result = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(result.status).toBe("success");
 
@@ -231,7 +231,7 @@ describe("Phase 2C.4.1 — RouterOS Protocol Correctness + Client Cache Safety",
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
 
     expect(p.status).toBe("success");
     expect(p.providerResourceId).toBeTruthy();
@@ -240,7 +240,7 @@ describe("Phase 2C.4.1 — RouterOS Protocol Correctness + Client Cache Safety",
 
     // Suspend using the .id
     const bi = { ...res.binding, providerResourceId: p.providerResourceId };
-    const s = await res.adapter.suspend({ entitlement: res.entitlement, binding: bi });
+    const s = await res.adapter.suspend({ entitlement: res.entitlement, binding: bi, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(s.status).toBe("success");
 
     // The PATCH should use the .id in the URL
@@ -264,7 +264,7 @@ describe("Phase 2C.4.1 — RouterOS Protocol Correctness + Client Cache Safety",
 
     const { binding } = await createBindingWithInstance(inst.id);
     const res = await resolveBindingRuntime(binding.id);
-    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding });
+    const p = await res.adapter.provision({ entitlement: res.entitlement, binding: res.binding, correlation: { tenantId: res.entitlement.tenantId, providerInstanceId: res.binding.providerInstanceId } });
     expect(p.status).toBe("success");
 
     // Now set instance to inactive
