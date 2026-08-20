@@ -9213,3 +9213,73 @@ Stage Summary:
 - Incident lookup exposes STARTED + recovery metadata.
 - Integrated with existing connectivity-reconcile cron.
 - 185/185 tests pass in 3 different orderings — deterministic.
+
+---
+Task ID: 12.4.4f.1
+Agent: Principal System Architect (main) — Phase 12.4.4f Ambiguity Recovery Fix
+Task: Fix the semantic contradiction where provider-unavailable/query-failed recovery transitions STARTED → AMBIGUOUS (terminal), making the record unrecoverable. Implement Option A: keep STARTED for transient provider unavailability, release the claim, and persist recovery metadata. The record is genuinely recoverable.
+
+Work Log:
+
+- P0 FIX — Non-terminal classification for provider unavailability:
+  The classifyTruthResult function now returns a `terminal: boolean` flag.
+  For query_failed and provider_unavailable, terminal=false.
+  The recovery worker checks this flag:
+    - terminal=true → completeProviderOperation (STARTED → terminal).
+    - terminal=false → release the recovery claim (set to null), persist
+      reconciliationState metadata ("provider_unavailable" or "query_failed"),
+      and leave the record as STARTED. It remains eligible for the next
+      recovery cycle.
+  The catch block (recovery threw) also releases the claim and leaves STARTED.
+
+- classifyTruthResult updated:
+  TERMINAL (provider truth was determined):
+    exists + active (provision/resume) → SUCCEEDED
+    exists + inactive (suspend) → SUCCEEDED
+    exists + active (suspend) → FAILED_RETRYABLE
+    exists (release) → FAILED_RETRYABLE
+    missing (provision) → FAILED_PERMANENT
+    missing (release) → SUCCEEDED
+    missing (suspend/resume) → AMBIGUOUS (terminal — provider truth was
+      "resource missing", which is an honest determination, not a transient
+      outage)
+  NON-TERMINAL (provider truth could NOT be determined):
+    query_failed → retains STARTED (transport/adapter error — retryable)
+    provider_unavailable → retains STARTED (timeout/5xx — retryable)
+
+- Test 12.4.4f.3 updated:
+  Was: expected AMBIGUOUS (terminal). Now: expects STARTED (retained),
+  recoveryClaimId=null (released), reconciliationState="provider_unavailable".
+
+- New tests:
+  12.4.4f.8: provider unavailable during recovery → STARTED retained, claim
+    released, second recovery succeeds. Attempt 1: provider unavailable →
+    STARTED retained. Restore getResource. Attempt 2: recovery succeeds →
+    SUCCEEDED. Record count = 1.
+  12.4.4f.9: two recovery cycles — first unavailable, second succeeds, SAME
+    record. Attempt 1: provider unavailable → STARTED retained. Incident
+    lookup shows STARTED (visible to operators during the interval). Attempt 2:
+    provider available → SUCCEEDED. Record count = 1.
+
+- Regression (3 runs, 3 different orderings):
+  Run 1 (canonical): 187 pass, 0 fail, 1199 expect() calls, 24.24s.
+  Run 2 (reverse):   187 pass, 0 fail, 1200 expect() calls, 24.29s.
+  Run 3 (interleaved): 187 pass, 0 fail, 1200 expect() calls, 23.89s.
+  +2 tests from Phase 12.4.4f.1 = 187 total (was 185).
+  ZERO new failures. ZERO regressions.
+
+- Lint: clean.
+- Dev server: 200, no errors.
+
+Stage Summary:
+- HEAD: (to be committed)
+- The semantic contradiction is fixed: transient provider unavailability during
+  recovery does NOT permanently strand the audit record in terminal AMBIGUOUS.
+- The record remains STARTED and is genuinely recoverable across multiple
+  recovery cycles.
+- The recovery claim is released on unavailability — another recovery worker
+  can claim it in the next cycle.
+- AMBIGUOUS (terminal) is reserved for cases where the provider truth WAS
+  determined but the outcome is genuinely inconclusive (e.g., resource missing
+  for suspend/resume — the operation's effect can never be verified).
+- 187/187 tests pass in 3 different orderings — deterministic.

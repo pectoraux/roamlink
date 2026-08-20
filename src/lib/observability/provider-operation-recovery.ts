@@ -208,46 +208,90 @@ export async function recoverStaleProviderOperations(): Promise<RecoveryResult> 
       // Step 4: Classify and resolve.
       const classification = classifyTruthResult(record.operation, truth);
 
-      // Step 5: Update the SAME record with the terminal outcome.
-      await completeProviderOperation(record.id, {
-        operation: record.operation as "provision" | "suspend" | "resume" | "release" | "getUsage" | "reconcile",
-        tenantId: record.tenantId,
-        bindingId: record.bindingId,
-        providerInstanceId: record.providerInstanceId,
-        providerType: record.providerType,
-        providerResourceId: record.providerResourceId,
-        requestId: record.requestId,
-        intentId: record.intentId,
-        decisionId: record.decisionId,
-        actionId: record.actionId,
-        sessionId: record.sessionId,
-        providerKey: record.providerKey,
-        outcome: classification.state,
-        outcomeDetail: {
-          recoveryClaimId: claimId,
-          recoveredAt: new Date().toISOString(),
+      if (classification.terminal) {
+        // Step 5a: Terminal classification — update the SAME record with the
+        // terminal outcome. The record transitions STARTED → terminal.
+        await completeProviderOperation(record.id, {
+          operation: record.operation as "provision" | "suspend" | "resume" | "release" | "getUsage" | "reconcile",
+          tenantId: record.tenantId,
+          bindingId: record.bindingId,
+          providerInstanceId: record.providerInstanceId,
+          providerType: record.providerType,
+          providerResourceId: record.providerResourceId,
+          requestId: record.requestId,
+          intentId: record.intentId,
+          decisionId: record.decisionId,
+          actionId: record.actionId,
+          sessionId: record.sessionId,
+          providerKey: record.providerKey,
+          outcome: classification.state,
+          outcomeDetail: {
+            recoveryClaimId: claimId,
+            recoveredAt: new Date().toISOString(),
+            providerTruthStatus: truth.status,
+            providerTruthObservedState: truth.observedState,
+            providerTruthError: truth.error,
+            classificationReason: classification.reason,
+          },
+          reconciliationState: classification.reconciliationState,
+        });
+
+        result.recovered++;
+
+        logger.info("provider_operation.recovery_completed", {
+          recordId: record.id,
+          operation: record.operation,
+          claimId,
+          outcome: classification.state,
           providerTruthStatus: truth.status,
-          providerTruthObservedState: truth.observedState,
-          providerTruthError: truth.error,
-          classificationReason: classification.reason,
-        },
-        reconciliationState: classification.reconciliationState,
-      });
+          reason: classification.reason,
+        });
+      } else {
+        // Step 5b: NON-TERMINAL classification (provider unavailable / query failed).
+        // The provider truth could not be determined. Do NOT transition to terminal.
+        // The record REMAINS STARTED and is eligible for the next recovery cycle.
+        // Release the recovery claim so another worker can try later.
+        // Persist the recovery attempt metadata on the record (reconciliationState)
+        // without changing the state.
+        await db.providerOperationRecord.update({
+          where: { id: record.id },
+          data: {
+            // Release the recovery claim — another recovery worker can claim
+            // this record in a future cycle.
+            recoveryClaimId: null,
+            recoveryClaimedAt: null,
+            recoveryClaimExpiresAt: null,
+            // Persist the recovery attempt metadata for operator visibility.
+            // The record stays STARTED — it is genuinely recoverable.
+            reconciliationState: classification.reconciliationState ?? "provider_unavailable",
+          },
+        });
 
-      result.recovered++;
+        result.retained++;
 
-      logger.info("provider_operation.recovery_completed", {
-        recordId: record.id,
-        operation: record.operation,
-        claimId,
-        outcome: classification.state,
-        providerTruthStatus: truth.status,
-        reason: classification.reason,
-      });
+        logger.info("provider_operation.recovery_retained", {
+          recordId: record.id,
+          operation: record.operation,
+          claimId,
+          providerTruthStatus: truth.status,
+          reason: classification.reason,
+          reconciliationState: classification.reconciliationState,
+          note: "provider truth unavailable; record remains STARTED and is eligible for next recovery cycle",
+        });
+      }
     } catch (err) {
       // The provider truth query threw (DB error, unexpected exception).
-      // The record remains STARTED (completeProviderOperation preserves STARTED
-      // on failure — see Phase 12.4.4e.1 Case 4). It is still recoverable.
+      // Release the recovery claim so another worker can try later.
+      // The record remains STARTED — it is still recoverable.
+      await db.providerOperationRecord.update({
+        where: { id: record.id },
+        data: {
+          recoveryClaimId: null,
+          recoveryClaimedAt: null,
+          recoveryClaimExpiresAt: null,
+        },
+      }).catch(() => {});
+
       result.failed++;
 
       logger.error("provider_operation.recovery_failed", {
@@ -255,7 +299,7 @@ export async function recoverStaleProviderOperations(): Promise<RecoveryResult> 
         operation: record.operation,
         claimId,
         error: err instanceof Error ? err.message : String(err),
-        reason: "recovery threw; record remains STARTED and is recoverable",
+        reason: "recovery threw; claim released; record remains STARTED and is recoverable",
       });
     }
   }
@@ -366,87 +410,90 @@ async function queryProviderTruth(record: {
 // ---------------------------------------------------------------------------
 
 /**
- * Classify the provider truth result into a terminal ProviderOperationState.
+ * Classify the provider truth result into a ProviderOperationState.
  *
- * Mapping:
- *   truth.status = "exists" + observedState = "active"   → SUCCEEDED
- *   truth.status = "exists" + observedState = "inactive" → depends on operation
- *   truth.status = "missing"                              → operation-specific failure
- *   truth.status = "query_failed"                         → AMBIGUOUS (retain STARTED)
- *   truth.status = "provider_unavailable"                 → AMBIGUOUS (retain STARTED)
+ * Phase 12.4.4f.1: The classification distinguishes TERMINAL outcomes
+ * (provider truth determined → record transitions) from NON-TERMINAL outcomes
+ * (provider truth could not be determined → record remains STARTED and is
+ * eligible for the next recovery cycle).
  *
- * The classification is CONSERVATIVE:
- *   - If the provider truth is ambiguous (query failed, provider unavailable),
- *     the record moves to AMBIGUOUS (not FAILED). This preserves recoverability.
- *   - If the provider truth says the resource is missing, the record moves to
- *     a failure state (the operation did not achieve its intended effect).
- *   - If the provider truth says the resource exists and is active, the
- *     record moves to SUCCEEDED (the operation's effect is confirmed).
+ * TERMINAL classifications:
+ *   exists + active (provision/resume)  → SUCCEEDED
+ *   exists + inactive (suspend)         → SUCCEEDED
+ *   exists + active (suspend)           → FAILED_RETRYABLE
+ *   exists (release)                    → FAILED_RETRYABLE
+ *   missing (provision)                 → FAILED_PERMANENT
+ *   missing (release)                   → SUCCEEDED
+ *   missing (suspend/resume)            → AMBIGUOUS (operation effect unknown —
+ *                                          the resource is gone, so the operation
+ *                                          can never be verified. This IS terminal
+ *                                          because the provider truth was determined:
+ *                                          "the resource does not exist.")
+ *
+ * NON-TERMINAL classifications:
+ *   query_failed                        → retains STARTED (retryable — provider
+ *                                          query itself failed, not the provider's
+ *                                          state. The next recovery cycle can retry.)
+ *   provider_unavailable                → retains STARTED (retryable — provider
+ *                                          is down/timeout. The next recovery
+ *                                          cycle can retry when the provider
+ *                                          comes back.)
+ *
+ * The key invariant: a transient provider outage during recovery does NOT
+ * permanently strand the audit record in a terminal AMBIGUOUS state. The
+ * record remains STARTED and is genuinely recoverable.
  */
 function classifyTruthResult(
   operation: string,
   truth: ProviderTruthResult,
-): { state: ProviderOperationState; reason: string; reconciliationState?: string } {
+): { state: ProviderOperationState; reason: string; reconciliationState?: string; terminal: boolean } {
   switch (truth.status) {
     case "exists": {
-      // The provider resource exists. The operation likely succeeded.
-      // For provision/resume: "active" means success.
-      // For suspend: "inactive" means success.
-      // For release: the resource should NOT exist (but reconcile says it does —
-      //   this is a state divergence, not a failure).
       if (operation === "suspend" && truth.observedState === "inactive") {
-        return { state: "SUCCEEDED", reason: "provider truth confirms suspended state" };
+        return { state: "SUCCEEDED", reason: "provider truth confirms suspended state", terminal: true };
       }
       if (operation === "suspend" && truth.observedState === "active") {
-        // The resource is still active — the suspend did not take effect.
-        return { state: "FAILED_RETRYABLE", reason: "provider truth shows resource still active after suspend" };
+        return { state: "FAILED_RETRYABLE", reason: "provider truth shows resource still active after suspend", terminal: true };
       }
       if (operation === "release" && truth.observedState !== "not_found") {
-        // The resource still exists after release — the release did not complete.
-        return { state: "FAILED_RETRYABLE", reason: "provider truth shows resource still exists after release" };
+        return { state: "FAILED_RETRYABLE", reason: "provider truth shows resource still exists after release", terminal: true };
       }
-      // Default: resource exists → operation succeeded.
-      return { state: "SUCCEEDED", reason: `provider truth confirms resource exists (state: ${truth.observedState})` };
+      return { state: "SUCCEEDED", reason: `provider truth confirms resource exists (state: ${truth.observedState})`, terminal: true };
     }
 
     case "missing": {
-      // The provider resource is missing. The operation's effect is unknown:
-      //   - For provision: the resource was never created (or was deleted).
-      //   - For suspend/resume: the resource is gone — the operation is moot.
-      //   - For release: the resource is gone — the release succeeded (idempotent).
       if (operation === "release") {
-        return { state: "SUCCEEDED", reason: "provider truth shows resource missing — release achieved desired state" };
+        return { state: "SUCCEEDED", reason: "provider truth shows resource missing — release achieved desired state", terminal: true };
       }
-      // For provision/suspend/resume: the resource is missing.
-      // This is a failure for provision (the resource was never created or was deleted).
-      // For suspend/resume, the resource is gone — the operation is moot but not failed.
       if (operation === "provision") {
-        return { state: "FAILED_PERMANENT", reason: "provider truth shows resource missing after provision", reconciliationState: "resource_missing" };
+        return { state: "FAILED_PERMANENT", reason: "provider truth shows resource missing after provision", reconciliationState: "resource_missing", terminal: true };
       }
-      // For suspend/resume: the resource is gone. The operation cannot be verified.
-      // Classify as AMBIGUOUS (the operation's effect is unknown — the resource
-      // may have been deleted independently).
-      return { state: "AMBIGUOUS", reason: "provider truth shows resource missing — operation effect unknown", reconciliationState: "resource_missing" };
+      // For suspend/resume: the resource is gone. The operation's effect cannot
+      // be verified. This IS terminal — the provider truth was determined
+      // ("resource missing"), and the outcome is genuinely ambiguous (not a
+      // transient outage). AMBIGUOUS here means "we looked, and the answer was
+      // inconclusive" — not "we couldn't look."
+      return { state: "AMBIGUOUS", reason: "provider truth shows resource missing — operation effect unknown", reconciliationState: "resource_missing", terminal: true };
     }
 
     case "query_failed": {
-      // The provider query itself failed (not a provider-side resource issue,
-      // but a query/transport error). The record remains recoverable.
-      // Move to AMBIGUOUS — the outcome is unknown, not failed.
-      return { state: "AMBIGUOUS", reason: `provider truth query failed: ${truth.error}`, reconciliationState: "query_failed" };
+      // The provider query itself failed (transport/adapter error).
+      // NON-TERMINAL: the record remains STARTED. The next recovery cycle
+      // can retry the query. This is NOT the same as "provider truth says
+      // ambiguous" — we never got a truth answer.
+      return { state: "AMBIGUOUS", reason: `provider truth query failed: ${truth.error}`, reconciliationState: "query_failed", terminal: false };
     }
 
     case "provider_unavailable": {
       // The provider is unavailable (timeout, connection refused, 5xx).
-      // The record remains STARTED — do NOT classify as terminal.
-      // But completeProviderOperation requires a terminal state...
-      // We use AMBIGUOUS here, but the record can be recovered again later
-      // if the provider comes back. AMBIGUOUS is the "unknown outcome" state.
-      return { state: "AMBIGUOUS", reason: `provider unavailable: ${truth.error}`, reconciliationState: "provider_unavailable" };
+      // NON-TERMINAL: the record remains STARTED. The next recovery cycle
+      // can retry when the provider comes back.
+      return { state: "AMBIGUOUS", reason: `provider unavailable: ${truth.error}`, reconciliationState: "provider_unavailable", terminal: false };
     }
 
     default:
-      return { state: "AMBIGUOUS", reason: "unknown provider truth status" };
+      // Unknown truth status — treat as non-terminal (conservative).
+      return { state: "AMBIGUOUS", reason: "unknown provider truth status", terminal: false };
   }
 }
 

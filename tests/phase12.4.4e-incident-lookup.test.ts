@@ -2136,7 +2136,7 @@ describe("Phase 12.4.4e — Incident Lookup Adversarial Tests", () => {
   // Recovery does NOT falsely classify as SUCCEEDED or FAILED_PERMANENT.
   // The record moves to AMBIGUOUS and remains recoverable.
   // =========================================================================
-  it("12.4.4f.3: provider query unavailable → AMBIGUOUS, remains recoverable", async () => {
+  it("12.4.4f.3: provider query unavailable → STARTED retained, genuinely recoverable", async () => {
     const { startProviderOperation } = await import("@/lib/observability/incident-lookup");
     const { recoverStaleProviderOperations, STARTED_RECOVERY_AFTER_MS } = await import("@/lib/observability/provider-operation-recovery");
     const { registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
@@ -2184,20 +2184,19 @@ describe("Phase 12.4.4e — Incident Lookup Adversarial Tests", () => {
 
       // Run recovery. The provider query will throw (simulated timeout).
       const result = await recoverStaleProviderOperations();
-      expect(result.recovered).toBeGreaterThanOrEqual(1);
+      expect(result.retained).toBeGreaterThanOrEqual(1); // retained, NOT recovered
 
-      // The record moved to AMBIGUOUS (not SUCCEEDED, not FAILED_PERMANENT).
+      // Phase 12.4.4f.1: The record REMAINS STARTED (not AMBIGUOUS).
+      // It is genuinely recoverable — the next recovery cycle can retry.
       const record = await db.providerOperationRecord.findUnique({
         where: { id: recordId },
-        select: { state: true, outcome: true, completedAt: true },
+        select: { state: true, outcome: true, completedAt: true, recoveryClaimId: true, reconciliationState: true },
       });
-      expect(record?.state).toBe("AMBIGUOUS");
-      expect(record?.outcome).toBe("AMBIGUOUS");
-      expect(record?.completedAt).not.toBeNull();
-
-      // The record is terminal (AMBIGUOUS is terminal). But it was RECOVERED
-      // (the recovery worker successfully classified it as ambiguous, which is
-      // an honest representation of the unknown outcome).
+      expect(record?.state).toBe("STARTED"); // NOT terminal
+      expect(record?.outcome).toBeNull(); // no terminal outcome
+      expect(record?.completedAt).toBeNull(); // not completed
+      expect(record?.recoveryClaimId).toBeNull(); // claim released — reclaimable
+      expect(record?.reconciliationState).toBe("provider_unavailable"); // metadata persisted
 
       // Cleanup.
       await db.providerOperationRecord.deleteMany({ where: { id: recordId } }).catch(() => {});
@@ -2511,4 +2510,216 @@ describe("Phase 12.4.4e — Incident Lookup Adversarial Tests", () => {
       await db.reevaluationEvent.deleteMany({ where: { subjectId: tA.userId } }).catch(() => {});
     }
   }, 30_000);
+
+  // =========================================================================
+  // 12.4.4f.8 — Provider unavailable during recovery → STARTED retained,
+  // claim released, second recovery attempt can run later.
+  //
+  // Phase 12.4.4f.1: A transient provider outage during recovery does NOT
+  // permanently strand the audit record in a terminal AMBIGUOUS state.
+  // =========================================================================
+  it("12.4.4f.8: provider unavailable during recovery → STARTED retained, second recovery succeeds", async () => {
+    const { startProviderOperation } = await import("@/lib/observability/incident-lookup");
+    const { recoverStaleProviderOperations, STARTED_RECOVERY_AFTER_MS } = await import("@/lib/observability/provider-operation-recovery");
+    const { registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+
+    const pi = await db.connectivityProviderInstance.create({
+      data: { tenantId: tA.tenantId, providerType: "mikrotik", name: `P1244f8 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik-f8" },
+    });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    // Create a mock resource so the second recovery can succeed.
+    const mockResource = await mockMikroTikProviderClient.createResource({
+      resourceType: "hotspot_user",
+      username: "rl-f8",
+      password: "pw-f8",
+      downloadRateLimitBps: 50000000,
+      uploadRateLimitBps: 10000000,
+    });
+
+    // First attempt: make getResource throw (provider unavailable).
+    const originalGetResource = mockMikroTikProviderClient.getResource.bind(mockMikroTikProviderClient);
+    mockMikroTikProviderClient.getResource = async () => {
+      throw new Error("ETIMEDOUT: connection timed out");
+    };
+
+    try {
+      const binding = await db.providerResourceBinding.create({
+        data: { entitlementId: tA.entitlementId, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: mockResource.id, providerMetadata: JSON.stringify({}), status: "BOUND", provisioningState: "COMPLETED", providerInstanceId: pi.id },
+      });
+      const cap = await db.protocolCapability.findFirst({ where: { tenantId: tA.tenantId } });
+      const res = await db.protocolResource.create({ data: { capabilityId: cap!.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "f8" }), state: "IN_USE", providerBindingId: binding.id } });
+
+      const oldStartedAt = new Date(Date.now() - STARTED_RECOVERY_AFTER_MS - 60_000);
+      const recordId = await startProviderOperation({
+        operation: "provision",
+        bindingId: binding.id,
+        providerInstanceId: pi.id,
+        providerType: "mikrotik",
+        tenantId: tA.tenantId,
+        providerResourceId: mockResource.id,
+        actionId: "action_f8",
+        requestId: "req_f8",
+      });
+      await db.providerOperationRecord.update({ where: { id: recordId }, data: { startedAt: oldStartedAt } });
+
+      // Attempt 1: provider unavailable → record stays STARTED.
+      const result1 = await recoverStaleProviderOperations();
+      expect(result1.retained).toBeGreaterThanOrEqual(1);
+      expect(result1.recovered).toBe(0); // NOT recovered — provider was unavailable
+
+      // Verify the record is STILL STARTED after attempt 1.
+      const recordAfter1 = await db.providerOperationRecord.findUnique({
+        where: { id: recordId },
+        select: { state: true, outcome: true, recoveryClaimId: true, reconciliationState: true },
+      });
+      expect(recordAfter1?.state).toBe("STARTED");
+      expect(recordAfter1?.outcome).toBeNull();
+      expect(recordAfter1?.recoveryClaimId).toBeNull(); // claim released
+      expect(recordAfter1?.reconciliationState).toBe("provider_unavailable");
+
+      // Restore getResource — provider is now available.
+      mockMikroTikProviderClient.getResource = originalGetResource;
+
+      // Attempt 2: provider is now available → recovery succeeds.
+      const result2 = await recoverStaleProviderOperations();
+      expect(result2.recovered).toBeGreaterThanOrEqual(1);
+
+      // The SAME record transitioned to SUCCEEDED.
+      const recordAfter2 = await db.providerOperationRecord.findUnique({
+        where: { id: recordId },
+        select: { state: true, outcome: true, completedAt: true },
+      });
+      expect(recordAfter2?.state).toBe("SUCCEEDED");
+      expect(recordAfter2?.outcome).toBe("SUCCEEDED");
+      expect(recordAfter2?.completedAt).not.toBeNull();
+
+      // Exactly ONE record (no duplicate created by the two attempts).
+      const allRecords = await db.providerOperationRecord.findMany({
+        where: { actionId: "action_f8", tenantId: tA.tenantId },
+      });
+      expect(allRecords.length).toBe(1);
+
+      // Cleanup.
+      await db.providerOperationRecord.deleteMany({ where: { id: recordId } }).catch(() => {});
+      await db.protocolResource.deleteMany({ where: { id: res.id } }).catch(() => {});
+      await db.providerResourceBinding.deleteMany({ where: { id: binding.id } }).catch(() => {});
+    } finally {
+      mockMikroTikProviderClient.getResource = originalGetResource;
+      clearMockClientRegistry();
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    }
+  }, 60_000);
+
+  // =========================================================================
+  // 12.4.4f.9 — Recovery attempt #1 → unavailable; #2 → provider becomes
+  // available → SAME record → SUCCEEDED.
+  //
+  // Proves the STARTED record is genuinely recoverable across multiple
+  // recovery cycles.
+  // =========================================================================
+  it("12.4.4f.9: two recovery cycles — first unavailable, second succeeds, SAME record", async () => {
+    const { startProviderOperation } = await import("@/lib/observability/incident-lookup");
+    const { recoverStaleProviderOperations, STARTED_RECOVERY_AFTER_MS } = await import("@/lib/observability/provider-operation-recovery");
+    const { registerMockClientForInstance, mockMikroTikProviderClient, clearMockClientRegistry } = await import("@/lib/connectivity");
+
+    const pi = await db.connectivityProviderInstance.create({
+      data: { tenantId: tA.tenantId, providerType: "mikrotik", name: `P1244f9 ${Date.now()}`, status: "active", configuration: JSON.stringify({}), configurationKey: "test-mikrotik-f9" },
+    });
+    registerMockClientForInstance(pi.id, mockMikroTikProviderClient);
+
+    const mockResource = await mockMikroTikProviderClient.createResource({
+      resourceType: "hotspot_user",
+      username: "rl-f9",
+      password: "pw-f9",
+      downloadRateLimitBps: 50000000,
+      uploadRateLimitBps: 10000000,
+    });
+
+    let providerAvailable = false;
+    const originalGetResource = mockMikroTikProviderClient.getResource.bind(mockMikroTikProviderClient);
+    mockMikroTikProviderClient.getResource = async (id: string) => {
+      if (!providerAvailable) {
+        throw new Error("ETIMEDOUT: connection timed out (first attempt)");
+      }
+      return originalGetResource(id);
+    };
+
+    try {
+      const binding = await db.providerResourceBinding.create({
+        data: { entitlementId: tA.entitlementId, providerType: "mikrotik", resourceType: "hotspot_user", providerResourceId: mockResource.id, providerMetadata: JSON.stringify({}), status: "BOUND", provisioningState: "COMPLETED", providerInstanceId: pi.id },
+      });
+      const cap = await db.protocolCapability.findFirst({ where: { tenantId: tA.tenantId } });
+      const res = await db.protocolResource.create({ data: { capabilityId: cap!.id, providerInstanceId: pi.id, identifiers: JSON.stringify({ id: "f9" }), state: "IN_USE", providerBindingId: binding.id } });
+
+      const oldStartedAt = new Date(Date.now() - STARTED_RECOVERY_AFTER_MS - 60_000);
+      const recordId = await startProviderOperation({
+        operation: "provision",
+        bindingId: binding.id,
+        providerInstanceId: pi.id,
+        providerType: "mikrotik",
+        tenantId: tA.tenantId,
+        providerResourceId: mockResource.id,
+        actionId: "action_f9",
+        requestId: "req_f9",
+      });
+      await db.providerOperationRecord.update({ where: { id: recordId }, data: { startedAt: oldStartedAt } });
+
+      // Attempt 1: provider unavailable.
+      providerAvailable = false;
+      const result1 = await recoverStaleProviderOperations();
+      expect(result1.retained).toBeGreaterThanOrEqual(1);
+
+      // The incident lookup shows the record as STARTED (visible to operators
+      // during the interval — it's not terminal/hidden).
+      // Need an intent with this requestId for the lookup to resolve the tenant.
+      const { createIntent } = await import("@/lib/control-plane/intent-service");
+      const intent = await createIntent({
+        subjectId: tA.userId,
+        rawText: "f9 recovery test",
+        capabilityType: "INTERNET",
+        mode: "AUTOMATIC",
+        maxPriceMinor: 500,
+        sourceRequestId: "req_f9",
+        sourceChannel: "api",
+        tenantId: tA.tenantId,
+      });
+      const { lookupIncident } = await import("@/lib/observability/incident-lookup");
+      const incidentDuringInterval = await lookupIncident({ kind: "requestId", value: "req_f9" }, tA.tenantId);
+      const starteOp = incidentDuringInterval.providerOperations.find((o) => o.id === recordId);
+      expect(starteOp).toBeDefined();
+      expect(starteOp!.state).toBe("STARTED");
+      expect(starteOp!.recoveryClaimId).toBeNull(); // claim released — reclaimable
+
+      // Attempt 2: provider now available.
+      providerAvailable = true;
+      const result2 = await recoverStaleProviderOperations();
+      expect(result2.recovered).toBeGreaterThanOrEqual(1);
+
+      // SAME record → SUCCEEDED.
+      const finalRecord = await db.providerOperationRecord.findUnique({
+        where: { id: recordId },
+        select: { state: true, outcome: true },
+      });
+      expect(finalRecord?.state).toBe("SUCCEEDED");
+      expect(finalRecord?.outcome).toBe("SUCCEEDED");
+
+      // Record count = 1 across both attempts.
+      const allRecords = await db.providerOperationRecord.findMany({
+        where: { actionId: "action_f9", tenantId: tA.tenantId },
+      });
+      expect(allRecords.length).toBe(1);
+
+      // Cleanup.
+      await db.providerOperationRecord.deleteMany({ where: { id: recordId } }).catch(() => {});
+      await db.connectivityIntentRecord.deleteMany({ where: { intentId: intent.intentId } }).catch(() => {});
+      await db.reevaluationEvent.deleteMany({ where: { subjectId: tA.userId } }).catch(() => {});
+      await db.protocolResource.deleteMany({ where: { id: res.id } }).catch(() => {});
+      await db.providerResourceBinding.deleteMany({ where: { id: binding.id } }).catch(() => {});
+    } finally {
+      mockMikroTikProviderClient.getResource = originalGetResource;
+      clearMockClientRegistry();
+      await db.connectivityProviderInstance.deleteMany({ where: { id: pi.id } }).catch(() => {});
+    }
+  }, 60_000);
 });
