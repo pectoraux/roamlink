@@ -91,17 +91,21 @@ describe("Phase 12.4.6.3.2 — Test Database Safety Guard", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 12.4.6.3.2.2 — DATABASE_TEST_URL === DATABASE_URL → guard refuses.
+  // 12.4.6.3.2.2 — DATABASE_TEST_URL === DATABASE_URL (Neon host) → guard refuses.
   //
-  // Proves: the test DB must differ from the runtime DB. Using the same
-  // connection string would let tests destroy production data.
+  // Proves: the test DB must differ from the runtime DB when both point at a
+  // Neon production host. Using the same Neon connection string would let
+  // tests destroy production data.
+  //
+  // NOTE: CI's service-container pattern (both URLs = localhost) is ALLOWED
+  // — see test 12.4.6.3.2.3 for that case.
   // -------------------------------------------------------------------------
-  it("12.4.6.3.2.2: DATABASE_TEST_URL === DATABASE_URL → guard refuses", () => {
-    // Case A: exact equality.
+  it("12.4.6.3.2.2: DATABASE_TEST_URL === DATABASE_URL (Neon) → guard refuses", () => {
+    // Case A: exact equality with a Neon production host.
     expect(() =>
       validateTestDatabaseEnv({
         DATABASE_URL: PRODUCTION_URL,
-        DATABASE_TEST_URL: PRODUCTION_URL, // same!
+        DATABASE_TEST_URL: PRODUCTION_URL, // same Neon host!
       }),
     ).toThrow(TestDatabaseSafetyError);
 
@@ -115,9 +119,9 @@ describe("Phase 12.4.6.3.2 — Test Database Safety Guard", () => {
     } catch (e) {
       errMsg = (e as Error).message;
     }
-    expect(errMsg).toContain("must NOT equal DATABASE_URL");
+    expect(errMsg).toContain("Neon production host");
 
-    // Case B: same host, different DB name — still refused (host collision).
+    // Case B: same Neon host, different DB name — still refused (host collision).
     const sameHostDiffDb =
       "postgresql://user:pass@ep-prod-pooler.region.aws.neon.tech/testdb?sslmode=require";
     expect(() =>
@@ -136,7 +140,7 @@ describe("Phase 12.4.6.3.2 — Test Database Safety Guard", () => {
     } catch (e) {
       hostErrMsg = (e as Error).message;
     }
-    expect(hostErrMsg).toContain("same host");
+    expect(hostErrMsg).toContain("same Neon host");
   });
 
   // -------------------------------------------------------------------------
@@ -185,6 +189,28 @@ describe("Phase 12.4.6.3.2 — Test Database Safety Guard", () => {
       validateTestDatabaseEnv({
         DATABASE_URL: PRODUCTION_URL,
         DATABASE_TEST_URL: "file:./test.db",
+      }),
+    ).toThrow(TestDatabaseSafetyError);
+
+    // Case F: CI service-container pattern — DATABASE_URL and DATABASE_TEST_URL
+    // both point at localhost (the same ephemeral container). This is ALLOWED
+    // because the host is NOT a Neon production host.
+    const CI_CONTAINER_URL =
+      "postgresql://test:test@localhost:5432/roamlink_test";
+    const ciResult = validateTestDatabaseEnv({
+      DATABASE_URL: CI_CONTAINER_URL,
+      DATABASE_TEST_URL: CI_CONTAINER_URL, // same localhost — allowed in CI
+      VERCEL_ENV: "",
+      NODE_ENV: "test",
+    });
+    expect(ciResult.testUrl).toBe(CI_CONTAINER_URL);
+
+    // Case G: CI pattern but VERCEL_ENV=production → refuses.
+    expect(() =>
+      validateTestDatabaseEnv({
+        DATABASE_URL: CI_CONTAINER_URL,
+        DATABASE_TEST_URL: CI_CONTAINER_URL,
+        VERCEL_ENV: "production",
       }),
     ).toThrow(TestDatabaseSafetyError);
   });

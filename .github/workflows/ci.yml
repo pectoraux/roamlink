@@ -5,8 +5,10 @@
 #   - No external credentials required (no Neon API key, no Vercel CLI).
 #   - The runner provisions an isolated PostgreSQL container per workflow run.
 #   - DATABASE_TEST_URL + DIRECT_TEST_URL point at the service container.
-#   - DATABASE_URL / DIRECT_URL are NOT set for test jobs → the safety guard
-#     cannot accidentally fall back to production.
+#   - DATABASE_URL / DIRECT_URL also point at the test container (Prisma reads
+#     these for migrate deploy). The safety guard allows this because the host
+#     is localhost, not a Neon production host. The guard REFUSES any Neon host
+#     in DATABASE_URL/DIRECT_URL during CI.
 #   - The container is destroyed when the job ends (ephemeral).
 #
 # Jobs:
@@ -60,19 +62,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run CI safety check
+      - name: Run CI safety check (no deps required)
         env:
-          # Simulate a properly-configured CI environment.
+          # CI service-container pattern: DATABASE_TEST_URL is the isolated
+          # test DB. DATABASE_URL is intentionally NOT set to a Neon host —
+          # ci-safety-check.js refuses any Neon host in CI.
           DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
-          DATABASE_URL: postgresql://prod:prod@prod-host.aws.neon.tech/roamlink
-          DIRECT_URL: postgresql://prod:prod@prod-host.aws.neon.tech/roamlink
+          # DATABASE_URL / DIRECT_URL intentionally unset → no production fallback.
         run: node scripts/ci-safety-check.js
 
-      - name: Run adversarial safety tests (no DB required)
+      - name: Run CI safety check (refuses Neon production host)
+        env:
+          DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+          DATABASE_URL: postgresql://prod:prod@ep-prod-pooler.region.aws.neon.tech/roamlink
         run: |
-          npm install --silent
-          npx prisma generate
-          bun test tests/phase12.4.6.3.2-test-database-safety.test.ts
+          # This should FAIL — CI must not point DATABASE_URL at Neon.
+          node scripts/ci-safety-check.js && exit 1 || echo "Correctly refused Neon host"
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Generate Prisma client
+        run: bun run db:generate
+      - name: Run adversarial safety tests (no DB required)
+        run: bun test tests/phase12.4.6.3.2-test-database-safety.test.ts
 
   # -------------------------------------------------------------------------
   # Job 2 — Lint.
@@ -123,7 +141,11 @@ jobs:
     env:
       DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
       DIRECT_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
-      # DATABASE_URL / DIRECT_URL intentionally NOT set → guard cannot fall back.
+      # DATABASE_URL / DIRECT_URL point at the SAME test container (CI pattern).
+      # The safety guard allows this because the host is localhost, not Neon.
+      # Prisma's schema reads DATABASE_URL/DIRECT_URL for migrations.
+      DATABASE_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DIRECT_URL: postgresql://test:test@localhost:5432/roamlink_test
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -142,7 +164,7 @@ jobs:
 
       - name: Deploy migrations to fresh PostgreSQL
         run: |
-          # Use DIRECT_TEST_URL for migrations (direct connection, not pooled).
+          # prisma migrate deploy reads DATABASE_URL/DIRECT_URL (set to test container).
           npx prisma migrate deploy
 
       - name: Verify schema diff is clean (no db push required)
@@ -193,6 +215,8 @@ jobs:
     env:
       DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
       DIRECT_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DATABASE_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DIRECT_URL: postgresql://test:test@localhost:5432/roamlink_test
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -273,6 +297,8 @@ jobs:
     env:
       DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
       DIRECT_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DATABASE_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DIRECT_URL: postgresql://test:test@localhost:5432/roamlink_test
       RATE_LIMIT_KEY_PER_MINUTE: "5"
       RATE_LIMIT_TENANT_PER_MINUTE: "5"
       RATE_LIMIT_SENSITIVE_PER_MINUTE: "3"
@@ -343,6 +369,8 @@ jobs:
     env:
       DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
       DIRECT_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DATABASE_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DIRECT_URL: postgresql://test:test@localhost:5432/roamlink_test
       RATE_LIMIT_KEY_PER_MINUTE: "5"
       RATE_LIMIT_TENANT_PER_MINUTE: "5"
       RATE_LIMIT_SENSITIVE_PER_MINUTE: "3"

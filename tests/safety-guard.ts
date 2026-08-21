@@ -70,15 +70,27 @@ export function validateTestDatabaseEnv(
     );
   }
 
-  // 2. DATABASE_TEST_URL must NOT equal DATABASE_URL.
+  // 2. DATABASE_TEST_URL must NOT equal DATABASE_URL — UNLESS the host is not
+  //    a Neon production host. This allows CI's service-container pattern
+  //    where DATABASE_URL and DATABASE_TEST_URL both point at localhost (the
+  //    ephemeral container). It blocks the dangerous case where
+  //    DATABASE_TEST_URL was accidentally set to the production Neon string.
   if (runtimeUrl && testUrl === runtimeUrl) {
-    throw new TestDatabaseSafetyError(
-      "DATABASE_TEST_URL must NOT equal DATABASE_URL.\n" +
-        "  The test database must be a SEPARATE isolated database — using the same\n" +
-        "  connection string as the runtime database would let tests destroy production\n" +
-        "  data. Set DATABASE_TEST_URL to a different isolated PostgreSQL database.\n" +
-        "  (Phase 12.4.6.3.2 — test/production database separation)",
-    );
+    const testHost = extractHost(testUrl);
+    const isNeonHost =
+      testHost !== null &&
+      (testHost.endsWith(".aws.neon.tech") || testHost.endsWith(".neon.tech"));
+    if (isNeonHost) {
+      throw new TestDatabaseSafetyError(
+        "DATABASE_TEST_URL equals DATABASE_URL (Neon production host).\n" +
+          "  The test database must be a SEPARATE isolated database — using the same\n" +
+          "  Neon production connection string would let tests destroy production\n" +
+          "  data. Set DATABASE_TEST_URL to a different isolated PostgreSQL database.\n" +
+          "  (Phase 12.4.6.3.2 — test/production database separation)",
+      );
+    }
+    // Same connection string but NOT a Neon host (e.g. localhost service
+    // container in CI) — allowed. This is the CI pattern.
   }
 
   // 3. Tests must NEVER run when VERCEL_ENV=production.
@@ -105,16 +117,35 @@ export function validateTestDatabaseEnv(
     );
   }
 
-  // 5. DATABASE_TEST_URL must NOT point at the same host as DATABASE_URL.
+  // 5. DATABASE_TEST_URL must NOT point at the same Neon PRODUCTION host as
+  //    DATABASE_URL. This allows CI's service-container pattern where both
+  //    DATABASE_URL and DATABASE_TEST_URL point at localhost (the container),
+  //    but blocks the dangerous case where DATABASE_TEST_URL was accidentally
+  //    set to the production Neon connection string.
+  //
+  //    Rule: if DATABASE_URL points at a Neon host (*.neon.tech), then
+  //    DATABASE_TEST_URL must NOT point at the same Neon host. Localhost or
+  //    other non-Neon hosts are allowed to be equal (CI service container).
   if (runtimeUrl) {
     const testHost = extractHost(testUrl);
     const runtimeHost = extractHost(runtimeUrl);
     if (testHost && runtimeHost && testHost === runtimeHost) {
-      throw new TestDatabaseSafetyError(
-        `DATABASE_TEST_URL points to the same host as DATABASE_URL (${testHost}).\n` +
-          `  The test database must be on a SEPARATE host or Neon branch.\n` +
-          `  (Phase 12.4.6.3.2 — test/production host separation)`,
-      );
+      const isNeonHost =
+        testHost.endsWith(".aws.neon.tech") || testHost.endsWith(".neon.tech");
+      if (isNeonHost) {
+        throw new TestDatabaseSafetyError(
+          `DATABASE_TEST_URL points to the same Neon host as DATABASE_URL (${testHost}).\n` +
+            `  The test database must be on a SEPARATE host or Neon branch —\n` +
+            `  using the production Neon host as the test database would let tests\n` +
+            `  destroy production data.\n` +
+            `  (Phase 12.4.6.3.2 — test/production host separation)`,
+        );
+      }
+      // Same host but NOT a Neon host (e.g. localhost service container) — allowed.
+      // CI uses this pattern: DATABASE_URL and DATABASE_TEST_URL both point at
+      // the same localhost service container. This is safe because:
+      //   - VERCEL_ENV is not production
+      //   - The host is localhost (the ephemeral container), not production Neon
     }
   }
 

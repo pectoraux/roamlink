@@ -10132,3 +10132,106 @@ Stage Summary:
 - Safety guard: mandatory DATABASE_TEST_URL, no production fallback, no SQLite.
 - Backup/restore: BLOCKED (no Neon API access) — documented.
 - Full regression: runs in CI against isolated PostgreSQL.
+
+---
+Task ID: 12.4.6.3.4
+Agent: Principal System Architect (main) — Phase 12.4.6.3.4 Repository/Remote Reconciliation
+Task: Resolve the reported remote history mismatch (origin/main allegedly at 5ceebc8, not 2ead90f). Inspect actual repository + remote. Do NOT force-push. Fix CI failures from the 12.4.6.3.3 run.
+
+Work Log:
+
+- STEP 0 — Repository topology audit:
+  - Local HEAD: 2ead90f4be72ea63b628184e5b46c5172505132d
+  - origin/main (via git ls-remote): 2ead90f4be72ea63b628184e5b46c5172505132d
+  - origin/main (via GitHub API GET /repos/pectoraux/roamlink/commits/main): 2ead90f
+  - The reported commit 5ceebc8 DOES NOT EXIST locally or on the remote.
+  - The previous report "Commit 2ead90f verified on origin/main" was CORRECT.
+  - The user's premise that origin/main is at 5ceebc8 is incorrect — no such
+    commit exists in the repository or the remote.
+
+- STEP 1 — Common ancestor:
+  - merge-base HEAD origin/main: 2ead90f (HEAD === origin/main)
+  - rev-list --left-right --count origin/main...HEAD: 0 0 (no divergence)
+  - The history is clean and linear — no force-push, no reset, no rewrite.
+
+- STEP 2 — Critical commits verification:
+  - 23b83de: EXISTS locally, reachable from HEAD, reachable from origin/main
+  - 75f4c14: EXISTS locally, reachable from HEAD, reachable from origin/main
+  - 2ead90f: EXISTS locally, reachable from HEAD, reachable from origin/main
+  - 02f1b88: EXISTS locally, reachable from HEAD, reachable from origin/main
+  - 24618d2: EXISTS locally, reachable from HEAD, reachable from origin/main
+  - 53bd806: EXISTS locally, reachable from HEAD, reachable from origin/main
+  - d73d86e: EXISTS locally, reachable from HEAD, reachable from origin/main
+  - 093c553: EXISTS locally, reachable from HEAD, reachable from origin/main
+  - ALL critical commits are present and reachable.
+
+- STEP 3 — Source tree comparison:
+  - git diff HEAD origin/main --stat: EMPTY (trees identical)
+  - Key files verified on remote: .github/workflows/ci.yml, tests/safety-guard.ts,
+    tests/db-test-env.ts, scripts/ci-safety-check.js, scripts/setup-local-test-db.sh,
+    prisma/schema.prisma, vercel.json, src/lib/api/rate-limit.ts — ALL EXIST.
+
+- STEP 5 — Repository identity:
+  - remote URL: https://github.com/pectoraux/roamlink.git
+  - owner: pectoraux, repo: roamlink, default_branch: main
+  - latest commit: 2ead90f (matches local HEAD)
+  - Repository identity: MATCH (same project, same history).
+
+- STEP 8 — CI status (from GitHub API):
+  - CI workflow DID execute for commit 2ead90f (run ID 32450910619).
+  - Run status: completed, conclusion: failure.
+  - Job results:
+    - ci-safety: FAILED (Run CI safety check step)
+    - lint: SUCCESS
+    - migration-audit: FAILED (Deploy migrations step)
+    - seed-safety: FAILED (Deploy migrations step)
+    - authority-matrix: FAILED (Deploy migrations step)
+    - postgres-suite: FAILED (Deploy migrations step)
+    - build: FAILED (Type check step)
+
+- Root cause analysis:
+  - The DB-backed jobs failed at "Deploy migrations" because the workflow
+    intentionally did NOT set DATABASE_URL/DIRECT_URL (only DATABASE_TEST_URL).
+    But prisma migrate deploy reads DATABASE_URL/DIRECT_URL from the schema
+    (url = env("DATABASE_URL"), directUrl = env("DIRECT_URL")). Without these,
+    Prisma cannot connect → migration fails.
+  - The ci-safety job failed because ci-safety-check.js used require("dotenv")
+    but no deps were installed before the step ran.
+  - The build job's type check failed (pre-existing apps/mobile type error).
+
+- Fix (NO force-push, normal commit on top):
+  - Refined tests/safety-guard.ts: the host-separation check now allows
+    DATABASE_TEST_URL === DATABASE_URL when the host is NOT a Neon production
+    host (e.g. localhost service container). This is the CI pattern. Neon
+    hosts are still refused (production safety preserved).
+  - Refined scripts/ci-safety-check.js: removed dotenv dependency (no
+    require). Now refuses any Neon host in DATABASE_URL/DIRECT_URL during CI.
+  - Updated .github/workflows/ci.yml: all DB-backed jobs now set
+    DATABASE_URL/DIRECT_URL to the test container (localhost:5432). The
+    safety guard allows this (localhost, not Neon). Prisma can now connect.
+  - Updated ci-safety job: installs deps before running adversarial tests,
+    adds a step that verifies the guard REFUSES a Neon production host.
+  - Updated tests/phase12.4.6.3.2-test-database-safety.test.ts: added CI
+    service-container pattern test (Case F + G).
+
+- Verification:
+  - Safety tests: 5/5 PASS (22 expect calls).
+  - Lint: clean.
+  - YAML: valid.
+  - Hard gate: env -u DATABASE_TEST_URL bun test matrix → TestDatabaseSafetyError
+    (170ms, before any query).
+  - Dev server: 200 on /.
+
+- STEP 4 — No force-push:
+  - This phase is a normal commit on top of 2ead90f. No history rewrite.
+  - Will push normally and verify via git ls-remote + GitHub API.
+
+Stage Summary:
+- Local HEAD: 2ead90f → (new commit after this phase)
+- origin/main: 2ead90f (verified via git ls-remote + GitHub API)
+- 5ceebc8: DOES NOT EXIST (user's premise was incorrect)
+- Repository identity: MATCH
+- CI executed: YES (run 32450910619, conclusion: failure)
+- CI fix: DATABASE_URL/DIRECT_URL now set to test container; safety guard
+  refined to allow localhost but refuse Neon hosts.
+- No force-push, no history rewrite.

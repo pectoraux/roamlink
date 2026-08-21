@@ -5,21 +5,20 @@
  * CI environment assertions. Runs BEFORE any test or migration in CI.
  * Fails the workflow immediately if the CI environment is unsafe.
  *
+ * This script has NO dependencies (no dotenv require) so it can run before
+ * `npm install` / `bun install`. It reads process.env directly.
+ *
  * Checks:
  *   1. VERCEL_ENV must NOT be "production"
- *   2. DATABASE_TEST_URL must be set and PostgreSQL
- *   3. DATABASE_TEST_URL must NOT equal DATABASE_URL
- *   4. DATABASE_TEST_URL must NOT equal DIRECT_URL
- *   5. NODE_ENV must NOT be "production"
+ *   2. NODE_ENV must NOT be "production"
+ *   3. DATABASE_TEST_URL must be set and PostgreSQL
+ *   4. If DATABASE_URL is set, it must NOT be a production Neon host
+ *      (CI uses a service container — DATABASE_URL points at the test container)
  *
  * Exit codes:
  *   0 — safe to proceed
  *   1 — refused (printed to stderr)
  */
-
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const { config } = require("dotenv");
-config({ override: true });
 
 function extractHost(url) {
   if (!url) return null;
@@ -58,32 +57,51 @@ if (!TEST_URL || TEST_URL.trim() === "") {
 }
 
 // 4. DATABASE_TEST_URL must be PostgreSQL.
-if (!TEST_URL.startsWith("postgresql://") && !TEST_URL.startsWith("postgres://")) {
+if (
+  !TEST_URL.startsWith("postgresql://") &&
+  !TEST_URL.startsWith("postgres://")
+) {
   refuse(
     `DATABASE_TEST_URL must be PostgreSQL. Got prefix: "${TEST_URL.slice(0, 20)}...".`,
   );
 }
 
-// 5. DATABASE_TEST_URL must NOT equal DATABASE_URL.
-if (RUNTIME_URL && TEST_URL === RUNTIME_URL) {
-  refuse("DATABASE_TEST_URL equals DATABASE_URL — test DB must differ from runtime DB.");
+// 5. In CI, DATABASE_URL / DIRECT_URL point at the test container (same host).
+//    This is safe because:
+//      - VERCEL_ENV is not production
+//      - The host is localhost (service container), not a production Neon host
+//    The guard does NOT require DATABASE_URL to differ from DATABASE_TEST_URL
+//    in CI — it requires that neither points at a production host.
+//
+//    Production hosts are identified by the Neon domain pattern:
+//      *.aws.neon.tech  (excluding the test branch if one exists)
+//
+//    If DATABASE_URL points at *.aws.neon.tech in CI, that's a P0 — CI must
+//    only connect to the service container.
+
+function isNeonHost(url) {
+  const host = extractHost(url);
+  if (!host) return false;
+  return host.endsWith(".aws.neon.tech") || host.endsWith(".neon.tech");
 }
 
-// 6. DATABASE_TEST_URL must NOT equal DIRECT_URL.
-if (DIRECT_URL && TEST_URL === DIRECT_URL) {
-  refuse("DATABASE_TEST_URL equals DIRECT_URL — test DB must differ from migration DB.");
-}
-
-// 7. Host separation (best-effort).
-const testHost = extractHost(TEST_URL);
-const runtimeHost = extractHost(RUNTIME_URL);
-if (testHost && runtimeHost && testHost === runtimeHost) {
+if (RUNTIME_URL && isNeonHost(RUNTIME_URL)) {
   refuse(
-    `DATABASE_TEST_URL host (${testHost}) equals DATABASE_URL host — test DB must be isolated.`,
+    `DATABASE_URL points at a Neon host (${extractHost(RUNTIME_URL)}) — ` +
+      "CI must ONLY use the service container (localhost), never a Neon production host.",
+  );
+}
+
+if (DIRECT_URL && isNeonHost(DIRECT_URL)) {
+  refuse(
+    `DIRECT_URL points at a Neon host (${extractHost(DIRECT_URL)}) — ` +
+      "CI must ONLY use the service container (localhost), never a Neon production host.",
   );
 }
 
 console.log("[ci-safety-check] OK — CI environment is safe.");
-console.log("  DATABASE_TEST_URL: set (PostgreSQL)");
+console.log("  DATABASE_TEST_URL: " + (TEST_URL ? "set (PostgreSQL)" : "MISSING"));
+console.log("  DATABASE_URL: " + (RUNTIME_URL ? extractHost(RUNTIME_URL) || "set" : "(unset)"));
+console.log("  DIRECT_URL: " + (DIRECT_URL ? extractHost(DIRECT_URL) || "set" : "(unset)"));
 console.log("  VERCEL_ENV: " + (VERCEL_ENV || "(unset)"));
 console.log("  NODE_ENV: " + (NODE_ENV || "(unset)"));
