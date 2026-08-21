@@ -30,20 +30,14 @@ import { logger } from "@/lib/logger";
 import { audit } from "@/lib/orders/idempotency";
 
 // ---------------------------------------------------------------------------
-// Database provider detection — used to make FOR UPDATE row locks portable.
-// PostgreSQL supports `SELECT ... FOR UPDATE` for explicit row-level locking.
-// SQLite (used in dev/test) does NOT support FOR UPDATE — it returns a syntax
-// error. SQLite uses SERIALIZABLE isolation by default within a transaction,
-// so the explicit lock is unnecessary. The guarded updateMany at the bottom of
-// the reconciliation transaction provides the atomicity guarantee in both
-// providers — the FOR UPDATE is an additional pessimistic lock that PostgreSQL
-// benefits from but SQLite can safely skip.
+// Database provider — PostgreSQL is canonical (Phase 12.4.6.3.1).
+// The runtime database is always PostgreSQL (Neon). `SELECT ... FOR UPDATE`
+// provides explicit row-level locking for pessimistic concurrency control
+// during binding reconciliation. The guarded updateMany at the bottom of the
+// reconciliation transaction provides the atomicity guarantee (ownership fence);
+// the FOR UPDATE is an additional pessimistic lock that prevents concurrent
+// readers from observing a mid-transition state.
 // ---------------------------------------------------------------------------
-const DATABASE_URL = process.env.DATABASE_URL ?? "";
-const IS_SQLITE =
-  DATABASE_URL.startsWith("file:") ||
-  DATABASE_URL.startsWith("sqlite:") ||
-  DATABASE_URL.startsWith(":memory:");
 
 // ---------------------------------------------------------------------------
 // Capability Types
@@ -882,22 +876,13 @@ export async function reconcileBindingWithProvider(bindingId: string): Promise<{
     const decision = mapReconciliationResult(observedBindingStatus, adapterResult);
 
     // Step 5: ATOMIC COMMIT — perform the transition + metadata update in ONE transaction.
-    // Lock the binding row with FOR UPDATE (PostgreSQL only). Verify the status
+    // Lock the binding row with FOR UPDATE (PostgreSQL). Verify the status
     // hasn't changed since we observed it (stale-observation prevention).
-    // SQLite (dev/test) does not support FOR UPDATE — the guarded updateMany
-    // below provides the atomicity guarantee in both providers.
     const txResult = await db.$transaction(async (tx) => {
-      // Lock the binding row (portable: skip FOR UPDATE on SQLite)
-      let lockedBinding: Array<{ id: string; status: string }>;
-      if (IS_SQLITE) {
-        lockedBinding = await tx.$queryRaw`
-          SELECT id, status FROM "ProviderResourceBinding" WHERE id = ${bindingId}
-        `;
-      } else {
-        lockedBinding = await tx.$queryRaw`
-          SELECT id, status FROM "ProviderResourceBinding" WHERE id = ${bindingId} FOR UPDATE
-        `;
-      }
+      // Lock the binding row (PostgreSQL row-level lock).
+      const lockedBinding: Array<{ id: string; status: string }> = await tx.$queryRaw`
+        SELECT id, status FROM "ProviderResourceBinding" WHERE id = ${bindingId} FOR UPDATE
+      `;
       if (lockedBinding.length === 0) {
         return { committed: false as const, reason: "Binding not found in transaction" };
       }

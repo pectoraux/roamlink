@@ -61,15 +61,61 @@ import { logger } from "@/lib/logger";
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+//
+// Phase 12.4.6.3.1 — Configurable limits (dependency injection).
+//
+// Production deployments DO NOT set the RATE_LIMIT_* env vars — the defaults
+// below (100 / 500 / 10) are used. This is the canonical production policy.
+//
+// Tests override these via env vars (e.g. RATE_LIMIT_KEY_PER_MINUTE=5) so the
+// same DB-authoritative semantics can be proven with a small number of
+// requests instead of 100+. The conditional-updateMany primitive is identical
+// regardless of the limit value — only the threshold differs.
+//
+// This is dependency injection via environment, NOT a hardcoded production
+// change: production behavior is unchanged when the env vars are absent.
 
-/** Default per-key rate limit: requests per minute. */
+/** Default per-key rate limit: requests per minute. (Production default.) */
 export const DEFAULT_KEY_LIMIT_PER_MINUTE = 100;
 
-/** Default per-tenant aggregate rate limit: requests per minute. */
+/** Default per-tenant aggregate rate limit: requests per minute. (Production default.) */
 export const DEFAULT_TENANT_LIMIT_PER_MINUTE = 500;
 
-/** Sensitive endpoint rate limit: requests per minute. */
+/** Sensitive endpoint rate limit: requests per minute. (Production default.) */
 export const SENSITIVE_ENDPOINT_LIMIT_PER_MINUTE = 10;
+
+/**
+ * Effective per-key limit. Reads RATE_LIMIT_KEY_PER_MINUTE at call time so
+ * tests can override per-file. Falls back to the production default.
+ */
+export function getKeyLimitPerMinute(): number {
+  const v = process.env.RATE_LIMIT_KEY_PER_MINUTE;
+  if (!v) return DEFAULT_KEY_LIMIT_PER_MINUTE;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_KEY_LIMIT_PER_MINUTE;
+}
+
+/**
+ * Effective per-tenant aggregate limit. Reads RATE_LIMIT_TENANT_PER_MINUTE at
+ * call time so tests can override. Falls back to the production default.
+ */
+export function getTenantLimitPerMinute(): number {
+  const v = process.env.RATE_LIMIT_TENANT_PER_MINUTE;
+  if (!v) return DEFAULT_TENANT_LIMIT_PER_MINUTE;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_TENANT_LIMIT_PER_MINUTE;
+}
+
+/**
+ * Effective sensitive-endpoint limit. Reads RATE_LIMIT_SENSITIVE_PER_MINUTE at
+ * call time so tests can override. Falls back to the production default.
+ */
+export function getSensitiveLimitPerMinute(): number {
+  const v = process.env.RATE_LIMIT_SENSITIVE_PER_MINUTE;
+  if (!v) return SENSITIVE_ENDPOINT_LIMIT_PER_MINUTE;
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) && n > 0 ? n : SENSITIVE_ENDPOINT_LIMIT_PER_MINUTE;
+}
 
 /** Fixed window size in milliseconds. */
 export const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
@@ -266,7 +312,7 @@ export async function checkRateLimit(
     scopes.push({
       scope: "key",
       scopeId: identity.apiKeyId,
-      limit: DEFAULT_KEY_LIMIT_PER_MINUTE,
+      limit: getKeyLimitPerMinute(),
     });
   }
 
@@ -274,7 +320,7 @@ export async function checkRateLimit(
   scopes.push({
     scope: "tenant",
     scopeId: identity.tenantId,
-    limit: DEFAULT_TENANT_LIMIT_PER_MINUTE,
+    limit: getTenantLimitPerMinute(),
   });
 
   // 3. Sensitive scope (if path matches).
@@ -283,7 +329,7 @@ export async function checkRateLimit(
     scopes.push({
       scope: "sensitive",
       scopeId: `${identity.tenantId}:${identity.path}`,
-      limit: SENSITIVE_ENDPOINT_LIMIT_PER_MINUTE,
+      limit: getSensitiveLimitPerMinute(),
     });
   }
 

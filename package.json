@@ -13,7 +13,11 @@
     "db:deploy": "prisma migrate deploy",
     "db:reset": "prisma migrate reset",
     "db:seed": "bun run prisma/seed.ts",
-    "test": "DATABASE_URL=$(grep '^DIRECT_URL=' .env | cut -d'=' -f2- | tr -d '\"') DIRECT_URL=$(grep '^DIRECT_URL=' .env | cut -d'=' -f2- | tr -d '\"') bun test",
+    "db:migrate:diff": "prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url",
+    "test": "bun test",
+    "test:fast": "bun test",
+    "test:authority": "bun test tests/phase12.4.6.3.1-postgres-concurrency-matrix.test.ts",
+    "test:smoke": "bun test tests/phase12.4.6.3-neon-smoke.test.ts tests/phase11.1-decision-retry-bound.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

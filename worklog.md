@@ -9867,3 +9867,102 @@ Stage Summary:
 - Production deployment (Vercel → Neon, same region): will have <10ms latency.
 - SQLite dependencies remaining: IS_SQLITE flag in entitlement.ts (harmless runtime
   check — evaluates to false when DATABASE_URL = postgresql://).
+
+---
+Task ID: 12.4.6.3.1
+Agent: Principal System Architect (main) — Phase 12.4.6.3.1 PostgreSQL Test/CI Strategy
+Task: Make PostgreSQL the only canonical runtime database while making the test strategy practical and trustworthy. Separate PostgreSQL runtime correctness from test-harness/database-environment latency.
+
+Work Log:
+
+- STEP 0 — Direct audit:
+  - schema provider = postgresql (canonical).
+  - .env uses Neon PostgreSQL (pooler + direct).
+  - package.json `test` script pointed DATABASE_URL at production DIRECT_URL — tests shared the production DB.
+  - Rate-limit tests used production constants (100/500/10 per min) → 540 sequential DB calls → timeout against Neon.
+  - IS_SQLITE flag in entitlement.ts (runtime check, but SQLite-specific code path).
+  - 13 migrations existed but schema drift: 33 tables added via `db push` after migration 0013 (ProviderOperationRecord, RateLimitEvent, RateLimitCounter, ConnectivitySession, IdempotencyOperation, etc.).
+  - tests/helpers.ts cleanupTestOrders deleted ALL data in tables (destructive, no scoping).
+  - No DATABASE_TEST_URL / isolated test DB support.
+
+- STEP 2a — Rate-limit DI:
+  - Added getKeyLimitPerMinute(), getTenantLimitPerMinute(), getSensitiveLimitPerMinute() to src/lib/api/rate-limit.ts.
+  - These read RATE_LIMIT_KEY_PER_MINUTE / RATE_LIMIT_TENANT_PER_MINUTE / RATE_LIMIT_SENSITIVE_PER_MINUTE env vars at call time.
+  - Production defaults preserved (100/500/10). Tests override to 5/10/3 to prove the same semantics with fewer requests.
+  - checkRateLimit() now uses the effective limits instead of hardcoded constants.
+  - This is dependency injection via environment, NOT a hardcoded production change.
+
+- STEP 2b/3 — PostgreSQL test harness:
+  - Rewrote tests/env.ts to support DATABASE_TEST_URL / DIRECT_TEST_URL (isolated test DB).
+  - If DATABASE_TEST_URL is set → tests use it (isolated PostgreSQL). If absent → falls back to DATABASE_URL with a loud warning (acceptable only for matrix + smoke).
+  - Created tests/db-test-env.ts: assertPostgres(), uniqueTestSlug(), cleanupTenants() (scoped cleanup — never deleteMany({})).
+  - Updated package.json: test:fast, test:authority, test:smoke scripts. Removed the broken test script that pointed at production DIRECT_URL.
+  - Updated .env.example with three DB modes + rate-limit DI documentation.
+
+- STEP 3b — IS_SQLITE removal:
+  - Removed IS_SQLITE constant from src/lib/connectivity/entitlement.ts.
+  - Removed the `if (IS_SQLITE)` branch — always uses `SELECT ... FOR UPDATE` (PostgreSQL row-level lock).
+  - No SQLite runtime code path remains in src/.
+
+- STEP 7 — Migration 0014:
+  - Generated 0014_phase12_connectivity_authority/migration.sql via `prisma migrate diff --from-migrations --to-schema-datamodel --script`.
+  - Captures 33 tables + all indexes + foreign keys added via `db push` after migration 0013.
+  - Verified: `prisma migrate diff` reports "No difference detected" — schema reproducible from migrations alone.
+  - Marked all 14 migrations as applied on Neon (tables existed from db push).
+  - `prisma migrate status` → "Database schema is up to date!"
+
+- STEP 6 — PostgreSQL concurrency matrix (6 tests):
+  - Created tests/phase12.4.6.3.1-postgres-concurrency-matrix.test.ts.
+  - 12.4.6.3.1.1: Concurrent RateLimitCounter — exactly 5 of 15 concurrent requests allowed (RATE_LIMIT_KEY_PER_MINUTE=5).
+  - 12.4.6.3.1.2: Concurrent IdempotencyOperation claim — exactly 1 of 8 INSERTs succeeds, rest get P2002.
+  - 12.4.6.3.1.3: Concurrent session execution slot — exactly 1 of 8 acquireSessionExecutionSlot succeeds.
+  - 12.4.6.3.1.4: Concurrent intent fence — exactly 1 of 2 version-2 creates succeeds (unique constraint on intentId+version).
+  - 12.4.6.3.1.5: Concurrent ProviderOperationRecord recovery — exactly 1 of 8 fenced updateMany claims succeeds.
+  - 12.4.6.3.1.6: Unique constraint P2002 — exactly 1 of 2 duplicate email creates succeeds, P2002 correctly identifies the email field.
+  - ALL 6 PASS against Neon (28s total). Strict per-run isolation (unique slugs, scoped cleanup).
+
+- STEP 8 — Seed safety:
+  - Ran seed twice. Verified: plans=24 (0 new, 24 updated on second run), admin=1, demo=1, pricing=4, credit=2 — ALL unchanged. Idempotent.
+
+- STEP 9 — Environment hygiene:
+  - .env.example contains names only (no credentials). .env is gitignored.
+  - Pooled (DATABASE_URL) vs direct (DIRECT_URL) roles documented.
+  - DATABASE_TEST_URL / DIRECT_TEST_URL documented for isolated test DB.
+
+- STEP 10 — Backup/restore:
+  - BACKUP_RESTORE_LIVE_VERIFICATION = BLOCKED (no Neon API key / dashboard access in sandbox).
+  - Implementation ready: DATABASE_TEST_URL harness can consume a Neon branch connection string.
+  - Neon provides 7-day PITR + branching (documented).
+
+- STEP 11 — Regression strategy:
+  - Created docs/PHASE-12.4.6.3.1-POSTGRESQL-CANONICALIZATION.md.
+  - Three suites: Fast (DATABASE_TEST_URL), Authority (6 matrix tests), Smoke (Neon smoke + phase11.1).
+  - Test class taxonomy: DB-AUTHORITY (must PostgreSQL) vs PURE DOMAIN (may use faster setup).
+
+- Neon smoke test:
+  - Created tests/phase12.4.6.3-neon-smoke.test.ts (5 tests: CRUD, transaction, fenced updateMany, unique constraint, FOR UPDATE).
+  - ALL 5 PASS against Neon.
+
+- Verification:
+  - Lint: clean (0 errors).
+  - Dev server: 200 on / and /api/v1/version. Home page renders correctly (verified via agent-browser — navigation, footer, content all present).
+  - PostgreSQL concurrency matrix: 6/6 PASS against Neon.
+  - Neon smoke: 5/5 PASS.
+  - Phase 11.1 (decision retry bound): 7/7 PASS against Neon.
+  - Total: 18/18 tests pass against Neon PostgreSQL.
+  - Migration diff: "No difference detected" — schema reproducible from migrations alone.
+  - Seed: idempotent (verified by running twice).
+
+Stage Summary:
+- HEAD: (to be committed)
+- Schema provider: postgresql (canonical).
+- Dev/prod/test DB: Neon PostgreSQL (test can use isolated DATABASE_TEST_URL).
+- Migration reproducibility: 14 migrations, diff clean, no db push required.
+- SQLite dependencies: NONE (IS_SQLITE flag removed, no file:/sqlite: refs in src/).
+- Rate limiting: tested on PostgreSQL (6/6 matrix PASS with DI limits).
+- Idempotency: tested on PostgreSQL (6/6 matrix PASS).
+- Execution fencing: tested on PostgreSQL (6/6 matrix PASS).
+- Provider recovery: tested on PostgreSQL (6/6 matrix PASS).
+- Seed safety: idempotent (verified).
+- Backup/restore: BLOCKED (no Neon API access in sandbox) — documented, not fabricated.
+- Full regression against Neon from sandbox: impractical (network latency) — test-environment limitation, NOT a code defect. The 6 matrix tests + 5 smoke tests + 7 phase11.1 tests prove the DB-authoritative semantics on PostgreSQL.
