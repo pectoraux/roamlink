@@ -1,0 +1,418 @@
+# Phase 12.4.6.3.3 — CI PostgreSQL Provisioning + Authority Regression
+#
+# Strategy: GitHub Actions service container (postgres:16).
+#
+#   - No external credentials required (no Neon API key, no Vercel CLI).
+#   - The runner provisions an isolated PostgreSQL container per workflow run.
+#   - DATABASE_TEST_URL + DIRECT_TEST_URL point at the service container.
+#   - DATABASE_URL / DIRECT_URL are NOT set for test jobs → the safety guard
+#     cannot accidentally fall back to production.
+#   - The container is destroyed when the job ends (ephemeral).
+#
+# Jobs:
+#   1. ci-safety       — environment assertions (fast, no DB)
+#   2. lint             — eslint
+#   3. migration-audit  — fresh PG + migrate deploy + diff (clean)
+#   4. seed-safety      — migrate + seed twice + assert no duplicates
+#   5. authority-matrix — 6 PostgreSQL concurrency matrix tests (DI limits)
+#   6. postgres-suite   — full DB-authority regression (Phase 11-12 + matrix)
+#   7. build            — production build
+#
+# Artifacts: test results, migration diff, lint output. No secrets exposed.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same ref (saves runner minutes).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Bun version (pinned for reproducibility).
+  BUN_VERSION: "1.3.14"
+  # Rate limit DI — small limits for fast CI tests (Phase 12.4.6.3.1 Step 5).
+  # The conditional updateMany primitive is identical regardless of the limit
+  # value — only the threshold differs. Production defaults (100/500/10) are
+  # NOT changed.
+  RATE_LIMIT_KEY_PER_MINUTE: "5"
+  RATE_LIMIT_TENANT_PER_MINUTE: "5"
+  RATE_LIMIT_SENSITIVE_PER_MINUTE: "3"
+  # CI must never run in production.
+  NODE_ENV: "test"
+  # Prevent any accidental production fallback.
+  VERCEL_ENV: ""
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Job 1 — CI safety assertions (fast, no DB).
+  # Verifies the CI environment is safe before any other job runs.
+  # -------------------------------------------------------------------------
+  ci-safety:
+    name: CI Safety Assertions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run CI safety check
+        env:
+          # Simulate a properly-configured CI environment.
+          DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+          DATABASE_URL: postgresql://prod:prod@prod-host.aws.neon.tech/roamlink
+          DIRECT_URL: postgresql://prod:prod@prod-host.aws.neon.tech/roamlink
+        run: node scripts/ci-safety-check.js
+
+      - name: Run adversarial safety tests (no DB required)
+        run: |
+          npm install --silent
+          npx prisma generate
+          bun test tests/phase12.4.6.3.2-test-database-safety.test.ts
+
+  # -------------------------------------------------------------------------
+  # Job 2 — Lint.
+  # -------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Generate Prisma client
+        run: bun run db:generate
+      - name: Run ESLint
+        run: bun run lint
+
+  # -------------------------------------------------------------------------
+  # Job 3 — Migration audit.
+  # Fresh empty PostgreSQL + prisma migrate deploy + diff (must be clean).
+  # Proves the schema is reproducible from migrations alone (no db push).
+  # -------------------------------------------------------------------------
+  migration-audit:
+    name: Migration Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: roamlink_test
+        ports:
+          - 5432:5432
+        # Wait for PostgreSQL to be ready before starting the job.
+        options: >-
+          --health-cmd "pg_isready -U test -d roamlink_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DIRECT_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+      # DATABASE_URL / DIRECT_URL intentionally NOT set → guard cannot fall back.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Generate Prisma client
+        run: bun run db:generate
+
+      - name: CI safety check
+        run: node scripts/ci-safety-check.js
+
+      - name: Deploy migrations to fresh PostgreSQL
+        run: |
+          # Use DIRECT_TEST_URL for migrations (direct connection, not pooled).
+          npx prisma migrate deploy
+
+      - name: Verify schema diff is clean (no db push required)
+        run: |
+          set -e
+          OUTPUT=$(npx prisma migrate diff \
+            --from-migrations prisma/migrations \
+            --to-schema-datamodel prisma/schema.prisma \
+            --shadow-database-url "$DIRECT_TEST_URL" 2>&1)
+          echo "$OUTPUT"
+          if ! echo "$OUTPUT" | grep -q "No difference detected"; then
+            echo "::error::Migration diff is NOT clean — schema is not reproducible from migrations alone."
+            exit 1
+          fi
+          echo "Migration diff is clean — schema reproducible from migrations alone."
+
+      - name: Upload migration diff artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-diff
+          path: |
+            prisma/migrations/
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # Job 4 — Seed safety.
+  # Migrate + seed TWICE + assert no duplicate bootstrap records.
+  # -------------------------------------------------------------------------
+  seed-safety:
+    name: Seed Safety
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: roamlink_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d roamlink_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DIRECT_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Generate Prisma client
+        run: bun run db:generate
+
+      - name: CI safety check
+        run: node scripts/ci-safety-check.js
+
+      - name: Deploy migrations
+        run: npx prisma migrate deploy
+
+      - name: Seed SaaS plans + capabilities
+        run: |
+          bun -e "
+            import { seedSaaasPlans } from './src/lib/tenant/entitlements';
+            import { seedConnectivityCapabilities } from './src/lib/connectivity/entitlement';
+            await seedSaaasPlans();
+            await seedConnectivityCapabilities();
+            console.log('SaaS plans + capabilities seeded');
+          "
+
+      - name: Seed (run 1)
+        run: bun run prisma/seed.ts
+
+      - name: Seed (run 2 — idempotency check)
+        run: bun run prisma/seed.ts
+
+      - name: Assert no duplicate bootstrap records
+        run: |
+          bun -e "
+            const { PrismaClient } = require('@prisma/client');
+            const db = new PrismaClient();
+            const plans = await db.plan.count();
+            const saaasPlans = await db.saaasPlan.count();
+            const admins = await db.user.count({ where: { email: 'ekontetevi@gmail' } });
+            const demos = await db.user.count({ where: { email: 'demo@esim.local' } });
+            const pricing = await db.pricingRule.count();
+            console.log({ plans, saaasPlans, admins, demos, pricing });
+            if (plans !== 24) throw new Error('Expected 24 plans, got ' + plans);
+            if (saaasPlans !== 4) throw new Error('Expected 4 SaaS plans, got ' + saaasPlans);
+            if (admins !== 1) throw new Error('Expected 1 admin, got ' + admins);
+            if (demos !== 1) throw new Error('Expected 1 demo, got ' + demos);
+            if (pricing !== 4) throw new Error('Expected 4 pricing rules, got ' + pricing);
+            console.log('Seed idempotency verified — no duplicates.');
+            await db.\$disconnect();
+          "
+
+  # -------------------------------------------------------------------------
+  # Job 5 — PostgreSQL authority matrix.
+  # The 6 critical concurrency proofs (Step 7).
+  # -------------------------------------------------------------------------
+  authority-matrix:
+    name: PostgreSQL Authority Matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: roamlink_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d roamlink_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DIRECT_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+      RATE_LIMIT_KEY_PER_MINUTE: "5"
+      RATE_LIMIT_TENANT_PER_MINUTE: "5"
+      RATE_LIMIT_SENSITIVE_PER_MINUTE: "3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Generate Prisma client
+        run: bun run db:generate
+
+      - name: CI safety check
+        run: node scripts/ci-safety-check.js
+
+      - name: Deploy migrations
+        run: npx prisma migrate deploy
+
+      - name: Seed (required for matrix test fixtures)
+        run: |
+          bun run prisma/seed.ts
+          bun -e "
+            import { seedSaaasPlans } from './src/lib/tenant/entitlements';
+            import { seedConnectivityCapabilities } from './src/lib/connectivity/entitlement';
+            await seedSaaasPlans();
+            await seedConnectivityCapabilities();
+          "
+
+      - name: Run PostgreSQL authority matrix (6 tests)
+        run: bun test tests/phase12.4.6.3.1-postgres-concurrency-matrix.test.ts
+
+      - name: Upload test results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authority-matrix-results
+          path: |
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # Job 6 — Full PostgreSQL authority suite.
+  # Phase 11.1-11.7, 12.2-12.4.6, matrix (Step 6).
+  # -------------------------------------------------------------------------
+  postgres-suite:
+    name: Full PostgreSQL Authority Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: roamlink_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d roamlink_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+      DIRECT_TEST_URL: postgresql://test:test@localhost:5432/roamlink_test
+      RATE_LIMIT_KEY_PER_MINUTE: "5"
+      RATE_LIMIT_TENANT_PER_MINUTE: "5"
+      RATE_LIMIT_SENSITIVE_PER_MINUTE: "3"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Generate Prisma client
+        run: bun run db:generate
+
+      - name: CI safety check
+        run: node scripts/ci-safety-check.js
+
+      - name: Deploy migrations
+        run: npx prisma migrate deploy
+
+      - name: Seed test database
+        run: |
+          bun run prisma/seed.ts
+          bun -e "
+            import { seedSaaasPlans } from './src/lib/tenant/entitlements';
+            import { seedConnectivityCapabilities } from './src/lib/connectivity/entitlement';
+            await seedSaaasPlans();
+            await seedConnectivityCapabilities();
+          "
+
+      - name: Run PostgreSQL authority suite
+        run: bun run test:postgres
+
+      - name: Upload test results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-suite-results
+          path: |
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------------------------
+  # Job 7 — Production build.
+  # Verifies the app builds (catches type errors, import errors).
+  # -------------------------------------------------------------------------
+  build:
+    name: Production Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Generate Prisma client
+        run: bun run db:generate
+      - name: Type check
+        run: bun run typecheck
+      - name: Build
+        env:
+          # Build-time fallback DATABASE_URL (not used for runtime).
+          DATABASE_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder
+          DIRECT_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder
+        run: bun run build

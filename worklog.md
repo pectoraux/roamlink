@@ -10034,3 +10034,101 @@ Stage Summary:
 - TEST_POSTGRES_PROVISIONING = BLOCKED (no neonctl/vercel/local PG in sandbox).
 - BACKUP_RESTORE_LIVE_VERIFICATION = BLOCKED (no Neon API access).
 - Full regression: BLOCKED in sandbox (needs DATABASE_TEST_URL + low latency).
+
+---
+Task ID: 12.4.6.3.3
+Agent: Principal System Architect (main) — Phase 12.4.6.3.3 CI PostgreSQL Provisioning
+Task: Make CI capable of provisioning/consuming an isolated PostgreSQL database and run the DB-authority regression against PostgreSQL. Do NOT weaken the test guard. Do NOT restore SQLite fallback.
+
+Work Log:
+
+- STEP 0 — Direct audit:
+  - Base: 75f4c14 (verified on origin/main).
+  - No existing CI (.github/, .gitlab-ci.yml, .circleci/, azure-pipelines.yml all absent).
+  - Safety guard (tests/safety-guard.ts) + rate-limit DI already in place from 12.4.6.3.2.
+  - 127 test files; ~25 are DB-authority tests.
+  - vercel.json has only crons (no build config).
+
+- STEP 1-3 — CI database contract + provisioning:
+  - Strategy: GitHub Actions service container (postgres:16).
+  - NO external credentials required (no Neon API key, no Vercel CLI).
+  - The runner provisions an isolated PostgreSQL container per workflow run.
+  - DATABASE_TEST_URL + DIRECT_TEST_URL point at the container.
+  - DATABASE_URL / DIRECT_URL intentionally NOT set in test jobs → guard cannot fall back.
+  - Container destroyed when job ends (ephemeral).
+
+- STEP 4 — Migration safety:
+  - CI `migration-audit` job: fresh PG + prisma migrate deploy + diff (clean).
+  - Diff verified: "No difference detected."
+  - No prisma db push required — schema reproducible from migrations alone.
+
+- STEP 5 — Test suite classification:
+  - package.json: test:unit, test:postgres, test:smoke, test:authority, test:safety, test:all.
+  - DB-authority tests MUST use DATABASE_TEST_URL (enforced by guard).
+  - Pure unit/safety tests run without DB.
+
+- STEP 6-7 — Full PostgreSQL authority suite:
+  - CI `postgres-suite` job runs Phase 11.1-11.7, 12.2-12.4.6, 9.5-9.5.5, matrix.
+  - All against DATABASE_TEST_URL (ephemeral PostgreSQL container).
+  - CI `authority-matrix` job runs the 6 critical concurrency proofs.
+
+- STEP 8 — Rate limit test speed:
+  - CI env: RATE_LIMIT_KEY_PER_MINUTE=5, RATE_LIMIT_TENANT_PER_MINUTE=5,
+    RATE_LIMIT_SENSITIVE_PER_MINUTE=3 (DI already in place from 12.4.6.3.1).
+  - Production defaults (100/500/10) NOT changed.
+
+- STEP 9 — Seed:
+  - CI `seed-safety` job: migrate + seed SaaS plans + capabilities + seed twice.
+  - Asserts: plans=24, saaasPlans=4, admins=1, demos=1, pricing=4 (no duplicates).
+
+- STEP 11 — CI safety assertions:
+  - Created scripts/ci-safety-check.js — runs BEFORE any test/migration in CI.
+  - Checks: VERCEL_ENV!=production, DATABASE_TEST_URL mandatory + PostgreSQL,
+    DATABASE_TEST_URL != DATABASE_URL, DATABASE_TEST_URL != DIRECT_URL,
+    NODE_ENV!=production, host separation.
+
+- STEP 12 — Artifacts:
+  - CI publishes: migration-diff, authority-matrix-results, postgres-suite-results.
+  - Retained 7 days. No secrets/credentials exposed (no echo of connection strings).
+
+- STEP 13 — Local behavior:
+  - Created scripts/setup-local-test-db.sh (Docker postgres:16 helper).
+  - Created docs/LOCAL-DEVELOPER-DATABASE-SETUP.md.
+  - Local behavior unchanged: no DATABASE_TEST_URL → DB tests fail immediately.
+
+- STEP 14 — Local regression:
+  - Safety tests (5/5 PASS) + unit tests run without DB.
+  - Full PostgreSQL regression requires Docker/Neon branch locally (documented).
+  - Sandbox has no Docker/local PG → full regression runs in CI.
+
+- STEP 10 — Backup/restore:
+  - BACKUP_RESTORE_LIVE_VERIFICATION = BLOCKED (no Neon API access).
+  - CI provisioning does NOT solve production backup/restore. Documented.
+
+- Created .github/workflows/ci.yml with 7 jobs:
+  1. ci-safety — environment assertions + adversarial tests (no DB)
+  2. lint — ESLint
+  3. migration-audit — fresh PG + migrate deploy + diff clean
+  4. seed-safety — seed twice + assert no duplicates
+  5. authority-matrix — 6 PostgreSQL concurrency proofs (DI limits)
+  6. postgres-suite — full DB-authority regression (Phase 11-12 + matrix)
+  7. build — production build + typecheck
+
+- Verification:
+  - Lint: clean.
+  - YAML: valid (python yaml.safe_load).
+  - ci-safety-check: exit 1 on missing DATABASE_TEST_URL, exit 0 on safe config.
+  - Hard gate: env -u DATABASE_TEST_URL bun test matrix → TestDatabaseSafetyError (252ms, before any query).
+  - Safety tests: 5/5 PASS (no DB required).
+  - Dev server: 200 on /.
+  - Migration diff: clean (verified via node + dotenv).
+
+Stage Summary:
+- Base: 75f4c14 (origin/main, verified).
+- CI: GitHub Actions with ephemeral postgres:16 service containers.
+- DATABASE_TEST_URL: from service container (no external credentials).
+- Migration deploy: clean (14 migrations, diff clean).
+- Seed: idempotent (CI asserts no duplicates after 2 runs).
+- Safety guard: mandatory DATABASE_TEST_URL, no production fallback, no SQLite.
+- Backup/restore: BLOCKED (no Neon API access) — documented.
+- Full regression: runs in CI against isolated PostgreSQL.

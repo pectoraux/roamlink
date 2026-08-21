@@ -16,10 +16,12 @@
     "db:seed:test": "DATABASE_TEST_URL_REQUIRED=1 bun run prisma/seed.ts",
     "db:migrate:diff": "prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url",
     "test": "bun test",
-    "test:fast": "bun test",
-    "test:authority": "bun test tests/phase12.4.6.3.1-postgres-concurrency-matrix.test.ts",
+    "test:unit": "bun test tests/phase12.4.6.3.2-test-database-safety.test.ts",
+    "test:postgres": "bun test tests/phase11.1-decision-retry-bound.test.ts tests/phase11.2-session-serialization.test.ts tests/phase11.3-provider-truth-flip.test.ts tests/phase11.4-intent-authority.test.ts tests/phase11.5-invariant-fail-closed.test.ts tests/phase11.6-event-convergence.test.ts tests/phase11.7-auditability.test.ts tests/phase12.2-tenant-security.test.ts tests/phase12.3-adoption.test.ts tests/phase12.3-api-protocol.test.ts tests/phase12.3-version-contract.test.ts tests/phase12.4-observability.test.ts tests/phase12.4.4d-test-isolation.test.ts tests/phase12.4.4e-incident-lookup.test.ts tests/phase12.4.6.1-rate-limit-correctness.test.ts tests/phase12.4.6.2-rate-limit.test.ts tests/phase12.4.6.2-route-rate-limit-proof.test.ts tests/phase12.4.6.2-route-rate-limit.test.ts tests/phase12.4.6.3-neon-smoke.test.ts tests/phase12.4.6.3.1-postgres-concurrency-matrix.test.ts tests/phase9.5-edge-intent-transparency.test.ts tests/phase9.5.1-intent-authority-behavioral.test.ts tests/phase9.5.2-budget-behavioral-claim-recovery.test.ts tests/phase9.5.4-reason-code-protocol.test.ts tests/phase9.5.5-reason-code-integrity.test.ts",
     "test:smoke": "bun test tests/phase12.4.6.3-neon-smoke.test.ts tests/phase11.1-decision-retry-bound.test.ts",
+    "test:authority": "bun test tests/phase12.4.6.3.1-postgres-concurrency-matrix.test.ts",
     "test:safety": "bun test tests/phase12.4.6.3.2-test-database-safety.test.ts",
+    "test:all": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
