@@ -1,25 +1,12 @@
 // =============================================================================
 // RoamLink OS — Prisma Schema
 // -----------------------------------------------------------------------------
-// DATABASE (Phase 12.1 — Canonicalization):
-//   Development/test environment: SQLite (sandbox constraint — no PostgreSQL
-//   available in the current cloud sandbox).
-//   Production target: PostgreSQL (Neon/Vercel).
+// DATABASE (Phase 12.4.6.3 — Neon PostgreSQL Canonicalization):
+//   Development, staging, and production all use Neon PostgreSQL.
 //
 //   The schema uses ONLY portable Prisma types (String, Int, Float, DateTime,
 //   Boolean). No @db.* native types, no Json fields, no Decimal, no Bytes.
-//   All JSON data is stored as String with JSON.stringify/parse. This makes the
-//   schema fully portable between SQLite and PostgreSQL — switching the
-//   provider for production is a one-line change.
-//
-//   The previous contradiction (schema declared PostgreSQL but DATABASE_URL
-//   pointed to a SQLite file) caused repeated engineering friction during
-//   Phase 11: Prisma client generation had to be switched between providers.
-//   This is now eliminated — the provider matches the actual DATABASE_URL.
-//
-//   PRODUCTION DEPLOYMENT: change `provider = "sqlite"` to
-//   `provider = "postgresql"` in the CI/CD pipeline before `prisma generate`.
-//   The schema itself needs no other changes.
+//   All JSON data is stored as String with JSON.stringify/parse.
 //
 //   Money is stored as Int (minor units) — never float.
 // =============================================================================
@@ -30,7 +17,7 @@ generator client {
 }
 
 datasource db {
-  provider  = "sqlite"
+  provider  = "postgresql"
   url       = env("DATABASE_URL")
   directUrl = env("DIRECT_URL")
 }
