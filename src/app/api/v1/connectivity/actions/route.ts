@@ -11,6 +11,7 @@
 import { NextRequest } from "next/server";
 import { resolveApiPrincipal, principalTenantId } from "@/lib/api/principal";
 import { getRequestId, apiV1ErrorResponse, apiV1SuccessResponse } from "@/lib/api/protocol";
+import { enforceRateLimit } from "@/lib/api/rate-limit-helper";
 import { createAction, executeAction } from "@/lib/control-plane/action-executor";
 import { db } from "@/lib/db";
 import { AppError } from "@/lib/errors";
@@ -20,6 +21,14 @@ export async function POST(req: NextRequest) {
   try {
     const principal = await resolveApiPrincipal(req, "write");
     const tenantId = principalTenantId(principal);
+
+    // Phase 12.4.6.2: Rate limit check (after auth, before handler logic).
+    const rateLimitResult = await enforceRateLimit({
+      tenantId,
+      apiKeyId: principal.type === "api_key" ? principal.id : undefined,
+      path: new URL(req.url).pathname,
+    }, requestId);
+    if (!rateLimitResult.allowed) return rateLimitResult.response!;
 
     const body = await req.json();
     const { sessionId, decisionId, type, targetResourceId, reason, policyVersion, execute } = body;

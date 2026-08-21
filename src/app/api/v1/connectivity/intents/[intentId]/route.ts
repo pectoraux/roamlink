@@ -12,6 +12,8 @@
 import { NextRequest } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { getRequestId, apiV1SuccessResponse, apiV1ErrorResponse } from "@/lib/api/protocol";
+import { enforceRateLimit } from "@/lib/api/rate-limit-helper";
+import { requireTenantContext } from "@/lib/tenant/context";
 import { getIntentHistory, cancelIntent, createIntent, emitIntentReevaluationEvent } from "@/lib/control-plane/intent-service";
 import { AppError } from "@/lib/errors";
 
@@ -24,6 +26,14 @@ export async function GET(
   try {
     const user = await getCurrentUser();
     if (!user) throw new AppError("auth", "No active session — authentication required", 401, "Authentication required.");
+
+    // Phase 12.4.6.2: Resolve tenant context for rate limiting (after auth).
+    const tenantCtx = await requireTenantContext(user);
+    const rateLimitResult = await enforceRateLimit({
+      tenantId: tenantCtx.tenantId,
+      path: new URL(req.url).pathname,
+    }, requestId);
+    if (!rateLimitResult.allowed) return rateLimitResult.response!;
 
     const { intentId } = await params;
     const history = await getIntentHistory(user.id, intentId);
@@ -43,6 +53,14 @@ export async function POST(
   try {
     const user = await getCurrentUser();
     if (!user) throw new AppError("auth", "No active session — authentication required", 401, "Authentication required.");
+
+    // Phase 12.4.6.2: Resolve tenant context for rate limiting (after auth).
+    const tenantCtx = await requireTenantContext(user);
+    const rateLimitResult = await enforceRateLimit({
+      tenantId: tenantCtx.tenantId,
+      path: new URL(req.url).pathname,
+    }, requestId);
+    if (!rateLimitResult.allowed) return rateLimitResult.response!;
 
     const { intentId } = await params;
     const body = await req.json();

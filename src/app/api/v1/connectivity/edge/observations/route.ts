@@ -23,6 +23,8 @@
 import { NextRequest } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { getRequestId, apiV1SuccessResponse, apiV1ErrorResponse } from "@/lib/api/protocol";
+import { enforceRateLimit } from "@/lib/api/rate-limit-helper";
+import { requireTenantContext } from "@/lib/tenant/context";
 import { ingestEdgeObservationBatch } from "@/lib/control-plane/edge-ingestion";
 import { AppError } from "@/lib/errors";
 import type { EdgeObservationBatch } from "@roamlink/shared";
@@ -32,6 +34,16 @@ export async function POST(req: NextRequest) {
   try {
     const user = await getCurrentUser();
     if (!user) throw new AppError("auth", "No active session — authentication required", 401, "Authentication required.");
+
+    // Phase 12.4.6.2: Resolve tenant context for rate limiting (after auth).
+    // Sensitive endpoint (path matches /api/v1/connectivity/edge/observations)
+    // — rate limit is enforced fail-closed on DB failure.
+    const tenantCtx = await requireTenantContext(user);
+    const rateLimitResult = await enforceRateLimit({
+      tenantId: tenantCtx.tenantId,
+      path: new URL(req.url).pathname,
+    }, requestId);
+    if (!rateLimitResult.allowed) return rateLimitResult.response!;
 
     const body = await req.json();
     const { deviceId, observations } = body;

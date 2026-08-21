@@ -43,6 +43,7 @@
 import { NextRequest } from "next/server";
 import { resolveApiPrincipal, principalTenantId } from "@/lib/api/principal";
 import { getRequestId, apiV1ErrorResponse, apiV1SuccessResponse } from "@/lib/api/protocol";
+import { enforceRateLimit } from "@/lib/api/rate-limit-helper";
 import { lookupIncident, type IncidentLookupKey } from "@/lib/observability/incident-lookup";
 import { AppError } from "@/lib/errors";
 
@@ -62,6 +63,14 @@ export async function GET(req: NextRequest) {
     // Step 1: Authenticate (API key OR session — both work).
     const principal = await resolveApiPrincipal(req, "read");
     const callerTenantId = principalTenantId(principal);
+
+    // Phase 12.4.6.2: Rate limit check (after auth, before handler logic).
+    const rateLimitResult = await enforceRateLimit({
+      tenantId: callerTenantId,
+      apiKeyId: principal.type === "api_key" ? principal.id : undefined,
+      path: new URL(req.url).pathname,
+    }, requestId);
+    if (!rateLimitResult.allowed) return rateLimitResult.response!;
 
     // Step 2: Parse the lookup key from query parameters.
     const url = new URL(req.url);

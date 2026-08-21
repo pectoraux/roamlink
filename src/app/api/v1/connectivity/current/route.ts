@@ -14,8 +14,9 @@
  */
 
 import { NextRequest } from "next/server";
-import { resolveApiPrincipal } from "@/lib/api/principal";
+import { resolveApiPrincipal, principalTenantId } from "@/lib/api/principal";
 import { getRequestId, apiV1ErrorResponse, apiV1SuccessResponse } from "@/lib/api/protocol";
+import { enforceRateLimit } from "@/lib/api/rate-limit-helper";
 import { getCurrentConnectivityForUser } from "@/lib/control-plane/current-connectivity";
 import { db } from "@/lib/db";
 import { AppError } from "@/lib/errors";
@@ -24,6 +25,15 @@ export async function GET(req: NextRequest) {
   const requestId = getRequestId(req);
   try {
     const principal = await resolveApiPrincipal(req, "read");
+    const tenantId = principalTenantId(principal);
+
+    // Phase 12.4.6.2: Rate limit check (after auth, before handler logic).
+    const rateLimitResult = await enforceRateLimit({
+      tenantId,
+      apiKeyId: principal.type === "api_key" ? principal.id : undefined,
+      path: new URL(req.url).pathname,
+    }, requestId);
+    if (!rateLimitResult.allowed) return rateLimitResult.response!;
 
     // For session auth, scope to the authenticated user (cannot be overridden).
     // For API-key auth, scope to the subjectId query param (the API key can

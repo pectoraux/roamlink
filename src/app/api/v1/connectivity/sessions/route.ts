@@ -14,6 +14,7 @@
 import { NextRequest } from "next/server";
 import { resolveApiPrincipal, principalTenantId } from "@/lib/api/principal";
 import { getRequestId, apiV1ErrorResponse, apiV1SuccessResponse } from "@/lib/api/protocol";
+import { enforceRateLimit } from "@/lib/api/rate-limit-helper";
 import { createSession } from "@/lib/control-plane/session-manager";
 import { db } from "@/lib/db";
 import { AppError } from "@/lib/errors";
@@ -23,6 +24,14 @@ export async function GET(req: NextRequest) {
   try {
     const principal = await resolveApiPrincipal(req, "read");
     const tenantId = principalTenantId(principal);
+
+    // Phase 12.4.6.2: Rate limit check (after auth, before handler logic).
+    const rateLimitResult = await enforceRateLimit({
+      tenantId,
+      apiKeyId: principal.type === "api_key" ? principal.id : undefined,
+      path: new URL(req.url).pathname,
+    }, requestId);
+    if (!rateLimitResult.allowed) return rateLimitResult.response!;
 
     // For session auth, sessions are scoped to the user. For API-key auth,
     // sessions are scoped to the tenant (the API key can see all sessions
@@ -59,6 +68,14 @@ export async function POST(req: NextRequest) {
     const principal = await resolveApiPrincipal(req, "write");
     const tenantId = principalTenantId(principal);
     const userId = principal.type === "session" ? principal.userId : null;
+
+    // Phase 12.4.6.2: Rate limit check (after auth, before handler logic).
+    const rateLimitResult = await enforceRateLimit({
+      tenantId,
+      apiKeyId: principal.type === "api_key" ? principal.id : undefined,
+      path: new URL(req.url).pathname,
+    }, requestId);
+    if (!rateLimitResult.allowed) return rateLimitResult.response!;
 
     const body = await req.json();
     const { intentId, entitlementId, policyId } = body;

@@ -27,6 +27,8 @@
 import { NextRequest } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { getRequestId, apiV1SuccessResponse, apiV1ErrorResponse } from "@/lib/api/protocol";
+import { enforceRateLimit } from "@/lib/api/rate-limit-helper";
+import { requireTenantContext } from "@/lib/tenant/context";
 import { db } from "@/lib/db";
 import { logger } from "@/lib/logger";
 import { createOrUpdatePolicy, getPolicy } from "@/lib/control-plane/policy-engine";
@@ -43,6 +45,14 @@ export async function POST(req: NextRequest) {
   try {
     const user = await getCurrentUser();
     if (!user) throw new AppError("auth", "No active session — authentication required", 401, "Authentication required.");
+
+    // Phase 12.4.6.2: Resolve tenant context for rate limiting (after auth).
+    const tenantCtx = await requireTenantContext(user);
+    const rateLimitResult = await enforceRateLimit({
+      tenantId: tenantCtx.tenantId,
+      path: new URL(req.url).pathname,
+    }, requestId);
+    if (!rateLimitResult.allowed) return rateLimitResult.response!;
 
     const body = await req.json();
     const { deviceId, context, observedAt } = body;
@@ -178,6 +188,14 @@ export async function GET(req: NextRequest) {
   try {
     const user = await getCurrentUser();
     if (!user) throw new AppError("auth", "No active session — authentication required", 401, "Authentication required.");
+
+    // Phase 12.4.6.2: Resolve tenant context for rate limiting (after auth).
+    const tenantCtx = await requireTenantContext(user);
+    const rateLimitResult = await enforceRateLimit({
+      tenantId: tenantCtx.tenantId,
+      path: new URL(req.url).pathname,
+    }, requestId);
+    if (!rateLimitResult.allowed) return rateLimitResult.response!;
 
     // Phase 9.3.1: Derive deviceId from the authenticated user's registered
     // devices, not from a query param. This prevents a user from reading
