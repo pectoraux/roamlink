@@ -11,13 +11,15 @@
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
-    "db:reset": "prisma migrate reset",
+    "db:reset": "node scripts/db-reset-guard.js && prisma migrate reset",
     "db:seed": "bun run prisma/seed.ts",
+    "db:seed:test": "DATABASE_TEST_URL_REQUIRED=1 bun run prisma/seed.ts",
     "db:migrate:diff": "prisma migrate diff --from-migrations prisma/migrations --to-schema-datamodel prisma/schema.prisma --shadow-database-url",
     "test": "bun test",
     "test:fast": "bun test",
     "test:authority": "bun test tests/phase12.4.6.3.1-postgres-concurrency-matrix.test.ts",
     "test:smoke": "bun test tests/phase12.4.6.3-neon-smoke.test.ts tests/phase11.1-decision-retry-bound.test.ts",
+    "test:safety": "bun test tests/phase12.4.6.3.2-test-database-safety.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

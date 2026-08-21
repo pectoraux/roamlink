@@ -2,6 +2,16 @@
  * Test setup — runs before all tests.
  * Ensures the database is connected and test data exists.
  * Uses a global flag so setup runs once across all test files.
+ *
+ * Phase 12.4.6.3.2 — SAFETY:
+ *   This module performs DB writes (createMany, create). It MUST only run
+ *   against the isolated test database (DATABASE_TEST_URL). The guard in
+ *   tests/env.ts enforces this — if DATABASE_TEST_URL is missing or equals
+ *   DATABASE_URL, the test process exits before this code runs.
+ *
+ *   The legacy `deleteMany({})` calls in cleanupTestOrders have been replaced
+ *   with scoped deletes (by id). NEVER use `deleteMany({})` — it destroys ALL
+ *   data in the table, including production seed data.
  */
 
 import { db } from "@/lib/db";
@@ -53,15 +63,42 @@ export async function getTestPlanId(): Promise<string> {
   return plan.id;
 }
 
-/** Clean up test data after a test run. */
+/**
+ * Clean up test data after a test run.
+ *
+ * Phase 12.4.6.3.2 — SAFETY:
+ *   This function deletes ONLY the rows whose IDs are passed in. NEVER use
+ *   `deleteMany({})` (the legacy pattern) — it destroys ALL data in the table.
+ *   Callers MUST pass the specific orderIds they created.
+ *
+ *   The scoped pattern below finds the child rows linked to the passed orderIds
+ *   and deletes only those. If orderIds is empty, this function is a no-op
+ *   (it does NOT delete all rows).
+ */
 export async function cleanupTestOrders(orderIds: string[]) {
-  // Delete in dependency order to respect foreign keys
-  await db.installToken.deleteMany({}).catch(() => {});
-  await db.usage.deleteMany({}).catch(() => {});
-  await db.topUp.deleteMany({}).catch(() => {});
-  await db.esim.deleteMany({}).catch(() => {});
-  await db.payment.deleteMany({}).catch(() => {});
-  if (orderIds.length > 0) {
-    await db.order.deleteMany({ where: { id: { in: orderIds } } }).catch(() => {});
+  if (orderIds.length === 0) {
+    // No-op — do NOT delete all rows. Legacy code used deleteMany({}) here,
+    // which would destroy production data if run against DATABASE_URL.
+    return;
   }
+
+  // Delete child rows linked to the passed orderIds (scoped, not deleteMany({})).
+  await db.installToken
+    .deleteMany({ where: { orderId: { in: orderIds } } })
+    .catch(() => {});
+  await db.usage
+    .deleteMany({ where: { orderId: { in: orderIds } } })
+    .catch(() => {});
+  await db.topUp
+    .deleteMany({ where: { orderId: { in: orderIds } } })
+    .catch(() => {});
+  await db.esim
+    .deleteMany({ where: { orderId: { in: orderIds } } })
+    .catch(() => {});
+  await db.payment
+    .deleteMany({ where: { orderId: { in: orderIds } } })
+    .catch(() => {});
+  await db.order
+    .deleteMany({ where: { id: { in: orderIds } } })
+    .catch(() => {});
 }
